@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::atomic::AtomicU32;
 
 use super::*;
@@ -163,6 +164,10 @@ fn force_option_from_help() {
         force_option("USAGE: drbdsetup secondary {resource}\n"),
         None
     );
+    assert!(is_secondary_usage(help));
+    assert!(!is_secondary_usage(
+        "error: timeout after 60s: drbdsetup secondary --help"
+    ));
     assert_eq!(help_argv(), argv(&["drbdsetup", "secondary", "--help"]));
     assert_eq!(
         demote_argv("--force=yes", "pvc-1"),
@@ -223,8 +228,10 @@ fn bounds_fit_the_critical_pod_window() {
     };
     assert!(total(PROBE_MODE) < DETECT_BOUND);
     assert!(total(DEMOTE_MODE) <= DEMOTE_BOUND);
+    assert!(total(FLUSH_MODE) <= FLUSH_BOUND);
+    assert!(total(AGAIN_MODE) <= AGAIN_BOUND);
     // kubelet's critical pod grace, with room left for the drain.
-    assert!(GUARD_MAX < Duration::from_secs(30));
+    assert!(GUARD_MAX <= Duration::from_secs(29), "{GUARD_MAX:?}");
 }
 
 /// Counts calls; answers with `pods` in turn, the last one repeated.
@@ -361,68 +368,284 @@ async fn detection_is_bounded() {
     assert_eq!(t0.elapsed(), DETECT_BOUND);
 }
 
-#[tokio::test]
-async fn guard_demotes_owned_primaries_in_parallel() {
-    let dir = std::env::temp_dir().join(format!("r-drbd-guard-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("pvc-a.res"), "").unwrap();
-    let t = Arc::new(Mutex::new(tracker(&[
-        &res("pvc-a", "Primary"),
-        &res("host-r0", "Primary"),
-        "exists -",
-    ])));
-    let x = ScriptedExec::new();
-    x.expect(preparing_argv(), ok("b true\n"))
-        .expect(system_state_argv(), ok("running\n"))
-        .expect(demote_argv("--force=yes", "pvc-a"), ok(""));
-    let x = Arc::new(x);
-    let gate = OpenGate::default();
-    let guard = Guard {
-        exec: x.clone(),
-        tracker: t.clone(),
-        res_dir: dir.clone(),
-        force: Some("--force=yes"),
-        pods: Box::new(Pods::new(vec![Err("unused".into())])),
-        gate: gate.clone(),
-    };
-    let feeder = {
-        let t = t.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            t.lock()
-                .unwrap()
-                .feed("change resource name:pvc-a role:Secondary")
-                .unwrap();
+/// A host for the guard: answers the probes, records every command,
+/// holds each demote until `parties` demotes have started, and turns a
+/// demoted resource Secondary unless it is sticky for the first round.
+struct GuardHost {
+    tracker: Arc<Mutex<Tracker>>,
+    seen: Mutex<Vec<Vec<String>>>,
+    barrier: tokio::sync::Barrier,
+    sticky: Mutex<BTreeSet<String>>,
+    flush_fails: bool,
+}
+
+impl GuardHost {
+    fn new(tracker: &Arc<Mutex<Tracker>>, parties: usize) -> Arc<Self> {
+        Arc::new(Self {
+            tracker: tracker.clone(),
+            seen: Mutex::default(),
+            barrier: tokio::sync::Barrier::new(parties),
+            sticky: Mutex::default(),
+            flush_fails: false,
         })
-    };
-    guard.on_signal().await;
-    feeder.await.unwrap();
-    std::fs::remove_dir_all(&dir).unwrap();
-    x.assert_done();
-    assert!(gate.is_closed());
+    }
+
+    fn seen(&self, program: &str) -> Vec<Vec<String>> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| a[0] == program)
+            .cloned()
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl Exec for GuardHost {
+    async fn run(&self, argv: &[String], _: ExecMode) -> Result<crate::Output, crate::ExecError> {
+        self.seen.lock().unwrap().push(argv.to_vec());
+        let out = |s: &str| {
+            code(0, s, "").map_err(|e| crate::ExecError::Spawn(e, std::io::Error::other("x")))
+        };
+        if argv == preparing_argv().as_slice() {
+            return out("b true\n");
+        }
+        if argv == system_state_argv().as_slice() {
+            return out("running\n");
+        }
+        if argv[0] == "sync" {
+            return if self.flush_fails {
+                code(1, "", "sync: error syncing")
+                    .map_err(|e| crate::ExecError::Spawn(e, std::io::Error::other("x")))
+            } else {
+                out("")
+            };
+        }
+        assert_eq!(
+            argv[..3],
+            argv_s(&["drbdsetup", "secondary", "--force=yes"])
+        );
+        let res = argv[3].clone();
+        let first = self.sticky.lock().unwrap().remove(&res);
+        if !first {
+            self.barrier.wait().await;
+            self.tracker
+                .lock()
+                .unwrap()
+                .feed(&format!("change resource name:{res} role:Secondary"))
+                .unwrap();
+        }
+        out("")
+    }
+}
+
+fn argv_s(parts: &[&str]) -> Vec<String> {
+    argv(parts)
+}
+
+struct ResDir(std::path::PathBuf);
+
+impl ResDir {
+    fn new(name: &str, files: &[&str]) -> Self {
+        let dir = std::env::temp_dir().join(format!("r-drbd-guard-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in files {
+            std::fs::write(dir.join(f), "").unwrap();
+        }
+        Self(dir)
+    }
+
+    fn mounts(&self, table: &str) -> std::path::PathBuf {
+        let p = self.0.join("mounts");
+        std::fs::write(&p, table).unwrap();
+        p
+    }
+}
+
+impl Drop for ResDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn guard(
+    host: &Arc<GuardHost>,
+    dir: &ResDir,
+    mounts: std::path::PathBuf,
+    force: Option<&'static str>,
+) -> Guard {
+    Guard {
+        exec: host.clone(),
+        tracker: host.tracker.clone(),
+        res_dir: dir.0.clone(),
+        force,
+        pods: Box::new(Pods::new(vec![Err("unused".into())])),
+        gate: OpenGate::default(),
+        inflight: crate::csi::Inflight::default(),
+        mounts,
+    }
+}
+
+fn dev(name: &str, minor: u32) -> String {
+    format!(
+        "exists device name:{name} volume:0 minor:{minor} backing_dev:/dev/vg/{name} disk:UpToDate client:no open:yes quorum:yes"
+    )
+}
+
+const MOUNTS: &str = "\
+/dev/vda3 / xfs rw 0 0
+/dev/drbd50000 /var/lib/kubelet/plugins/kubernetes.io/csi/r-drbd.io/abc/globalmount xfs rw 0 0
+/dev/drbd50000 /var/lib/kubelet/pods/uid/volumes/kubernetes.io~csi/pvc-a/mount xfs rw 0 0
+/dev/drbd50001 /var/lib/kubelet/plugins/kubernetes.io/csi/r-drbd.io/def/globalmount xfs rw 0 0
+/dev/drbd50003 /mnt/host\\040r0 xfs rw 0 0
+";
+
+#[test]
+fn mount_table() {
+    let m = mountpoints(MOUNTS);
+    assert_eq!(
+        m[&50000],
+        "/var/lib/kubelet/plugins/kubernetes.io/csi/r-drbd.io/abc/globalmount"
+    );
+    assert_eq!(m[&50003], "/mnt/host r0");
+    assert_eq!(m.len(), 3);
+    assert_eq!(flush_argv("/m"), argv(&["sync", "-f", "/m"]));
+}
+
+/// pvc-a mounted, pvc-b mounted but suspended, pvc-c a block volume (no
+/// mount), host-r0 mounted but not ours.
+fn flush_tracker() -> Tracker {
+    tracker(&[
+        &res("pvc-a", "Primary"),
+        &dev("pvc-a", 50000),
+        "exists resource name:pvc-b role:Primary suspended:quorum force-io-failures:no may_promote:no promotion_score:0",
+        &dev("pvc-b", 50001),
+        &res("pvc-c", "Primary"),
+        &dev("pvc-c", 50002),
+        &res("host-r0", "Primary"),
+        &dev("host-r0", 50003),
+        "exists -",
+    ])
+}
+
+#[test]
+fn flush_only_mounted_owned_unsuspended() {
+    let owned: BTreeSet<String> = ["pvc-a", "pvc-b", "pvc-c"].map(String::from).into();
+    assert_eq!(
+        flush_plan(&owned, &flush_tracker(), &mountpoints(MOUNTS)),
+        [(
+            "pvc-a".to_owned(),
+            "/var/lib/kubelet/plugins/kubernetes.io/csi/r-drbd.io/abc/globalmount".to_owned()
+        )]
+    );
+    assert_eq!(
+        flush_plan(&owned, &Tracker::default(), &mountpoints(MOUNTS)),
+        []
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn guard_flushes_then_forces_in_parallel() {
+    let dir = ResDir::new("flush", &["pvc-a.res", "pvc-b.res", "pvc-c.res"]);
+    let t = Arc::new(Mutex::new(flush_tracker()));
+    // All three demotes must be running at once to pass the barrier.
+    let host = GuardHost::new(&t, 3);
+    let g = guard(&host, &dir, dir.mounts(MOUNTS), Some("--force=yes"));
+    tokio::time::timeout(Duration::from_secs(20), g.on_signal())
+        .await
+        .expect("demotes ran in parallel");
+    assert!(g.gate.is_closed());
+    let seen = host.seen.lock().unwrap().clone();
+    let first_sync = seen.iter().position(|a| a[0] == "sync").unwrap();
+    let first_demote = seen.iter().position(|a| a[0] == "drbdsetup").unwrap();
+    assert!(first_sync < first_demote, "flush before force: {seen:?}");
+    assert_eq!(
+        host.seen("sync"),
+        [flush_argv(
+            "/var/lib/kubelet/plugins/kubernetes.io/csi/r-drbd.io/abc/globalmount"
+        )]
+    );
+    let mut demoted = host.seen("drbdsetup");
+    demoted.sort();
+    assert_eq!(
+        demoted,
+        ["pvc-a", "pvc-b", "pvc-c"].map(|r| demote_argv("--force=yes", r))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_flush_still_forces() {
+    let dir = ResDir::new("flushfail", &["pvc-a.res"]);
+    let t = Arc::new(Mutex::new(flush_tracker()));
+    let mut host = GuardHost::new(&t, 1);
+    Arc::get_mut(&mut host).unwrap().flush_fails = true;
+    let g = guard(&host, &dir, dir.mounts(MOUNTS), Some("--force=yes"));
+    g.on_signal().await;
+    assert_eq!(host.seen("sync").len(), 1);
+    assert_eq!(
+        host.seen("drbdsetup"),
+        [demote_argv("--force=yes", "pvc-a")]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn still_primary_is_forced_once_more() {
+    let dir = ResDir::new("again", &["pvc-a.res"]);
+    let t = Arc::new(Mutex::new(tracker(&[&res("pvc-a", "Primary"), "exists -"])));
+    let host = GuardHost::new(&t, 1);
+    host.sticky.lock().unwrap().insert("pvc-a".into());
+    let g = guard(&host, &dir, dir.mounts(""), Some("--force=yes"));
+    g.on_signal().await;
+    assert_eq!(
+        host.seen("drbdsetup"),
+        [
+            demote_argv("--force=yes", "pvc-a"),
+            demote_argv("--force=yes", "pvc-a")
+        ]
+    );
     assert!(!t.lock().unwrap().resource("pvc-a").unwrap().is_primary());
-    assert!(t.lock().unwrap().resource("host-r0").unwrap().is_primary());
+}
+
+#[tokio::test(start_paused = true)]
+async fn guard_waits_for_inflight_csi_calls() {
+    let dir = ResDir::new("inflight", &["pvc-a.res"]);
+    let t = Arc::new(Mutex::new(tracker(&[&res("pvc-a", "Primary"), "exists -"])));
+    let host = GuardHost::new(&t, 1);
+    let g = guard(&host, &dir, dir.mounts(""), Some("--force=yes"));
+    let busy = g.inflight.hold_for_test("pvc-a");
+    let t0 = tokio::time::Instant::now();
+    let release = async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        drop(busy);
+    };
+    tokio::join!(g.on_signal(), release);
+    assert!(t0.elapsed() >= Duration::from_secs(1));
+    assert_eq!(host.seen("drbdsetup").len(), 1);
 }
 
 #[tokio::test]
 async fn guard_without_force_or_shutdown_touches_nothing() {
+    let dir = ResDir::new("noforce", &["pvc-a.res"]);
     let t = Arc::new(Mutex::new(tracker(&[&res("pvc-a", "Primary"), "exists -"])));
     for (busctl, force) in [("b false\n", Some("--force=yes")), ("b true\n", None)] {
         let x = ScriptedExec::new();
         x.expect(preparing_argv(), ok(busctl))
             .expect(system_state_argv(), ok("running\n"));
         let x = Arc::new(x);
-        let guard = Guard {
+        let g = Guard {
             exec: x.clone(),
             tracker: t.clone(),
-            res_dir: std::path::PathBuf::from("/nonexistent"),
+            res_dir: dir.0.clone(),
             force,
             pods: Box::new(Pods::new(vec![Err("unused".into())])),
             gate: OpenGate::default(),
+            inflight: crate::csi::Inflight::default(),
+            mounts: dir.mounts(MOUNTS),
         };
-        guard.on_signal().await;
+        g.on_signal().await;
         x.assert_done();
-        assert!(guard.gate.is_closed());
+        assert!(g.gate.is_closed());
     }
 }

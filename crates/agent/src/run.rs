@@ -170,6 +170,8 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
             Ok(Err(e)) => e.to_string(),
             Err(e) => e.to_string(),
         })),
+        // The other arms are only borrowed: while the guard runs, the
+        // reconcile and CSI tasks keep running and the drain below waits for them.
         r = signalled(&guard) => r,
     };
     let _ = stop_tx.send(true);

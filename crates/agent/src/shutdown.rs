@@ -17,33 +17,57 @@ use crate::events2::Tracker;
 use crate::exec::{argv, run_any};
 use crate::{Exec, ExecMode};
 
+// The bounds below add up to GUARD_MAX, which must fit kubelet's 30 s
+// window for node-critical pods with a second to spare.
+
 /// Each local probe; both run at once, so a systemd host answers in well
 /// under a second and a hung bus costs at most this.
 pub const PROBE_MODE: ExecMode = ExecMode::Timeout {
-    wait: Duration::from_secs(2),
+    wait: Duration::from_millis(1500),
+    term: Duration::from_millis(250),
+    kill: Duration::from_millis(250),
+};
+/// Whole detection, the pod probe included.
+pub const DETECT_BOUND: Duration = Duration::from_secs(4);
+/// kubelet writes the DisruptionTarget condition asynchronously.
+pub const POD_TRIES: u32 = 3;
+const POD_GET: Duration = Duration::from_secs(1);
+const POD_RETRY: Duration = Duration::from_millis(500);
+/// In-flight CSI calls: a release that ends demotes by itself, an open
+/// that ends is forced with the rest.
+pub const INFLIGHT_WAIT: Duration = Duration::from_secs(3);
+/// One `sync -f`; a flush that cannot finish is cut by the force anyway.
+pub const FLUSH_MODE: ExecMode = ExecMode::Timeout {
+    wait: Duration::from_secs(3),
     term: Duration::from_millis(500),
     kill: Duration::from_millis(500),
 };
-/// Whole detection, the pod probe included.
-pub const DETECT_BOUND: Duration = Duration::from_secs(6);
-/// kubelet writes the DisruptionTarget condition asynchronously.
-pub const POD_TRIES: u32 = 3;
-const POD_GET: Duration = Duration::from_millis(1500);
-const POD_RETRY: Duration = Duration::from_millis(500);
-/// One forced demote; kubelet's critical pod window is 30 s and the
-/// detection and the drain need their share of it.
+pub const FLUSH_BOUND: Duration = Duration::from_secs(4);
+/// One forced demote.
 pub const DEMOTE_MODE: ExecMode = ExecMode::Timeout {
-    wait: Duration::from_secs(12),
+    wait: Duration::from_secs(9),
     term: Duration::from_secs(2),
     kill: Duration::from_secs(1),
 };
-pub const DEMOTE_BOUND: Duration = Duration::from_secs(15);
+pub const DEMOTE_BOUND: Duration = Duration::from_secs(12);
 /// How long the demoted roles may take to show in the events2 stream.
 const SETTLE: Duration = Duration::from_secs(2);
+/// The second round, for what is Primary again after the settle.
+pub const AGAIN_MODE: ExecMode = ExecMode::Timeout {
+    wait: Duration::from_secs(2),
+    term: Duration::from_secs(1),
+    kill: Duration::from_secs(1),
+};
+pub const AGAIN_BOUND: Duration = Duration::from_secs(4);
 /// The guard's share of the shutdown, before the drain.
 pub const GUARD_MAX: Duration = DETECT_BOUND
+    .saturating_add(INFLIGHT_WAIT)
+    .saturating_add(FLUSH_BOUND)
     .saturating_add(DEMOTE_BOUND)
-    .saturating_add(SETTLE);
+    .saturating_add(SETTLE)
+    .saturating_add(AGAIN_BOUND);
+/// drbdsetup's exit code for a resource that is not up.
+const NOT_UP: i32 = 10;
 
 /// The node shutdown message kubelet puts on the DisruptionTarget condition
 /// (`nodeShutdownMessage` in pkg/kubelet/nodeshutdown, Kubernetes v1.35.0).
@@ -262,6 +286,11 @@ pub fn force_option(help: &str) -> Option<&'static str> {
     }
 }
 
+/// The usage text drbdsetup prints for `secondary`, not an error.
+pub fn is_secondary_usage(text: &str) -> bool {
+    text.contains("USAGE:") && text.contains("secondary")
+}
+
 pub fn demote_argv(force: &str, res: &str) -> Vec<String> {
     argv(&["drbdsetup", "secondary", force, res])
 }
@@ -320,6 +349,9 @@ pub struct Guard {
     pub force: Option<&'static str>,
     pub pods: Box<dyn PodProbe>,
     pub gate: OpenGate,
+    pub inflight: crate::csi::Inflight,
+    /// The host's mount table: hostPID makes PID 1 the host's init.
+    pub mounts: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for Guard {
@@ -329,6 +361,70 @@ impl std::fmt::Debug for Guard {
             .field("force", &self.force)
             .finish_non_exhaustive()
     }
+}
+
+/// `sync -f` flushes one file system only: a global sync would block on a
+/// suspended device.
+pub fn flush_argv(mountpoint: &str) -> Vec<String> {
+    argv(&["sync", "-f", mountpoint])
+}
+
+/// The first mount point of each `/dev/drbd<minor>` in a mounts table; a
+/// bind mount of the same file system needs no second flush.
+pub fn mountpoints(table: &str) -> std::collections::BTreeMap<u32, String> {
+    let mut found = std::collections::BTreeMap::new();
+    for line in table.lines() {
+        let mut f = line.split(' ');
+        let (Some(src), Some(at)) = (f.next(), f.next()) else {
+            continue;
+        };
+        if let Some(minor) = src
+            .strip_prefix("/dev/drbd")
+            .and_then(|m| m.parse::<u32>().ok())
+        {
+            found.entry(minor).or_insert_with(|| unescape_mount(at));
+        }
+    }
+    found
+}
+
+/// The kernel writes space, tab, newline and backslash as octal escapes.
+fn unescape_mount(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let oct = b
+            .get(i + 1..i + 4)
+            .filter(|d| b[i] == b'\\' && d.iter().all(|c| (b'0'..=b'7').contains(c)));
+        if let Some(d) = oct {
+            out.push((d[0] - b'0') * 64 + (d[1] - b'0') * 8 + (d[2] - b'0'));
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Owned, tracked, not suspended and mounted: (resource, mount point).
+pub fn flush_plan(
+    owned: &BTreeSet<String>,
+    tracker: &Tracker,
+    mounts: &std::collections::BTreeMap<u32, String>,
+) -> Vec<(String, String)> {
+    owned
+        .iter()
+        .filter_map(|r| {
+            let res = tracker.resource(r)?;
+            if !res.suspended.is_empty() {
+                return None;
+            }
+            let at = res.devices.values().find_map(|d| mounts.get(&d.minor?))?;
+            Some((r.clone(), at.clone()))
+        })
+        .collect()
 }
 
 impl Guard {
@@ -351,12 +447,14 @@ impl Guard {
                 cfg.pod.clone(),
             )),
             gate: csi.open_gate(),
+            inflight: csi.inflight(),
+            mounts: "/proc/1/mounts".into(),
         }
     }
 
-    /// The signal path, before the drain: gate, detect, demote. Never
-    /// from the reconcile pass, which may sit behind a command on a
-    /// suspended device.
+    /// The signal path, before the drain: gate, detect, then wait, flush
+    /// and force. Never from the reconcile pass, which may sit behind a
+    /// command on a suspended device.
     pub async fn on_signal(&self) {
         self.gate.close();
         tracing::info!("refusing new volume opens");
@@ -373,61 +471,111 @@ impl Guard {
         }
     }
 
-    fn primaries(&self, among: &BTreeSet<String>) -> Vec<String> {
-        let t = self
-            .tracker
+    /// A poisoned lock still holds the last state, which is all this needs.
+    fn tracker(&self) -> std::sync::MutexGuard<'_, Tracker> {
+        self.tracker
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        demote_plan(among, &t)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn primaries(&self, among: &BTreeSet<String>) -> Vec<String> {
+        demote_plan(among, &self.tracker())
     }
 
     async fn demote(&self, force: &str) {
         let owned = owned(&self.res_dir);
+        if !self.inflight.wait_idle(INFLIGHT_WAIT).await {
+            tracing::warn!(bound = ?INFLIGHT_WAIT, "CSI calls still running, forcing anyway");
+        }
+        self.flush(&owned).await;
         let plan = self.primaries(&owned);
         if plan.is_empty() {
             tracing::info!(owned = owned.len(), "no Primary to demote");
             return;
         }
         tracing::warn!(resources = ?plan, "forcing Primary resources to Secondary");
-        let runs = plan.iter().map(|r| {
-            let cmd = demote_argv(force, r);
-            async move { (r, run_any(self.exec.as_ref(), &cmd, DEMOTE_MODE).await) }
-        });
-        let Ok(results) = tokio::time::timeout(DEMOTE_BOUND, futures::future::join_all(runs)).await
-        else {
-            tracing::warn!(bound = ?DEMOTE_BOUND, "forced demotes still running");
-            self.report(plan).await;
-            return;
-        };
-        for (r, res) in results {
-            let error = match res {
-                Ok(out) if out.exit_code == Some(0) => continue,
-                Ok(out) => crate::exec::failure(&demote_argv(force, r), &out).to_string(),
-                Err(e) => e.to_string(),
-            };
-            tracing::warn!(resource = r, error, "forced demote failed");
-        }
-        self.report(plan).await;
-    }
-
-    /// The roles after the demotes, from the events2 stream.
-    async fn report(&self, plan: Vec<String>) {
-        let planned: BTreeSet<String> = plan.into_iter().collect();
-        if !self.tracker.lock().is_ok_and(|t| t.is_available()) {
-            tracing::warn!(resources = ?planned, "roles after the forced demote unknown: no DRBD event stream");
+        self.force_all(force, &plan, DEMOTE_MODE, DEMOTE_BOUND)
+            .await;
+        if !self.tracker().is_available() {
+            tracing::warn!(resources = ?plan, "roles after the forced demote unknown: no DRBD event stream");
             return;
         }
         let deadline = tokio::time::Instant::now() + SETTLE;
-        let mut left = self.primaries(&planned);
-        while !left.is_empty() && tokio::time::Instant::now() < deadline {
+        while !self.primaries(&owned).is_empty() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            left = self.primaries(&planned);
         }
-        for r in &planned {
-            if left.contains(r) {
-                tracing::warn!(resource = r, "still Primary after the forced demote");
-            } else {
+        let again = self.primaries(&owned);
+        for r in &plan {
+            if !again.contains(r) {
                 tracing::info!(resource = r, "demoted to Secondary");
+            }
+        }
+        if again.is_empty() {
+            return;
+        }
+        tracing::warn!(resources = ?again, "still or again Primary, forcing once more");
+        self.force_all(force, &again, AGAIN_MODE, AGAIN_BOUND).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for r in self.primaries(&again.iter().cloned().collect()) {
+            tracing::warn!(resource = r, "still Primary after the forced demote");
+        }
+    }
+
+    /// A forced Secondary fails every write still in the page cache, as a
+    /// crash would; whatever can be flushed first is not lost.
+    async fn flush(&self, owned: &BTreeSet<String>) {
+        let table = std::fs::read_to_string(&self.mounts).unwrap_or_else(|e| {
+            tracing::warn!(file = %self.mounts.display(), error = %e, "mount table unreadable, no flush");
+            String::new()
+        });
+        let plan = flush_plan(owned, &self.tracker(), &mountpoints(&table));
+        if plan.is_empty() {
+            return;
+        }
+        let runs = plan.iter().map(|(r, at)| async move {
+            let t0 = tokio::time::Instant::now();
+            let res = run_any(self.exec.as_ref(), &flush_argv(at), FLUSH_MODE).await;
+            match res {
+                Ok(out) if out.exit_code == Some(0) => {
+                    tracing::info!(resource = r, mountpoint = at, took = ?t0.elapsed(), "flushed");
+                }
+                Ok(out) => {
+                    let error = crate::exec::failure(&flush_argv(at), &out);
+                    tracing::warn!(resource = r, mountpoint = at, %error, "flush failed");
+                }
+                Err(e) => tracing::warn!(resource = r, mountpoint = at, error = %e, "flush failed"),
+            }
+        });
+        if tokio::time::timeout(FLUSH_BOUND, futures::future::join_all(runs))
+            .await
+            .is_err()
+        {
+            tracing::warn!(bound = ?FLUSH_BOUND, "flushes still running, forcing anyway");
+        }
+    }
+
+    async fn force_all(&self, force: &str, plan: &[String], mode: ExecMode, bound: Duration) {
+        let tracked = self.tracker().is_available();
+        let runs = plan.iter().map(|r| {
+            let cmd = demote_argv(force, r);
+            async move { (r, run_any(self.exec.as_ref(), &cmd, mode).await) }
+        });
+        let Ok(results) = tokio::time::timeout(bound, futures::future::join_all(runs)).await else {
+            tracing::warn!(?bound, "forced demotes still running");
+            return;
+        };
+        for (r, res) in results {
+            match res {
+                Ok(out) if out.exit_code == Some(0) => {}
+                // Without the event stream every owned resource was tried.
+                Ok(out) if !tracked && out.exit_code == Some(NOT_UP) => {
+                    tracing::info!(resource = r, "not up, nothing to demote");
+                }
+                Ok(out) => {
+                    let error = crate::exec::failure(&demote_argv(force, r), &out);
+                    tracing::warn!(resource = r, %error, "forced demote failed");
+                }
+                Err(e) => tracing::warn!(resource = r, error = %e, "forced demote failed"),
             }
         }
     }

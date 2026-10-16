@@ -69,10 +69,11 @@ With graceful node shutdown on (see install), a reboot or power-off releases eve
 - The agent is a node-critical pod, stopped last.
   On SIGTERM it refuses new NodeStage and NodePublish calls; unstage and unpublish keep working.
 - It then checks whether the node is going down: logind preparing for shutdown, systemd stopping, or, on hosts without systemd, kubelet's node shutdown condition on the agent's pod.
-- If so, it forces every Primary it owns to Secondary (`drbdsetup secondary --force`).
+- If so, it waits briefly for running CSI calls, flushes each mounted file system it owns (`sync -f`, skipped on a device with suspended I/O), then forces every Primary it owns to Secondary (`drbdsetup secondary --force`).
   A pod stuck on suspended I/O then gets I/O errors instead of holding the shutdown; the peers stay UpToDate.
+- A volume still in use when the node goes down is flushed when it can be and then cut like a crash; the clean result needs graceful node shutdown.
 - An agent update or a pod delete is not a shutdown and demotes nothing.
-  On hosts without systemd, that check waits up to 6 s for the pod.
+  On hosts without systemd, that check waits up to 4 s for the pod.
 
 The one gap: no guard runs when the agent pod is not running at that moment.
 The cost is a volume that waits for the node to return, or a slow reboot; never data loss.

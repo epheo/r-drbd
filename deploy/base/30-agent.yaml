@@ -14,7 +14,7 @@ spec:
     spec:
       serviceAccountName: r-drbd-agent
       priorityClassName: system-node-critical
-      # Above the agent's shutdown (23 s shutdown guard, 60 s drain, 90 s LVM change wait, 5 s CSI); the only hard stop for a stuck LVM change.
+      # Above the agent's shutdown (29 s shutdown guard, 60 s drain, 90 s LVM change wait, 5 s CSI); the only hard stop for a stuck LVM change.
       terminationGracePeriodSeconds: 200
       hostNetwork: true
       hostPID: true

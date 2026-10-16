@@ -293,7 +293,7 @@ pub struct Inflight {
     set: Arc<Mutex<HashSet<String>>>,
 }
 
-struct InflightGuard {
+pub(crate) struct InflightGuard {
     inflight: Inflight,
     volume: String,
 }
@@ -313,6 +313,11 @@ impl Inflight {
             inflight: self.clone(),
             volume: volume.to_owned(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_for_test(&self, volume: &str) -> InflightGuard {
+        self.begin(volume).unwrap()
     }
 
     pub fn is_idle(&self) -> bool {
