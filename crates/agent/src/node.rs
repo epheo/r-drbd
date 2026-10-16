@@ -153,11 +153,26 @@ impl std::fmt::Debug for KubeNodeEvents {
     }
 }
 
+/// One Event per node and reason, patched on every repeat, so an hourly
+/// warning never piles up objects.
+pub fn event_name(node: &str, reason: &str) -> String {
+    format!("{node}.r-drbd.{}", reason.to_ascii_lowercase())
+}
+
+/// What a repeat changes on the existing Event.
+pub fn event_repeat(count: i32, message: &str) -> serde_json::Value {
+    json!({
+        "count": count.saturating_add(1),
+        "message": message,
+        "lastTimestamp": Time(Timestamp::now()),
+    })
+}
+
 pub fn node_event(node: &str, uid: Option<String>, reason: &str, message: &str) -> Event {
     let now = Time(Timestamp::now());
     Event {
         metadata: ObjectMeta {
-            generate_name: Some(format!("{node}.")),
+            name: Some(event_name(node, reason)),
             namespace: Some("default".into()),
             ..ObjectMeta::default()
         },
@@ -189,14 +204,29 @@ pub const AGENT_COMPONENT: &str = "r-drbd-agent";
 #[async_trait::async_trait]
 impl NodeEvents for KubeNodeEvents {
     async fn warn(&self, reason: &str, message: &str) {
-        let uid = Api::<Node>::all(self.client.clone())
-            .get(&self.node)
-            .await
-            .ok()
-            .and_then(|n| n.metadata.uid);
-        let ev = node_event(&self.node, uid, reason, message);
         let api: Api<Event> = Api::namespaced(self.client.clone(), "default");
-        if let Err(e) = api.create(&PostParams::default(), &ev).await {
+        let name = event_name(&self.node, reason);
+        let done = match api.get_opt(&name).await {
+            Ok(Some(ev)) => api
+                .patch(
+                    &name,
+                    &PatchParams::default(),
+                    &Patch::Merge(event_repeat(ev.count.unwrap_or(1), message)),
+                )
+                .await
+                .map(drop),
+            Ok(None) => {
+                let uid = Api::<Node>::all(self.client.clone())
+                    .get(&self.node)
+                    .await
+                    .ok()
+                    .and_then(|n| n.metadata.uid);
+                let ev = node_event(&self.node, uid, reason, message);
+                api.create(&PostParams::default(), &ev).await.map(drop)
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = done {
             tracing::warn!(reason, error = %e, "recording the node event failed");
         }
     }
@@ -293,12 +323,23 @@ pub async fn probe(exec: &dyn Exec) -> Tools {
     tools
 }
 
+/// Only usage text that parses and lacks the option disables the guard:
+/// a help call that failed says nothing about the option, and the guard
+/// is worth more than a failed demote costs.
 async fn probe_secondary_force(exec: &dyn Exec) -> Option<&'static str> {
-    let force = match run_any(exec, &crate::shutdown::help_argv(), DEFAULT_TIMEOUT).await {
-        Ok(out) => crate::shutdown::force_option(&format!("{}{}", out.stdout, out.stderr)),
-        Err(e) => {
-            tracing::warn!(error = %e, "drbdsetup secondary --help failed");
-            None
+    let text = match run_any(exec, &crate::shutdown::help_argv(), DEFAULT_TIMEOUT).await {
+        Ok(out) => format!("{}{}", out.stdout, out.stderr),
+        Err(e) => format!("error: {e}"),
+    };
+    let force = match crate::shutdown::force_option(&text) {
+        Some(option) => Some(option),
+        None if crate::shutdown::is_secondary_usage(&text) => None,
+        None => {
+            tracing::warn!(
+                output = text.trim(),
+                "drbdsetup secondary --help unreadable, assuming --force=yes"
+            );
+            Some("--force=yes")
         }
     };
     if let Some(option) = force {
@@ -519,6 +560,24 @@ mod tests {
         check_graceful(&x, &ev, GRACEFUL_RECHECK).await;
         x.assert_done();
         assert_eq!(ev.reasons(), [] as [String; 0]);
+    }
+
+    #[tokio::test]
+    async fn force_probe_falls_back_only_when_unreadable() {
+        let help = crate::shutdown::help_argv();
+        let x = ScriptedExec::new();
+        x.expect(help.clone(), Err("timeout after 60s".into()))
+            .expect(help.clone(), crate::exec::scripted::code(1, "", "segfault"))
+            .expect(
+                help.clone(),
+                ok("drbdsetup secondary - Change the role\n\nUSAGE: drbdsetup secondary {resource}\n"),
+            )
+            .expect(help, ok("USAGE: drbdsetup secondary {resource}\n    [--force={yes|no}]\n"));
+        assert_eq!(probe_secondary_force(&x).await, Some("--force=yes"));
+        assert_eq!(probe_secondary_force(&x).await, Some("--force=yes"));
+        assert_eq!(probe_secondary_force(&x).await, None);
+        assert_eq!(probe_secondary_force(&x).await, Some("--force=yes"));
+        x.assert_done();
     }
 
     #[test]
