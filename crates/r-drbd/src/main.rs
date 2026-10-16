@@ -33,6 +33,9 @@ enum Role {
         namespace: String,
         #[arg(long, env = "R_DRBD_RES_DIR", default_value = model::keys::RES_DIR)]
         res_dir: std::path::PathBuf,
+        /// Read at shutdown on hosts without systemd.
+        #[arg(long, env = "POD_NAME")]
+        pod: Option<String>,
     },
     /// Print the CRDs as a JSON List for kubectl apply.
     Crds,
@@ -131,12 +134,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 csi_endpoint,
                 namespace,
                 res_dir,
+                pod,
             } => agent::run(agent::Config {
                 node,
                 namespace,
                 csi_endpoint,
                 res_dir,
                 host_exec_prefix: host_exec_prefix(),
+                pod,
             })
             .await
             .map_err(Into::into),

@@ -12,7 +12,7 @@ use crate::events2::Tracker;
 use crate::exec::TokioExec;
 use crate::reconcile::{DrbdEnv, Reconciler};
 use crate::watch::{self, Trigger};
-use crate::{Exec, csi, drbd, node};
+use crate::{Exec, csi, drbd, node, shutdown};
 
 const DRBD_CONF_DIR: &str = "/etc/drbd.d";
 const DRBD_INCLUDE_FILE: &str = "r-drbd.res";
@@ -30,6 +30,8 @@ pub struct Config {
     /// Prepended to every external command, e.g. `[/proc/self/exe,
     /// host-exec, <ns>, --]` to run tools in the host mount namespace.
     pub host_exec_prefix: Option<Vec<String>>,
+    /// This agent's pod, read at shutdown on hosts without systemd.
+    pub pod: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -80,12 +82,13 @@ async fn clients() -> Result<(Client, Client), Error> {
 
 /// Bound on finishing the running pass and in-flight CSI operations at shutdown.
 const DRAIN: Duration = Duration::from_secs(60);
-/// Shutdown when every LVM change ends within its wait: the drain, an LVM
+/// Shutdown when every LVM change ends within its wait: the guard, the drain, an LVM
 /// change the abandoned pass left running, the CSI server's 5 s. The pod
 /// grace must exceed it; a change stuck longer is waited for until the
 /// grace runs out, the only hard stop, since killing it could leave a
 /// thin pool suspended.
 const SHUTDOWN_MAX: Duration = DRAIN
+    .saturating_add(shutdown::GUARD_MAX)
     .saturating_add(crate::exec::LVM_CHANGE_WAIT)
     .saturating_add(Duration::from_secs(5));
 /// How often shutdown says it still waits for an LVM change.
@@ -101,8 +104,7 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
     let exec: Arc<dyn Exec> = runner.clone();
     let tools = node::probe(exec.as_ref()).await;
     // Spawned: the first heartbeat never waits on systemctl.
-    let guard_exec = exec.clone();
-    tokio::spawn(async move { node::check_shutdown_guard(guard_exec.as_ref()).await });
+    tokio::spawn(node::startup_checks(exec.clone(), &client, &cfg.node));
 
     let trigger = Arc::new(Trigger::default());
     let changes = Arc::new(Trigger::default());
@@ -125,7 +127,7 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
     let reconciler = Reconciler::new(cfg.node.clone(), exec.clone()).with_drbd(DrbdEnv::new(
         features,
         cfg.res_dir.clone(),
-        tracker,
+        tracker.clone(),
     ));
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
@@ -138,6 +140,7 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
         Arc::new(csi::KubeFsMarker::new(client.clone())),
     );
     let inflight = node_service.inflight();
+    let guard = shutdown::Guard::new(&exec, tracker, &cfg, &tools, &client, &node_service);
     let mut csi_stop = stop_rx.clone();
     let mut csi_task = tokio::spawn(csi::serve(listener, node_service, async move {
         stopped(&mut csi_stop).await;
@@ -167,7 +170,7 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
             Ok(Err(e)) => e.to_string(),
             Err(e) => e.to_string(),
         })),
-        r = shutdown() => r.map(|()| tracing::info!(bound = ?SHUTDOWN_MAX, "shutting down")),
+        r = signalled(&guard) => r,
     };
     let _ = stop_tx.send(true);
     let pass = async {
@@ -334,6 +337,14 @@ async fn apply(client: &Client, node: &str, writes: Vec<crate::reconcile::Status
     }
 }
 
+/// The shutdown guard runs before the drain.
+async fn signalled(guard: &shutdown::Guard) -> Result<(), Error> {
+    shutdown().await?;
+    guard.on_signal().await;
+    tracing::info!(bound = ?SHUTDOWN_MAX, "shutting down");
+    Ok(())
+}
+
 async fn shutdown() -> Result<(), Error> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| Error::io("install SIGTERM handler", e))?;
@@ -383,6 +394,7 @@ mod tests {
             csi_endpoint: "/nonexistent/csi.sock".into(),
             res_dir: PathBuf::from("/nonexistent"),
             host_exec_prefix: None,
+            pod: None,
         });
         assert_send(&fut);
     }

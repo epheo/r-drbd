@@ -1,13 +1,14 @@
 //! Node-level duties: startup tool probe, Node annotations, heartbeat Lease.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use drbd_config::Features;
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
-use k8s_openapi::api::core::v1::Node;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta};
+use k8s_openapi::api::core::v1::{Event, EventSource, Node, ObjectReference};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta, Time};
 use k8s_openapi::jiff::Timestamp;
-use kube::api::{Patch, PatchParams};
+use kube::api::{Patch, PatchParams, PostParams};
 use kube::{Api, Client};
 use model::keys;
 use serde_json::json;
@@ -25,6 +26,9 @@ pub struct Tools {
     /// Optional resource file settings drbdsetup knows; probed only when
     /// drbd-utils are present.
     pub drbd_features: Features,
+    /// How `drbdsetup secondary` takes its force option; `None` leaves the
+    /// shutdown guard without its demote.
+    pub secondary_force: Option<&'static str>,
 }
 
 impl Tools {
@@ -68,58 +72,192 @@ fn drbdadm_field(stdout: &str, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Shipped by drbd-utils, enabled by the host OS: takes every DRBD resource
-/// down before shutdown.target, so a Primary with suspended IO cannot hang
-/// a node shutdown. The agent installs nothing.
-pub const SHUTDOWN_GUARD_UNIT: &str = "drbd-graceful-down.service";
-
-/// A hung systemctl must not hold the agent start.
-pub const SHUTDOWN_GUARD_TIMEOUT: crate::ExecMode = crate::ExecMode::Timeout {
+/// A hung systemctl or bus must not hold anything up; none of these
+/// checks blocks the start or the first heartbeat.
+pub const CHECK_TIMEOUT: crate::ExecMode = crate::ExecMode::Timeout {
     wait: Duration::from_secs(5),
     term: Duration::from_secs(1),
     kill: Duration::from_secs(1),
 };
 
-pub fn shutdown_guard_argv() -> Vec<String> {
-    argv(&[
-        "systemctl",
-        "show",
-        "-p",
-        "LoadState",
-        "-p",
-        "ActiveState",
-        SHUTDOWN_GUARD_UNIT,
-    ])
+/// How often a node without graceful node shutdown is checked again.
+pub const GRACEFUL_RECHECK: Duration = Duration::from_secs(3600);
+
+/// Shipped by drbd-utils and pulled in by its udev rule: one disconnects
+/// every resource when the network goes down, the other takes them all
+/// down at shutdown.
+pub const HOST_DRBD_UNITS: [&str; 2] = [
+    "drbd-graceful-disconnect.service",
+    "drbd-graceful-down.service",
+];
+
+pub fn host_units_argv() -> Vec<String> {
+    let mut a = argv(&["systemctl", "show", "-p", "LoadState"]);
+    a.extend(HOST_DRBD_UNITS.iter().map(|&u| u.to_owned()));
+    a
 }
 
-/// `systemctl show` prints `LoadState=not-found` for a missing unit, with exit 0.
-pub fn shutdown_guard_loaded(stdout: &str) -> bool {
+/// One `LoadState=` block per unit, in argv order; `not-found` and
+/// `masked` are absent units.
+pub fn loaded_units(stdout: &str) -> Vec<&'static str> {
     stdout
         .lines()
-        .any(|l| l.trim().strip_prefix("LoadState=") == Some("loaded"))
+        .filter_map(|l| l.trim().strip_prefix("LoadState="))
+        .zip(HOST_DRBD_UNITS)
+        .filter(|(state, _)| *state == "loaded")
+        .map(|(_, u)| u)
+        .collect()
 }
 
-/// Read-only startup check; a host without the unit or without systemd
-/// still runs the agent.
-pub async fn check_shutdown_guard(exec: &dyn Exec) {
-    let warn = |detail: String| {
-        tracing::warn!(
-            unit = SHUTDOWN_GUARD_UNIT,
-            detail,
-            "host has no drbd-graceful-down.service: a Primary without quorum can hang the node shutdown"
-        );
-    };
-    match run_any(exec, &shutdown_guard_argv(), SHUTDOWN_GUARD_TIMEOUT).await {
-        Ok(out) if out.exit_code == Some(0) && shutdown_guard_loaded(&out.stdout) => {
-            tracing::info!(unit = SHUTDOWN_GUARD_UNIT, state = %out.stdout.trim().replace('\n', " "), "shutdown guard present");
+pub const GRACEFUL_OFF: &str =
+    "graceful node shutdown is off: pods are not stopped before the node shuts down";
+
+pub fn host_units_message(units: &[&str]) -> String {
+    format!(
+        "host drbd-utils units loaded ({}): r-drbd does not need them; with graceful node shutdown on, their shutdown hooks find no Primary in use; on hosts whose network is managed by systemd-networkd or netplan, a network restart can disconnect an in-use Primary and outdate its peers",
+        units.join(", ")
+    )
+}
+
+/// Layer one of the shutdown guard: kubelet holds logind's delay lock.
+/// `None` when the host cannot tell (no systemd-inhibit, no bus).
+pub async fn graceful_shutdown_on(exec: &dyn Exec) -> Option<bool> {
+    let out = run_any(exec, &crate::shutdown::inhibitors_argv(), CHECK_TIMEOUT)
+        .await
+        .ok()?;
+    if out.exit_code != Some(0) {
+        return None;
+    }
+    crate::shutdown::parse_inhibitors(&out.stdout)
+        .map(|list| crate::shutdown::kubelet_delays_shutdown(&list))
+}
+
+/// Records the warning where `kubectl describe node` shows it.
+#[async_trait::async_trait]
+pub trait NodeEvents: Send + Sync {
+    async fn warn(&self, reason: &str, message: &str);
+}
+
+/// A core/v1 Event on this Node, in "default" where kubectl describe
+/// looks for cluster-scoped objects. Failure only logs.
+pub struct KubeNodeEvents {
+    pub client: Client,
+    pub node: String,
+}
+
+impl std::fmt::Debug for KubeNodeEvents {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KubeNodeEvents")
+            .field("node", &self.node)
+            .finish_non_exhaustive()
+    }
+}
+
+pub fn node_event(node: &str, uid: Option<String>, reason: &str, message: &str) -> Event {
+    let now = Time(Timestamp::now());
+    Event {
+        metadata: ObjectMeta {
+            generate_name: Some(format!("{node}.")),
+            namespace: Some("default".into()),
+            ..ObjectMeta::default()
+        },
+        involved_object: ObjectReference {
+            api_version: Some("v1".into()),
+            kind: Some("Node".into()),
+            name: Some(node.to_owned()),
+            uid,
+            ..ObjectReference::default()
+        },
+        reason: Some(reason.into()),
+        message: Some(message.into()),
+        type_: Some("Warning".into()),
+        count: Some(1),
+        first_timestamp: Some(now.clone()),
+        last_timestamp: Some(now),
+        source: Some(EventSource {
+            component: Some(AGENT_COMPONENT.into()),
+            host: Some(node.to_owned()),
+        }),
+        reporting_component: Some(AGENT_COMPONENT.into()),
+        reporting_instance: Some(node.to_owned()),
+        ..Event::default()
+    }
+}
+
+pub const AGENT_COMPONENT: &str = "r-drbd-agent";
+
+#[async_trait::async_trait]
+impl NodeEvents for KubeNodeEvents {
+    async fn warn(&self, reason: &str, message: &str) {
+        let uid = Api::<Node>::all(self.client.clone())
+            .get(&self.node)
+            .await
+            .ok()
+            .and_then(|n| n.metadata.uid);
+        let ev = node_event(&self.node, uid, reason, message);
+        let api: Api<Event> = Api::namespaced(self.client.clone(), "default");
+        if let Err(e) = api.create(&PostParams::default(), &ev).await {
+            tracing::warn!(reason, error = %e, "recording the node event failed");
         }
-        Ok(out) => warn(format!(
-            "exit {:?}: {} {}",
-            out.exit_code,
-            out.stdout.trim().replace('\n', " "),
-            out.stderr.trim()
-        )),
-        Err(e) => warn(e.to_string()),
+    }
+}
+
+/// Read-only host checks for the shutdown guard, run once at start; the
+/// graceful shutdown check repeats while it finds it off.
+pub fn startup_checks(
+    exec: Arc<dyn Exec>,
+    client: &Client,
+    node: &str,
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let events = KubeNodeEvents {
+        client: client.clone(),
+        node: node.to_owned(),
+    };
+    async move { startup_checks_with(exec, events).await }
+}
+
+async fn startup_checks_with(exec: Arc<dyn Exec>, events: KubeNodeEvents) {
+    tokio::join!(
+        check_host_units(exec.as_ref(), &events),
+        check_graceful(exec.as_ref(), &events, GRACEFUL_RECHECK),
+    );
+}
+
+pub async fn check_host_units(exec: &dyn Exec, events: &dyn NodeEvents) {
+    let out = match run_any(exec, &host_units_argv(), CHECK_TIMEOUT).await {
+        Ok(out) if out.exit_code == Some(0) => out,
+        Ok(out) => {
+            tracing::debug!(exit = ?out.exit_code, stderr = out.stderr.trim(), "host units unknown");
+            return;
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "host units unknown");
+            return;
+        }
+    };
+    let units = loaded_units(&out.stdout);
+    if units.is_empty() {
+        return;
+    }
+    let message = host_units_message(&units);
+    tracing::warn!("{message}");
+    events.warn("HostDrbdUnits", &message).await;
+}
+
+pub async fn check_graceful(exec: &dyn Exec, events: &dyn NodeEvents, every: Duration) {
+    loop {
+        match graceful_shutdown_on(exec).await {
+            Some(true) => {
+                tracing::info!("graceful node shutdown on: kubelet delays shutdown");
+                return;
+            }
+            Some(false) => {
+                tracing::warn!("{GRACEFUL_OFF}");
+                events.warn("GracefulShutdownOff", GRACEFUL_OFF).await;
+            }
+            None => return,
+        }
+        tokio::time::sleep(every).await;
     }
 }
 
@@ -149,9 +287,29 @@ pub async fn probe(exec: &dyn Exec) -> Tools {
     }
     if tools.drbd_utils.is_some() {
         tools.drbd_features = probe_features(exec).await;
+        tools.secondary_force = probe_secondary_force(exec).await;
     }
     tracing::info!(?tools, "tool probe");
     tools
+}
+
+async fn probe_secondary_force(exec: &dyn Exec) -> Option<&'static str> {
+    let force = match run_any(exec, &crate::shutdown::help_argv(), DEFAULT_TIMEOUT).await {
+        Ok(out) => crate::shutdown::force_option(&format!("{}{}", out.stdout, out.stderr)),
+        Err(e) => {
+            tracing::warn!(error = %e, "drbdsetup secondary --help failed");
+            None
+        }
+    };
+    if let Some(option) = force {
+        tracing::info!(
+            option,
+            "shutdown guard: drbdsetup secondary takes a force option"
+        );
+    } else {
+        tracing::warn!("shutdown guard unavailable: drbdsetup secondary has no --force");
+    }
+    force
 }
 
 /// Reads the usage text of the drbdsetup commands that own each optional
@@ -258,46 +416,129 @@ mod tests {
 
     const DRBDADM: &str = "DRBDADM_BUILDTAG=GIT-hash:\\ abc\nDRBDADM_API_VERSION=2\nDRBD_KERNEL_VERSION_CODE=0x090210\nDRBD_KERNEL_VERSION=9.2.16\nDRBDADM_VERSION_CODE=0x092100\nDRBDADM_VERSION=9.33.0\n";
 
-    #[test]
-    fn shutdown_guard_output() {
-        assert!(shutdown_guard_loaded(
-            "LoadState=loaded\nActiveState=inactive\n"
-        ));
-        assert!(shutdown_guard_loaded(
-            "ActiveState=active\nLoadState=loaded\n"
-        ));
-        assert!(!shutdown_guard_loaded(
-            "LoadState=not-found\nActiveState=inactive\n"
-        ));
-        assert!(!shutdown_guard_loaded("LoadState=masked\n"));
-        assert!(!shutdown_guard_loaded(""));
+    #[derive(Default)]
+    struct Recorded(std::sync::Mutex<Vec<(String, String)>>);
+
+    #[async_trait::async_trait]
+    impl NodeEvents for Recorded {
+        async fn warn(&self, reason: &str, message: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((reason.to_owned(), message.to_owned()));
+        }
+    }
+
+    impl Recorded {
+        fn reasons(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(r, _)| r.clone())
+                .collect()
+        }
     }
 
     #[test]
-    fn shutdown_guard_query_is_bounded() {
-        let crate::ExecMode::Timeout { wait, term, kill } = SHUTDOWN_GUARD_TIMEOUT else {
-            panic!("bounded mode expected");
-        };
-        assert!(wait <= Duration::from_secs(5));
-        assert!(wait + term + kill <= Duration::from_secs(7));
+    fn host_unit_states() {
+        assert_eq!(
+            host_units_argv(),
+            argv(&[
+                "systemctl",
+                "show",
+                "-p",
+                "LoadState",
+                "drbd-graceful-disconnect.service",
+                "drbd-graceful-down.service",
+            ])
+        );
+        assert_eq!(
+            loaded_units("LoadState=loaded\n\nLoadState=loaded\n"),
+            HOST_DRBD_UNITS
+        );
+        assert_eq!(
+            loaded_units("LoadState=not-found\n\nLoadState=loaded\n"),
+            ["drbd-graceful-down.service"]
+        );
+        assert_eq!(
+            loaded_units("LoadState=masked\n\nLoadState=not-found\n"),
+            [] as [&str; 0]
+        );
+        assert_eq!(loaded_units(""), [] as [&str; 0]);
     }
 
     #[tokio::test]
-    async fn shutdown_guard_check_is_one_read_only_query() {
+    async fn host_units_warn_once() {
         let x = ScriptedExec::new();
         x.expect(
-            shutdown_guard_argv(),
-            ok("LoadState=not-found\nActiveState=inactive\n"),
+            host_units_argv(),
+            ok("LoadState=loaded\n\nLoadState=loaded\n"),
         );
-        check_shutdown_guard(&x).await;
+        let ev = Recorded::default();
+        check_host_units(&x, &ev).await;
         x.assert_done();
+        assert_eq!(ev.reasons(), ["HostDrbdUnits"]);
+        assert!(ev.0.lock().unwrap()[0].1.contains("systemd-networkd"));
+
         let x = ScriptedExec::new();
         x.expect(
-            shutdown_guard_argv(),
+            host_units_argv(),
             crate::exec::scripted::code(1, "", "System has not been booted with systemd"),
         );
-        check_shutdown_guard(&x).await;
+        let ev = Recorded::default();
+        check_host_units(&x, &ev).await;
+        assert_eq!(ev.reasons(), [] as [String; 0]);
+    }
+
+    const OFF: &str = "WHO            UID USER PID  COMM           WHAT  WHY                                       MODE\nNetworkManager 0   root 2204 NetworkManager sleep NetworkManager needs to turn off networks delay\n\n1 inhibitors listed.\n";
+    const ON: &str = "WHO     UID USER PID  COMM       WHAT     WHY                                        MODE\nkubelet 0   root 1585 microshift shutdown Kubelet needs time to handle node shutdown delay\n\n1 inhibitors listed.\n";
+
+    #[tokio::test(start_paused = true)]
+    async fn graceful_off_rechecked_until_on() {
+        let x = ScriptedExec::new();
+        let inhibit = crate::shutdown::inhibitors_argv();
+        x.expect(inhibit.clone(), ok(OFF))
+            .expect(inhibit.clone(), ok(OFF))
+            .expect(inhibit, ok(ON));
+        let ev = Recorded::default();
+        check_graceful(&x, &ev, GRACEFUL_RECHECK).await;
         x.assert_done();
+        assert_eq!(ev.reasons(), ["GracefulShutdownOff", "GracefulShutdownOff"]);
+        assert_eq!(ev.0.lock().unwrap()[0].1, GRACEFUL_OFF);
+    }
+
+    #[tokio::test]
+    async fn graceful_unknown_is_silent() {
+        let x = ScriptedExec::new();
+        x.expect(
+            crate::shutdown::inhibitors_argv(),
+            Err("spawn systemd-inhibit: No such file or directory".into()),
+        );
+        let ev = Recorded::default();
+        check_graceful(&x, &ev, GRACEFUL_RECHECK).await;
+        x.assert_done();
+        assert_eq!(ev.reasons(), [] as [String; 0]);
+    }
+
+    #[test]
+    fn checks_are_bounded() {
+        let crate::ExecMode::Timeout { wait, .. } = CHECK_TIMEOUT else {
+            panic!("bounded mode expected");
+        };
+        assert!(wait <= Duration::from_secs(5));
+    }
+
+    #[test]
+    fn event_on_the_node() {
+        let v = serde_json::to_value(node_event("n1", Some("u1".into()), "HostDrbdUnits", "m"))
+            .unwrap();
+        assert_eq!(v["metadata"]["namespace"], "default");
+        assert_eq!(v["involvedObject"]["kind"], "Node");
+        assert_eq!(v["involvedObject"]["name"], "n1");
+        assert_eq!(v["involvedObject"]["uid"], "u1");
+        assert_eq!(v["type"], "Warning");
+        assert_eq!(v["reason"], "HostDrbdUnits");
     }
 
     #[test]
@@ -333,9 +574,14 @@ mod tests {
         .expect_s(
             &["drbdsetup", "help", "resource-options"],
             ok("    [--quorum={off|majority|all}|(1 ... 32)]\n"),
+        )
+        .expect_s(
+            &["drbdsetup", "secondary", "--help"],
+            ok("USAGE: drbdsetup secondary {resource}\n    [--force={yes|no}]\n"),
         );
         let tools = probe(&x).await;
         x.assert_done();
+        assert_eq!(tools.secondary_force, Some("--force=yes"));
         assert_eq!(
             tools.drbd(),
             Some(Features {

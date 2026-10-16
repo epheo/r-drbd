@@ -984,20 +984,8 @@ async fn stage_adopts_xfs_without_a_record() {
     lvm.remove(VG, lv).await.unwrap();
 }
 
-/// The host ships drbd-graceful-down.service; read-only query, nothing installed.
-#[tokio::test]
-#[ignore = "needs a host with drbd-graceful-down.service"]
-async fn shutdown_guard_unit_is_loaded() {
-    if !enabled() {
-        return;
-    }
-    let argv = agent::node::shutdown_guard_argv();
-    let parts: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let out = sh(&parts).await;
-    println!("{}", out.stdout.trim());
-    assert_eq!(out.exit_code, Some(0), "{out:?}");
-    assert!(agent::node::shutdown_guard_loaded(&out.stdout), "{out:?}");
-}
-
 #[path = "host/drbd.rs"]
 mod drbd;
+
+#[path = "host/shutdown.rs"]
+mod shutdown;
