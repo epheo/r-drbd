@@ -61,11 +61,26 @@ Use the standard non-graceful shutdown: once the node is really off, taint it
 
 and remove the taint when it is back.
 
+## Node shutdown
+
+With graceful node shutdown on (see install), a reboot or power-off releases every volume first:
+
+- kubelet stops the pods, their volumes are unmounted and DRBD turns Secondary on the last close.
+- The agent is a node-critical pod, stopped last.
+  On SIGTERM it refuses new NodeStage and NodePublish calls; unstage and unpublish keep working.
+- It then checks whether the node is going down: logind preparing for shutdown, systemd stopping, or, on hosts without systemd, kubelet's node shutdown condition on the agent's pod.
+- If so, it forces every Primary it owns to Secondary (`drbdsetup secondary --force`).
+  A pod stuck on suspended I/O then gets I/O errors instead of holding the shutdown; the peers stay UpToDate.
+- An agent update or a pod delete is not a shutdown and demotes nothing.
+  On hosts without systemd, that check waits up to 6 s for the pod.
+
+The one gap: no guard runs when the agent pod is not running at that moment.
+The cost is a volume that waits for the node to return, or a slow reboot; never data loss.
+
 ## Planned maintenance
 
 1. `kubectl drain node2 --ignore-daemonsets`.
 2. Reboot or service the node.
-   With `drbd-graceful-down.service` enabled, DRBD goes down cleanly at shutdown.
 3. `kubectl uncordon node2`; replicas resync.
 
 With 3 nodes, service one node at a time and wait for every Volume to be Ready before the next.
