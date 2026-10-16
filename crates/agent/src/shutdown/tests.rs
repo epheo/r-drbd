@@ -550,17 +550,38 @@ fn flush_tracker() -> Tracker {
 #[test]
 fn flush_only_mounted_owned_unsuspended() {
     let owned: BTreeSet<String> = ["pvc-a", "pvc-b", "pvc-c"].map(String::from).into();
-    assert_eq!(
-        flush_plan(&owned, &flush_tracker(), &mountpoints(MOUNTS)),
-        [(
-            "pvc-a".to_owned(),
-            "/var/lib/kubelet/plugins/kubernetes.io/csi/r-drbd.io/abc/globalmount".to_owned()
-        )]
+    let none = std::collections::BTreeMap::new();
+    let a = (
+        "pvc-a".to_owned(),
+        "/var/lib/kubelet/plugins/kubernetes.io/csi/r-drbd.io/abc/globalmount".to_owned(),
     );
     assert_eq!(
-        flush_plan(&owned, &Tracker::default(), &mountpoints(MOUNTS)),
+        flush_plan(&owned, &flush_tracker(), &none, &mountpoints(MOUNTS)),
+        std::slice::from_ref(&a)
+    );
+    // Event stream gone: minors from the resource files, suspension unknown.
+    let minors = [("pvc-a", 50000), ("pvc-b", 50001), ("pvc-c", 50002)]
+        .map(|(r, m)| (r.to_owned(), m))
+        .into();
+    let b = (
+        "pvc-b".to_owned(),
+        "/var/lib/kubelet/plugins/kubernetes.io/csi/r-drbd.io/def/globalmount".to_owned(),
+    );
+    assert_eq!(
+        flush_plan(&owned, &Tracker::default(), &minors, &mountpoints(MOUNTS)),
+        [a, b]
+    );
+    assert_eq!(
+        flush_plan(&owned, &Tracker::default(), &none, &mountpoints(MOUNTS)),
         []
     );
+    assert_eq!(
+        res_minor(
+            "resource \"r\" {\n    on \"n1\" {\n        volume 0 {\n            device minor 50001;\n"
+        ),
+        Some(50001)
+    );
+    assert_eq!(res_minor("resource \"r\" {}\n"), None);
 }
 
 #[tokio::test(start_paused = true)]

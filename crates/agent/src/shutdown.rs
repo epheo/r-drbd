@@ -419,21 +419,41 @@ fn unescape_mount(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Owned, tracked, not suspended and mounted: (resource, mount point).
+/// The minor from an installed resource file: every host of one resource
+/// uses the same one.
+pub fn res_minor(text: &str) -> Option<u32> {
+    text.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("device minor ")?
+            .trim_end_matches(';')
+            .trim()
+            .parse()
+            .ok()
+    })
+}
+
+/// Owned, mounted and not suspended: (resource, mount point). `minors`
+/// comes from the resource files: when systemd stops the pod it also
+/// kills the events2 stream, and the tracker then knows nothing. A device
+/// whose state is unknown is flushed too; the bound covers a hung flush.
 pub fn flush_plan(
     owned: &BTreeSet<String>,
     tracker: &Tracker,
+    minors: &std::collections::BTreeMap<String, u32>,
     mounts: &std::collections::BTreeMap<u32, String>,
 ) -> Vec<(String, String)> {
     owned
         .iter()
         .filter_map(|r| {
-            let res = tracker.resource(r)?;
-            if !res.suspended.is_empty() {
-                return None;
+            let state = tracker.is_available().then(|| tracker.resource(r));
+            let minor = match state {
+                Some(None) => return None,
+                Some(Some(res)) if !res.suspended.is_empty() => return None,
+                Some(Some(res)) => res.devices.values().find_map(|d| d.minor),
+                None => None,
             }
-            let at = res.devices.values().find_map(|d| mounts.get(&d.minor?))?;
-            Some((r.clone(), at.clone()))
+            .or_else(|| minors.get(r).copied())?;
+            Some((r.clone(), mounts.get(&minor)?.clone()))
         })
         .collect()
 }
@@ -539,7 +559,14 @@ impl Guard {
             tracing::warn!(file = %self.mounts.display(), error = %e, "mount table unreadable, no flush");
             String::new()
         });
-        let plan = flush_plan(owned, &self.tracker(), &mountpoints(&table));
+        let minors = owned
+            .iter()
+            .filter_map(|r| {
+                let text = std::fs::read_to_string(self.res_dir.join(format!("{r}.res"))).ok()?;
+                Some((r.clone(), res_minor(&text)?))
+            })
+            .collect();
+        let plan = flush_plan(owned, &self.tracker(), &minors, &mountpoints(&table));
         if plan.is_empty() {
             return;
         }
