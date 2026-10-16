@@ -94,10 +94,11 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch", "patch"]
-  # Warnings about the node's shutdown setup, as core Events on the Node.
+  # Warnings about the node's shutdown setup, as core Events on the Node:
+  # one per node and reason, read to bump its count.
   - apiGroups: [""]
     resources: ["events"]
-    verbs: ["create", "patch"]
+    verbs: ["get", "create", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
