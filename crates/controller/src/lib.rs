@@ -204,6 +204,8 @@ pub(crate) struct Memory {
     pub(crate) evict_blocked: HashMap<String, String>,
     /// Per Volume uid: when each PeerUnreachable probe record was first seen.
     pub(crate) probes: HashMap<String, volume::ProbesSeen>,
+    /// Volume uids with a probe record awaiting a Lease renewal.
+    pub(crate) probe_wait: HashSet<String>,
     /// Per Volume uid: what PeerUnreachable last announced as an Event.
     pub(crate) peer_unreachable: HashMap<String, volume::Announced>,
 }
@@ -234,6 +236,29 @@ impl Memory {
             .filter(|c| c.status == model::condition::TRUE)
             .map(|c| volume::pairs_from_message(&c.message))
             .unwrap_or_default()
+    }
+
+    pub(crate) fn set_probe_wait(&mut self, v: &model::Volume, waiting: bool) {
+        if let Some(uid) = v.metadata.uid.clone() {
+            if waiting {
+                self.probe_wait.insert(uid);
+            } else {
+                self.probe_wait.remove(&uid);
+            }
+        }
+    }
+
+    /// A pass due soon for PeerUnreachable: a fresh Lease renewal wakes
+    /// nothing, yet a waiting record counts only after one, and a cleared
+    /// condition waits out its grace. Nothing armed otherwise, so a fault
+    /// that lasts adds no passes.
+    pub(crate) fn peer_timer(&self) -> Option<Duration> {
+        (!self.probe_wait.is_empty()
+            || self
+                .peer_unreachable
+                .values()
+                .any(|a| a.false_since.is_some()))
+        .then(|| Duration::from_secs(model::keys::LEASE_RENEW_SECS + 1))
     }
 
     /// Notes the Volume's probe records and returns their first sightings.
@@ -314,6 +339,7 @@ async fn pass(ctx: &Ctx<'_>, memory: &mut Memory) -> Option<Duration> {
         .peer_unreachable
         .retain(|uid, _| seen.contains_key(uid));
     memory.probes.retain(|uid, _| seen.contains_key(uid));
+    memory.probe_wait.retain(|uid| seen.contains_key(uid));
     let snapshots: HashSet<String> = ctx
         .stores
         .snapshots
@@ -325,14 +351,7 @@ async fn pass(ctx: &Ctx<'_>, memory: &mut Memory) -> Option<Duration> {
     volume::reconcile_all(ctx, memory).await;
     pool::reconcile_all(ctx, memory).await;
     let snapshots = snapshot::reconcile_all(ctx, memory).await;
-    // A fresh Lease renewal wakes nothing, yet a probe record counts only
-    // after one, and a cleared PeerUnreachable waits out its grace.
-    let peers = (memory.probes.values().any(|m| !m.is_empty())
-        || memory
-            .peer_unreachable
-            .values()
-            .any(|a| a.false_since.is_some()))
-    .then(|| Duration::from_secs(model::keys::LEASE_RENEW_SECS + 1));
+    let peers = memory.peer_timer();
     [snapshots, ctx.stores.next_lease_expiry(), peers]
         .into_iter()
         .flatten()

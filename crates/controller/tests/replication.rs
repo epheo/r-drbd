@@ -1346,15 +1346,35 @@ async fn peer_unreachable_while_provisioning() {
     .await;
     assert_eq!(warned[0].type_.as_deref(), Some("Warning"));
 
-    // n2 reboots: its Lease stops renewing, still fresh for 40 s, and n1's
-    // next probe fails. Not a firewall.
-    support::agent_lease(&client, "n2", Duration::from_secs(15), true).await;
-    a1.report("rep", stuck("n1", "n2", model::ProbeResult::Filtered))
-        .await;
+    // A re-probe of the same run keeps the condition True.
+    let mut reprobed = stuck("n1", "n2", model::ProbeResult::Filtered);
+    reprobed.unreachable_peers[0].probed_at = secs_ago(0);
+    a1.report("rep", reprobed).await;
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(fired(&get_volume(&client, "rep").await.unwrap()));
+    }
+
+    // The link recovers, then n2 reboots: its Lease stops renewing, still
+    // fresh for 40 s, and n1's probe of the rebooting n2 fails. Not a
+    // firewall.
+    a1.report("rep", healthy("n1", &["n2"], None)).await;
     volume_where(&client, "rep", |v| {
         cond_is(v, types::PEER_UNREACHABLE, "False")
     })
     .await;
+    support::agent_lease(&client, "n2", Duration::from_secs(15), true).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    a1.report("rep", stuck("n1", "n2", model::ProbeResult::Filtered))
+        .await;
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(cond_is(
+            &get_volume(&client, "rep").await.unwrap(),
+            types::PEER_UNREACHABLE,
+            "False"
+        ));
+    }
     // Back with a new agent run: n1's old record does not count.
     let run =
         k8s_openapi::jiff::Timestamp::from_second(k8s_openapi::jiff::Timestamp::now().as_second())

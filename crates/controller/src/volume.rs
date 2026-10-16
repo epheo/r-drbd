@@ -962,12 +962,32 @@ pub fn probe_counts(
     })
 }
 
+/// A record that could count but waits for a renewal this process sees;
+/// only those need an early pass. One from another run, or without a run,
+/// never counts and waits for nothing.
+pub fn awaiting_renewal(
+    lease: Option<&AgentLease>,
+    peer_run: Option<&Time>,
+    first_seen: Option<std::time::Instant>,
+) -> bool {
+    lease.is_some_and(|l| l.run.is_some() && l.run == peer_run.map(|t| t.0))
+        && !probe_counts(lease, peer_run, first_seen)
+}
+
 /// When this process first saw each probe record, by (prober, peer,
-/// probedAt).
+/// peerRun). Not by probedAt: a re-probe of the same run keeps counting
+/// instead of waiting for another renewal.
 pub type ProbesSeen = HashMap<(String, String, String), std::time::Instant>;
 
 fn probe_key(prober: &str, p: &model::PeerProbe) -> (String, String, String) {
-    (prober.to_owned(), p.node.clone(), p.probed_at.0.to_string())
+    (
+        prober.to_owned(),
+        p.node.clone(),
+        p.peer_run
+            .as_ref()
+            .map(|t| t.0.to_string())
+            .unwrap_or_default(),
+    )
 }
 
 /// Notes the first sight of the Volume's probe records, forgetting gone ones.
@@ -1038,6 +1058,21 @@ impl Health {
                 })
                 .collect(),
         }
+    }
+
+    /// Any probe record of `v` that awaits a renewal.
+    fn awaiting(&self, v: &Volume, seen: &ProbesSeen) -> bool {
+        v.status
+            .iter()
+            .flat_map(|s| &s.replicas)
+            .flat_map(|e| e.unreachable_peers.iter().map(move |p| (e, p)))
+            .any(|(e, p)| {
+                awaiting_renewal(
+                    self.leases.get(&p.node),
+                    p.peer_run.as_ref(),
+                    seen.get(&probe_key(&e.node, p)).copied(),
+                )
+            })
     }
 
     fn summarize(
@@ -1117,7 +1152,9 @@ async fn reconcile(
     }
     if let Some(a) = memory.assignment(v).cloned() {
         let a = converge(memory, placing, api, v, a).await;
-        let mut summary = health.summarize(v, &a, &memory.latched(v), &memory.probes_seen(v));
+        let seen = memory.probes_seen(v);
+        memory.set_probe_wait(v, health.awaiting(v, &seen));
+        let mut summary = health.summarize(v, &a, &memory.latched(v), &seen);
         memory.latch(v, summary.split_pairs.clone());
         evict_step(ctx, memory, placing, api, v, &a, &mut summary).await;
         remove_orphans(ctx, health, api, v, &a).await;
@@ -2347,6 +2384,114 @@ mod tests {
         assert!(!probe_counts(Some(&lease(1000, later)), None, Some(t0)));
         assert!(!probe_counts(None, Some(&run), Some(t0)));
         assert!(!probe_counts(Some(&lease(1000, later)), Some(&run), None));
+    }
+
+    #[test]
+    fn a_reprobe_of_the_same_run_keeps_counting() {
+        let mut v = Volume::new(
+            "v",
+            model::VolumeSpec {
+                size_bytes: G,
+                replicas: 2,
+                tier: "t".into(),
+                pool: None,
+                node: None,
+                access_mode: model::AccessMode::default(),
+                attachments: vec![],
+                evict: vec![],
+                source: None,
+                resolve: None,
+                assignment: Some(two_with_tb()),
+            },
+        );
+        let run = Time(ts(1000));
+        let mut p = probe("n2", model::ProbeResult::Filtered);
+        p.peer_run = Some(run.clone());
+        let mut e = ReplicaStatus {
+            node: "n1".into(),
+            ..ReplicaStatus::default()
+        };
+        e.unreachable_peers = vec![p];
+        v.status = Some(status(VolumePhase::Provisioning, vec![e]));
+        let t0 = std::time::Instant::now();
+        let mut seen = ProbesSeen::new();
+        note_probes(&mut seen, &v, t0);
+        let lease = AgentLease {
+            run: Some(run.0),
+            renewed_seen: Some(t0 + std::time::Duration::from_secs(5)),
+        };
+        let counts = |seen: &ProbesSeen, v: &Volume| {
+            let p = &v.status.as_ref().unwrap().replicas[0].unreachable_peers[0];
+            probe_counts(
+                Some(&lease),
+                p.peer_run.as_ref(),
+                seen.get(&probe_key("n1", p)).copied(),
+            )
+        };
+        assert!(counts(&seen, &v));
+        // Five minutes later the agent probes again: a new probedAt.
+        v.status.as_mut().unwrap().replicas[0].unreachable_peers[0].probed_at = Time(ts(1300));
+        note_probes(&mut seen, &v, t0 + std::time::Duration::from_secs(300));
+        assert!(counts(&seen, &v), "no False gap after a re-probe");
+    }
+
+    #[test]
+    fn the_peer_timer_disarms() {
+        let t0 = std::time::Instant::now();
+        let run = Time(ts(1000));
+        let waiting = AgentLease {
+            run: Some(run.0),
+            renewed_seen: Some(t0),
+        };
+        let renewed = AgentLease {
+            run: Some(run.0),
+            renewed_seen: Some(t0 + std::time::Duration::from_secs(10)),
+        };
+        assert!(awaiting_renewal(Some(&waiting), Some(&run), Some(t0)));
+        assert!(
+            !awaiting_renewal(Some(&renewed), Some(&run), Some(t0)),
+            "counted"
+        );
+        assert!(!awaiting_renewal(Some(&waiting), None, Some(t0)), "no run");
+        let other = Time(ts(2000));
+        assert!(
+            !awaiting_renewal(Some(&waiting), Some(&other), Some(t0)),
+            "old run"
+        );
+
+        let mut v = Volume::new(
+            "v",
+            model::VolumeSpec {
+                size_bytes: G,
+                replicas: 2,
+                tier: "t".into(),
+                pool: None,
+                node: None,
+                access_mode: model::AccessMode::default(),
+                attachments: vec![],
+                evict: vec![],
+                source: None,
+                resolve: None,
+                assignment: None,
+            },
+        );
+        v.metadata.uid = Some("u".into());
+        let mut m = crate::Memory::default();
+        assert_eq!(m.peer_timer(), None);
+        m.set_probe_wait(&v, true);
+        assert!(m.peer_timer().is_some());
+        m.set_probe_wait(&v, false);
+        assert_eq!(m.peer_timer(), None);
+        m.peer_unreachable.insert(
+            "u".into(),
+            Announced {
+                reason: reason::FIREWALL.into(),
+                false_since: Some(t0),
+            },
+        );
+        assert!(m.peer_timer().is_some(), "grace pending");
+        m.peer_unreachable.insert("u".into(), Announced::default());
+        assert_eq!(m.peer_timer(), None);
     }
 
     #[test]
