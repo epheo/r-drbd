@@ -336,6 +336,27 @@ fn micro(t: k8s_openapi::jiff::Timestamp) -> serde_json::Value {
 /// Creates or rewrites `node`'s agent Lease renewed `ago` in the past;
 /// `paused` stops the heartbeat from renewing it.
 pub async fn agent_lease(client: &Client, node: &str, ago: Duration, paused: bool) {
+    agent_lease_run(client, node, ago, paused, agent_started()).await;
+}
+
+/// When every simulated agent run began, unless restarted.
+fn agent_started() -> k8s_openapi::jiff::Timestamp {
+    static AT: std::sync::OnceLock<k8s_openapi::jiff::Timestamp> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        k8s_openapi::jiff::Timestamp::now()
+            .checked_sub(Duration::from_secs(3600))
+            .expect("time")
+    })
+}
+
+/// `agent_lease` for an agent run that began at `acquired`.
+pub async fn agent_lease_run(
+    client: &Client,
+    node: &str,
+    ago: Duration,
+    paused: bool,
+    acquired: k8s_openapi::jiff::Timestamp,
+) {
     let api: Api<Lease> = Api::namespaced(client.clone(), NAMESPACE);
     let renewed = micro(
         k8s_openapi::jiff::Timestamp::now()
@@ -350,6 +371,7 @@ pub async fn agent_lease(client: &Client, node: &str, ago: Duration, paused: boo
             "holderIdentity": if paused { PAUSED } else { node },
             "leaseDurationSeconds": model::keys::LEASE_STALE_SECS,
             "renewTime": renewed,
+            "acquireTime": micro(acquired),
         },
     });
     api.patch(

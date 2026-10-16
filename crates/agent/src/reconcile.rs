@@ -258,6 +258,9 @@ pub struct Reconciler {
     lvm_unsupported: Option<String>,
     /// Connections out of Connected, per volume and peer.
     peers: crate::peer::Watch,
+    /// Agent Leases by node; None until set, which tests without Leases
+    /// read as every peer alive.
+    peer_leases: Option<BTreeMap<String, crate::peer::PeerLease>>,
 }
 
 impl Reconciler {
@@ -284,6 +287,7 @@ impl Reconciler {
             invalid_pools: HashSet::new(),
             lvm_unsupported: None,
             peers: crate::peer::Watch::default(),
+            peer_leases: None,
         }
     }
 
@@ -304,6 +308,10 @@ impl Reconciler {
 
     pub fn tracker(&self) -> Arc<Mutex<Tracker>> {
         self.drbd.tracker.clone()
+    }
+
+    pub fn set_peer_leases(&mut self, leases: BTreeMap<String, crate::peer::PeerLease>) {
+        self.peer_leases = Some(leases);
     }
 
     pub fn set_addresses(&mut self, addresses: BTreeMap<String, IpAddr>) {

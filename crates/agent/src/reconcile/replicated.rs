@@ -19,6 +19,8 @@ use model::{
 use super::{
     Place, Reads, Reconciler, StatusWrite, find_in_pool, is_lost, lost_after_report, rebuild_error,
 };
+use futures::StreamExt;
+
 use crate::drbd::{self, DRBD_TIMEOUT, Facts, FileInputs, Host, RealHost, ResFiles, VOLUME, argv};
 use crate::events2::Resource;
 use crate::events2::Tracker;
@@ -508,18 +510,33 @@ impl Reconciler {
                 .iter()
                 .any(|e| e.node == node && e.present)
         };
+        let lease = |node: &str| match &self.peer_leases {
+            None => (true, None),
+            Some(m) => m
+                .get(node)
+                .map_or((false, None), |l| (l.fresh(), l.acquired)),
+        };
+        let prior = entries
+            .unwrap_or_default()
+            .iter()
+            .find(|e| e.node == self.node)
+            .map(|e| e.unreachable_peers.as_slice())
+            .unwrap_or_default();
         let seen = res
             .into_iter()
             .flat_map(|r| &r.connections)
             .filter_map(|(peer, c)| {
                 let r = a.replicas.iter().find(|r| &r.node == peer)?;
                 let target = drbd::socket(peer, r.port, &self.addresses).ok()?;
+                let (fresh, epoch) = lease(peer);
                 Some((
                     peer.clone(),
                     crate::peer::Seen {
                         state: c.state.clone(),
                         target,
-                        peer_up: up(peer),
+                        peer_up: up(peer) && fresh,
+                        epoch,
+                        prior: prior.iter().find(|p| &p.node == peer).cloned(),
                     },
                 ))
             })
@@ -528,8 +545,8 @@ impl Reconciler {
             .observe(&name, &seen, tokio::time::Instant::now());
     }
 
-    /// Probes the connections stuck past the window, all at once so a
-    /// firewall that drops costs one timeout per pass, not one per
+    /// Probes the connections stuck past the window, many at once so a
+    /// firewall that drops costs a few timeouts per pass, not one per
     /// volume; then refreshes the writes of the volumes they changed.
     pub(super) async fn probe_peers(&mut self, vols: &[&Volume], writes: &mut Vec<StatusWrite>) {
         if let Ok(t) = self.drbd.tracker.lock() {
@@ -539,17 +556,23 @@ impl Reconciler {
         if due.is_empty() {
             return;
         }
-        let probes = due.iter().map(|(_, _, target)| {
-            let (host, target) = (self.drbd.host.clone(), *target);
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    host.connect(target, crate::peer::PROBE_TIMEOUT)
-                })
-                .await
-                .unwrap_or_else(|e| Err(std::io::Error::other(e)))
-            }
-        });
-        let results = futures::future::join_all(probes).await;
+        // From the address DRBD uses here, as source-keyed rules see it.
+        let from = self.addresses.get(&self.node).copied();
+        // Boxed: a stream of borrowing closures trips the Send check of
+        // the spawned reconcile loop.
+        let probes: Vec<futures::future::BoxFuture<'static, std::io::Result<()>>> = due
+            .iter()
+            .map(|(_, _, target)| {
+                let (host, target) = (self.drbd.host.clone(), *target);
+                Box::pin(
+                    async move { host.connect(from, target, crate::peer::PROBE_TIMEOUT).await },
+                ) as futures::future::BoxFuture<'static, _>
+            })
+            .collect();
+        let results: Vec<_> = futures::stream::iter(probes)
+            .buffered(crate::peer::PROBES_AT_ONCE)
+            .collect()
+            .await;
         let mut changed = std::collections::BTreeSet::new();
         let now = tokio::time::Instant::now();
         for ((volume, peer, target), r) in due.into_iter().zip(results) {

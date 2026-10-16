@@ -191,7 +191,9 @@ pub async fn annotate(client: &Client, node: &str, tools: &Tools) -> Result<(), 
     Ok(())
 }
 
-pub fn lease(node: &str, namespace: &str, now: Timestamp) -> Lease {
+/// `started` is this process's start, as acquireTime: a peer's probe
+/// result only counts while the same agent run renewed across it.
+pub fn lease(node: &str, namespace: &str, now: Timestamp, started: Timestamp) -> Lease {
     Lease {
         metadata: ObjectMeta {
             name: Some(keys::agent_lease_name(node)),
@@ -202,6 +204,7 @@ pub fn lease(node: &str, namespace: &str, now: Timestamp) -> Lease {
             holder_identity: Some(node.to_owned()),
             lease_duration_seconds: i32::try_from(keys::LEASE_STALE_SECS).ok(),
             renew_time: Some(MicroTime(now)),
+            acquire_time: Some(MicroTime(started)),
             ..LeaseSpec::default()
         }),
     }
@@ -215,11 +218,12 @@ pub async fn heartbeat(client: Client, namespace: String, node: String, tools: T
     let params = PatchParams::apply(&keys::agent_field_manager(&node)).force();
     let name = keys::agent_lease_name(&node);
     let mut annotated = false;
+    let started = Timestamp::now();
     let mut tick = tokio::time::interval(Duration::from_secs(keys::LEASE_RENEW_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        let lease = lease(&node, &namespace, Timestamp::now());
+        let lease = lease(&node, &namespace, Timestamp::now(), started);
         let patch = Patch::Apply(&lease);
         let renewed = crate::retry::with_backoff(
             &name,
@@ -346,11 +350,17 @@ mod tests {
 
     #[test]
     fn lease_shape() {
-        let l = lease("n1", "r-drbd-system", Timestamp::UNIX_EPOCH);
+        let l = lease(
+            "n1",
+            "r-drbd-system",
+            Timestamp::UNIX_EPOCH,
+            Timestamp::UNIX_EPOCH,
+        );
         let v = serde_json::to_value(&l).unwrap();
         assert_eq!(v["kind"], "Lease");
         assert_eq!(v["metadata"]["name"], "r-drbd-agent-n1");
         assert_eq!(v["spec"]["leaseDurationSeconds"], 40);
         assert_eq!(v["spec"]["holderIdentity"], "n1");
+        assert_eq!(v["spec"]["acquireTime"], "1970-01-01T00:00:00.000000Z");
     }
 }

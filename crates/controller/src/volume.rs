@@ -140,6 +140,9 @@ pub struct Nodes<'a> {
     pub reachable: &'a dyn Fn(&str) -> bool,
     /// The volume's spec.evict: those nodes' connections are expected to break.
     pub evicting: &'a [String],
+    /// (node, since, probedAt): one run of the node's agent held its Lease
+    /// from before `since` and renewed after `probedAt`.
+    pub alive_across: &'a dyn Fn(&str, &Time, &Time) -> bool,
 }
 
 impl std::fmt::Debug for Nodes<'_> {
@@ -320,9 +323,10 @@ fn drbd_conditions(
 
 /// The stuck connections an agent probed, worst cause first. A record
 /// counts only when both ends have a fresh agent, report their resource
-/// up and are not in spec.evict, and the pair is not split: a down node is
-/// NodeUnreachable's news, an evicted node is expected to drop, and a
-/// StandAlone connection is SplitBrain's.
+/// up and are not in spec.evict, the peer's agent ran across the window
+/// and renewed after the probe, and the pair is not split: a down or
+/// rebooting node is NodeUnreachable's news, an evicted node is expected
+/// to drop, and a StandAlone connection is SplitBrain's.
 fn peer_unreachable(
     assignment: &Assignment,
     entries: &HashMap<&str, &model::ReplicaStatus>,
@@ -341,73 +345,121 @@ fn peer_unreachable(
             .get(a)
             .is_some_and(|e| eq(e.peers.get(b), "StandAlone"))
     };
-    let mut found: Vec<(u8, &'static str, String)> = Vec::new();
+    let mut found = Vec::new();
     for e in entries.values().filter(|e| up(&e.node)) {
         for p in &e.unreachable_peers {
             let (a, b) = (e.node.as_str(), p.node.as_str());
-            if !up(b) || split_pairs.contains(&pair(a, b)) || stand_alone(a, b) || stand_alone(b, a)
+            if !up(b)
+                || !(nodes.alive_across)(b, &p.since, &p.probed_at)
+                || split_pairs.contains(&pair(a, b))
+                || stand_alone(a, b)
+                || stand_alone(b, a)
             {
                 continue;
             }
-            let (rank, why, what) = probe_cause(p);
-            let at = match p.address.parse::<std::net::IpAddr>() {
-                Ok(ip) => std::net::SocketAddr::new(ip, p.port).to_string(),
-                Err(_) => format!("{}:{}", p.address, p.port),
-            };
-            found.push((rank, why, format!("{a} cannot reach {b} at {at}: {what}")));
+            found.push((a, p));
         }
     }
-    found.sort();
-    match found.first() {
-        None => Cond::new(FALSE, reason::PEERS_REACHABLE, ""),
-        Some((_, why, _)) => Cond::new(
-            TRUE,
-            why,
-            found
-                .iter()
-                .map(|(_, _, m)| m.as_str())
-                .collect::<Vec<_>>()
-                .join("; "),
-        ),
-    }
+    peer_message(&found)
 }
 
-/// Rank (most actionable first), reason and words for one probe result.
-fn probe_cause(p: &model::PeerProbe) -> (u8, &'static str, String) {
+/// Long messages crowd kubectl output; per pair detail stays in
+/// replicas[].unreachablePeers.
+const PEER_MESSAGE_MAX: usize = 300;
+
+/// Nodes, ports and whether the port range hint applies, of one result.
+type Group<'a> = (BTreeSet<&'a str>, BTreeSet<u16>, bool);
+
+/// One clause per probe result, naming the nodes and ports involved.
+fn peer_message(found: &[(&str, &model::PeerProbe)]) -> Cond {
     use model::ProbeResult as R;
-    let range = model::keys::PORT_RANGE;
-    let open = format!("open TCP {}-{} between nodes", range.start(), range.end());
-    match p.result {
+    // (rank, reason, words, firewall hint), most actionable first.
+    let cause = |p: &model::PeerProbe| match p.result {
         R::Filtered => (
             0,
             reason::FIREWALL,
-            format!("rejected by a firewall; {open}"),
+            "rejected by a firewall".to_owned(),
+            true,
         ),
         R::TimedOut => (
             1,
             reason::TIMEOUT,
-            format!("no answer, packets dropped (often a firewall); {open}"),
+            "no answer, packets dropped".to_owned(),
+            true,
         ),
+        // A firewall that answers with a TCP reset looks the same.
         R::Refused => (
             2,
             reason::NOT_LISTENING,
-            "connection refused: nothing listens there, or a firewall resets".to_owned(),
+            "connection refused (nothing listens, or a firewall resets)".to_owned(),
+            true,
         ),
         R::Accepted => (
             3,
             reason::UNKNOWN,
-            "the port answers but DRBD does not connect; see the kernel log on both nodes"
-                .to_owned(),
+            "port answers but DRBD does not connect (see the kernel log on both nodes)".to_owned(),
+            false,
         ),
         R::Failed => (
             3,
             reason::UNKNOWN,
             format!(
-                "probe failed: {}",
+                "probe failed ({})",
                 p.error.as_deref().unwrap_or("no error text")
             ),
+            false,
         ),
+    };
+    let mut groups: std::collections::BTreeMap<_, Group<'_>> = std::collections::BTreeMap::new();
+    for (a, p) in found {
+        let (rank, why, words, hint) = cause(p);
+        let g = groups.entry((rank, why, words)).or_default();
+        g.0.insert(a);
+        g.0.insert(&p.node);
+        g.1.insert(p.port);
+        g.2 |= hint;
     }
+    let Some(((_, why, _), _)) = groups.first_key_value() else {
+        return Cond::new(FALSE, reason::PEERS_REACHABLE, "");
+    };
+    let why = *why;
+    let range = model::keys::PORT_RANGE;
+    let hint = groups
+        .values()
+        .any(|g| g.2)
+        .then(|| format!("open TCP {}-{} between nodes", range.start(), range.end()));
+    let clauses: Vec<String> = groups
+        .iter()
+        .map(|((_, _, words), (nodes, ports, _))| {
+            let nodes: Vec<&str> = nodes.iter().copied().collect();
+            let ports: Vec<String> = ports.iter().map(u16::to_string).collect();
+            format!(
+                "{words} between {} (TCP {})",
+                nodes.join(", "),
+                ports.join(", ")
+            )
+        })
+        .collect();
+    let room = PEER_MESSAGE_MAX.saturating_sub(hint.as_ref().map_or(0, |h| h.len() + 2));
+    let mut message = String::new();
+    for (i, c) in clauses.iter().enumerate() {
+        let more = format!("; +{} more", clauses.len() - i);
+        let next = if message.is_empty() {
+            c.clone()
+        } else {
+            format!("{message}; {c}")
+        };
+        let last = i + 1 == clauses.len();
+        if i > 0 && next.len() + if last { 0 } else { more.len() } > room {
+            message.push_str(&more);
+            break;
+        }
+        message = next;
+    }
+    if let Some(h) = hint {
+        message = format!("{message}; {h}");
+    }
+    Cond::new(TRUE, why, message)
 }
 
 /// Status aggregation, pure. Provisioning until every assigned replica is
@@ -428,6 +480,7 @@ pub fn aggregate(
             ready: node_ready,
             reachable: &|_| true,
             evicting: &[],
+            alive_across: &|_, _, _| true,
         },
         &BTreeSet::new(),
         None,
@@ -884,6 +937,21 @@ fn pool_views(pools: &[Arc<Pool>], usage: &Usage, ready_nodes: &[String]) -> Vec
         .collect()
 }
 
+/// Agent Lease (acquireTime, renewTime).
+pub type LeaseTimes = (
+    Option<k8s_openapi::jiff::Timestamp>,
+    Option<k8s_openapi::jiff::Timestamp>,
+);
+
+/// One agent run held the Lease from before `since` and renewed after
+/// `probed`. A peer that rebooted or crashed fails one side: its renewals
+/// stop before the probe, or its new run starts after the window did.
+pub fn alive_across(lease: Option<&LeaseTimes>, since: &Time, probed: &Time) -> bool {
+    lease.is_some_and(|(acquired, renewed)| {
+        acquired.is_some_and(|t| t <= since.0) && renewed.is_some_and(|t| t > probed.0)
+    })
+}
+
 /// Node facts of one pass.
 pub(crate) struct Health {
     ready: HashSet<String>,
@@ -893,6 +961,9 @@ pub(crate) struct Health {
     unreachable: HashSet<String>,
     /// Nodes with a core Node object.
     exists: HashSet<String>,
+    /// Agent Lease (acquireTime, renewTime) by node. Peer clocks against
+    /// the prober's: skew within the 20 s window only delays a report.
+    leases: HashMap<String, LeaseTimes>,
 }
 
 impl Health {
@@ -922,6 +993,25 @@ impl Health {
             ready: ready_nodes.iter().cloned().collect(),
             unreachable,
             exists: stores.nodes.state().iter().map(|n| n.name_any()).collect(),
+            leases: stores
+                .leases
+                .state()
+                .iter()
+                .filter_map(|l| {
+                    let node = l
+                        .name_any()
+                        .strip_prefix(&model::keys::agent_lease_name(""))?
+                        .to_owned();
+                    let spec = l.spec.as_ref()?;
+                    Some((
+                        node,
+                        (
+                            spec.acquire_time.as_ref().map(|t| t.0),
+                            spec.renew_time.as_ref().map(|t| t.0),
+                        ),
+                    ))
+                })
+                .collect(),
         }
     }
 
@@ -934,6 +1024,7 @@ impl Health {
                 ready: &|n| self.ready.contains(n),
                 reachable: &|n| !self.unreachable.contains(n),
                 evicting: &v.spec.evict,
+                alive_across: &|n, since, probed| alive_across(self.leases.get(n), since, probed),
             },
             latched,
             v.metadata.generation,
@@ -1203,19 +1294,54 @@ async fn evict_step(
     }
 }
 
-/// The Event a PeerUnreachable change is due: a Warning when it turns
-/// True or its reason changes, a Normal one when it turns False. `last` is
-/// the reason last announced, empty for False.
-pub fn peer_transition(last: &str, now: &Cond) -> Option<(&'static str, String)> {
-    let key = if now.status == TRUE { now.reason } else { "" };
-    if key == last {
-        return None;
+/// False must hold this long before the Normal Event: a link that flaps
+/// with long Connected spells (20 s window, 10 s steady, 30 s pass)
+/// would otherwise announce every cycle.
+pub const PEER_CLEAR_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// What was last announced for a Volume's PeerUnreachable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Announced {
+    /// The reason of the last Warning; empty once cleared.
+    pub reason: String,
+    /// When False was first seen after that Warning.
+    pub false_since: Option<std::time::Instant>,
+}
+
+/// The next announcement state and the Event due, if any: a Warning when
+/// it turns True or its reason changes, a Normal one once False held
+/// `grace`.
+pub fn peer_transition(
+    last: &Announced,
+    now: &Cond,
+    at: std::time::Instant,
+    grace: std::time::Duration,
+) -> (Announced, Option<(&'static str, String)>) {
+    if now.status == TRUE {
+        let next = Announced {
+            reason: now.reason.to_owned(),
+            false_since: None,
+        };
+        let event = (last.reason != now.reason).then(|| ("Warning", now.message.clone()));
+        return (next, event);
     }
-    Some(if key.is_empty() {
-        ("Normal", "no stuck DRBD connection to report".to_owned())
-    } else {
-        ("Warning", now.message.clone())
-    })
+    if last.reason.is_empty() {
+        return (Announced::default(), None);
+    }
+    let since = last.false_since.unwrap_or(at);
+    if at.duration_since(since) >= grace {
+        return (
+            Announced::default(),
+            Some(("Normal", "no stuck DRBD connection to report".to_owned())),
+        );
+    }
+    (
+        Announced {
+            reason: last.reason.clone(),
+            false_since: Some(since),
+        },
+        None,
+    )
 }
 
 /// One Event per PeerUnreachable transition. Memory, seeded from the
@@ -1229,25 +1355,34 @@ async fn peer_event(ctx: &Ctx<'_>, memory: &mut Memory, v: &Volume, now: &Cond) 
         .peer_unreachable
         .get(&uid)
         .cloned()
-        .unwrap_or_else(|| {
-            v.status
+        .unwrap_or_else(|| Announced {
+            reason: v
+                .status
                 .as_ref()
                 .and_then(|s| condition::get(&s.conditions, types::PEER_UNREACHABLE))
                 .filter(|c| c.status == TRUE)
                 .map(|c| c.reason.clone())
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            false_since: None,
         });
-    if let Some((kind, message)) = peer_transition(&last, now) {
-        if kind == "Warning" {
+    let (next, event) = peer_transition(
+        &last,
+        now,
+        std::time::Instant::now(),
+        ctx.cfg.peer_clear_grace,
+    );
+    match event {
+        Some(("Warning", message)) => {
             warn!(volume = v.name_any(), message, "peer unreachable");
             crate::warning_event(ctx.client, v, reason::PEER_UNREACHABLE, &message).await;
-        } else {
+        }
+        Some((_, message)) => {
             info!(volume = v.name_any(), "peers reachable again");
             crate::event(ctx.client, v, reason::PEERS_REACHABLE, &message).await;
         }
+        None => {}
     }
-    let key = if now.status == TRUE { now.reason } else { "" };
-    memory.peer_unreachable.insert(uid, key.to_owned());
+    memory.peer_unreachable.insert(uid, next);
 }
 
 /// Status entries no agent will remove (crate::evict::orphan_entries).
@@ -2024,6 +2159,7 @@ mod tests {
             ready: &|_| true,
             reachable: &|_| true,
             evicting: &[],
+            alive_across: &|_, _, _| true,
         };
         let none = BTreeSet::new();
         let c = peer_cond(healthy(), &all, &none);
@@ -2036,29 +2172,30 @@ mod tests {
         assert_eq!((c.status, c.reason), (TRUE, reason::FIREWALL));
         assert_eq!(
             c.message,
-            "n1 cannot reach n2 at 10.0.0.2:11003: rejected by a firewall; open TCP 11000-11999 between nodes"
+            "rejected by a firewall between n1, n2 (TCP 11003); open TCP 11000-11999 between nodes"
         );
 
-        // The worst cause names the reason; every finding is listed.
+        // Both directions and the tiebreaker: one clause per result, the
+        // worst names the reason.
+        r[1].unreachable_peers = vec![probe("n1", R::Filtered)];
         r[2].unreachable_peers = vec![probe("n1", R::Refused)];
-        r[1].unreachable_peers = vec![probe("n1", R::TimedOut)];
         let c = peer_cond(r.clone(), &all, &none);
         assert_eq!(c.reason, reason::FIREWALL);
         assert_eq!(
-            c.message.matches("cannot reach").count(),
-            3,
-            "{}",
-            c.message
+            c.message,
+            "rejected by a firewall between n1, n2 (TCP 11003); connection refused (nothing listens, or a firewall resets) between n1, n3 (TCP 11003); open TCP 11000-11999 between nodes"
         );
-        r[0].unreachable_peers.clear();
-        assert_eq!(peer_cond(r.clone(), &all, &none).reason, reason::TIMEOUT);
+        r[0].unreachable_peers = vec![probe("n2", R::TimedOut)];
         r[1].unreachable_peers.clear();
-        assert_eq!(
-            peer_cond(r.clone(), &all, &none).reason,
-            reason::NOT_LISTENING
-        );
+        assert_eq!(peer_cond(r.clone(), &all, &none).reason, reason::TIMEOUT);
+        r[0].unreachable_peers.clear();
+        let c = peer_cond(r.clone(), &all, &none);
+        assert_eq!(c.reason, reason::NOT_LISTENING);
+        assert!(c.message.ends_with("open TCP 11000-11999 between nodes"));
         r[2].unreachable_peers = vec![probe("n1", R::Accepted)];
-        assert_eq!(peer_cond(r.clone(), &all, &none).reason, reason::UNKNOWN);
+        let c = peer_cond(r.clone(), &all, &none);
+        assert_eq!(c.reason, reason::UNKNOWN);
+        assert!(!c.message.contains("open TCP"), "{}", c.message);
 
         let mut r = healthy();
         r[0].peers.insert("n2".into(), "Connecting".into());
@@ -2070,6 +2207,7 @@ mod tests {
                 ready: &|_| true,
                 reachable: &|n| n != down,
                 evicting: &[],
+                alive_across: &|_, _, _| true,
             };
             assert_eq!(peer_cond(r.clone(), &nodes, &none).status, FALSE, "{down}");
         }
@@ -2080,6 +2218,7 @@ mod tests {
                 ready: &|_| true,
                 reachable: &|_| true,
                 evicting: &evicting,
+                alive_across: &|_, _, _| true,
             };
             assert_eq!(peer_cond(r.clone(), &nodes, &none).status, FALSE, "{gone}");
         }
@@ -2096,33 +2235,100 @@ mod tests {
             q[side].peers.insert(peer.into(), "StandAlone".into());
             assert_eq!(peer_cond(q, &all, &none).status, FALSE, "{side}");
         }
-        // An IPv6 address keeps its brackets.
-        let mut q = r.clone();
-        q[0].unreachable_peers[0].address = "fd00::2".into();
-        assert!(
-            peer_cond(q, &all, &none)
-                .message
-                .contains("[fd00::2]:11003"),
-            "ipv6"
-        );
+        // A peer agent not alive across the window and the probe.
+        let nodes = Nodes {
+            ready: &|_| true,
+            reachable: &|_| true,
+            evicting: &[],
+            alive_across: &|n, _, _| n != "n2",
+        };
+        assert_eq!(peer_cond(r, &nodes, &none).status, FALSE);
+    }
+
+    #[test]
+    fn peer_message_is_bounded() {
+        let probes: Vec<(String, model::PeerProbe)> = (0..20)
+            .map(|i| {
+                let mut p = probe("n2", model::ProbeResult::Failed);
+                p.error = Some(format!("error number {i} with a long text"));
+                (format!("node-{i:02}"), p)
+            })
+            .collect();
+        let found: Vec<(&str, &model::PeerProbe)> =
+            probes.iter().map(|(a, p)| (a.as_str(), p)).collect();
+        let c = peer_message(&found);
+        assert!(c.message.len() <= PEER_MESSAGE_MAX, "{}", c.message.len());
+        assert!(c.message.contains(" more"), "{}", c.message);
+    }
+
+    fn ts(s: i64) -> k8s_openapi::jiff::Timestamp {
+        k8s_openapi::jiff::Timestamp::from_second(s).unwrap()
+    }
+
+    #[test]
+    fn peer_agent_alive_across_reboot_and_crash() {
+        let (since, probed) = (Time(ts(1000)), Time(ts(1020)));
+        // Up the whole time, renewing every 10 s.
+        assert!(alive_across(
+            Some(&(Some(ts(10)), Some(ts(1025)))),
+            &since,
+            &probed
+        ));
+        // Rebooted or crashed: last renewal before the probe.
+        assert!(!alive_across(
+            Some(&(Some(ts(10)), Some(ts(1001)))),
+            &since,
+            &probed
+        ));
+        // Back with a new run: acquired after the window began.
+        assert!(!alive_across(
+            Some(&(Some(ts(1090)), Some(ts(1095)))),
+            &since,
+            &probed
+        ));
+        // An agent without acquireTime, or no Lease at all.
+        assert!(!alive_across(
+            Some(&(None, Some(ts(1025)))),
+            &since,
+            &probed
+        ));
+        assert!(!alive_across(None, &since, &probed));
     }
 
     #[test]
     fn peer_events_once_per_transition() {
+        let t0 = std::time::Instant::now();
         let t = Cond::new(TRUE, reason::FIREWALL, "m");
         let f = Cond::new(FALSE, reason::PEERS_REACHABLE, "");
-        assert_eq!(peer_transition("", &f), None);
-        assert_eq!(peer_transition("", &t), Some(("Warning", "m".to_owned())));
-        assert_eq!(peer_transition(reason::FIREWALL, &t), None);
+        let quiet = Announced::default();
+        assert_eq!(
+            peer_transition(&quiet, &f, t0, PEER_CLEAR_GRACE),
+            (quiet.clone(), None)
+        );
+        let (fw, ev) = peer_transition(&quiet, &t, t0, PEER_CLEAR_GRACE);
+        assert_eq!(ev, Some(("Warning", "m".to_owned())));
+        assert_eq!(peer_transition(&fw, &t, t0, PEER_CLEAR_GRACE).1, None);
         let timeout = Cond::new(TRUE, reason::TIMEOUT, "n");
         assert_eq!(
-            peer_transition(reason::FIREWALL, &timeout),
+            peer_transition(&fw, &timeout, t0, PEER_CLEAR_GRACE).1,
             Some(("Warning", "n".to_owned()))
         );
+        // False starts the grace; True again inside it says nothing.
+        let (waiting, ev) = peer_transition(&fw, &f, t0, PEER_CLEAR_GRACE);
+        assert_eq!(ev, None);
+        assert_eq!(waiting.false_since, Some(t0));
+        let later = t0 + PEER_CLEAR_GRACE / 2;
+        let (again, ev) = peer_transition(&waiting, &t, later, PEER_CLEAR_GRACE);
+        assert_eq!((again.clone(), ev), (fw.clone(), None));
+        // False held through the grace: one Normal Event.
+        let (waiting, _) = peer_transition(&again, &f, later, PEER_CLEAR_GRACE);
         assert_eq!(
-            peer_transition(reason::FIREWALL, &f).map(|(k, _)| k),
-            Some("Normal")
+            peer_transition(&waiting, &f, later + PEER_CLEAR_GRACE / 2, PEER_CLEAR_GRACE).1,
+            None
         );
+        let (done, ev) = peer_transition(&waiting, &f, later + PEER_CLEAR_GRACE, PEER_CLEAR_GRACE);
+        assert_eq!(ev.map(|(k, _)| k), Some("Normal"));
+        assert_eq!(done, quiet);
     }
 
     #[test]
@@ -2182,6 +2388,7 @@ mod tests {
                 ready: &|_| true,
                 reachable: &|n| n != "n2",
                 evicting: &[],
+                alive_across: &|_, _, _| true,
             },
             &BTreeSet::new(),
             None,
@@ -2196,6 +2403,7 @@ mod tests {
             ready: &|_| true,
             reachable: &|n| n != "n2",
             evicting: &[],
+            alive_across: &|_, _, _| true,
         };
         let s = aggregate_nodes(
             G,
@@ -2455,6 +2663,7 @@ mod tests {
                 ready: &|_| true,
                 reachable: &|n| n != "n2",
                 evicting: &[],
+                alive_across: &|_, _, _| true,
             },
             &BTreeSet::new(),
             None,
@@ -2500,6 +2709,7 @@ mod tests {
             ready: &|_| true,
             reachable: &|_| true,
             evicting: &[],
+            alive_across: &|_, _, _| true,
         };
         let with = |a: &str, b: &str| {
             let mut r = healthy();
@@ -2540,6 +2750,7 @@ mod tests {
                 ready: &|_| true,
                 reachable: &|n| n != "n1",
                 evicting: &[],
+                alive_across: &|_, _, _| true,
             },
             &latched,
             None,
@@ -2574,6 +2785,7 @@ mod tests {
             ready: &|_| true,
             reachable: &|_| true,
             evicting: &[],
+            alive_across: &|_, _, _| true,
         };
         let mut r = healthy();
         r[0].disk_state = Some("Inconsistent".into());
@@ -2593,6 +2805,7 @@ mod tests {
             ready: &|_| true,
             reachable: &|n| n != "n2",
             evicting: &[],
+            alive_across: &|_, _, _| true,
         };
         assert!(!init(&r, &stale));
         // Ready while resizing still counts.
@@ -2659,6 +2872,7 @@ mod tests {
             ready: &|_| true,
             reachable: &|_| true,
             evicting: &[],
+            alive_across: &|_, _, _| true,
         };
         let s = aggregate_nodes(G, &two, Some(&st), &all, &BTreeSet::new(), Some(4));
         assert_eq!(s.primary.as_deref(), Some("n2"));
@@ -2688,6 +2902,7 @@ mod tests {
             ready: &|_| true,
             reachable: &|_| true,
             evicting: &[],
+            alive_across: &|_, _, _| true,
         };
         for order in [[1, 3], [3, 1]] {
             let mut list: Vec<ReplicaStatus> = r.clone();
@@ -2709,6 +2924,7 @@ mod tests {
                 ready: &|_| true,
                 reachable: &|n| n != "n0",
                 evicting: &[],
+                alive_across: &|_, _, _| true,
             },
             &BTreeSet::new(),
             Some(4),

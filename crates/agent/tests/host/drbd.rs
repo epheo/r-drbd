@@ -993,29 +993,48 @@ fn up_entry(node: &str) -> ReplicaStatus {
     }
 }
 
+/// One probe from `from` to `to`, classified.
+async fn probe(from: &str, to: &str) -> (model::ProbeResult, Option<String>) {
+    use agent::drbd::Host as _;
+    let r = agent::drbd::RealHost
+        .connect(
+            Some(from.parse().unwrap()),
+            to.parse().unwrap(),
+            agent::peer::PROBE_TIMEOUT,
+        )
+        .await;
+    agent::peer::classify(&r)
+}
+
 /// Both DRBD ports rejected by a test firewall: each side reports the
 /// other Filtered once the window passed; the record goes once they
-/// connect; a peer with nothing listening is Refused. Also the raw
-/// probe against a dropping rule and a closed port.
+/// connect and the result is kept for the next drop. Also the raw probe
+/// against a dropping rule, a closed port and an unbindable source.
 #[tokio::test]
 #[ignore = "needs root, DRBD 9 and the test VG"]
 async fn drbd_blocked_port_is_reported() {
-    use agent::drbd::Host as _;
     use model::ProbeResult;
     if !enabled() {
         return;
     }
     drbd_clean(EVERY).await;
     let fw = Firewall::block();
-    let probe = |addr: &str| {
-        agent::peer::classify(
-            &agent::drbd::RealHost.connect(addr.parse().unwrap(), agent::peer::PROBE_TIMEOUT),
-        )
-        .0
-    };
-    assert_eq!(probe("127.0.0.3:11992"), ProbeResult::TimedOut);
-    assert_eq!(probe("127.0.0.4:11993"), ProbeResult::Refused);
-    assert_eq!(probe("127.0.0.2:11991"), ProbeResult::Filtered);
+    assert_eq!(
+        probe("127.0.0.1", "127.0.0.3:11992").await.0,
+        ProbeResult::TimedOut
+    );
+    assert_eq!(
+        probe("127.0.0.1", "127.0.0.4:11993").await.0,
+        ProbeResult::Refused
+    );
+    assert_eq!(
+        probe("127.0.0.1", "127.0.0.2:11991").await.0,
+        ProbeResult::Filtered
+    );
+    // The source is this node's DRBD address; one not on the host fails.
+    let (r, e) = probe("192.0.2.1", "127.0.0.2:11991").await;
+    assert_eq!(r, ProbeResult::Failed);
+    assert!(e.unwrap().starts_with("bind 192.0.2.1"));
 
     let h = start().await;
     let pools = [pool(&h.node)];
@@ -1073,7 +1092,8 @@ async fn drbd_blocked_port_is_reported() {
         assert!(connected(&t, "rw-a") && connected(&t, "rw-b"));
     }
 
-    // b down: nothing listens on its port.
+    // b down: stuck again; the last probe is younger than PROBE_EVERY, so
+    // its result is reported again without a new probe.
     assert_eq!(sh(&["drbdsetup", "down", "rw-b"]).await.exit_code, Some(0));
     let down = tokio::time::Instant::now();
     loop {
@@ -1087,7 +1107,7 @@ async fn drbd_blocked_port_is_reported() {
         );
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    assert_eq!(a.stuck()[0].result, ProbeResult::Refused);
+    assert_eq!(a.stuck()[0].result, ProbeResult::Filtered);
 
     for m in [&mut *a, &mut *b] {
         delete(&h, m).await;

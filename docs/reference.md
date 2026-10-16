@@ -116,7 +116,7 @@ Volume `PeerUnreachable`:
 | `PeersReachable` | No stuck connection between running replicas |
 | `Firewall` | The probe was rejected (ICMP prohibited or unreachable); open TCP 11000 to 11999 between nodes |
 | `Timeout` | The probe got no answer: packets dropped |
-| `NotListening` | The probe was refused: nothing listens at that address and port |
+| `NotListening` | The probe was refused: nothing listens at that address and port, or a firewall answers with a TCP reset |
 | `Unknown` | The port answers but DRBD does not connect, or the probe failed |
 
 Pool `Available`: `ThinPoolReady`, `ThinPoolUnavailable`, `ZeroingDisabled`, `InvalidName`, `LvmUnsupported` (host LVM older than 2.03.03).

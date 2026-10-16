@@ -48,6 +48,8 @@ pub struct Config {
     pub ready_timeout: Duration,
     /// An agent Lease unrenewed this long marks its node unreachable.
     pub lease_stale: Duration,
+    /// PeerUnreachable False this long before its Normal Event.
+    pub peer_clear_grace: Duration,
 }
 
 impl Config {
@@ -64,6 +66,7 @@ impl Config {
             suspend_timeout: Duration::from_secs(30),
             ready_timeout: Duration::from_secs(30),
             lease_stale: store::LEASE_STALE,
+            peer_clear_grace: volume::PEER_CLEAR_GRACE,
         }
     }
 }
@@ -199,9 +202,8 @@ pub(crate) struct Memory {
     /// Per Volume uid: the EvictionBlocked text last sent as an Event, so a
     /// block that lasts emits one Event per reason, not one per pass.
     pub(crate) evict_blocked: HashMap<String, String>,
-    /// Per Volume uid: the PeerUnreachable reason last sent as an Event,
-    /// empty for False.
-    pub(crate) peer_unreachable: HashMap<String, String>,
+    /// Per Volume uid: what PeerUnreachable last announced as an Event.
+    pub(crate) peer_unreachable: HashMap<String, volume::Announced>,
 }
 
 impl Memory {

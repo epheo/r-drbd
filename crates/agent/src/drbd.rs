@@ -57,19 +57,26 @@ pub fn is_md_tag(tag: &str) -> bool {
 
 /// Host access that is not an external command, behind a trait so the
 /// reconciler tests can fake it.
+#[async_trait::async_trait]
 pub trait Host: Send + Sync + std::fmt::Debug {
     /// /sys/block/drbd<minor>/size, 512 byte sectors.
     fn device_sectors(&self, minor: u32) -> std::io::Result<u64>;
     /// Bind test with SO_REUSEADDR; an address not assigned here
     /// falls back to the wildcard.
     fn port_in_use(&self, addr: IpAddr, port: u16) -> bool;
-    /// A TCP connect, closed at once.
-    fn connect(&self, addr: SocketAddr, timeout: Duration) -> std::io::Result<()>;
+    /// A TCP connect from `from` (any port), closed at once.
+    async fn connect(
+        &self,
+        from: Option<IpAddr>,
+        to: SocketAddr,
+        timeout: Duration,
+    ) -> std::io::Result<()>;
 }
 
 #[derive(Debug, Default)]
 pub struct RealHost;
 
+#[async_trait::async_trait]
 impl Host for RealHost {
     fn device_sectors(&self, minor: u32) -> std::io::Result<u64> {
         let text = std::fs::read_to_string(format!("/sys/block/drbd{minor}/size"))?;
@@ -94,8 +101,26 @@ impl Host for RealHost {
         }
     }
 
-    fn connect(&self, addr: SocketAddr, timeout: Duration) -> std::io::Result<()> {
-        std::net::TcpStream::connect_timeout(&addr, timeout).map(drop)
+    async fn connect(
+        &self,
+        from: Option<IpAddr>,
+        to: SocketAddr,
+        timeout: Duration,
+    ) -> std::io::Result<()> {
+        let socket = if to.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+        if let Some(ip) = from {
+            socket
+                .bind(SocketAddr::new(ip, 0))
+                .map_err(|e| std::io::Error::new(e.kind(), format!("bind {ip}: {e}")))?;
+        }
+        match tokio::time::timeout(timeout, socket.connect(to)).await {
+            Ok(r) => r.map(drop),
+            Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
+        }
     }
 }
 

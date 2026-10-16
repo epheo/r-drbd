@@ -1,10 +1,12 @@
 //! Reflector caches of Pool, Volume, Snapshot and Node (every node: peers'
-//! InternalIPs are DRBD addresses), and the trigger that wakes the reconciler.
+//! InternalIPs are DRBD addresses), the agent Leases (peers' runs), and the
+//! trigger that wakes the reconciler.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{FutureExt, StreamExt};
+use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::Node;
 use kube::runtime::reflector::{self, Store};
 use kube::runtime::{WatchStreamExt, watcher};
@@ -61,6 +63,7 @@ pub struct Stores {
     pub volumes: Store<Volume>,
     pub snapshots: Store<Snapshot>,
     pub nodes: Store<Node>,
+    pub leases: Store<Lease>,
 }
 
 impl std::fmt::Debug for Stores {
@@ -75,7 +78,8 @@ impl Stores {
         self.pools.wait_until_ready().await?;
         self.volumes.wait_until_ready().await?;
         self.snapshots.wait_until_ready().await?;
-        self.nodes.wait_until_ready().await
+        self.nodes.wait_until_ready().await?;
+        self.leases.wait_until_ready().await
     }
 }
 
@@ -107,7 +111,7 @@ where
 }
 
 /// Starts the watches; the tasks run until the JoinSet is dropped.
-pub fn start(client: &Client, trigger: &Arc<Trigger>) -> (Stores, JoinSet<()>) {
+pub fn start(client: &Client, namespace: &str, trigger: &Arc<Trigger>) -> (Stores, JoinSet<()>) {
     let mut tasks = JoinSet::new();
     let all = watcher::Config::default;
     let stores = Stores {
@@ -115,6 +119,13 @@ pub fn start(client: &Client, trigger: &Arc<Trigger>) -> (Stores, JoinSet<()>) {
         volumes: spawn(&mut tasks, Api::all(client.clone()), all(), trigger.clone()),
         snapshots: spawn(&mut tasks, Api::all(client.clone()), all(), trigger.clone()),
         nodes: spawn(&mut tasks, Api::all(client.clone()), all(), trigger.clone()),
+        // Every agent renews each 10 s: no pass per renewal, passes read the cache.
+        leases: spawn(
+            &mut tasks,
+            Api::namespaced(client.clone(), namespace),
+            all(),
+            Arc::new(Trigger::default()),
+        ),
     };
     (stores, tasks)
 }

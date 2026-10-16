@@ -106,7 +106,7 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
 
     let trigger = Arc::new(Trigger::default());
     let changes = Arc::new(Trigger::default());
-    let (stores, _watches) = watch::start(&watch_client, &trigger);
+    let (stores, _watches) = watch::start(&watch_client, &cfg.namespace, &trigger);
     let tracker = Arc::new(Mutex::new(Tracker::default()));
     let features = tools.drbd();
     let events = features.is_some().then(|| {
@@ -243,6 +243,7 @@ async fn reconcile_loop(
     let mut lvm_checked = false;
     loop {
         rec.set_addresses(addresses(&stores));
+        rec.set_peer_leases(peer_leases(&stores));
         let pools = stores.pools.state();
         if !lvm_checked && pools.iter().any(|p| p.spec.node == node) {
             lvm_checked = check_lvm(exec.as_ref(), &mut rec).await;
@@ -274,6 +275,28 @@ async fn reconcile_loop(
             }
         }
     }
+}
+
+fn peer_leases(stores: &watch::Stores) -> BTreeMap<String, crate::peer::PeerLease> {
+    stores
+        .leases
+        .state()
+        .iter()
+        .filter_map(|l| {
+            let node = l
+                .name_any()
+                .strip_prefix(&model::keys::agent_lease_name(""))?
+                .to_owned();
+            let spec = l.spec.as_ref()?;
+            Some((
+                node,
+                crate::peer::PeerLease {
+                    acquired: spec.acquire_time.as_ref().map(|t| t.0),
+                    renewed: spec.renew_time.as_ref().map(|t| t.0),
+                },
+            ))
+        })
+        .collect()
 }
 
 fn addresses(stores: &watch::Stores) -> BTreeMap<String, std::net::IpAddr> {

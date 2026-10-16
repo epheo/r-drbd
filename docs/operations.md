@@ -138,14 +138,19 @@ A replicated Volume stuck in Provisioning, or Degraded with `ReplicaDisconnected
 How it is detected:
 
 - A connection that stays out of Connected for 20 s, or keeps dropping, while both agents run and both replicas are up, counts as stuck.
-- The stuck side's agent then opens a TCP connection to the peer's DRBD address and port, at most every 5 minutes, and records the result in `replicas[].unreachablePeers`.
-- The controller turns `PeerUnreachable` True within about a minute and emits a Warning Event `PeerUnreachable`; a Normal Event `PeersReachable` follows when it clears.
-- It clears once the connection has held Connected for 10 s, at the agent's next pass (up to 30 s later).
-- It stays False for a node whose agent is down (that is `NodeUnreachable`), for a node in `spec.evict`, and for a StandAlone or split pair (that is `SplitBrain`).
+- The stuck side's agent then opens a TCP connection from its DRBD address to the peer's DRBD address and port, at most every 5 minutes per connection, and records the result in `replicas[].unreachablePeers`.
+- The controller turns `PeerUnreachable` True within about a minute and emits a Warning Event `PeerUnreachable`.
+- A result counts only while the peer's agent ran across the whole window: same Lease acquireTime since before the connection dropped, renewed after the probe.
+  A peer that reboots or crashes is `NodeUnreachable`'s news, not a firewall.
+- It turns False once the connection has held Connected for 10 s, at the agent's next pass (up to 30 s later).
+  The Normal Event `PeersReachable` follows after 5 minutes of False, so a flapping link does not announce every drop.
+- It stays False for a node whose agent is down, for a node in `spec.evict`, and for a StandAlone or split pair (that is `SplitBrain`).
 
 Example message:
 
-    node1 cannot reach node2 at 10.0.0.2:11003: rejected by a firewall; open TCP 11000-11999 between nodes
+    rejected by a firewall between node1, node2, node3 (TCP 11000); open TCP 11000-11999 between nodes
+
+The message has one clause per probe result; `replicas[].unreachablePeers` holds each direction.
 
 Reasons and what to check:
 
@@ -153,11 +158,14 @@ Reasons and what to check:
 |---|---|---|
 | `Firewall` | ICMP prohibited or unreachable, or a local filter | Open TCP 11000 to 11999 between nodes, both directions |
 | `Timeout` | No answer in 3 s | A firewall that drops, or a routing problem between the addresses |
-| `NotListening` | Connection refused | The Node InternalIP is the address DRBD should use on that host; a firewall that answers with a TCP reset looks the same |
+| `NotListening` | Connection refused | Check the firewall too: one that answers with a TCP reset looks the same. Then check that the Node InternalIP is the address DRBD should use on that host |
 | `Unknown` | The port answers, or the probe failed | The kernel log (`dmesg`) on both nodes; the agent logs |
 
-The message lists every stuck connection; the reason is the most actionable one.
+The reason is the most actionable one in the message.
 A probe of a port where DRBD listens adds one line to that node's kernel log ("Error receiving initial packet") and changes nothing in DRBD.
+
+Not covered: an authentication or protocol mismatch ends the connection StandAlone, so `PeerUnreachable` stays False.
+It shows as Degraded `ReplicaDisconnected` (or Ready False while Provisioning), `replicas[].peers` reading StandAlone on one side, an agent `lastError` saying the adjust does not converge, and the reason in the kernel log of both nodes.
 
 ## A lost backing LV
 

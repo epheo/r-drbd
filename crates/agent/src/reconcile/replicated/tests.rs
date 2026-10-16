@@ -59,6 +59,7 @@ struct FakeHost {
     probes: AtomicU32,
 }
 
+#[async_trait::async_trait]
 impl Host for FakeHost {
     fn device_sectors(&self, _: u32) -> std::io::Result<u64> {
         Ok(*self.sectors.lock().unwrap())
@@ -66,7 +67,12 @@ impl Host for FakeHost {
     fn port_in_use(&self, _: IpAddr, _: u16) -> bool {
         self.port_busy
     }
-    fn connect(&self, _: std::net::SocketAddr, _: Duration) -> std::io::Result<()> {
+    async fn connect(
+        &self,
+        _: Option<IpAddr>,
+        _: std::net::SocketAddr,
+        _: Duration,
+    ) -> std::io::Result<()> {
         self.probes.fetch_add(1, Ordering::Relaxed);
         Err(std::io::ErrorKind::HostUnreachable.into())
     }
@@ -1648,4 +1654,37 @@ async fn a_stuck_connection_is_probed_and_reported() {
     dry(&x, "");
     let writes = rig.pass(&[vol], &[]).await;
     assert_eq!(entry_of(&writes).unreachable_peers, vec![]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_with_a_stale_lease_is_not_probed() {
+    let mut lines = healthy();
+    lines[1] = "exists connection name:pvc-1 peer-node-id:1 conn-name:n2 connection:Connecting role:Unknown".into();
+    let mut rig = Rig::new(&lines, up_host());
+    let x = rig.x.clone();
+    let old = k8s_openapi::jiff::Timestamp::now()
+        .checked_sub(std::time::Duration::from_secs(120))
+        .unwrap();
+    let lease = crate::peer::PeerLease {
+        acquired: Some(old),
+        renewed: Some(old),
+    };
+    rig.rec
+        .set_peer_leases(BTreeMap::from([("n2".to_owned(), lease)]));
+    let peer = ReplicaStatus {
+        node: "n2".into(),
+        present: true,
+        ..ReplicaStatus::default()
+    };
+    let vol = with_entries(volume(GIB), vec![reported(), peer]);
+    reads(&x, &[lv(LV_KIB)]);
+    rig.expect_check();
+    rig.expect_sweep();
+    dry(&x, "");
+    rig.pass(std::slice::from_ref(&vol), &[]).await;
+    tokio::time::advance(crate::peer::STUCK).await;
+    reads_again(&x, &[lv(LV_KIB)]);
+    dry(&x, "");
+    rig.pass(std::slice::from_ref(&vol), &[]).await;
+    assert_eq!(rig.host.probes.load(Ordering::Relaxed), 0);
 }
