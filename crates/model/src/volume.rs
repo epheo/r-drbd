@@ -279,6 +279,10 @@ pub struct PeerProbe {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 256))]
     pub error: Option<String>,
+    /// The peer agent run (its Lease acquireTime) the prober saw; a result
+    /// counts only while that run holds the Lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_run: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>,
 }
 
 /// What a TCP connect to a peer's DRBD port found.

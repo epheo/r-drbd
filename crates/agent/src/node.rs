@@ -198,6 +198,7 @@ pub fn lease(node: &str, namespace: &str, now: Timestamp, started: Timestamp) ->
         metadata: ObjectMeta {
             name: Some(keys::agent_lease_name(node)),
             namespace: Some(namespace.to_owned()),
+            labels: Some([(keys::AGENT_LEASE_LABEL.to_owned(), "true".to_owned())].into()),
             ..ObjectMeta::default()
         },
         spec: Some(LeaseSpec {
@@ -218,7 +219,12 @@ pub async fn heartbeat(client: Client, namespace: String, node: String, tools: T
     let params = PatchParams::apply(&keys::agent_field_manager(&node)).force();
     let name = keys::agent_lease_name(&node);
     let mut annotated = false;
-    let started = Timestamp::now();
+    // Whole seconds: probe records carry the run as a Time, which keeps no
+    // more, and the controller compares the two for equality. Fixed for
+    // this process, so overlapping pods of one node alternate between two
+    // runs instead of minting a new one per renewal.
+    let started =
+        Timestamp::from_second(Timestamp::now().as_second()).unwrap_or(Timestamp::UNIX_EPOCH);
     let mut tick = tokio::time::interval(Duration::from_secs(keys::LEASE_RENEW_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -361,6 +367,7 @@ mod tests {
         assert_eq!(v["metadata"]["name"], "r-drbd-agent-n1");
         assert_eq!(v["spec"]["leaseDurationSeconds"], 40);
         assert_eq!(v["spec"]["holderIdentity"], "n1");
+        assert_eq!(v["metadata"]["labels"]["r-drbd.io/agent-lease"], "true");
         assert_eq!(v["spec"]["acquireTime"], "1970-01-01T00:00:00.000000Z");
     }
 }

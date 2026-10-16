@@ -1307,6 +1307,9 @@ fn stuck(node: &str, peer: &str, result: model::ProbeResult) -> ReplicaStatus {
         result,
         probed_at: secs_ago(1),
         error: None,
+        peer_run: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+            support::agent_started(),
+        )),
     }];
     e
 }
@@ -1353,14 +1356,10 @@ async fn peer_unreachable_while_provisioning() {
     })
     .await;
     // Back with a new agent run: n1's old record does not count.
-    support::agent_lease_run(
-        &client,
-        "n2",
-        Duration::ZERO,
-        false,
-        k8s_openapi::jiff::Timestamp::now(),
-    )
-    .await;
+    let run =
+        k8s_openapi::jiff::Timestamp::from_second(k8s_openapi::jiff::Timestamp::now().as_second())
+            .unwrap();
+    support::agent_lease_run(&client, "n2", Duration::ZERO, false, run).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(cond_is(
         &get_volume(&client, "rep").await.unwrap(),
@@ -1372,6 +1371,8 @@ async fn peer_unreachable_while_provisioning() {
     let mut again = stuck("n1", "n2", model::ProbeResult::Filtered);
     again.unreachable_peers[0].since = secs_ago(0);
     again.unreachable_peers[0].probed_at = secs_ago(0);
+    again.unreachable_peers[0].peer_run =
+        Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(run));
     a1.report("rep", again).await;
     volume_where(&client, "rep", fired).await;
 

@@ -28,9 +28,13 @@ pub const STABLE: Duration = Duration::from_secs(10);
 pub const PROBE_EVERY: Duration = Duration::from_secs(300);
 /// Linux resends a SYN after 1 s, then 3 s: one resend is enough on a LAN.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-/// Async sockets, no thread each; the bound keeps a dead peer with
-/// hundreds of volumes to a few timeouts per pass and few sockets open.
-pub const PROBES_AT_ONCE: usize = 32;
+/// Async sockets, no thread each, all of a pass at once so the pass waits
+/// one timeout at most. The cap bounds open sockets; the rest are due
+/// again on the next pass.
+pub const PROBES_PER_PASS: usize = 256;
+/// A result older than this is probed again when a new window opens: a
+/// link that recovered and broke again may have a new cause.
+pub const CARRY_MAX: Duration = Duration::from_secs(60);
 
 const CONNECTED: &str = "Connected";
 /// DRBD stopped trying: split brain or an explicit disconnect.
@@ -188,6 +192,14 @@ impl Watch {
                 Some(p) => (back(now, age(&p.since)), p.since.clone()),
                 None => (now, wall_now()),
             };
+            if prior.is_none()
+                && self
+                    .probes
+                    .get(&key)
+                    .is_some_and(|p| now.duration_since(p.at) >= CARRY_MAX)
+            {
+                self.probes.remove(&key);
+            }
             if let Some(p) = prior {
                 self.probes.entry(key).or_insert_with(|| Probed {
                     at: back(now, age(&p.probed_at)),
@@ -218,9 +230,12 @@ impl Watch {
         self.seeded.retain(|v| keep(v));
     }
 
-    /// Stuck connections, down right now, never probed or probed long ago.
+    /// Stuck connections, down right now, never probed or probed long ago;
+    /// the least recently probed first, at most PROBES_PER_PASS.
     pub fn due(&self, now: Instant) -> Vec<Due> {
-        self.conns
+        let last = |v: &String, p: &String| self.probes.get(&(v.clone(), p.clone())).map(|x| x.at);
+        let mut due: Vec<Due> = self
+            .conns
             .iter()
             .flat_map(|(v, conns)| conns.iter().map(move |(p, c)| (v, p, c)))
             .filter(|(_, _, c)| c.stuck(now) && c.up_at.is_none())
@@ -230,7 +245,10 @@ impl Watch {
                     .is_none_or(|x| now.duration_since(x.at) >= PROBE_EVERY)
             })
             .map(|(v, p, c)| (v.clone(), p.clone(), c.target))
-            .collect()
+            .collect();
+        due.sort_by_key(|(v, p, _)| last(v, p));
+        due.truncate(PROBES_PER_PASS);
+        due
     }
 
     /// Stores a probe result; None when the connection moved on meanwhile.
@@ -256,6 +274,7 @@ impl Watch {
             result,
             probed_at: wall_now(),
             error,
+            peer_run: c.epoch.map(Time),
         };
         let epoch = c.epoch;
         self.probes.insert(
@@ -514,6 +533,7 @@ mod tests {
             result: ProbeResult::TimedOut,
             probed_at: ten,
             error: None,
+            peer_run: None,
         };
         let mut w = Watch::default();
         let s = with("Connecting", |s| s.prior = Some(prior.clone()));
@@ -538,5 +558,51 @@ mod tests {
             Instant::now(),
         );
         assert_eq!(w.reported("v", Instant::now()), Vec::<PeerProbe>::new());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_old_result_is_probed_again_in_a_new_window() {
+        let mut w = Watch::default();
+        probed_then_closed(&mut w).await;
+        tokio::time::advance(CARRY_MAX).await;
+        w.observe("v", &seen("Connecting", true), Instant::now());
+        tokio::time::advance(STUCK).await;
+        w.observe("v", &seen("Connecting", true), Instant::now());
+        assert_eq!(w.reported("v", Instant::now()), Vec::<PeerProbe>::new());
+        assert_eq!(w.due(Instant::now()).len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn probes_per_pass_are_capped_least_recent_first() {
+        let mut w = Watch::default();
+        for i in 0..300 {
+            w.observe(
+                &format!("v{i:03}"),
+                &seen("Connecting", true),
+                Instant::now(),
+            );
+        }
+        tokio::time::advance(STUCK).await;
+        let due = w.due(Instant::now());
+        assert_eq!(due.len(), PROBES_PER_PASS);
+        for (v, p, t) in &due {
+            w.record(v, p, *t, &Ok(()), Instant::now());
+        }
+        let rest = w.due(Instant::now());
+        assert_eq!(rest.len(), 300 - PROBES_PER_PASS);
+        assert!(rest.iter().all(|d| !due.contains(d)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_record_names_the_peer_run() {
+        let mut w = Watch::default();
+        let run = Timestamp::from_second(1_700_000_000).unwrap();
+        let s = with("Connecting", |s| s.epoch = Some(run));
+        w.observe("v", &s, Instant::now());
+        tokio::time::advance(STUCK).await;
+        let p = w
+            .record("v", "n2", addr(), &Ok(()), Instant::now())
+            .unwrap();
+        assert_eq!(p.peer_run, Some(Time(run)));
     }
 }

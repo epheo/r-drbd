@@ -59,7 +59,7 @@ Status:
 | `initializedAt` | First time the volume was Ready |
 | `fileSystem` | File system the node plugin created or inherited |
 | `replicas[]` | `node`, `present`, `diskState`, `syncPercent`, `peers`, `inUse`, `quorum`, `devicePath`, `allocatedBytes`, `sizeBytes`, `observedGeneration`, `lastError`, `unreachablePeers` |
-| `replicas[].unreachablePeers[]` | Stuck DRBD connections from this node: `node`, `address`, `port`, `since`, `result` (Refused, Filtered, TimedOut, Accepted, Failed), `probedAt`, `error` |
+| `replicas[].unreachablePeers[]` | Stuck DRBD connections from this node: `node`, `address`, `port`, `since`, `result` (Refused, Filtered, TimedOut, Accepted, Failed), `probedAt`, `error`, `peerRun` (the peer agent run probed) |
 
 Finalizer `r-drbd.io/volume` holds deletion until every replica is removed.
 

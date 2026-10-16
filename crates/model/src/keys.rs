@@ -25,6 +25,8 @@ pub const ANNOTATION_LVM: &str = "r-drbd.io/lvm";
 pub fn agent_lease_name(node: &str) -> String {
     format!("r-drbd-agent-{node}")
 }
+/// Label on every agent Lease, value "true", so agents watch only those.
+pub const AGENT_LEASE_LABEL: &str = "r-drbd.io/agent-lease";
 pub const CONTROLLER_LEASE_NAME: &str = "r-drbd-controller";
 pub const LEASE_RENEW_SECS: u64 = 10;
 pub const LEASE_STALE_SECS: u64 = 40;

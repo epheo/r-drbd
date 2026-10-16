@@ -19,8 +19,6 @@ use model::{
 use super::{
     Place, Reads, Reconciler, StatusWrite, find_in_pool, is_lost, lost_after_report, rebuild_error,
 };
-use futures::StreamExt;
-
 use crate::drbd::{self, DRBD_TIMEOUT, Facts, FileInputs, Host, RealHost, ResFiles, VOLUME, argv};
 use crate::events2::Resource;
 use crate::events2::Tracker;
@@ -545,9 +543,9 @@ impl Reconciler {
             .observe(&name, &seen, tokio::time::Instant::now());
     }
 
-    /// Probes the connections stuck past the window, many at once so a
-    /// firewall that drops costs a few timeouts per pass, not one per
-    /// volume; then refreshes the writes of the volumes they changed.
+    /// Probes the connections stuck past the window, all at once so a
+    /// firewall that drops costs one timeout per pass, not one per volume;
+    /// then refreshes the writes of the volumes they changed.
     pub(super) async fn probe_peers(&mut self, vols: &[&Volume], writes: &mut Vec<StatusWrite>) {
         if let Ok(t) = self.drbd.tracker.lock() {
             self.peers.retain(|v| t.resource(v).is_some());
@@ -569,10 +567,7 @@ impl Reconciler {
                 ) as futures::future::BoxFuture<'static, _>
             })
             .collect();
-        let results: Vec<_> = futures::stream::iter(probes)
-            .buffered(crate::peer::PROBES_AT_ONCE)
-            .collect()
-            .await;
+        let results = futures::future::join_all(probes).await;
         let mut changed = std::collections::BTreeSet::new();
         let now = tokio::time::Instant::now();
         for ((volume, peer, target), r) in due.into_iter().zip(results) {

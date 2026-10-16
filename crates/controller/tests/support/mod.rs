@@ -339,13 +339,15 @@ pub async fn agent_lease(client: &Client, node: &str, ago: Duration, paused: boo
     agent_lease_run(client, node, ago, paused, agent_started()).await;
 }
 
-/// When every simulated agent run began, unless restarted.
-fn agent_started() -> k8s_openapi::jiff::Timestamp {
+/// When every simulated agent run began, unless restarted; whole seconds
+/// as the agent writes it.
+pub fn agent_started() -> k8s_openapi::jiff::Timestamp {
     static AT: std::sync::OnceLock<k8s_openapi::jiff::Timestamp> = std::sync::OnceLock::new();
     *AT.get_or_init(|| {
-        k8s_openapi::jiff::Timestamp::now()
-            .checked_sub(Duration::from_secs(3600))
-            .expect("time")
+        k8s_openapi::jiff::Timestamp::from_second(
+            k8s_openapi::jiff::Timestamp::now().as_second() - 3600,
+        )
+        .expect("time")
     })
 }
 
@@ -366,7 +368,11 @@ pub async fn agent_lease_run(
     let lease = json!({
         "apiVersion": "coordination.k8s.io/v1",
         "kind": "Lease",
-        "metadata": { "name": agent_lease_name(node), "namespace": NAMESPACE },
+        "metadata": {
+            "name": agent_lease_name(node),
+            "namespace": NAMESPACE,
+            "labels": { (model::keys::AGENT_LEASE_LABEL): "true" },
+        },
         "spec": {
             "holderIdentity": if paused { PAUSED } else { node },
             "leaseDurationSeconds": model::keys::LEASE_STALE_SECS,

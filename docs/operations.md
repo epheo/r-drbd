@@ -138,12 +138,16 @@ A replicated Volume stuck in Provisioning, or Degraded with `ReplicaDisconnected
 How it is detected:
 
 - A connection that stays out of Connected for 20 s, or keeps dropping, while both agents run and both replicas are up, counts as stuck.
-- The stuck side's agent then opens a TCP connection from its DRBD address to the peer's DRBD address and port, at most every 5 minutes per connection, and records the result in `replicas[].unreachablePeers`.
+- The stuck side's agent then opens a TCP connection from its DRBD address to the peer's DRBD address and port, and records the result in `replicas[].unreachablePeers`.
+  It probes each connection at most every 5 minutes, again when a new drop follows a result older than 60 s, and at most 256 connections per pass.
 - The controller turns `PeerUnreachable` True within about a minute and emits a Warning Event `PeerUnreachable`.
-- A result counts only while the peer's agent ran across the whole window: same Lease acquireTime since before the connection dropped, renewed after the probe.
+- A result counts only while the peer agent run the prober saw (`peerRun`, the Lease acquireTime) still holds the Lease and the controller has seen it renewed since the record appeared.
+  Node clocks are never compared, so a peer booting with a wrong clock changes nothing.
   A peer that reboots or crashes is `NodeUnreachable`'s news, not a firewall.
+  While two agent pods of one node overlap in a rollout, the run alternates and no new result is recorded; reports resume about 20 s after the old pod is gone.
 - It turns False once the connection has held Connected for 10 s, at the agent's next pass (up to 30 s later).
   The Normal Event `PeersReachable` follows after 5 minutes of False, so a flapping link does not announce every drop.
+  A controller restart inside those 5 minutes skips that Normal Event; the condition itself is correct.
 - It stays False for a node whose agent is down, for a node in `spec.evict`, and for a StandAlone or split pair (that is `SplitBrain`).
 
 Example message:

@@ -202,6 +202,8 @@ pub(crate) struct Memory {
     /// Per Volume uid: the EvictionBlocked text last sent as an Event, so a
     /// block that lasts emits one Event per reason, not one per pass.
     pub(crate) evict_blocked: HashMap<String, String>,
+    /// Per Volume uid: when each PeerUnreachable probe record was first seen.
+    pub(crate) probes: HashMap<String, volume::ProbesSeen>,
     /// Per Volume uid: what PeerUnreachable last announced as an Event.
     pub(crate) peer_unreachable: HashMap<String, volume::Announced>,
 }
@@ -232,6 +234,16 @@ impl Memory {
             .filter(|c| c.status == model::condition::TRUE)
             .map(|c| volume::pairs_from_message(&c.message))
             .unwrap_or_default()
+    }
+
+    /// Notes the Volume's probe records and returns their first sightings.
+    pub(crate) fn probes_seen(&mut self, v: &model::Volume) -> volume::ProbesSeen {
+        let Some(uid) = v.metadata.uid.clone() else {
+            return volume::ProbesSeen::new();
+        };
+        let seen = self.probes.entry(uid).or_default();
+        volume::note_probes(seen, v, std::time::Instant::now());
+        seen.clone()
     }
 
     pub(crate) fn latch(&mut self, v: &model::Volume, pairs: BTreeSet<volume::Pair>) {
@@ -301,6 +313,7 @@ async fn pass(ctx: &Ctx<'_>, memory: &mut Memory) -> Option<Duration> {
     memory
         .peer_unreachable
         .retain(|uid, _| seen.contains_key(uid));
+    memory.probes.retain(|uid, _| seen.contains_key(uid));
     let snapshots: HashSet<String> = ctx
         .stores
         .snapshots
@@ -312,7 +325,15 @@ async fn pass(ctx: &Ctx<'_>, memory: &mut Memory) -> Option<Duration> {
     volume::reconcile_all(ctx, memory).await;
     pool::reconcile_all(ctx, memory).await;
     let snapshots = snapshot::reconcile_all(ctx, memory).await;
-    [snapshots, ctx.stores.next_lease_expiry()]
+    // A fresh Lease renewal wakes nothing, yet a probe record counts only
+    // after one, and a cleared PeerUnreachable waits out its grace.
+    let peers = (memory.probes.values().any(|m| !m.is_empty())
+        || memory
+            .peer_unreachable
+            .values()
+            .any(|a| a.false_since.is_some()))
+    .then(|| Duration::from_secs(model::keys::LEASE_RENEW_SECS + 1));
+    [snapshots, ctx.stores.next_lease_expiry(), peers]
         .into_iter()
         .flatten()
         .min()

@@ -80,6 +80,13 @@ impl Stores {
         self.nodes.get(&ObjectRef::new(name))
     }
 
+    /// When this process last saw the node's agent Lease renewTime change.
+    pub fn agent_renewed_at(&self, node: &str) -> Option<Instant> {
+        lock(&self.renewals)
+            .get(&model::keys::agent_lease_name(node))
+            .copied()
+    }
+
     /// The node's agent renewed its Lease within the stale window, as seen
     /// from here; false without a Lease.
     pub fn agent_fresh(&self, node: &str) -> bool {

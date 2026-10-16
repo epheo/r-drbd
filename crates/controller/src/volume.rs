@@ -140,9 +140,9 @@ pub struct Nodes<'a> {
     pub reachable: &'a dyn Fn(&str) -> bool,
     /// The volume's spec.evict: those nodes' connections are expected to break.
     pub evicting: &'a [String],
-    /// (node, since, probedAt): one run of the node's agent held its Lease
-    /// from before `since` and renewed after `probedAt`.
-    pub alive_across: &'a dyn Fn(&str, &Time, &Time) -> bool,
+    /// (prober, record): the peer agent run the prober saw still holds the
+    /// Lease and renewed after this controller first saw the record.
+    pub alive_across: &'a dyn Fn(&str, &model::PeerProbe) -> bool,
 }
 
 impl std::fmt::Debug for Nodes<'_> {
@@ -350,7 +350,7 @@ fn peer_unreachable(
         for p in &e.unreachable_peers {
             let (a, b) = (e.node.as_str(), p.node.as_str());
             if !up(b)
-                || !(nodes.alive_across)(b, &p.since, &p.probed_at)
+                || !(nodes.alive_across)(a, p)
                 || split_pairs.contains(&pair(a, b))
                 || stand_alone(a, b)
                 || stand_alone(b, a)
@@ -480,7 +480,7 @@ pub fn aggregate(
             ready: node_ready,
             reachable: &|_| true,
             evicting: &[],
-            alive_across: &|_, _, _| true,
+            alive_across: &|_, _| true,
         },
         &BTreeSet::new(),
         None,
@@ -937,19 +937,51 @@ fn pool_views(pools: &[Arc<Pool>], usage: &Usage, ready_nodes: &[String]) -> Vec
         .collect()
 }
 
-/// Agent Lease (acquireTime, renewTime).
-pub type LeaseTimes = (
-    Option<k8s_openapi::jiff::Timestamp>,
-    Option<k8s_openapi::jiff::Timestamp>,
-);
+/// A peer agent's Lease: its run (acquireTime) and when this process last
+/// saw it renewed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentLease {
+    pub run: Option<k8s_openapi::jiff::Timestamp>,
+    pub renewed_seen: Option<std::time::Instant>,
+}
 
-/// One agent run held the Lease from before `since` and renewed after
-/// `probed`. A peer that rebooted or crashed fails one side: its renewals
-/// stop before the probe, or its new run starts after the window did.
-pub fn alive_across(lease: Option<&LeaseTimes>, since: &Time, probed: &Time) -> bool {
-    lease.is_some_and(|(acquired, renewed)| {
-        acquired.is_some_and(|t| t <= since.0) && renewed.is_some_and(|t| t > probed.0)
+/// A probe record counts when the peer run the prober saw still holds the
+/// Lease and renewed after this process first saw the record. Run ids are
+/// compared for equality and renewals on this process's clock, so node
+/// clocks never meet: a peer that rebooted or crashed has a new run or no
+/// renewal since.
+pub fn probe_counts(
+    lease: Option<&AgentLease>,
+    peer_run: Option<&Time>,
+    first_seen: Option<std::time::Instant>,
+) -> bool {
+    lease.is_some_and(|l| {
+        l.run.is_some()
+            && l.run == peer_run.map(|t| t.0)
+            && matches!((l.renewed_seen, first_seen), (Some(r), Some(f)) if r > f)
     })
+}
+
+/// When this process first saw each probe record, by (prober, peer,
+/// probedAt).
+pub type ProbesSeen = HashMap<(String, String, String), std::time::Instant>;
+
+fn probe_key(prober: &str, p: &model::PeerProbe) -> (String, String, String) {
+    (prober.to_owned(), p.node.clone(), p.probed_at.0.to_string())
+}
+
+/// Notes the first sight of the Volume's probe records, forgetting gone ones.
+pub fn note_probes(seen: &mut ProbesSeen, v: &Volume, now: std::time::Instant) {
+    let current: Vec<_> = v
+        .status
+        .iter()
+        .flat_map(|s| &s.replicas)
+        .flat_map(|e| e.unreachable_peers.iter().map(|p| probe_key(&e.node, p)))
+        .collect();
+    seen.retain(|k, _| current.contains(k));
+    for k in current {
+        seen.entry(k).or_insert(now);
+    }
 }
 
 /// Node facts of one pass.
@@ -961,9 +993,7 @@ pub(crate) struct Health {
     unreachable: HashSet<String>,
     /// Nodes with a core Node object.
     exists: HashSet<String>,
-    /// Agent Lease (acquireTime, renewTime) by node. Peer clocks against
-    /// the prober's: skew within the 20 s window only delays a report.
-    leases: HashMap<String, LeaseTimes>,
+    leases: HashMap<String, AgentLease>,
 }
 
 impl Health {
@@ -1002,20 +1032,21 @@ impl Health {
                         .name_any()
                         .strip_prefix(&model::keys::agent_lease_name(""))?
                         .to_owned();
-                    let spec = l.spec.as_ref()?;
-                    Some((
-                        node,
-                        (
-                            spec.acquire_time.as_ref().map(|t| t.0),
-                            spec.renew_time.as_ref().map(|t| t.0),
-                        ),
-                    ))
+                    let run = l.spec.as_ref()?.acquire_time.as_ref().map(|t| t.0);
+                    let renewed_seen = stores.agent_renewed_at(&node);
+                    Some((node, AgentLease { run, renewed_seen }))
                 })
                 .collect(),
         }
     }
 
-    fn summarize(&self, v: &Volume, a: &Assignment, latched: &BTreeSet<Pair>) -> Summary {
+    fn summarize(
+        &self,
+        v: &Volume,
+        a: &Assignment,
+        latched: &BTreeSet<Pair>,
+        seen: &ProbesSeen,
+    ) -> Summary {
         aggregate_nodes(
             v.spec.size_bytes,
             a,
@@ -1024,7 +1055,13 @@ impl Health {
                 ready: &|n| self.ready.contains(n),
                 reachable: &|n| !self.unreachable.contains(n),
                 evicting: &v.spec.evict,
-                alive_across: &|n, since, probed| alive_across(self.leases.get(n), since, probed),
+                alive_across: &|prober, p| {
+                    probe_counts(
+                        self.leases.get(&p.node),
+                        p.peer_run.as_ref(),
+                        seen.get(&probe_key(prober, p)).copied(),
+                    )
+                },
             },
             latched,
             v.metadata.generation,
@@ -1080,7 +1117,7 @@ async fn reconcile(
     }
     if let Some(a) = memory.assignment(v).cloned() {
         let a = converge(memory, placing, api, v, a).await;
-        let mut summary = health.summarize(v, &a, &memory.latched(v));
+        let mut summary = health.summarize(v, &a, &memory.latched(v), &memory.probes_seen(v));
         memory.latch(v, summary.split_pairs.clone());
         evict_step(ctx, memory, placing, api, v, &a, &mut summary).await;
         remove_orphans(ctx, health, api, v, &a).await;
@@ -1543,7 +1580,7 @@ async fn delete(memory: &mut Memory, api: &Api<Volume>, v: &Volume, health: &Hea
         set_finalizer(api, v, FINALIZER_VOLUME, false).await;
         return;
     }
-    let mut summary = health.summarize(v, &a, &memory.latched(v));
+    let mut summary = health.summarize(v, &a, &memory.latched(v), &memory.probes_seen(v));
     summary.ready = Cond::new(
         FALSE,
         reason::DELETING,
@@ -2137,6 +2174,7 @@ mod tests {
             result,
             probed_at: t,
             error: None,
+            peer_run: None,
         }
     }
 
@@ -2159,7 +2197,7 @@ mod tests {
             ready: &|_| true,
             reachable: &|_| true,
             evicting: &[],
-            alive_across: &|_, _, _| true,
+            alive_across: &|_, _| true,
         };
         let none = BTreeSet::new();
         let c = peer_cond(healthy(), &all, &none);
@@ -2207,7 +2245,7 @@ mod tests {
                 ready: &|_| true,
                 reachable: &|n| n != down,
                 evicting: &[],
-                alive_across: &|_, _, _| true,
+                alive_across: &|_, _| true,
             };
             assert_eq!(peer_cond(r.clone(), &nodes, &none).status, FALSE, "{down}");
         }
@@ -2218,7 +2256,7 @@ mod tests {
                 ready: &|_| true,
                 reachable: &|_| true,
                 evicting: &evicting,
-                alive_across: &|_, _, _| true,
+                alive_across: &|_, _| true,
             };
             assert_eq!(peer_cond(r.clone(), &nodes, &none).status, FALSE, "{gone}");
         }
@@ -2240,7 +2278,7 @@ mod tests {
             ready: &|_| true,
             reachable: &|_| true,
             evicting: &[],
-            alive_across: &|n, _, _| n != "n2",
+            alive_across: &|_, p| p.node != "n2",
         };
         assert_eq!(peer_cond(r, &nodes, &none).status, FALSE);
     }
@@ -2266,33 +2304,85 @@ mod tests {
     }
 
     #[test]
-    fn peer_agent_alive_across_reboot_and_crash() {
-        let (since, probed) = (Time(ts(1000)), Time(ts(1020)));
-        // Up the whole time, renewing every 10 s.
-        assert!(alive_across(
-            Some(&(Some(ts(10)), Some(ts(1025)))),
-            &since,
-            &probed
+    fn probe_counts_on_run_identity_and_local_renewals() {
+        let t0 = std::time::Instant::now();
+        let later = t0 + std::time::Duration::from_secs(10);
+        let run = Time(ts(1000));
+        let lease = |r: i64, renewed| AgentLease {
+            run: Some(ts(r)),
+            renewed_seen: Some(renewed),
+        };
+        // Same run, renewed after the record was first seen.
+        assert!(probe_counts(
+            Some(&lease(1000, later)),
+            Some(&run),
+            Some(t0)
         ));
-        // Rebooted or crashed: last renewal before the probe.
-        assert!(!alive_across(
-            Some(&(Some(ts(10)), Some(ts(1001)))),
-            &since,
-            &probed
+        // No renewal since: rebooted or crashed.
+        assert!(!probe_counts(
+            Some(&lease(1000, t0)),
+            Some(&run),
+            Some(later)
         ));
-        // Back with a new run: acquired after the window began.
-        assert!(!alive_across(
-            Some(&(Some(ts(1090)), Some(ts(1095)))),
-            &since,
-            &probed
+        // Back with a new run.
+        assert!(!probe_counts(
+            Some(&lease(1090, later)),
+            Some(&run),
+            Some(t0)
         ));
-        // An agent without acquireTime, or no Lease at all.
-        assert!(!alive_across(
-            Some(&(None, Some(ts(1025)))),
-            &since,
-            &probed
-        ));
-        assert!(!alive_across(None, &since, &probed));
+        // Peer clock far ahead or behind the prober's: only identity counts.
+        let ahead = Time(ts(4_000_000_000));
+        let l = AgentLease {
+            run: Some(ahead.0),
+            renewed_seen: Some(later),
+        };
+        assert!(probe_counts(Some(&l), Some(&ahead), Some(t0)));
+        let behind = Time(ts(1));
+        let l = AgentLease {
+            run: Some(behind.0),
+            renewed_seen: Some(later),
+        };
+        assert!(probe_counts(Some(&l), Some(&behind), Some(t0)));
+        // No run recorded, no Lease, never seen.
+        assert!(!probe_counts(Some(&lease(1000, later)), None, Some(t0)));
+        assert!(!probe_counts(None, Some(&run), Some(t0)));
+        assert!(!probe_counts(Some(&lease(1000, later)), Some(&run), None));
+    }
+
+    #[test]
+    fn first_sight_of_probe_records() {
+        let mut v = Volume::new(
+            "v",
+            model::VolumeSpec {
+                size_bytes: G,
+                replicas: 2,
+                tier: "t".into(),
+                pool: None,
+                node: None,
+                access_mode: model::AccessMode::default(),
+                attachments: vec![],
+                evict: vec![],
+                source: None,
+                resolve: None,
+                assignment: Some(two_with_tb()),
+            },
+        );
+        let mut e = ReplicaStatus {
+            node: "n1".into(),
+            ..ReplicaStatus::default()
+        };
+        e.unreachable_peers = vec![probe("n2", model::ProbeResult::Filtered)];
+        v.status = Some(status(VolumePhase::Provisioning, vec![e]));
+        let mut seen = ProbesSeen::new();
+        let t0 = std::time::Instant::now();
+        note_probes(&mut seen, &v, t0);
+        note_probes(&mut seen, &v, t0 + std::time::Duration::from_secs(5));
+        assert_eq!(seen.values().copied().collect::<Vec<_>>(), vec![t0]);
+        v.status.as_mut().unwrap().replicas[0]
+            .unreachable_peers
+            .clear();
+        note_probes(&mut seen, &v, t0);
+        assert!(seen.is_empty());
     }
 
     #[test]
@@ -2388,7 +2478,7 @@ mod tests {
                 ready: &|_| true,
                 reachable: &|n| n != "n2",
                 evicting: &[],
-                alive_across: &|_, _, _| true,
+                alive_across: &|_, _| true,
             },
             &BTreeSet::new(),
             None,
@@ -2403,7 +2493,7 @@ mod tests {
             ready: &|_| true,
             reachable: &|n| n != "n2",
             evicting: &[],
-            alive_across: &|_, _, _| true,
+            alive_across: &|_, _| true,
         };
         let s = aggregate_nodes(
             G,
@@ -2663,7 +2753,7 @@ mod tests {
                 ready: &|_| true,
                 reachable: &|n| n != "n2",
                 evicting: &[],
-                alive_across: &|_, _, _| true,
+                alive_across: &|_, _| true,
             },
             &BTreeSet::new(),
             None,
@@ -2709,7 +2799,7 @@ mod tests {
             ready: &|_| true,
             reachable: &|_| true,
             evicting: &[],
-            alive_across: &|_, _, _| true,
+            alive_across: &|_, _| true,
         };
         let with = |a: &str, b: &str| {
             let mut r = healthy();
@@ -2750,7 +2840,7 @@ mod tests {
                 ready: &|_| true,
                 reachable: &|n| n != "n1",
                 evicting: &[],
-                alive_across: &|_, _, _| true,
+                alive_across: &|_, _| true,
             },
             &latched,
             None,
@@ -2785,7 +2875,7 @@ mod tests {
             ready: &|_| true,
             reachable: &|_| true,
             evicting: &[],
-            alive_across: &|_, _, _| true,
+            alive_across: &|_, _| true,
         };
         let mut r = healthy();
         r[0].disk_state = Some("Inconsistent".into());
@@ -2805,7 +2895,7 @@ mod tests {
             ready: &|_| true,
             reachable: &|n| n != "n2",
             evicting: &[],
-            alive_across: &|_, _, _| true,
+            alive_across: &|_, _| true,
         };
         assert!(!init(&r, &stale));
         // Ready while resizing still counts.
@@ -2872,7 +2962,7 @@ mod tests {
             ready: &|_| true,
             reachable: &|_| true,
             evicting: &[],
-            alive_across: &|_, _, _| true,
+            alive_across: &|_, _| true,
         };
         let s = aggregate_nodes(G, &two, Some(&st), &all, &BTreeSet::new(), Some(4));
         assert_eq!(s.primary.as_deref(), Some("n2"));
@@ -2902,7 +2992,7 @@ mod tests {
             ready: &|_| true,
             reachable: &|_| true,
             evicting: &[],
-            alive_across: &|_, _, _| true,
+            alive_across: &|_, _| true,
         };
         for order in [[1, 3], [3, 1]] {
             let mut list: Vec<ReplicaStatus> = r.clone();
@@ -2924,7 +3014,7 @@ mod tests {
                 ready: &|_| true,
                 reachable: &|n| n != "n0",
                 evicting: &[],
-                alive_across: &|_, _, _| true,
+                alive_across: &|_, _| true,
             },
             &BTreeSet::new(),
             Some(4),

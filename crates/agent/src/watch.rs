@@ -123,7 +123,7 @@ pub fn start(client: &Client, namespace: &str, trigger: &Arc<Trigger>) -> (Store
         leases: spawn(
             &mut tasks,
             Api::namespaced(client.clone(), namespace),
-            all(),
+            all().labels(&format!("{}=true", model::keys::AGENT_LEASE_LABEL)),
             Arc::new(Trigger::default()),
         ),
     };
