@@ -61,7 +61,7 @@ See deploy/README.md for the manifests.
 
 ## Documentation
 
-User documentation is coming under docs/.
+See [docs/](docs/README.md): concepts, install, pools, volumes, snapshots, operations, data safety and reference.
 
 ## License
 

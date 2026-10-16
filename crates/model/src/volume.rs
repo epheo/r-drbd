@@ -210,8 +210,9 @@ pub struct VolumeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initialized_at: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>,
     /// File system the node plugin created (or inherited from a snapshot),
-    /// written before the first mount. A signature on the device without
-    /// this marker is a mkfs that was cut short and is redone.
+    /// written before the first mount. An XFS signature without this
+    /// marker is adopted, never formatted, unless it still carries the
+    /// mkfs-time label, which proves a format that was cut short.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 16))]
     pub file_system: Option<String>,
