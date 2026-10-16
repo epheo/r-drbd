@@ -34,6 +34,11 @@ pub enum ExecMode {
         term: Duration,
         kill: Duration,
     },
+    /// Never killed: neither a dropped caller, nor `wait`, nor shutdown ends
+    /// the process. After `wait` it gets SIGTERM and the caller a Timeout
+    /// error, while the runner keeps reaping it; shutdown waits for it.
+    /// For commands a SIGKILL would leave half done (LVM with a pool suspended).
+    Finish { wait: Duration },
     /// Timeout restarts while the process or its devices show IO
     /// (create-md, dd copies).
     IoProgress { wait: Duration },

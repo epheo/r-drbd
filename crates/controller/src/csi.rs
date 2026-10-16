@@ -166,6 +166,13 @@ fn size_fits(size: u64, range: Option<&CapacityRange>) -> bool {
     })
 }
 
+/// Device-mapper bytes (`-` counted twice) a mapped name may take: those of
+/// `pvc-<uuid>`, so a mapped name never takes more of the LV name budget
+/// than a name CSI sends itself.
+const MAPPED_DM_MAX: usize = 45;
+/// The hash suffix: `-` (two device-mapper bytes) and 16 hex digits.
+const SUFFIX_DM: usize = 2 + 16;
+
 /// Object name for a CSI name. The external-provisioner and snapshotter
 /// send pvc-<uuid> and snapshot-<uuid>, which pass unchanged. Anything that
 /// is not both a Kubernetes name and an LV name (uppercase, too long) is
@@ -197,7 +204,10 @@ pub fn object_name(csi_name: &str) -> String {
             }
         })
         .skip_while(|c| !c.is_ascii_lowercase())
-        .take(31)
+        .scan(0, |dm, c| {
+            *dm += if c == '-' { 2 } else { 1 };
+            (*dm <= MAPPED_DM_MAX - SUFFIX_DM).then_some(c)
+        })
         .collect();
     while base.ends_with('-') {
         base.pop();
@@ -1199,6 +1209,14 @@ impl Controller for Csi {
                 done = true;
                 break;
             }
+            // Assignments only the reconciler has in memory are missed; a
+            // newer one lands in the store within a pass.
+            let volumes = Stores::sorted(&self.stores.volumes);
+            let usage = crate::pool::usage(&volumes, &crate::Memory::default());
+            let pools = Stores::sorted(&self.stores.pools);
+            if let Some(why) = crate::pool::resize_refusal(&v, wanted, &pools, &usage) {
+                return Err(Status::resource_exhausted(format!("volume {name}: {why}")));
+            }
             let patch = json!({
                 "metadata": { "resourceVersion": v.metadata.resource_version },
                 "spec": { "sizeBytes": wanted },
@@ -1402,8 +1420,13 @@ mod tests {
             mapped,
             object_name("sanity-controller-create-single-with-capacity-C603B253-8E7C995F")
         );
+        assert_eq!(
+            lvm::names::dm_len("pvc-0a1b2c3d-4e5f-6789-abcd-ef0123456789"),
+            MAPPED_DM_MAX
+        );
         for n in [
             long,
+            "A-B-C-D-E-F-G-H-I-J-K-L-M-N-O-P-Q-R-S-T",
             "UPPER",
             "1abc",
             "x",
@@ -1414,7 +1437,7 @@ mod tests {
         ] {
             let m = object_name(n);
             assert!(crate::valid_name(&m), "{n} -> {m}");
-            assert!(m.len() <= 48, "{m}");
+            assert!(lvm::names::dm_len(&m) <= MAPPED_DM_MAX, "{m}");
             assert!(
                 m.bytes()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-'),
@@ -1423,7 +1446,7 @@ mod tests {
             assert!(m.starts_with(|c: char| c.is_ascii_lowercase()), "{m}");
             assert_eq!(object_name(&m), m, "mapping is idempotent");
         }
-        assert!(object_name(long).starts_with("sanity-controller-create-single-"));
+        assert!(object_name(long).starts_with("sanity-controller-create-"));
     }
 
     #[test]

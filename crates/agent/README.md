@@ -6,24 +6,26 @@ Entry point: `agent::run(Config)`; `src/bin/agent-dev.rs` (feature `dev-bin`) is
 
 Modules:
 - `exec`: tokio process runner behind `Exec` (stdin null, Timeout mode with SIGTERM then SIGKILL).
-- `storage`: thin LVM through the lvm crate argv builders and parsers, PV filter per VG with the fresh-filter retry.
-- `node`: tool probe, Node annotations, heartbeat Lease.
+- `storage`: thin LVM through the lvm crate argv builders and parsers; separate timeouts for reports and changes; remove waits a bounded time for an open LV.
+- `node`: tool probe (versions, and the optional DRBD settings `drbdsetup help` lists), Node annotations, heartbeat Lease.
 - `watch`: reflectors for Pool, Volume, Snapshot and every Node (peers' InternalIPs are DRBD addresses); a trigger that coalesces changes over 250 ms and fires every 30 s.
 - `reconcile`: one pass (pools, volumes by name, snapshots), host work first, then server-side apply of this node's status entries only, skipped when unchanged; `reconcile::replicated` is the DRBD path, and `refresh` rewrites the entries of volumes events2 touched without a full pass.
-- `events2`: line parser and tracked state, with the initial dump gate; cleared on every stream restart, so resources destroyed while the stream was down do not linger.
-- `drbd`: command lines, generation ids, resource files and their backups, state derivation into the status contract, the `drbdsetup events2 all` process.
+- `events2`: line parser and tracked state, built from the initial dump only (a change before its end restarts the stream); cleared on every restart, so resources destroyed while the stream was down do not linger.
+- `drbd`: command lines, ownership tags, resource files (checked by drbdadm, then renamed into place), state derivation into the status contract, the `drbdsetup events2 all` process with its restart backoff.
 - `csi`: Identity and Node services on the Unix socket.
 
 Rules:
 - Every external command goes through `Exec`; unit tests script outputs with `ScriptedExec`. The one exception is the long running events2 stream, a tokio child with the same host-exec prefix.
 - An LV is removed only when its Volume has a deletionTimestamp, its replicated Volume no longer assigns this node, or its Snapshot is Deleting; unknown LVs are logged once and left alone.
 - No DRBD work before the initial events2 dump; a restart re-adopts from `lvs`, the resource files and events2.
-- Only the initialUpToDateNode creates a fresh current generation id, and only while no replica (its own included) has reported data; otherwise it takes the day-0 id like the others, so a rebuilt replica never claims newer data than a peer.
-- A restored diskful replica recreates its metadata until it first reports present: the snapshot carried the source volume's metadata.
+- Adjust runs only when `drbdadm --dry-run adjust` plans commands, and never during a split brain (the helper call, carried over an events2 restart while still StandAlone, or the Volume's SplitBrain condition), a snapshot round's suspend or a resolve in flight. A plan that comes back after a successful adjust is retried on a doubling wait (30 s to 10 min) and reported in lastError.
+- Every new diskful replica gets just-created metadata. Before initializedAt the initialUpToDateNode makes the first data current: without a sync once every diskful peer is connected and Inconsistent, or after a bounded wait when DRBD reports quorum, no replica was rebuilt and no status ever showed data; as the sync source for a restore, whose LV it restores again if lost before initializedAt.
+- Bitmap slots of node ids no longer assigned are freed with forget-peer, read from the superblock once per spec generation and retried until clean.
+- Metadata ownership is the LVM tag `r-drbd.md.<volume uid>.<node id>`; `r-drbd.new` marks an LV that never held data; anything else is stale or refused, never adopted.
 
 Tests:
 - `cargo test -p agent`: unit tests with scripted commands.
-- `tests/host.rs`: real LVM, mounts and DRBD against the VG `r-drbd-test` (resources pvc-test-*, minors 1900 to 1999, ports 7900 to 7999, the replicated test uses a peer "ghost" that never answers); ignored unless `R_DRBD_HOST_TEST=1` and `--ignored`.
+- `tests/host.rs`: real LVM and mounts against a test VG set at build time by `R_DRBD_TEST_VG`, `R_DRBD_TEST_THIN` and `R_DRBD_TEST_DIR` (LVM tests use LVs rw-l-*; the guest signature test brings up rw-l-d on minor 99989); `tests/host/drbd.rs`: DRBD with resources rw-*, minors 99990 to 99999, ports 11990 to 11999, replicas of one volume as separate resources on loopback addresses; ignored unless `R_DRBD_HOST_TEST=1` and `--ignored`.
 - `tests/csi_client.rs`: CSI client over the Unix socket for the end-to-end demo; ignored unless `CSI_SOCKET` is set.
 
 Dependencies:

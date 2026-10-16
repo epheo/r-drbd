@@ -122,18 +122,13 @@ pub struct Assignment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[x_kube(validation = Rule::new("self == oldSelf").message("minor is immutable"))]
     pub minor: Option<u32>,
-    /// Shared secret, 15 random bytes in Base64; absent for replicas 1.
+    /// Shared secret, 32 random bytes in Base64; absent for replicas 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 64))]
     #[x_kube(validation = Rule::new("self == oldSelf").message("secret is immutable"))]
     pub secret: Option<String>,
-    /// Day-0 generation id, uppercase hex, lowest bit cleared, not 0 or 4;
-    /// the initial sync is skipped because every replica starts from it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(max = 16))]
-    #[x_kube(validation = Rule::new("self == oldSelf").message("gi is immutable"))]
-    pub gi: Option<String>,
-    /// The node whose metadata is marked UpToDate first.
+    /// The node that makes the first data current: it starts the volume
+    /// without a sync, or, for a restore, is the sync source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 253))]
     #[x_kube(validation = Rule::new("self == oldSelf").message("initialUpToDateNode is immutable"))]
@@ -206,7 +201,7 @@ pub struct VolumeStatus {
     /// diskful replica UpToDate and connected), which is before any consumer
     /// could write. From then on a replica created on any node (a lost LV, a
     /// node from spec.evict) gets just-created DRBD metadata and a full sync
-    /// from its peers; nobody mints a fresh current generation id.
+    /// from its peers; the initial-node start-up never runs again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initialized_at: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>,
     /// File system the node plugin created (or inherited from a snapshot),

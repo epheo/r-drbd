@@ -64,6 +64,10 @@ impl Stores {
         Ok(())
     }
 
+    pub fn pool(&self, name: &str) -> Option<Arc<Pool>> {
+        self.pools.get(&ObjectRef::new(name))
+    }
+
     pub fn volume(&self, name: &str) -> Option<Arc<Volume>> {
         self.volumes.get(&ObjectRef::new(name))
     }

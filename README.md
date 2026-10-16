@@ -19,7 +19,7 @@ Kubernetes CRDs are the API; one static binary runs as the controller and as a p
 
 - Kubernetes, OpenShift or MicroShift; the external-snapshotter CRDs and snapshot controller for snapshots.
 - On every storage node: the DRBD 9 kernel module, drbd-utils, lvm2 with a thin pool, xfsprogs.
-- TCP ports 7000 to 7999 open between nodes for DRBD.
+- TCP ports 11000 to 11999 open between nodes for DRBD.
 - 3 nodes for replicated volumes: DRBD quorum needs a third vote, which can come from a node without storage.
 - Recommended: `drbd-graceful-down.service` from drbd-utils enabled on each node, so a node with a suspended Primary can still shut down.
 - The agent runs privileged with hostPID: it executes the host's lvm, drbd-utils, xfsprogs and mount in the host mount namespace.

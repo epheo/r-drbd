@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::api::{Patch, PatchParams};
 use kube::{Api, Client, ResourceExt};
-use lvm::report::{LvRow, VgRow};
+use lvm::report::{Lv, Vg};
 use model::condition::{self, Condition};
 use model::{
     AssignedReplica, Pool, ReplicaStatus, Role, Snapshot, SnapshotAck, SnapshotPhase, Volume,
@@ -35,6 +35,7 @@ const REASON_READY: &str = "ThinPoolReady";
 const REASON_UNAVAILABLE: &str = "ThinPoolUnavailable";
 const REASON_ZEROING_DISABLED: &str = "ZeroingDisabled";
 const REASON_INVALID_NAME: &str = "InvalidName";
+const REASON_LVM_UNSUPPORTED: &str = "LvmUnsupported";
 const NO_DRBD_LOCAL: &str = "replicas 1 volume: no DRBD to suspend or resume";
 pub(crate) const LV_LOST: &str = model::keys::LV_LOST;
 
@@ -146,8 +147,8 @@ impl StatusWrite {
 /// lvs and vgs reads of one pass, per VG; a mutation drops the VG's entry.
 #[derive(Debug, Default)]
 struct Reads {
-    lvs: HashMap<String, Result<Vec<LvRow>, String>>,
-    vgs: HashMap<String, Result<Vec<VgRow>, String>>,
+    lvs: HashMap<String, Result<Vec<Lv>, String>>,
+    vgs: HashMap<String, Result<Vg, String>>,
     /// Tags per LV, read only when a decision needs them.
     tags: HashMap<String, Result<HashMap<String, Vec<String>>, String>>,
     /// `vg/lv` of the LVs this pass created; never snapshotted in the same pass.
@@ -155,7 +156,7 @@ struct Reads {
 }
 
 impl Reads {
-    async fn lvs(&mut self, lvm: &Lvm, vg: &str) -> Result<Vec<LvRow>, String> {
+    async fn lvs(&mut self, lvm: &Lvm, vg: &str) -> Result<Vec<Lv>, String> {
         if let Some(r) = self.lvs.get(vg) {
             return r.clone();
         }
@@ -164,11 +165,11 @@ impl Reads {
         r
     }
 
-    async fn vgs(&mut self, lvm: &Lvm, vg: &str) -> Result<Vec<VgRow>, String> {
+    async fn vg(&mut self, lvm: &Lvm, vg: &str) -> Result<Vg, String> {
         if let Some(r) = self.vgs.get(vg) {
             return r.clone();
         }
-        let r = lvm.vgs(vg).await.map_err(|e| e.to_string());
+        let r = lvm.vg(vg).await.map_err(|e| e.to_string());
         self.vgs.insert(vg.to_owned(), r.clone());
         r
     }
@@ -180,9 +181,9 @@ impl Reads {
         vg: &str,
         name: &str,
         thin: &str,
-    ) -> Result<Option<LvRow>, String> {
+    ) -> Result<Option<Lv>, String> {
         let rows = self.lvs(lvm, vg).await?;
-        find_in_pool(&rows, name, thin).map(Option::<&LvRow>::cloned)
+        find_in_pool(&rows, name, thin).map(Option::<&Lv>::cloned)
     }
 
     /// Tags of one LV (empty when it has none).
@@ -232,10 +233,29 @@ pub struct Reconciler {
     resolved: HashSet<(String, String, i64)>,
     /// Last pass facts of each replicated volume, for event refreshes.
     facts: HashMap<String, Facts>,
-    /// When each resource was last adjusted, for the rate limit.
-    adjusted: HashMap<String, tokio::time::Instant>,
+    /// Volumes whose first data this node makes current, with when it
+    /// started waiting for its peers.
+    init_started: HashMap<String, Option<tokio::time::Instant>>,
+    /// A refresh saw a change a pass must act on.
+    pass_wanted: bool,
+    /// Volumes whose replica here was rebuilt empty before initializedAt.
+    /// Memory only. After an agent restart the timeout start is still held
+    /// by the lost-LV error in this node's status entry and by any entry
+    /// that showed data. A status wipe on top removes both (and
+    /// initializedAt); then only DRBD guards: the start needs quorum, and a
+    /// peer holding data that connects later finds unrelated data and goes
+    /// StandAlone, visible in the replica's peers, never a silent sync.
+    rebuilt_seen: HashSet<String>,
+    /// Dry-run plans that came back after a successful adjust.
+    repeats: HashMap<String, replicated::Repeat>,
+    /// Spec generation of each volume's last clean bitmap slot sweep.
+    slots_swept: HashMap<String, i64>,
+    /// Volumes whose left-out settings were logged.
+    dropped_logged: HashSet<String>,
     /// This node's Pools whose vg or thinPool name failed the check this pass.
     invalid_pools: HashSet<String>,
+    /// Why the host's LVM cannot serve Pools, from the startup check.
+    lvm_unsupported: Option<String>,
 }
 
 impl Reconciler {
@@ -253,9 +273,20 @@ impl Reconciler {
             addresses: BTreeMap::new(),
             resolved: HashSet::new(),
             facts: HashMap::new(),
-            adjusted: HashMap::new(),
+            init_started: HashMap::new(),
+            pass_wanted: false,
+            rebuilt_seen: HashSet::new(),
+            repeats: HashMap::new(),
+            slots_swept: HashMap::new(),
+            dropped_logged: HashSet::new(),
             invalid_pools: HashSet::new(),
+            lvm_unsupported: None,
         }
+    }
+
+    /// Every Pool reports Available False with this reason's text.
+    pub fn set_lvm_unsupported(&mut self, why: Option<String>) {
+        self.lvm_unsupported = why;
     }
 
     #[must_use]
@@ -304,7 +335,7 @@ impl Reconciler {
             .filter(|p| invalid_name(p).is_some())
             .map(|p| p.name_any())
             .collect();
-        pools.retain(|p| invalid_name(p).is_none());
+        pools.retain(|p| invalid_name(p).is_none() && self.lvm_unsupported.is_none());
 
         let mut vols: Vec<&Volume> = volumes.iter().map(AsRef::as_ref).collect();
         vols.sort_by_key(|v| v.name_any());
@@ -328,9 +359,10 @@ impl Reconciler {
 
     async fn pool(&self, reads: &mut Reads, pool: &Pool) -> Option<StatusWrite> {
         let (vg, thin) = (&pool.spec.vg, &pool.spec.thin_pool);
-        let probed = match invalid_name(pool) {
-            Some(e) => Err((REASON_INVALID_NAME, e)),
-            None => self.probe_pool(reads, vg, thin).await,
+        let probed = match (invalid_name(pool), &self.lvm_unsupported) {
+            (Some(e), _) => Err((REASON_INVALID_NAME, e)),
+            (None, Some(e)) => Err((REASON_LVM_UNSUPPORTED, e.clone())),
+            (None, None) => self.probe_pool(reads, vg, thin).await,
         };
         let generation = pool.metadata.generation;
         let (status, reason, message) = match &probed {
@@ -371,6 +403,7 @@ impl Reconciler {
 
     /// Capacity of a usable thin pool. Pool zeroing is switched on first:
     /// without it a new thin LV can expose blocks of deleted ones.
+    /// The VG read here serves every volume of the pass.
     async fn probe_pool(
         &self,
         reads: &mut Reads,
@@ -379,15 +412,18 @@ impl Reconciler {
     ) -> Result<PoolCapacity, (&'static str, String)> {
         let unavailable = |e: String| (REASON_UNAVAILABLE, e);
         let mut lvs = reads.lvs(&self.lvm, vg).await.map_err(unavailable)?;
-        if lvs.iter().any(|r| r.lv_name == thin && !r.is_zeroing()) {
+        if lvs
+            .iter()
+            .any(|r| r.name == thin && r.thin_pool && !r.zeroing)
+        {
             tracing::info!(vg, thin, "enabling thin pool zeroing");
-            let res = self.lvm.thinpool_zero(vg, thin).await;
+            let res = self.lvm.enable_zeroing(vg, thin).await;
             reads.invalidate(vg);
             res.map_err(|e| (REASON_ZEROING_DISABLED, e.to_string()))?;
             lvs = reads.lvs(&self.lvm, vg).await.map_err(unavailable)?;
         }
-        let vgs = reads.vgs(&self.lvm, vg).await.map_err(unavailable)?;
-        storage::pool_capacity(&lvs, &vgs, thin).map_err(unavailable)
+        reads.vg(&self.lvm, vg).await.map_err(unavailable)?;
+        storage::pool_capacity(&lvs, thin).map_err(unavailable)
     }
 
     fn my_replica<'a>(&self, vol: &'a Volume) -> Option<&'a AssignedReplica> {
@@ -406,6 +442,9 @@ impl Reconciler {
 
     fn place(&self, pools: &[&Pool], pool_name: Option<&str>) -> Result<Place, String> {
         let name = pool_name.ok_or_else(|| "assignment has no pool".to_owned())?;
+        if let Some(e) = &self.lvm_unsupported {
+            return Err(e.clone());
+        }
         if self.invalid_pools.contains(name) {
             return Err(format!("pool {name} has an invalid vg or thinPool name"));
         }
@@ -488,12 +527,8 @@ impl Reconciler {
                 changed = true;
             }
         } else {
-            let desired = match reads.vgs(&self.lvm, vg).await.and_then(|v| {
-                v.first()
-                    .map(|r| storage::desired_kib(vol.spec.size_bytes, r.vg_extent_size))
-                    .ok_or_else(|| format!("volume group {vg} not found"))
-            }) {
-                Ok(d) => d,
+            let desired = match reads.vg(&self.lvm, vg).await {
+                Ok(v) => storage::desired_bytes(vol.spec.size_bytes, v.extent_bytes),
                 Err(e) => return self.error_entry(prev, e),
             };
             if row.is_none() {
@@ -518,21 +553,21 @@ impl Reconciler {
                 }
             }
             if let (None, Some(r)) = (&error, &row) {
-                if !r.is_active() {
+                if !r.active {
                     changed = true;
                     if let Err(e) = self.lvm.activate(vg, &lv).await {
                         error = Some(e.to_string());
                     }
                 }
-                if error.is_none() && r.lv_size < desired {
+                if error.is_none() && r.size_bytes < desired {
                     tracing::info!(
                         volume = name,
-                        from = r.lv_size,
+                        from = r.size_bytes,
                         to = desired,
                         "growing volume LV"
                     );
                     changed = true;
-                    if let Err(e) = self.lvm.resize(vg, &lv, desired).await {
+                    if let Err(e) = self.lvm.extend(vg, &lv, desired).await {
                         error = Some(e.to_string());
                     }
                 }
@@ -560,50 +595,48 @@ impl Reconciler {
     /// from lvcreate on, so it never exists untagged.
     async fn create_lv(
         &self,
-        rows: &[LvRow],
+        rows: &[Lv],
         snapshots: &[Arc<Snapshot>],
         place: &Place,
         vol: &Volume,
         lv: &str,
         desired: u64,
     ) -> Result<(), String> {
-        let tag = (vol.spec.replicas >= 2).then_some(storage::NEW_TAG);
+        let tags: &[&str] = if vol.spec.replicas >= 2 {
+            &[storage::NEW_TAG]
+        } else {
+            &[]
+        };
         if let Some(src) = &vol.spec.source {
             return self
-                .restore(rows, snapshots, place, &src.snapshot, lv, tag)
+                .restore(rows, snapshots, place, &src.snapshot, lv, tags)
                 .await;
         }
-        tracing::info!(lv, vg = place.vg, kib = desired, "creating volume LV");
+        tracing::info!(lv, vg = place.vg, bytes = desired, "creating volume LV");
         self.lvm
-            .create_tagged(&place.vg, &place.thin, lv, desired, tag)
+            .create(&place.vg, &place.thin, lv, desired, tags)
             .await
             .map_err(|e| e.to_string())
     }
 
-    async fn remove_volume(&self, vg: &str, row: &LvRow) -> Result<(), String> {
-        tracing::info!(lv = row.lv_name, vg, "removing volume LV");
-        if row.is_active() {
-            self.lvm
-                .deactivate(vg, &row.lv_name)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
+    async fn remove_volume(&self, vg: &str, row: &Lv) -> Result<(), String> {
+        tracing::info!(lv = row.name, vg, "removing volume LV");
         self.lvm
-            .remove(vg, &row.lv_name)
+            .remove(vg, &row.name)
             .await
             .map_err(|e| e.to_string())
     }
 
-    /// Restore source: `<Snapshot.spec.volume>_<snapshot>` in the same VG.
+    /// Restore source: the snapshot LV in the same VG.
     /// A missing source is an error, never an empty LV: the caller asked for data.
     async fn restore(
         &self,
-        rows: &[LvRow],
+        rows: &[Lv],
         snapshots: &[Arc<Snapshot>],
         place: &Place,
         snapshot: &str,
         lv: &str,
-        tag: Option<&str>,
+        tags: &[&str],
     ) -> Result<(), String> {
         let snap = snapshots
             .iter()
@@ -635,7 +668,7 @@ impl Reconciler {
             "restoring volume LV from snapshot"
         );
         self.lvm
-            .restore_tagged(&place.vg, &source, lv, tag)
+            .restore(&place.vg, &source, lv, tags)
             .await
             .map_err(|e| e.to_string())
     }
@@ -693,7 +726,19 @@ impl Reconciler {
                 p @ (SnapshotPhase::Suspending | SnapshotPhase::Resuming) => {
                     if let Some(v) = replicated {
                         self.my_replica(v)?;
-                        let res = self.suspend_resume(&snap.spec.volume, p).await;
+                        // Backstop to the controller's admission check: an
+                        // LV name LVM refuses here would fail in Taking,
+                        // with IO already suspended on every replica.
+                        let refused = (p == SnapshotPhase::Suspending && replica.is_some())
+                            .then(|| self.place(pools, pool_name.as_deref()))
+                            .and_then(|place| {
+                                let place = place.ok()?;
+                                lvm::names::check_new_lv(&place.vg, &lv).err()
+                            });
+                        let res = match refused {
+                            Some(e) => Err(e),
+                            None => self.suspend_resume(&snap.spec.volume, p).await,
+                        };
                         ack(&self.node, p, pool_name, res)
                     } else {
                         replica?;
@@ -736,13 +781,13 @@ impl Reconciler {
         if let Some(e) = not_ready {
             return Err(e);
         }
-        // An origin's tags are copied: a snapshot must not inherit the
-        // proof of the origin's metadata.
+        // Thin snapshots copy no tags (seen on LVM 2.03); kept as a guard,
+        // since a snapshot must never carry the proof of the origin's metadata.
         let inherited: Vec<String> = reads
             .tags(&self.lvm, &place.vg, origin)
             .await?
             .into_iter()
-            .filter(|t| storage::is_md_tag(t) || t == storage::NEW_TAG)
+            .filter(|t| crate::drbd::is_md_tag(t) || t == storage::NEW_TAG)
             .collect();
         tracing::info!(lv, origin, vg = place.vg, "taking snapshot");
         let res = self.lvm.snapshot(&place.vg, origin, lv).await;
@@ -817,8 +862,8 @@ impl Reconciler {
                 continue;
             };
             for r in storage::thin_lvs(&rows, &pool.spec.thin_pool) {
-                let key = format!("{}/{}", r.vg_name, r.lv_name);
-                if !known.contains(&r.lv_name) && self.orphans_logged.insert(key.clone()) {
+                let key = format!("{}/{}", pool.spec.vg, r.name);
+                if !known.contains(&r.name) && self.orphans_logged.insert(key.clone()) {
                     tracing::info!(lv = key, "LV without a Volume or Snapshot: left alone");
                 }
             }
@@ -869,21 +914,11 @@ fn keep_lost(prev: Option<&ReplicaStatus>, error: String) -> String {
     }
 }
 
-pub(crate) fn unwrap_rebuild(e: &str) -> &str {
-    e.strip_prefix(LV_LOST)
-        .and_then(|r| r.strip_prefix(LOST_SEP))
-        .map_or(e, |r| r.strip_prefix(REBUILD).unwrap_or(r))
-}
-
 /// The LV of that name in the Pool's thin pool. A same-named LV elsewhere
 /// (thick, another thin pool) is not ours and is never touched.
-fn find_in_pool<'a>(
-    rows: &'a [LvRow],
-    name: &str,
-    thin: &str,
-) -> Result<Option<&'a LvRow>, String> {
-    match rows.iter().find(|r| r.lv_name == name) {
-        Some(r) if r.pool_lv.as_deref() != Some(thin) => {
+fn find_in_pool<'a>(rows: &'a [Lv], name: &str, thin: &str) -> Result<Option<&'a Lv>, String> {
+    match rows.iter().find(|r| r.name == name) {
+        Some(r) if r.pool.as_deref() != Some(thin) => {
             Err(format!("LV exists outside thin pool {thin}"))
         }
         r => Ok(r),
@@ -908,7 +943,7 @@ fn ack(
 /// This node's Volume status entry from the LV row after the pass.
 pub fn replica_entry(
     node: &str,
-    row: Option<&LvRow>,
+    row: Option<&Lv>,
     observed_generation: Option<i64>,
     last_error: Option<String>,
 ) -> ReplicaStatus {
@@ -916,10 +951,10 @@ pub fn replica_entry(
         node: node.to_owned(),
         present: row.is_some(),
         disk_state: row.map(|_| DISK_UP_TO_DATE.to_owned()),
-        in_use: row.is_some_and(storage::is_open),
-        device_path: row.filter(|r| r.is_active()).map(|r| r.lv_path.clone()),
-        allocated_bytes: row.map(|r| r.lv_size * 1024),
-        size_bytes: row.map(|r| r.lv_size * 1024),
+        in_use: row.is_some_and(|r| r.open),
+        device_path: row.filter(|r| r.active).map(|r| r.path.clone()),
+        allocated_bytes: row.map(|r| r.size_bytes),
+        size_bytes: row.map(|r| r.size_bytes),
         observed_generation,
         last_error,
         ..ReplicaStatus::default()

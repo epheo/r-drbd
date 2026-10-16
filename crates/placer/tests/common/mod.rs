@@ -13,7 +13,9 @@ pub(crate) fn pool(name: &str, node: &str, free: u64) -> PoolView {
         available: true,
         total_bytes: 100 * GIB,
         free_bytes: free,
-        reserved_bytes: 0,
+        committed_bytes: 0,
+        overcommit_percent: 100,
+        reserve_percent: 5,
         volume_count: 0,
     }
 }
@@ -26,6 +28,7 @@ pub(crate) fn request(replicas: u32) -> Request {
         pool: None,
         node: None,
         existing: Vec::new(),
+        holds_data: false,
     }
 }
 

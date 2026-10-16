@@ -167,3 +167,33 @@ fn condition_set_keeps_transition_time_when_status_unchanged() {
     assert_eq!(conds[0].last_transition_time, t1);
     assert!(!condition::is_true(&conds, types::READY));
 }
+
+#[test]
+fn pool_capacity_policy_defaults_ranges_and_mutability() {
+    let spec: model::PoolSpec = serde_json::from_value(
+        json!({"node": "n1", "tier": "fast", "vg": "vg", "thinPool": "thin"}),
+    )
+    .unwrap();
+    assert_eq!(spec.overcommit_percent, 100);
+    assert_eq!(spec.reserve_percent, 5);
+
+    let crd = to_json(&Pool::crd());
+    let props = &schema(&crd)["properties"]["spec"]["properties"];
+    let over = &props["overcommitPercent"];
+    assert_eq!(over["default"], 100);
+    assert_eq!(over["minimum"].as_f64(), Some(100.0));
+    assert_eq!(over["maximum"].as_f64(), Some(1000.0));
+    let reserve = &props["reservePercent"];
+    assert_eq!(reserve["default"], 5);
+    assert_eq!(reserve["maximum"].as_f64(), Some(50.0));
+    for field in [over, reserve] {
+        assert!(field.get("x-kubernetes-validations").is_none());
+    }
+    assert_eq!(reserve["minimum"].as_f64(), Some(0.0));
+    let required = schema(&crd)["properties"]["spec"]["required"]
+        .as_array()
+        .unwrap();
+    for optional in ["overcommitPercent", "reservePercent"] {
+        assert!(!required.iter().any(|r| r == optional), "{optional}");
+    }
+}

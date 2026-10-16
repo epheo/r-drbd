@@ -12,6 +12,7 @@ futures = "0.3.34"
 getrandom = "0.3.4"
 k8s-openapi = { version = "0.28.0", features = ["latest"] }
 kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "rustls-tls", "ring", "jsonpatch"] }
+lvm = { path = "../lvm" }
 model = { path = "../model" }
 placer = { path = "../placer" }
 prost-types = "0.14.4"

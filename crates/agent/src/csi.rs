@@ -599,8 +599,8 @@ impl Inner {
     }
 
     async fn device_bytes(&self, dev: &str) -> Result<u64, Status> {
-        let out = self.run(&lvm::argv::blockdev_getsize64(dev)).await?;
-        out.trim().parse().map_err(|_| {
+        let out = self.run(&lvm::cmd::device_size(dev)).await?;
+        lvm::cmd::parse_device_size(&out).ok_or_else(|| {
             Status::internal(format!("blockdev {dev}: unparsable size '{}'", out.trim()))
         })
     }

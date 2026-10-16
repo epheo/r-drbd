@@ -45,7 +45,7 @@ A node may hold several Pools of the same tier.
 
 - Each diskful replica goes to a distinct node.
 - Candidates are Available Pools of the requested tier on Ready nodes.
-- A Pool accepts volumes until their total size reaches 20 times its own size (thin oversubscription).
+- A Pool accepts a volume only while its capacity policy allows it; by default, never more than the pool holds less a 5 percent reserve (see [Pools](pools.md#capacity)).
 - Among the candidates, the most free space wins.
 - A PVC can pin a node or a Pool with annotations (see [Volumes](volumes.md)).
 - A restore always lands where the snapshot lives.
@@ -72,4 +72,4 @@ r-drbd has no per-volume tuning.
 - Thin LVM only.
 - XFS for file system volumes; raw block otherwise.
 - DRBD protocol C, quorum majority, IO suspended while quorum is lost, internal metadata.
-- DRBD ports 7000 to 7999, minors 1000 to 49999.
+- DRBD ports 11000 to 11999, minors 50000 to 99999.

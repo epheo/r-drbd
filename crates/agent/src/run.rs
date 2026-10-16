@@ -80,6 +80,16 @@ async fn clients() -> Result<(Client, Client), Error> {
 
 /// Bound on finishing the running pass and in-flight CSI operations at shutdown.
 const DRAIN: Duration = Duration::from_secs(60);
+/// Shutdown when every LVM change ends within its wait: the drain, an LVM
+/// change the abandoned pass left running, the CSI server's 5 s. The pod
+/// grace must exceed it; a change stuck longer is waited for until the
+/// grace runs out, the only hard stop, since killing it could leave a
+/// thin pool suspended.
+const SHUTDOWN_MAX: Duration = DRAIN
+    .saturating_add(crate::exec::LVM_CHANGE_WAIT)
+    .saturating_add(Duration::from_secs(5));
+/// How often shutdown says it still waits for an LVM change.
+const CHANGE_WAIT_LOG: Duration = Duration::from_secs(30);
 
 /// Runs until SIGTERM or Ctrl-C; returns early only on a fatal startup
 /// error or when the CSI server dies. On a signal the running pass, its
@@ -87,7 +97,8 @@ const DRAIN: Duration = Duration::from_secs(60);
 pub async fn run(cfg: Config) -> Result<(), Error> {
     prepare_host(&cfg.res_dir, Path::new(DRBD_CONF_DIR))?;
     let (client, watch_client) = clients().await?;
-    let exec: Arc<dyn Exec> = Arc::new(TokioExec::new(cfg.host_exec_prefix.clone()));
+    let runner = Arc::new(TokioExec::new(cfg.host_exec_prefix.clone()));
+    let exec: Arc<dyn Exec> = runner.clone();
     let tools = node::probe(exec.as_ref()).await;
     // Spawned: the first heartbeat never waits on systemctl.
     let guard_exec = exec.clone();
@@ -97,8 +108,8 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
     let changes = Arc::new(Trigger::default());
     let (stores, _watches) = watch::start(&watch_client, &trigger);
     let tracker = Arc::new(Mutex::new(Tracker::default()));
-    let versions = tools.drbd_versions();
-    let events = versions.is_some().then(|| {
+    let features = tools.drbd();
+    let events = features.is_some().then(|| {
         tokio::spawn(drbd::events2(
             cfg.host_exec_prefix.clone(),
             tracker.clone(),
@@ -112,7 +123,7 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
         tracing::warn!("DRBD not found: replicated volumes cannot be served on this node");
     }
     let reconciler = Reconciler::new(cfg.node.clone(), exec.clone()).with_drbd(DrbdEnv::new(
-        versions,
+        features,
         cfg.res_dir.clone(),
         tracker,
     ));
@@ -139,6 +150,7 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
     ));
     let mut reconcile = tokio::spawn(reconcile_loop(
         client,
+        exec.clone(),
         reconciler,
         stores,
         Triggers {
@@ -155,7 +167,7 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
             Ok(Err(e)) => e.to_string(),
             Err(e) => e.to_string(),
         })),
-        r = shutdown() => r.map(|()| tracing::info!("shutting down")),
+        r = shutdown() => r.map(|()| tracing::info!(bound = ?SHUTDOWN_MAX, "shutting down")),
     };
     let _ = stop_tx.send(true);
     let pass = async {
@@ -170,6 +182,9 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
         }
     };
     tokio::join!(pass, csi_ops);
+    while !runner.wait_idle(CHANGE_WAIT_LOG).await {
+        tracing::warn!("waiting for a running LVM change before exit");
+    }
     if !csi_task.is_finished() {
         let _ = tokio::time::timeout(Duration::from_secs(5), &mut csi_task).await;
         csi_task.abort();
@@ -179,6 +194,24 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
         e.abort();
     }
     result
+}
+
+/// The host LVM check, logged. Runs once this node has a Pool, until a
+/// version is read: a failed probe blocks nothing and is tried next pass.
+async fn check_lvm(exec: &dyn Exec, rec: &mut Reconciler) -> bool {
+    let host = crate::storage::probe_host(exec).await;
+    if let Some(w) = &host.warning {
+        tracing::warn!("{w}");
+    }
+    if host.version.is_none() {
+        tracing::warn!("LVM version unreadable; checking again next pass");
+        return false;
+    }
+    if let Some(e) = &host.unsupported {
+        tracing::error!("{e}; every Pool on this node reports Available False");
+    }
+    rec.set_lvm_unsupported(host.unsupported);
+    true
 }
 
 async fn stopped(rx: &mut tokio::sync::watch::Receiver<bool>) {
@@ -195,6 +228,7 @@ struct Triggers {
 /// Passes and refreshes run to completion; `stop` is only looked at between them.
 async fn reconcile_loop(
     client: Client,
+    exec: Arc<dyn Exec>,
     mut rec: Reconciler,
     stores: watch::Stores,
     triggers: Triggers,
@@ -206,9 +240,13 @@ async fn reconcile_loop(
     }
     let node = rec.node().to_owned();
     tracing::info!(node, "caches ready, reconciling");
+    let mut lvm_checked = false;
     loop {
         rec.set_addresses(addresses(&stores));
         let pools = stores.pools.state();
+        if !lvm_checked && pools.iter().any(|p| p.spec.node == node) {
+            lvm_checked = check_lvm(exec.as_ref(), &mut rec).await;
+        }
         let volumes = stores.volumes.state();
         let snapshots = stores.snapshots.state();
         apply(&client, &node, rec.pass(&pools, &volumes, &snapshots).await).await;
@@ -229,6 +267,9 @@ async fn reconcile_loop(
                     triggers.changes.drain();
                     let volumes = stores.volumes.state();
                     apply(&client, &node, rec.refresh(&volumes).await).await;
+                    if rec.take_pass_wanted() {
+                        break;
+                    }
                 }
             }
         }
@@ -342,5 +383,19 @@ mod tests {
         let text = std::fs::read_to_string(drbd.join(DRBD_INCLUDE_FILE)).unwrap();
         assert_eq!(text, "mine\n");
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn pod_grace_exceeds_the_longest_shutdown() {
+        let yaml = include_str!("../../../deploy/base/30-agent.yaml");
+        let grace: u64 = yaml
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("terminationGracePeriodSeconds:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap();
+        assert!(
+            Duration::from_secs(grace) > SHUTDOWN_MAX,
+            "{grace} s <= {SHUTDOWN_MAX:?}"
+        );
     }
 }

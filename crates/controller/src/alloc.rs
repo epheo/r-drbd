@@ -48,32 +48,20 @@ impl Used {
 /// Random inputs, apart so tests can fix them.
 #[derive(Debug, Clone, Copy)]
 pub struct Entropy {
-    pub secret: [u8; 15],
-    pub gi: u64,
+    pub secret: [u8; 32],
 }
 
 impl Entropy {
     pub fn random() -> Result<Self, getrandom::Error> {
-        let mut secret = [0_u8; 15];
+        let mut secret = [0_u8; 32];
         getrandom::fill(&mut secret)?;
-        loop {
-            let gi = getrandom::u64()?;
-            if gi_hex(gi).is_some() {
-                return Ok(Self { secret, gi });
-            }
-        }
+        Ok(Self { secret })
     }
 }
 
-/// Day-0 generation id: lowest bit cleared, never 0 or 4, 16 uppercase hex
-/// digits. None asks the caller to draw again.
-pub fn gi_hex(raw: u64) -> Option<String> {
-    let v = raw & !1;
-    (v != 0 && v != 4).then(|| format!("{v:016X}"))
-}
-
-/// 15 bytes give exactly 20 Base64 characters with no padding.
-pub fn secret(bytes: &[u8; 15]) -> String {
+/// 256 bits, the size of the sha256 HMAC key; 44 Base64 characters, under
+/// DRBD's 64 character limit.
+pub fn secret(bytes: &[u8; 32]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
@@ -85,8 +73,6 @@ pub enum AllocError {
     NoPort(String),
     #[error("more than {} DRBD peers", u32::from(NODE_ID_MAX) + 1)]
     TooManyPeers,
-    #[error("generation id draw was 0 or 4")]
-    BadGi,
     #[error("no diskful replica to assign")]
     Empty,
 }
@@ -94,7 +80,7 @@ pub enum AllocError {
 /// Builds the assignment for freshly placed replicas. One diskful replica
 /// is a plain LV: no DRBD fields at all. Otherwise node ids go 0.. in
 /// placement order, the tiebreaker last; each replica gets the lowest free
-/// port on its node; the first diskful node starts UpToDate.
+/// port on its node; the first diskful node makes the first data current.
 pub fn allocate(
     diskful: &[placer::Chosen],
     tiebreaker: Option<&str>,
@@ -113,7 +99,6 @@ pub fn allocate(
             }],
             minor: None,
             secret: None,
-            gi: None,
             initial_up_to_date_node: None,
         });
     }
@@ -142,7 +127,6 @@ pub fn allocate(
         replicas,
         minor: Some(used.lowest_free_minor().ok_or(AllocError::NoMinor)?),
         secret: Some(secret(&entropy.secret)),
-        gi: Some(gi_hex(entropy.gi).ok_or(AllocError::BadGi)?),
         initial_up_to_date_node: Some(first.node.clone()),
     })
 }
@@ -158,10 +142,7 @@ mod tests {
         }
     }
 
-    const E: Entropy = Entropy {
-        secret: [7; 15],
-        gi: 0xABCD_EF01_2345_6789,
-    };
+    const E: Entropy = Entropy { secret: [7; 32] };
 
     #[test]
     fn single_replica_has_no_drbd_fields() {
@@ -171,7 +152,7 @@ mod tests {
         assert_eq!(a.replicas[0].port, None);
         assert_eq!(a.replicas[0].pool.as_deref(), Some("p1"));
         assert_eq!(a.replicas[0].role, Role::Diskful);
-        assert!(a.minor.is_none() && a.secret.is_none() && a.gi.is_none());
+        assert!(a.minor.is_none() && a.secret.is_none());
         assert!(a.initial_up_to_date_node.is_none());
     }
 
@@ -192,15 +173,14 @@ mod tests {
         assert_eq!(
             ids,
             [
-                ("n2", 0, Some(7000), Role::Diskful),
-                ("n1", 1, Some(7000), Role::Diskful),
-                ("n3", 2, Some(7000), Role::Tiebreaker),
+                ("n2", 0, Some(11000), Role::Diskful),
+                ("n1", 1, Some(11000), Role::Diskful),
+                ("n3", 2, Some(11000), Role::Tiebreaker),
             ]
         );
         assert_eq!(a.replicas[2].pool, None);
-        assert_eq!(a.minor, Some(1000));
-        assert_eq!(a.secret.as_deref().map(str::len), Some(20));
-        assert_eq!(a.gi.as_deref(), Some("ABCDEF0123456788"));
+        assert_eq!(a.minor, Some(50000));
+        assert_eq!(a.secret.as_deref().map(str::len), Some(44));
         assert_eq!(a.initial_up_to_date_node.as_deref(), Some("n2"));
     }
 
@@ -215,15 +195,15 @@ mod tests {
         .unwrap();
         let mut used = Used::from_assignments([&first]);
         let second = allocate(&[chosen("n1", "p1"), chosen("n3", "p3")], None, &used, E).unwrap();
-        assert_eq!(second.minor, Some(1001));
-        assert_eq!(second.replicas[0].port, Some(7001));
-        assert_eq!(second.replicas[1].port, Some(7000));
+        assert_eq!(second.minor, Some(50001));
+        assert_eq!(second.replicas[0].port, Some(11001));
+        assert_eq!(second.replicas[1].port, Some(11000));
         used.add(&second);
         // The first volume goes away: its minor and n1 port are free again.
         let used = Used::from_assignments([&second]);
         let third = allocate(&[chosen("n1", "p1"), chosen("n2", "p2")], None, &used, E).unwrap();
-        assert_eq!(third.minor, Some(1000));
-        assert_eq!(third.replicas[0].port, Some(7000));
+        assert_eq!(third.minor, Some(50000));
+        assert_eq!(third.replicas[0].port, Some(11000));
     }
 
     #[test]
@@ -241,45 +221,32 @@ mod tests {
                 .collect(),
             minor: None,
             secret: None,
-            gi: None,
             initial_up_to_date_node: None,
         };
         used.add(&full);
         assert_eq!(used.lowest_free_port("n1"), None);
-        assert_eq!(used.lowest_free_port("n2"), Some(7000));
+        assert_eq!(used.lowest_free_port("n2"), Some(11000));
         let err = allocate(&[chosen("n2", "p"), chosen("n1", "p")], None, &used, E).unwrap_err();
         assert_eq!(err, AllocError::NoPort("n1".into()));
         assert_eq!(allocate(&[], None, &used, E), Err(AllocError::Empty));
     }
 
     #[test]
-    fn gi_rules() {
-        assert_eq!(gi_hex(0), None);
-        assert_eq!(gi_hex(1), None);
-        assert_eq!(gi_hex(4), None);
-        assert_eq!(gi_hex(5), None);
-        assert_eq!(gi_hex(2).as_deref(), Some("0000000000000002"));
-        assert_eq!(gi_hex(u64::MAX).as_deref(), Some("FFFFFFFFFFFFFFFE"));
-        for _ in 0..64 {
-            let e = Entropy::random().unwrap();
-            let g = gi_hex(e.gi).unwrap();
-            assert_eq!(g.len(), 16);
-            assert!(
-                g.chars()
-                    .all(|c| c.is_ascii_digit() || c.is_ascii_uppercase())
-            );
-            let v = u64::from_str_radix(&g, 16).unwrap();
-            assert_eq!(v & 1, 0);
-            assert!(v != 0 && v != 4);
-        }
-    }
-
-    #[test]
-    fn secret_is_twenty_chars() {
-        let e = Entropy::random().unwrap();
-        let s = secret(&e.secret);
-        assert_eq!(s.len(), 20);
-        assert!(!s.contains('='));
-        assert_eq!(secret(&[0; 15]), "AAAAAAAAAAAAAAAAAAAA");
+    fn secret_is_32_random_bytes() {
+        let a = Entropy::random().unwrap();
+        let b = Entropy::random().unwrap();
+        assert_ne!(a.secret, b.secret);
+        let s = secret(&a.secret);
+        assert_eq!(s.len(), 44);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&s)
+                .unwrap(),
+            a.secret
+        );
+        assert_eq!(
+            secret(&[0; 32]),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        );
     }
 }

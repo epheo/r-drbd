@@ -1,15 +1,16 @@
 //! Replicated volumes (spec.replicas >= 2) on this node: backing LV of
-//! gross size, resource file, metadata with the day-0 generation id,
-//! adjust, peers leaving, resize, teardown, snapshot suspend and resume,
-//! split-brain resolution, status from events2.
+//! gross size, resource file, metadata owned through LVM tags, adjust when
+//! drbdadm has something to do, the first data made current, peers
+//! leaving, resize, teardown, snapshot suspend and resume, split-brain
+//! resolution, status from events2.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use drbd_config::{MetaParams, ToolVersions};
+use drbd_config::Features;
 use kube::ResourceExt;
-use lvm::report::LvRow;
+use lvm::report::Lv as LvRow;
 use model::{
     AssignedReplica, Assignment, Pool, ReplicaStatus, Resolve, Role, Snapshot, SnapshotPhase,
     Volume,
@@ -17,73 +18,68 @@ use model::{
 
 use super::{
     Place, Reads, Reconciler, StatusWrite, find_in_pool, is_lost, lost_after_report, rebuild_error,
-    unwrap_rebuild,
 };
-use crate::ExecMode;
-use crate::drbd::{self, Facts, FileInputs, Host, RealHost, ResFiles, VOLUME, argv};
-use crate::events2::{Resource, Tracker};
-use crate::exec::{DEFAULT_TIMEOUT, failure, run_any, run_ok};
-use crate::storage;
+use crate::drbd::{self, DRBD_TIMEOUT, Facts, FileInputs, Host, RealHost, ResFiles, VOLUME, argv};
+use crate::events2::Resource;
+use crate::events2::Tracker;
+use crate::exec::{failure, run_any, run_ok};
+use crate::{ExecMode, storage};
 
-const NO_DRBD: &str = "drbd-utils not found on this node";
-const MD_NOT_AT_END: &str =
-    "metadata not at device end; refusing create-md on a replica that held data";
-const MD_OTHER_VOLUME: &str = "metadata of another volume on the LV";
+const NO_DRBD: &str = "drbd-utils or the DRBD module not found on this node";
+/// The wording of drbdsetup's refusal, matched to retry.
 const RESYNC_BUSY: &str = "Resize not allowed during resync";
 const POLL: Duration = Duration::from_millis(100);
+const NOT_OURS: &str = "LV exists without an r-drbd ownership tag; not used. Remove it, or tag it r-drbd.new to let r-drbd recreate its DRBD metadata";
 
 /// Everything DRBD work needs besides the executor.
 #[derive(Debug, Clone)]
 pub struct DrbdEnv {
     /// None when drbd-utils or the module are missing on this node.
-    pub versions: Option<ToolVersions>,
+    pub features: Option<Features>,
     pub files: ResFiles,
     pub host: Arc<dyn Host>,
     pub tracker: Arc<Mutex<Tracker>>,
     /// Bound on the events2 destroy after `drbdsetup down`.
     pub down_wait: Duration,
-    /// Sleeps between adjust retries while a resync blocks it.
-    pub adjust_retry: [Duration; 3],
-    /// Least time between two adjusts driven by events2 state alone.
-    pub adjust_interval: Duration,
+    /// Sleeps between adjust retries while a resync blocks a resize in it.
+    pub adjust_retry: Vec<Duration>,
+    /// How long the initial node waits for its diskful peers before it
+    /// starts the volume without them.
+    pub init_wait: Duration,
+    /// First wait before a plan that came back is adjusted again.
+    pub repeat_backoff: Duration,
 }
 
 impl DrbdEnv {
     pub fn new(
-        versions: Option<ToolVersions>,
+        features: Option<Features>,
         res_dir: impl Into<PathBuf>,
         tracker: Arc<Mutex<Tracker>>,
     ) -> Self {
         Self {
-            versions,
+            features,
             files: ResFiles::new(res_dir),
             host: Arc::new(RealHost),
             tracker,
+            // Down is a local state change; events2 reports it within
+            // milliseconds, and drbdsetup status decides after anyway.
             down_wait: Duration::from_secs(5),
-            adjust_interval: Duration::from_secs(30),
-            adjust_retry: [
-                Duration::from_millis(500),
-                Duration::from_millis(1000),
-                Duration::from_millis(2000),
-            ],
+            // A resync finishing on a fresh small volume takes seconds;
+            // a longer one leaves the adjust to the next pass.
+            adjust_retry: vec![Duration::from_secs(1), Duration::from_secs(3)],
+            // A peer agent is stale after 40 s without a heartbeat. A peer
+            // still away after 60 s is down, and waiting longer only keeps
+            // the volume unusable; it costs that peer one full sync.
+            init_wait: Duration::from_secs(60),
+            // One pass interval: a plan back on the next pass waits a pass.
+            repeat_backoff: Duration::from_secs(30),
         }
     }
 }
 
-fn meta_params() -> MetaParams {
-    MetaParams {
-        peer_slots: model::keys::PEER_SLOTS,
-        ..MetaParams::default()
-    }
-}
-
-/// Net size the caller asked for, in KiB.
-fn net_kib(vol: &Volume) -> u64 {
-    vol.spec.size_bytes.div_ceil(1024)
-}
-
-fn gross_kib(vol: &Volume) -> Result<u64, String> {
-    drbd_config::gross_size_kib(net_kib(vol), meta_params()).map_err(|e| e.to_string())
+/// Gross backing size for the volume's net size.
+fn gross_bytes(vol: &Volume) -> u64 {
+    drbd_config::gross_bytes(vol.spec.size_bytes, model::keys::PEER_SLOTS)
 }
 
 /// Phases during which a user suspend of the volume is expected.
@@ -104,33 +100,9 @@ fn snapshot_round_active(snapshots: &[Arc<Snapshot>], volume: &str) -> bool {
     })
 }
 
-/// Whose metadata sits on the backing LV, from its generation ids.
-enum MdIdentity {
-    /// Our day-0 id appears: never recreated.
-    Ours,
-    /// create-md ran but no id was set yet (current 4, nothing else): no
-    /// data identity, so creating it again is safe.
-    Unfinished,
-    /// Another resource's metadata: the snapshot source's, or a stranger's.
-    Other,
-}
-
-/// The 64-bit ids in get-gi output (current, bitmap, two history) or in
-/// dump-superblock output (current, every bitmap and history id).
-fn gi_ids(text: &str) -> Vec<u64> {
-    text.split(|c: char| matches!(c, ':' | ';' | ',' | '"') || c.is_whitespace())
-        .filter_map(|t| {
-            let h = t.strip_prefix("0x").unwrap_or(t);
-            (h.len() == 16)
-                .then(|| u64::from_str_radix(h, 16).ok())
-                .flatten()
-        })
-        .collect()
-}
-
-/// DRBD keeps a role flag in bit 0 of an id; day-0 ids have it cleared.
-fn same_id(a: u64, b: u64) -> bool {
-    a & !1 == b & !1
+/// Disk states that hold data a just-created replica must not override.
+fn holds_data(disk: Option<&str>) -> bool {
+    matches!(disk, Some("UpToDate" | "Consistent" | "Outdated"))
 }
 
 /// The backing LV after [`Reconciler::ensure_drbd_lv`].
@@ -140,21 +112,91 @@ struct Backing {
     grown: bool,
     /// This pass created the LV.
     created: bool,
-    /// Created in place of an LV this node had reported: empty, never a restore.
+    /// Created in place of an LV this node had reported.
     rebuilt: bool,
+    /// Created this pass from the source snapshot.
+    restored: bool,
 }
+
+/// A dry-run plan that came back after its adjust succeeded.
+#[derive(Debug, Clone)]
+pub(super) struct Repeat {
+    pub(super) plan: String,
+    pub(super) times: u32,
+    next: tokio::time::Instant,
+}
+
+/// The cap on the wait between adjusts of a plan that keeps coming back:
+/// a StandAlone after an auth mismatch or a disk failing on attach gains
+/// nothing from tries more often than this, and a fixed cause is picked up
+/// within it.
+const REPEAT_MAX: Duration = Duration::from_secs(600);
 
 enum Resize {
     NotNeeded,
-    /// Grown: adjust follows.
     Done,
     /// This node resizes once every diskful peer has grown its LV.
     Waiting,
 }
 
+/// Why the initial node must not start without its missing peers, if
+/// anything.
+fn timeout_blocker(s: &Step<'_>, r: &Resource, lost: bool) -> Option<&'static str> {
+    // Statuses only report a disk state DRBD reached; UpToDate, Consistent
+    // or Outdated anywhere means data was made already.
+    let seen_data = s
+        .vol
+        .status
+        .iter()
+        .flat_map(|st| &st.replicas)
+        .any(|e| holds_data(e.disk_state.as_deref()));
+    if lost || seen_data {
+        return Some("data may exist on a peer not connected");
+    }
+    if r.devices.get(&VOLUME).and_then(|d| d.quorum) != Some(true) {
+        // UpToDate without quorum serves nothing and costs the missing
+        // peers a full sync.
+        return Some("no quorum yet");
+    }
+    None
+}
+
+/// Why this pass must not adjust, if anything.
+fn adjust_blocker(s: &Step<'_>, snapshots: &[Arc<Snapshot>], resolved: bool) -> Option<String> {
+    let r = s.res?;
+    // The controller's latched condition outlives an agent restart, which
+    // loses the split-brain helper call.
+    let latched = s.vol.status.as_ref().is_some_and(|st| {
+        model::condition::is_true(&st.conditions, model::condition::types::SPLIT_BRAIN)
+    });
+    let diskful_peer = |p: &str| {
+        s.a.replicas
+            .iter()
+            .any(|x| x.node == p && x.role == Role::Diskful)
+    };
+    if let Some((peer, _)) = r
+        .connections
+        .iter()
+        .find(|(p, c)| c.state == "StandAlone" && (c.split_brain || (latched && diskful_peer(p))))
+    {
+        // A reconnect would only split again; spec.resolve decides.
+        return Some(format!("split brain with {peer} waits for spec.resolve"));
+    }
+    if r.suspended_by_user() && snapshot_round_active(snapshots, &s.vol.name_any()) {
+        // An attach or a connect can block on the frozen IO and push the
+        // round past its bound; the round resumes IO soon.
+        return Some("IO suspended for a snapshot round".to_owned());
+    }
+    if resolved {
+        // The discard handshake is in flight; adjust would race it.
+        return Some("split-brain resolution in progress".to_owned());
+    }
+    None
+}
+
 impl Reconciler {
     pub(super) fn drbd_available(&self) -> bool {
-        self.drbd.versions.is_some() && self.drbd.tracker.lock().is_ok_and(|t| t.is_available())
+        self.drbd.features.is_some() && self.drbd.tracker.lock().is_ok_and(|t| t.is_available())
     }
 
     pub(super) fn tracked(&self, name: &str) -> Option<Resource> {
@@ -172,10 +214,10 @@ impl Reconciler {
             .cloned()
     }
 
-    async fn drbd_cmd(&self, argv: &[String], mode: ExecMode) -> Result<(), String> {
+    async fn drbd_cmd(&self, argv: &[String], mode: ExecMode) -> Result<String, String> {
         run_ok(self.lvm.exec(), argv, mode)
             .await
-            .map(|_| ())
+            .map(|o| o.stdout)
             .map_err(|e| e.to_string())
     }
 
@@ -194,7 +236,7 @@ impl Reconciler {
             .iter()
             .find(|r| r.node == self.node)
             .cloned();
-        let Some(versions) = self.drbd.versions.clone() else {
+        let Some(features) = self.drbd.features else {
             mine.as_ref()?;
             let e = self.error_entry(prev.as_ref(), NO_DRBD.to_owned());
             return (prev.as_ref() != Some(&e)).then_some(StatusWrite::Volume { name, entry: e });
@@ -209,10 +251,16 @@ impl Reconciler {
         };
         match mine {
             Some(m) if vol.metadata.deletion_timestamp.is_none() => {
-                self.drbd_up(
-                    reads, pools, snapshots, vol, assignment, &m, &versions, res, prev,
-                )
-                .await
+                let step = Step {
+                    vol,
+                    a: assignment,
+                    mine: &m,
+                    features,
+                    minor: 0,
+                    res: res.as_ref(),
+                    prev: prev.as_ref(),
+                };
+                self.drbd_up(reads, pools, snapshots, step).await
             }
             mine => {
                 self.drbd_remove(reads, pools, vol, mine.as_ref(), res.as_ref(), prev)
@@ -233,9 +281,11 @@ impl Reconciler {
     ) -> Option<StatusWrite> {
         let name = vol.name_any();
         let lv = lvm::names::volume_lv(&name);
-        let minor = vol.spec.assignment.as_ref().and_then(|a| a.minor);
         self.facts.remove(&name);
-        self.adjusted.remove(&name);
+        self.init_started.remove(&name);
+        self.rebuilt_seen.remove(&name);
+        self.repeats.remove(&name);
+        self.slots_swept.remove(&name);
         if mine.is_none() && vol.metadata.deletion_timestamp.is_none() {
             return self.drbd_depart(reads, pools, &name, &lv, res, prev).await;
         }
@@ -255,10 +305,9 @@ impl Reconciler {
                 let local = res.is_some()
                     || found.is_some()
                     || self.drbd.files.exists(&name)
-                    || self.drbd.files.backup_path(&name).exists();
+                    || self.drbd.files.candidate_path(&name).exists();
                 if local {
-                    self.teardown(reads, &name, res, minor, found.as_ref())
-                        .await
+                    self.teardown(reads, &name, res, found.as_ref()).await
                 } else {
                     Ok(())
                 }
@@ -291,7 +340,7 @@ impl Reconciler {
 
     /// This node left the assignment of a live Volume. An entry can vanish by
     /// an edit or a bug, so the data stays: DRBD down, files removed, entry
-    /// dropped, the LV and its metadata left alone as an orphan.
+    /// dropped, the LV left alone as an orphan without its ownership tag.
     async fn drbd_depart(
         &mut self,
         reads: &mut Reads,
@@ -311,7 +360,7 @@ impl Reconciler {
                     "node left the assignment: LV kept as an orphan"
                 );
             }
-            // If placed here again, this data must earn adoption anew.
+            // Placed here again, the copy is stale and must not pass as ours.
             if result.is_ok() {
                 result = self.drop_md_tags(reads, &place, lv).await;
             }
@@ -337,7 +386,7 @@ impl Reconciler {
         let del: Vec<&str> = tags
             .iter()
             .map(String::as_str)
-            .filter(|t| storage::is_md_tag(t))
+            .filter(|t| drbd::is_md_tag(t))
             .collect();
         if del.is_empty() {
             return Ok(());
@@ -357,11 +406,10 @@ impl Reconciler {
     async fn down(&self, name: &str, r: &Resource) -> Result<(), String> {
         if r.suspended_by_user() {
             tracing::info!(volume = name, "resuming IO before down");
-            self.drbd_cmd(&argv::resume_io(name), DEFAULT_TIMEOUT)
-                .await?;
+            self.drbd_cmd(&argv::resume_io(name), DRBD_TIMEOUT).await?;
         }
         tracing::info!(volume = name, "taking DRBD resource down");
-        self.drbd_cmd(&argv::down(name), DEFAULT_TIMEOUT).await?;
+        self.drbd_cmd(&argv::down(name), DRBD_TIMEOUT).await?;
         self.wait_down(name).await
     }
 
@@ -385,29 +433,22 @@ impl Reconciler {
         None
     }
 
-    /// Down (resumed first if a snapshot round left it suspended), wipe the
-    /// metadata, remove the LV, remove the res file and its backup.
+    /// Down (resumed first if a snapshot round left it suspended), remove
+    /// the LV, remove the files. The LV goes with its metadata: a thin
+    /// pool hands out zeroed blocks, so nothing of it reaches a later LV.
     async fn teardown(
         &self,
         reads: &mut Reads,
         name: &str,
         res: Option<&Resource>,
-        minor: Option<u32>,
         found: Option<&(Place, LvRow)>,
     ) -> Result<(), String> {
         match res {
             Some(r) => self.down(name, r).await?,
-            // Not tracked is not proof of down: wipe-md and lvremove follow.
+            // Not tracked is not proof of down: lvremove follows.
             None => self.confirm_down(name).await?,
         }
         if let Some((place, row)) = found {
-            if let Some(minor) = minor
-                && row.is_active()
-                && self.md_magic(&row.lv_path).await?
-            {
-                self.drbd_cmd(&argv::wipe_md(minor, &row.lv_path), DEFAULT_TIMEOUT)
-                    .await?;
-            }
             let removed = self.remove_volume(&place.vg, row).await;
             reads.invalidate(&place.vg);
             removed?;
@@ -425,9 +466,8 @@ impl Reconciler {
         self.confirm_down(name).await
     }
 
-    /// Exit 0 of `drbdsetup status <res>` means still up.
     async fn confirm_down(&self, name: &str) -> Result<(), String> {
-        let out = run_any(self.lvm.exec(), &argv::status(name), DEFAULT_TIMEOUT)
+        let out = run_any(self.lvm.exec(), &argv::status(name), DRBD_TIMEOUT)
             .await
             .map_err(|e| e.to_string())?;
         if out.exit_code == Some(0) {
@@ -435,16 +475,6 @@ impl Reconciler {
         } else {
             Ok(())
         }
-    }
-
-    async fn md_magic(&self, dev: &str) -> Result<bool, String> {
-        let host = self.drbd.host.clone();
-        let path = dev.to_owned();
-        tokio::task::spawn_blocking(move || host.read_tail(&path))
-            .await
-            .map_err(|e| e.to_string())?
-            .map(|t| drbd::has_md_magic(&t))
-            .map_err(|e| format!("read metadata area of {dev}: {e}"))
     }
 
     async fn sectors(&self, minor: u32) -> std::io::Result<u64> {
@@ -465,49 +495,36 @@ impl Reconciler {
         drbd::entry(&self.node, now.as_ref(), facts, sectors, fallback)
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn drbd_up(
         &mut self,
         reads: &mut Reads,
         pools: &[&Pool],
         snapshots: &[Arc<Snapshot>],
-        vol: &Volume,
-        a: &Assignment,
-        mine: &AssignedReplica,
-        versions: &ToolVersions,
-        res: Option<Resource>,
-        prev: Option<ReplicaStatus>,
+        mut step: Step<'_>,
     ) -> Option<StatusWrite> {
-        let name = vol.name_any();
-        let Some(minor) = a.minor else {
-            let e = self.error_entry(prev.as_ref(), "assignment has no minor".to_owned());
-            return (prev.as_ref() != Some(&e)).then_some(StatusWrite::Volume { name, entry: e });
+        let name = step.vol.name_any();
+        let prev = step.prev;
+        let Some(minor) = step.a.minor else {
+            let e = self.error_entry(prev, "assignment has no minor".to_owned());
+            return (prev != Some(&e)).then_some(StatusWrite::Volume { name, entry: e });
         };
+        step.minor = minor;
         let mut facts = Facts {
             minor,
-            diskful: mine.role == Role::Diskful,
+            diskful: step.mine.role == Role::Diskful,
             allocated_bytes: self
                 .facts
                 .get(&name)
                 .and_then(|f| f.allocated_bytes)
-                .or_else(|| prev.as_ref().and_then(|p| p.allocated_bytes)),
-            observed_generation: prev.as_ref().and_then(|p| p.observed_generation),
+                .or_else(|| prev.and_then(|p| p.allocated_bytes)),
+            observed_generation: prev.and_then(|p| p.observed_generation),
             last_error: None,
-        };
-        let step = Step {
-            vol,
-            a,
-            mine,
-            versions,
-            minor,
-            res: res.as_ref(),
-            prev: prev.as_ref(),
         };
         match self
             .drbd_apply(reads, pools, snapshots, &step, &mut facts)
             .await
         {
-            Ok(true) => facts.observed_generation = vol.metadata.generation,
+            Ok(true) => facts.observed_generation = step.vol.metadata.generation,
             Ok(false) => {}
             Err(e) => {
                 tracing::warn!(volume = name, error = %e, "replicated volume reconcile failed");
@@ -516,7 +533,7 @@ impl Reconciler {
         }
         let entry = self.current_entry(&name, &facts).await;
         self.facts.insert(name.clone(), facts);
-        (prev.as_ref() != Some(&entry)).then_some(StatusWrite::Volume { name, entry })
+        (prev != Some(&entry)).then_some(StatusWrite::Volume { name, entry })
     }
 
     /// The pass for one replica; Ok(false) while a resize waits on peers.
@@ -529,12 +546,8 @@ impl Reconciler {
         facts: &mut Facts,
     ) -> Result<bool, String> {
         // Until a pass completes, every error of a rebuild keeps the
-        // loss on record, so the next pass rebuilds again (never restores,
-        // never sets day-0 ids).
-        let prev_lost = s
-            .prev
-            .and_then(|p| p.last_error.as_deref())
-            .is_some_and(is_lost);
+        // loss on record, so the next pass rebuilds again (never restores).
+        let prev_lost = s.prev_lost();
         let mut rebuilt = false;
         self.drbd_apply_steps(reads, pools, snapshots, s, facts, &mut rebuilt)
             .await
@@ -563,8 +576,13 @@ impl Reconciler {
             let place = self.place(pools, s.mine.pool.as_deref())?;
             let b = self.ensure_drbd_lv(reads, snapshots, s, &place).await?;
             *rebuilt = b.rebuilt;
+            if b.restored {
+                self.rebuilt_seen.remove(&name);
+            } else if b.rebuilt {
+                self.rebuilt_seen.insert(name.clone());
+            }
             complete &= b.grown;
-            facts.allocated_bytes = Some(b.row.lv_size * 1024);
+            facts.allocated_bytes = Some(b.row.size_bytes);
             let chunk = pools
                 .iter()
                 .find(|p| p.name_any() == place.pool)
@@ -574,52 +592,32 @@ impl Reconciler {
             None
         };
 
-        let file = drbd::resource_file(&FileInputs {
-            node: &self.node,
-            volume: &name,
-            assignment: s.a,
-            backing: backing.as_ref().map(|(b, ..)| b.row.lv_path.as_str()),
-            addresses: &self.addresses,
-            versions: s.versions,
-            replicas: s.vol.spec.replicas,
-            chunk_bytes: backing.as_ref().and_then(|(_, c, ..)| *c),
-            access_mode: s.vol.spec.access_mode,
-        })?;
-        // Explicit triggers adjust at once; state alone at most once per
-        // adjust_interval, so a peer that keeps failing is not hammered.
-        let written = self
-            .drbd
-            .files
-            .write_if_differs(&name, &drbd_config::render(&file))?;
-        let mut adjust = written || s.res.is_none();
-        let peers: Vec<&str> =
-            s.a.replicas
-                .iter()
-                .filter(|r| r.node != self.node && drbd::connects(s.mine, r))
-                .map(|r| r.node.as_str())
-                .collect();
-        let state_adjust = drbd::needs_adjust(s.res, &peers, diskful);
+        self.write_file(
+            s,
+            &name,
+            backing.as_ref().map(|(b, c, _)| (b.row.path.as_str(), *c)),
+        )
+        .await?;
 
-        adjust |= self.remove_departed(s, &name, diskful).await?;
+        self.remove_departed(s, &name, diskful).await?;
+        if let Some((b, ..)) = &backing {
+            self.sweep_slots(s, &name, &b.row.path).await;
+        }
 
-        if let Some((b, _, place)) = &backing {
-            match self.ensure_metadata(reads, s, place, b).await {
-                Ok(made) => adjust |= made,
-                Err(e) => {
-                    if b.created {
-                        // An LV made this pass holds no data; without it the
-                        // next pass starts over instead of finding half-made
-                        // metadata it must refuse.
-                        tracing::warn!(volume = name, "removing the LV created this pass");
-                        let removed = self.remove_volume(&place.vg, &b.row).await;
-                        reads.invalidate(&place.vg);
-                        if let Err(re) = removed {
-                            tracing::warn!(volume = name, error = %re, "LV removal failed");
-                        }
-                    }
-                    return Err(e);
+        if let Some((b, _, place)) = &backing
+            && let Err(e) = self.ensure_metadata(reads, s, place, b).await
+        {
+            if b.created {
+                // An LV made this pass holds no data; without it the next
+                // pass starts over from a clean create.
+                tracing::warn!(volume = name, "removing the LV created this pass");
+                let removed = self.remove_volume(&place.vg, &b.row).await;
+                reads.invalidate(&place.vg);
+                if let Err(re) = removed {
+                    tracing::warn!(volume = name, error = %re, "LV removal failed");
                 }
             }
+            return Err(e);
         }
 
         if let Some(r) = s.res
@@ -630,45 +628,98 @@ impl Reconciler {
                 volume = name,
                 "IO suspended without a snapshot round: resuming"
             );
-            self.drbd_cmd(&argv::resume_io(&name), DEFAULT_TIMEOUT)
-                .await?;
+            self.drbd_cmd(&argv::resume_io(&name), DRBD_TIMEOUT).await?;
         }
 
-        let mut skip_adjust = false;
+        let mut resolved = false;
         if diskful && let (Some(rv), Some(r)) = (&s.vol.spec.resolve, s.res) {
-            skip_adjust = self.resolve(s, rv, r).await?;
+            resolved = self.resolve(s, rv, r).await?;
         }
 
         if diskful && let Some(r) = s.res {
             match self.resize_step(s, r).await? {
-                Resize::NotNeeded => {}
-                Resize::Done => adjust = true,
+                Resize::NotNeeded | Resize::Done => {}
                 Resize::Waiting => complete = false,
             }
         }
 
-        let due = self
-            .adjusted
-            .get(&name)
-            .is_none_or(|t| t.elapsed() >= self.drbd.adjust_interval);
-        if (adjust || (state_adjust && due)) && !skip_adjust {
-            self.adjusted
-                .insert(name.clone(), tokio::time::Instant::now());
-            if s.res.is_none() {
-                self.probe_port(s.mine).await?;
+        match adjust_blocker(s, snapshots, resolved) {
+            Some(why) => tracing::debug!(volume = name, why, "adjust held"),
+            None => {
+                if let Some(held) = self.adjust_if_needed(s, &name).await? {
+                    // Only the adjust waits; the rest of the pass runs.
+                    tracing::warn!(volume = name, held, "adjust backed off");
+                    facts.last_error = Some(held);
+                    complete = false;
+                }
             }
-            self.adjust(&name).await?;
+        }
+
+        if diskful {
+            let lost = *rebuilt || s.prev_lost() || self.rebuilt_seen.contains(&name);
+            self.first_data(s, &name, lost).await?;
         }
         Ok(complete)
     }
 
+    /// Renders, and installs only a changed file that drbdadm accepts.
+    async fn write_file(
+        &mut self,
+        s: &Step<'_>,
+        name: &str,
+        backing: Option<(&str, Option<u64>)>,
+    ) -> Result<(), String> {
+        let inputs = FileInputs {
+            node: &self.node,
+            volume: name,
+            assignment: s.a,
+            backing: backing.map(|(p, _)| p),
+            addresses: &self.addresses,
+            chunk_bytes: backing.and_then(|(_, c)| c),
+            access_mode: s.vol.spec.access_mode,
+        };
+        let resource = drbd::resource(&inputs)?;
+        let rendered = drbd_config::render(&resource, s.features).map_err(|e| e.to_string())?;
+        if !rendered.dropped.is_empty() && self.dropped_logged.insert(name.to_owned()) {
+            tracing::warn!(
+                volume = name,
+                settings = rendered.dropped.join(", "),
+                "drbd-utils on this node lack these settings: left out"
+            );
+        }
+        let files = &self.drbd.files;
+        if files.installed(name, &rendered.hash)? {
+            return Ok(());
+        }
+        let candidate = files.write_candidate(name, &rendered.text)?;
+        let installed = files.path(name);
+        let check = argv::validate(
+            &candidate.to_string_lossy(),
+            &installed.to_string_lossy(),
+            name,
+        );
+        if let Err(e) = self.drbd_cmd(&check, DRBD_TIMEOUT).await {
+            let _ = std::fs::remove_file(&candidate);
+            return Err(format!("drbdadm rejects the new resource file: {e}"));
+        }
+        tracing::info!(
+            volume = name,
+            hash = rendered.hash,
+            "installing resource file"
+        );
+        self.drbd.files.install(name)
+    }
+
     /// Create, restore, activate or grow the backing LV to the DRBD gross
-    /// size rounded to the extent. Growth moves the end of
-    /// the device where internal metadata lives, so an existing LV grows
-    /// only under an attached disk (DRBD relocates its metadata online) or
-    /// right after this pass created it (a restore of a smaller snapshot).
-    /// An LV this node had reported is rebuilt empty: its peers hold the
-    /// data, and a restore would bring back data older than theirs.
+    /// size rounded to the extent. Growth moves the end of the device where
+    /// internal metadata lives, so an existing LV grows only under an
+    /// attached disk (DRBD relocates its metadata online) or right after
+    /// this pass created it (a restore of a smaller snapshot).
+    /// A lost LV is rebuilt empty once the volume is initialized: its peers
+    /// hold the data, and a restore would bring back older data. Before
+    /// that, the initial node of a restore always restores, a rebuild too:
+    /// nobody else holds the data, and an empty copy would become the
+    /// source.
     async fn ensure_drbd_lv(
         &self,
         reads: &mut Reads,
@@ -687,42 +738,51 @@ impl Reconciler {
         let vg = place.vg.as_str();
         let rows = reads.lvs(&self.lvm, vg).await?;
         let mut row = find_in_pool(&rows, &lv, &place.thin)?.cloned();
-        let extent = reads
-            .vgs(&self.lvm, vg)
-            .await?
-            .first()
-            .map(|r| r.vg_extent_size)
-            .ok_or_else(|| format!("volume group {vg} not found"))?;
-        let desired = storage::desired_kib(gross_kib(vol)? * 1024, extent);
+        let extent = reads.vg(&self.lvm, vg).await?.extent_bytes;
+        let desired = storage::desired_bytes(gross_bytes(vol), extent);
         let rebuilt = row.is_none() && lost_after_report(prev);
-        if rebuilt {
-            tracing::warn!(lv, vg, kib = desired, "rebuilding lost backing LV");
-            let created = self
-                .lvm
-                .create_tagged(vg, &place.thin, &lv, desired, Some(storage::NEW_TAG))
-                .await;
+        // Only the initial node's copy of a restore is ever read: the
+        // others full-sync from it, so they start empty.
+        let restore =
+            row.is_none() && vol.spec.source.is_some() && s.initial_node() && !s.initialized();
+        if row.is_none() {
+            let created = if restore {
+                if rebuilt {
+                    tracing::warn!(
+                        lv,
+                        vg,
+                        "restoring the lost backing LV again: not initialized yet"
+                    );
+                }
+                self.create_lv(&rows, snapshots, place, vol, &lv, desired)
+                    .await
+                    .map_err(|e| format!("restore before the volume was initialized: {e}; the volume cannot start without its source"))
+            } else if rebuilt {
+                tracing::warn!(lv, vg, bytes = desired, "rebuilding lost backing LV");
+                self.lvm
+                    .create(vg, &place.thin, &lv, desired, &[storage::NEW_TAG])
+                    .await
+                    .map_err(|e| e.to_string())
+            } else {
+                tracing::info!(lv, vg, bytes = desired, "creating DRBD backing LV");
+                self.lvm
+                    .create(vg, &place.thin, &lv, desired, &[storage::NEW_TAG])
+                    .await
+                    .map_err(|e| e.to_string())
+            };
             reads.invalidate(vg);
-            created.map_err(|e| rebuild_error(&e.to_string()))?;
-            row = reads.find(&self.lvm, vg, &lv, &place.thin).await?;
-        } else if row.is_none() {
-            let created = self
-                .create_lv(&rows, snapshots, place, vol, &lv, desired)
-                .await;
-            reads.invalidate(vg);
-            created?;
-            if vol.spec.source.is_some() {
-                self.strip_inherited(reads, place, &lv).await?;
-            }
+            // The loss stays on record until a pass completes.
+            created.map_err(|e| if rebuilt { rebuild_error(&e) } else { e })?;
             row = reads.find(&self.lvm, vg, &lv, &place.thin).await?;
         }
-        let created = row.is_some() && rows.iter().all(|r| r.lv_name != lv);
+        let created = row.is_some() && rows.iter().all(|r| r.name != lv);
         if created {
             reads.created.insert(format!("{vg}/{lv}"));
         }
         let may_grow = attached || created;
         let r = row.ok_or_else(|| format!("LV {vg}/{lv} missing after create"))?;
         let mut changed = false;
-        if !r.is_active() {
+        if !r.active {
             changed = true;
             self.lvm
                 .activate(vg, &lv)
@@ -730,19 +790,19 @@ impl Reconciler {
                 .map_err(|e| e.to_string())?;
         }
         let mut grown = true;
-        if r.lv_size < desired && !may_grow {
+        if r.size_bytes < desired && !may_grow {
             tracing::info!(lv, "backing LV grows once the DRBD disk is attached");
             grown = false;
-        } else if r.lv_size < desired {
+        } else if r.size_bytes < desired {
             tracing::info!(
                 lv,
-                from = r.lv_size,
+                from = r.size_bytes,
                 to = desired,
                 "growing DRBD backing LV"
             );
             changed = true;
             self.lvm
-                .resize(vg, &lv, desired)
+                .extend(vg, &lv, desired)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -760,11 +820,20 @@ impl Reconciler {
             grown,
             created,
             rebuilt,
+            restored: restore,
         })
     }
 
-    /// Decided from what is on the disk, never from
-    /// status (a failed pass reports present false while data is there).
+    /// Ownership comes from the LV's tags only:
+    /// - `r-drbd.md.<volume uid>.<node id>` of this replica: ours, kept;
+    /// - `r-drbd.new` (set by lvcreate) or created this pass: never held
+    ///   data, metadata is (re)created;
+    /// - another r-drbd metadata tag: a former placement of this node, or a
+    ///   deleted Volume that had the same name; stale, made new first;
+    /// - no r-drbd tag: what departure leaves behind, so stale when this node
+    ///   has no entry on an initialized volume (its peers hold the data);
+    ///   otherwise not provably ours and refused.
+    ///
     /// Returns whether metadata was created.
     async fn ensure_metadata(
         &self,
@@ -781,289 +850,173 @@ impl Reconciler {
         if attached {
             return Ok(false);
         }
-        let dev = row.lv_path.as_str();
         let name = s.vol.name_any();
-        let mut tags = reads.tags(&self.lvm, &place.vg, &row.lv_name).await?;
-        let own = storage::md_tag(s.mine.node_id);
-        let has = |t: &str| tags.iter().any(|x| x == t);
-        // Made by us and never attached, in this pass or one cut short.
-        let fresh_lv = b.created || has(storage::NEW_TAG);
-        let reported = lost_after_report(s.prev);
-        // An entry goes only through our own departure or the controller's
-        // cleanup of a stale node: no entry is the departure signal.
-        let has_entry = s.prev.is_some();
-        let rebuilt = b.rebuilt || (fresh_lv && reported);
-        let restored = fresh_lv && !rebuilt && s.vol.spec.source.is_some();
-        if has(&own) {
-            if restored {
-                return Err(format!(
-                    "restored LV still carries the {own} tag of its source"
-                ));
-            }
+        let uid = s.vol.metadata.uid.as_deref().ok_or("Volume has no uid")?;
+        let own = drbd::md_tag(uid, s.mine.node_id);
+        let mut tags = reads.tags(&self.lvm, &place.vg, &row.name).await?;
+        let has = |tags: &[String], t: &str| tags.iter().any(|x| x == t);
+        if has(&tags, &own) {
             return Ok(false);
         }
-        if has(storage::MD_TAG) && has_entry && !fresh_lv {
-            // Legacy tag plus any entry of ours: ours, retag only.
-            self.seal(reads, place, &row.lv_name, &tags, &own).await?;
-            return Ok(false);
-        }
-        // Sticky refusals: a later pass finds them in the entry, also inside
-        // an LV_LOST-wrapped error, and refuses again without a probe. The
-        // tag above, or a fresh LV, clears them.
-        let prev_error = s
-            .prev
-            .and_then(|p| p.last_error.as_deref())
-            .map(unwrap_rebuild);
-        if !fresh_lv && let Some(e @ (MD_NOT_AT_END | MD_OTHER_VOLUME)) = prev_error {
-            return Err(e.to_owned());
-        }
-        let day0 = s.a.gi.as_deref().ok_or("assignment has no gi")?;
-        let day0_id = u64::from_str_radix(day0, 16)
-            .map_err(|_| format!("assignment gi {day0} is not hex"))?;
-        let mut magic = self.md_magic(dev).await?;
-        if !magic && !fresh_lv {
-            magic = self.check_resize(s, dev).await?;
-        }
-        let initialized = s
-            .vol
-            .status
-            .as_ref()
-            .is_some_and(|st| st.initialized_at.is_some());
-        let foreign = if magic {
-            match self.md_identity(s, dev, day0_id).await? {
-                // Only a node with no entry at all on an initialized
-                // volume is a departed node placed again; an error never costs data.
-                MdIdentity::Ours if !fresh_lv && (has_entry || !initialized) => {
-                    if let Err(e) = self.seal(reads, place, &row.lv_name, &tags, &own).await {
-                        tracing::warn!(volume = name, error = %e, "tagging adopted metadata failed");
-                    }
-                    return Ok(false);
-                }
-                MdIdentity::Unfinished => false,
-                // The source's metadata only on a copy we made, or before
-                // any replica ever held data.
-                MdIdentity::Other if s.vol.spec.source.is_some() && (fresh_lv || !initialized) => {
-                    true
-                }
-                MdIdentity::Other if !fresh_lv => return Err(MD_OTHER_VOLUME.to_owned()),
-                // An LV of ours never attached proves nothing by its ids;
-                // so a departed node's stale metadata lands here too.
-                MdIdentity::Ours | MdIdentity::Other => {
-                    tags = self.wipe_stale(reads, place, s, dev, &tags).await?;
-                    false
-                }
+        let fresh = b.created || has(&tags, storage::NEW_TAG);
+        if !fresh {
+            let tagged = tags.iter().any(|t| drbd::is_md_tag(t));
+            let initialized = s
+                .vol
+                .status
+                .as_ref()
+                .is_some_and(|st| st.initialized_at.is_some());
+            let departed = initialized && s.prev.is_none();
+            if !tagged && !departed {
+                return Err(NOT_OURS.to_owned());
             }
-        } else {
-            let never_held = !initialized && !s.prev.is_some_and(|p| p.present);
-            if !fresh_lv && !never_held {
-                return Err(MD_NOT_AT_END.to_owned());
-            }
-            false
-        };
-        // Nobody writes before initializedAt, so only a replica created
-        // before it by a node that never reported may claim day-0 data.
-        // Any other keeps just-created metadata and gets a full sync.
-        let fresh = !initialized && !reported && !rebuilt;
-        tracing::info!(volume = name, dev, foreign, fresh, "creating DRBD metadata");
+            tracing::warn!(volume = name, ?tags, "stale DRBD metadata: recreating");
+            // The new tag goes on before the metadata changes, so a crash
+            // in between leaves an LV that is plainly fresh.
+            let del: Vec<&str> = tags
+                .iter()
+                .map(String::as_str)
+                .filter(|t| drbd::is_md_tag(t))
+                .collect();
+            let r = self
+                .lvm
+                .change_tags(&place.vg, &row.name, &[storage::NEW_TAG], &del)
+                .await;
+            reads.tags.remove(&place.vg);
+            r.map_err(|e| e.to_string())?;
+            tags = vec![storage::NEW_TAG.to_owned()];
+        }
+        tracing::info!(volume = name, dev = row.path, "creating DRBD metadata");
         self.drbd_cmd(
-            &argv::create_md(&name, model::keys::PEER_SLOTS, s.versions),
+            &argv::create_md(&name, model::keys::PEER_SLOTS),
             drbd::CREATE_MD_TIMEOUT,
         )
         .await
         .map_err(|e| format!("create-md {name}/{VOLUME}: {e}"))?;
-        if fresh {
-            self.set_day0_gi(s, dev, day0).await?;
-        }
-        self.seal(reads, place, &row.lv_name, &tags, &own).await?;
+        // Own tag in, the new tag and any other metadata tag out, in one
+        // lvchange.
+        let del: Vec<&str> = tags
+            .iter()
+            .map(String::as_str)
+            .filter(|t| *t != own && (*t == storage::NEW_TAG || drbd::is_md_tag(t)))
+            .collect();
+        let r = self
+            .lvm
+            .change_tags(&place.vg, &row.name, &[&own], &del)
+            .await;
+        reads.tags.remove(&place.vg);
+        r.map_err(|e| e.to_string())?;
         Ok(true)
     }
 
-    /// Moves internal metadata after an offline grow, from the last known
-    /// device size drbd-utils keeps under /var/lib/drbd. True when the magic
-    /// is at the end afterwards.
-    async fn check_resize(&self, s: &Step<'_>, dev: &str) -> Result<bool, String> {
-        let argv = argv::check_resize(s.minor, dev);
-        match run_any(self.lvm.exec(), &argv, DEFAULT_TIMEOUT).await {
-            Ok(o) if o.exit_code == Some(0) => return self.md_magic(dev).await,
-            Ok(o) => {
-                tracing::debug!(volume = s.vol.name_any(), error = %failure(&argv, &o), "check-resize");
-            }
-            Err(e) => tracing::debug!(volume = s.vol.name_any(), error = %e, "check-resize"),
+    /// Makes the first data current, on the initial node of a volume not
+    /// yet initialized, while no replica holds data:
+    /// - restore: this replica becomes the source, every peer full-syncs
+    ///   (before initializedAt its LV only ever comes from the snapshot);
+    /// - fresh: once every diskful peer is connected and Inconsistent, the
+    ///   bitmap is cleared and nobody syncs; after `init_wait` the same
+    ///   runs with whoever is there, when DRBD reports quorum, and late
+    ///   peers full-sync.
+    ///
+    /// `lost`: this replica was rebuilt. A rebuilt replica may still take
+    /// the all-connected path (nobody holds data then), never the timeout
+    /// path: a second clear-bitmap beside data made by the first would
+    /// leave two unrelated data sets.
+    async fn first_data(&mut self, s: &Step<'_>, name: &str, lost: bool) -> Result<(), String> {
+        if s.initialized() || !s.initial_node() {
+            self.init_started.remove(name);
+            self.rebuilt_seen.remove(name);
+            return Ok(());
         }
-        Ok(false)
-    }
-
-    /// The metadata tags give way to the new tag first, in one lvchange,
-    /// so a crash after the wipe leaves a fresh LV, never one that is
-    /// untagged or legacy-tagged without metadata. Returns the tags now on
-    /// the LV.
-    async fn wipe_stale(
-        &self,
-        reads: &mut Reads,
-        place: &Place,
-        s: &Step<'_>,
-        dev: &str,
-        tags: &[String],
-    ) -> Result<Vec<String>, String> {
-        let name = s.vol.name_any();
-        tracing::warn!(volume = name, dev, "stale metadata: wiping");
-        let del: Vec<&str> = tags
-            .iter()
-            .map(String::as_str)
-            .filter(|t| storage::is_md_tag(t))
-            .collect();
-        let has_new = tags.iter().any(|t| t == storage::NEW_TAG);
-        let mut now: Vec<String> = tags
-            .iter()
-            .filter(|t| !storage::is_md_tag(t))
-            .cloned()
-            .collect();
-        if !has_new || !del.is_empty() {
-            let add: &[&str] = if has_new { &[] } else { &[storage::NEW_TAG] };
-            let r = self
-                .lvm
-                .change_tags(&place.vg, &lvm::names::volume_lv(&name), add, &del)
-                .await;
-            reads.tags.remove(&place.vg);
-            r.map_err(|e| e.to_string())?;
-            if !has_new {
-                now.push(storage::NEW_TAG.to_owned());
-            }
-        }
-        self.drbd_cmd(&argv::wipe_md(s.minor, dev), DEFAULT_TIMEOUT)
-            .await?;
-        Ok(now)
-    }
-
-    /// Metadata proven for this node id: `own` in, the new tag and every
-    /// other metadata tag out, in one lvchange.
-    async fn seal(
-        &self,
-        reads: &mut Reads,
-        place: &Place,
-        lv: &str,
-        tags: &[String],
-        own: &str,
-    ) -> Result<(), String> {
-        let del: Vec<&str> = tags
-            .iter()
-            .map(String::as_str)
-            .filter(|t| *t != own && (*t == storage::NEW_TAG || storage::is_md_tag(t)))
-            .collect();
-        let r = self.lvm.change_tags(&place.vg, lv, &[own], &del).await;
-        reads.tags.remove(&place.vg);
-        r.map_err(|e| e.to_string())
-    }
-
-    /// A restored copy carries its snapshot's tags: the metadata tags go,
-    /// the new tag lvcreate set stays. A copy that cannot be cleaned is
-    /// removed; it holds nothing of this volume yet.
-    async fn strip_inherited(
-        &self,
-        reads: &mut Reads,
-        place: &Place,
-        lv: &str,
-    ) -> Result<(), String> {
-        let vg = place.vg.as_str();
-        let res = match reads.tags(&self.lvm, vg, lv).await {
-            Ok(tags) => {
-                let del: Vec<&str> = tags
-                    .iter()
-                    .map(String::as_str)
-                    .filter(|t| storage::is_md_tag(t))
-                    .collect();
-                if del.is_empty() {
-                    return Ok(());
-                }
-                let r = self
-                    .lvm
-                    .change_tags(vg, lv, &[], &del)
-                    .await
-                    .map_err(|e| e.to_string());
-                reads.tags.remove(vg);
-                r
-            }
-            Err(e) => Err(e),
+        let Some(r) = s.res else {
+            // Not up yet: its events must bring the next pass.
+            self.init_started.entry(name.to_owned()).or_insert(None);
+            return Ok(());
         };
-        let Err(e) = res else { return Ok(()) };
-        reads.invalidate(vg);
-        if let Ok(Some(row)) = reads.find(&self.lvm, vg, lv, &place.thin).await {
-            let removed = self.remove_volume(vg, &row).await;
-            reads.invalidate(vg);
-            if let Err(re) = removed {
-                tracing::warn!(lv, error = %re, "removing the restored copy");
-            }
+        let local = r.devices.get(&VOLUME).and_then(|d| d.disk.as_deref());
+        let peer_data = r.peer_devices.iter().any(|((_, v), p)| {
+            *v == VOLUME
+                && (holds_data(p.peer_disk.as_deref())
+                    || matches!(
+                        p.replication.as_deref(),
+                        Some("SyncSource" | "SyncTarget" | "PausedSyncS" | "PausedSyncT")
+                    ))
+        });
+        if holds_data(local) || peer_data {
+            self.init_started.remove(name);
+            return Ok(());
         }
-        Err(format!(
-            "remove inherited metadata tags from {vg}/{lv}: {e}"
-        ))
-    }
-
-    /// The initial node mints the current id, the
-    /// others take day 0, so the first sync is a bitmap sync of nothing.
-    async fn set_day0_gi(&self, s: &Step<'_>, dev: &str, day0: &str) -> Result<(), String> {
-        let winner = s.a.initial_up_to_date_node.as_deref() == Some(self.node.as_str());
-        let current = if winner {
-            let r = self
-                .drbd
-                .host
-                .random()
-                .map_err(|e| format!("random generation id: {e}"))?;
-            Some(drbd::fresh_gi(r))
-        } else {
-            None
-        };
-        for id in 0..=model::keys::NODE_ID_MAX {
-            let gi = drbd::gi_value(id, s.mine.node_id, day0, current.as_deref());
-            self.drbd_cmd(&argv::set_gi(id, s.minor, dev, &gi), DEFAULT_TIMEOUT)
+        if local != Some("Inconsistent") {
+            // Still attaching: its events must bring the next pass.
+            self.init_started.entry(name.to_owned()).or_insert(None);
+            return Ok(());
+        }
+        if s.vol.spec.source.is_some() {
+            tracing::info!(
+                volume = name,
+                "restored data becomes current: peers full-sync"
+            );
+            self.drbd_cmd(&argv::start_as_source(name), DRBD_TIMEOUT)
                 .await?;
+            self.init_started.remove(name);
+            return Ok(());
         }
+        let waiting: Vec<&str> =
+            s.a.replicas
+                .iter()
+                .filter(|p| p.node != self.node && drbd::is_diskful(p))
+                .filter(|p| {
+                    let connected = r
+                        .connections
+                        .get(&p.node)
+                        .is_some_and(|c| c.state == "Connected");
+                    let inconsistent = r
+                        .peer_devices
+                        .get(&(p.node.clone(), VOLUME))
+                        .is_some_and(|d| d.peer_disk.as_deref() == Some("Inconsistent"));
+                    !(connected && inconsistent)
+                })
+                .map(|p| p.node.as_str())
+                .collect();
+        let since = *self
+            .init_started
+            .entry(name.to_owned())
+            .or_insert(None)
+            .get_or_insert_with(tokio::time::Instant::now);
+        if !waiting.is_empty() && since.elapsed() < self.drbd.init_wait {
+            tracing::info!(
+                volume = name,
+                ?waiting,
+                "waiting for diskful peers before the first data"
+            );
+            return Ok(());
+        }
+        if !waiting.is_empty() {
+            if let Some(why) = timeout_blocker(s, r, lost) {
+                tracing::warn!(
+                    volume = name,
+                    ?waiting,
+                    why,
+                    "not starting without these peers"
+                );
+                return Ok(());
+            }
+            tracing::warn!(
+                volume = name,
+                ?waiting,
+                "starting without these peers: they will full-sync"
+            );
+        }
+        tracing::info!(volume = name, "first data current without a sync");
+        self.drbd_cmd(&argv::start_without_sync(name), DRBD_TIMEOUT)
+            .await?;
+        self.init_started.remove(name);
         Ok(())
     }
 
-    /// get-gi of this node's slot; when day0 is not among its two history
-    /// ids, dump-superblock with the full history decides.
-    async fn md_identity(&self, s: &Step<'_>, dev: &str, day0: u64) -> Result<MdIdentity, String> {
-        let argv = argv::get_gi(s.mine.node_id, s.minor, dev);
-        let out = run_any(self.lvm.exec(), &argv, DEFAULT_TIMEOUT)
-            .await
-            .map_err(|e| e.to_string())?;
-        match out.exit_code {
-            Some(0) => {}
-            Some(1 | 255) => {
-                return Err(format!(
-                    "corrupt DRBD metadata on {dev}; check that drbd-utils match the kernel module"
-                ));
-            }
-            _ => return Err(failure(&argv, &out).to_string()),
-        }
-        let ids = gi_ids(out.stdout.lines().next().unwrap_or_default());
-        if ids.iter().any(|i| same_id(*i, day0)) {
-            return Ok(MdIdentity::Ours);
-        }
-        if ids.first() == Some(&4) && ids.iter().skip(1).all(|i| *i == 0) {
-            return Ok(MdIdentity::Unfinished);
-        }
-        let argv = argv::dump_superblock(s.minor, dev);
-        let out = run_ok(self.lvm.exec(), &argv, drbd::SUPERBLOCK_TIMEOUT)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(if gi_ids(&out.stdout).iter().any(|i| same_id(*i, day0)) {
-            MdIdentity::Ours
-        } else {
-            MdIdentity::Other
-        })
-    }
-
-    /// Connections to peers no longer in the assignment; true when any was removed.
-    async fn remove_departed(
-        &self,
-        s: &Step<'_>,
-        name: &str,
-        diskful: bool,
-    ) -> Result<bool, String> {
-        let Some(r) = s.res else { return Ok(false) };
-        let mut removed = false;
+    /// Connections to peers no longer in the assignment.
+    async fn remove_departed(&self, s: &Step<'_>, name: &str, diskful: bool) -> Result<(), String> {
+        let Some(r) = s.res else { return Ok(()) };
         for (conn, c) in &r.connections {
             if s.a.replicas.iter().any(|x| &x.node == conn) {
                 continue;
@@ -1077,12 +1030,60 @@ impl Reconciler {
                 });
             self.forget_peer(name, conn, id, diskful, peer_diskless)
                 .await?;
-            removed = true;
         }
-        Ok(removed)
+        Ok(())
     }
 
-    /// On the remaining nodes: del-peer, then forget-peer on a diskful replica.
+    /// Frees bitmap slots of node ids no longer in the assignment, read from
+    /// the superblock: a forget-peer that failed, or a peer that left while
+    /// this node was down, leaves one behind. Once per spec generation when
+    /// clean; a failure is retried on the next pass.
+    async fn sweep_slots(&mut self, s: &Step<'_>, name: &str, dev: &str) {
+        let attached = s
+            .res
+            .and_then(|r| r.devices.get(&VOLUME))
+            .is_some_and(|d| drbd::disk_has_metadata(d.disk.as_deref()));
+        let generation = s.vol.metadata.generation.unwrap_or_default();
+        if !attached || self.slots_swept.get(name) == Some(&generation) {
+            return;
+        }
+        let argv = argv::dump_superblock(s.minor, dev);
+        let holders = match self.drbd_cmd(&argv, DRBD_TIMEOUT).await {
+            Ok(out) => drbd::slot_holders(&out),
+            Err(e) => Err(e),
+        };
+        let stale: Vec<u8> = match holders {
+            Ok(h) => h
+                .into_iter()
+                .filter(|id| *id != s.mine.node_id)
+                .filter(|id| !s.a.replicas.iter().any(|x| x.node_id == *id))
+                .collect(),
+            Err(e) => {
+                tracing::warn!(volume = name, error = %e, "reading bitmap slots failed, retried next pass");
+                return;
+            }
+        };
+        let mut clean = true;
+        for id in stale {
+            tracing::info!(
+                volume = name,
+                id,
+                "freeing the bitmap slot of a departed node id"
+            );
+            if let Err(e) = self
+                .drbd_cmd(&argv::forget_peer(name, id), DRBD_TIMEOUT)
+                .await
+            {
+                tracing::warn!(volume = name, id, error = %e, "forget-peer failed, retried next pass");
+                clean = false;
+            }
+        }
+        if clean {
+            self.slots_swept.insert(name.to_owned(), generation);
+        }
+    }
+
+    /// del-peer, then forget-peer on a diskful replica to free the slot.
     async fn forget_peer(
         &self,
         name: &str,
@@ -1093,20 +1094,21 @@ impl Reconciler {
     ) -> Result<(), String> {
         tracing::info!(volume = name, peer, id, "removing departed peer");
         let del = self
-            .drbd_cmd(&argv::del_peer(name, id), DEFAULT_TIMEOUT)
+            .drbd_cmd(&argv::del_peer(name, id), DRBD_TIMEOUT)
             .await
             .err();
         if !local_diskful {
             return del.map_or(Ok(()), Err);
         }
         match self
-            .drbd_cmd(&argv::forget_peer(name, id), DEFAULT_TIMEOUT)
+            .drbd_cmd(&argv::forget_peer(name, id), DRBD_TIMEOUT)
             .await
         {
-            Ok(()) => Ok(()),
+            Ok(_) => Ok(()),
+            // A diskless peer never had a slot to free.
             Err(_) if peer_diskless => Ok(()),
             Err(fe) => match del {
-                // del-peer removed the connection, so the slot error is moot.
+                // The connection is gone; the slot sweep frees it later.
                 None => {
                     tracing::warn!(volume = name, peer, error = %fe, "forget-peer failed after del-peer");
                     Ok(())
@@ -1116,54 +1118,59 @@ impl Reconciler {
         }
     }
 
-    /// Only the diskful replica with the lowest node id resizes,
-    /// once every diskful peer reports an LV of the new gross size.
+    /// Only the diskful replica with the lowest node id resizes, once every
+    /// diskful peer reports an LV of the new gross size and is connected:
+    /// DRBD grows only to what every connected peer can hold, and a peer
+    /// away during the resize would have to catch up on the size later.
     async fn resize_step(&self, s: &Step<'_>, r: &Resource) -> Result<Resize, String> {
         if !r.devices.contains_key(&VOLUME) {
             return Ok(Resize::NotNeeded);
         }
-        let current_kib = self
+        let current = self
             .sectors(s.minor)
             .await
             .map_err(|e| format!("size of {}: {e}", drbd::device_path(s.minor)))?
-            / 2;
-        if current_kib >= net_kib(s.vol) {
+            * 512;
+        if current >= s.vol.spec.size_bytes {
             return Ok(Resize::NotNeeded);
         }
         let diskful = || s.a.replicas.iter().filter(|x| x.role == Role::Diskful);
         if diskful().map(|x| x.node_id).min() != Some(s.mine.node_id) {
             return Ok(Resize::NotNeeded);
         }
-        let gross = gross_kib(s.vol)? * 1024;
+        let gross = gross_bytes(s.vol);
         let entries = s
             .vol
             .status
             .as_ref()
             .map(|st| st.replicas.as_slice())
             .unwrap_or_default();
-        let peers_grown = diskful().filter(|x| x.node != self.node).all(|x| {
-            entries
+        let peers_ready = diskful().filter(|x| x.node != self.node).all(|x| {
+            let grown = entries
                 .iter()
-                .any(|e| e.node == x.node && e.allocated_bytes.is_some_and(|b| b >= gross))
+                .any(|e| e.node == x.node && e.allocated_bytes.is_some_and(|b| b >= gross));
+            let connected = r
+                .connections
+                .get(&x.node)
+                .is_some_and(|c| c.state == "Connected");
+            grown && connected
         });
         let up_to_date = r
             .devices
             .get(&VOLUME)
             .is_some_and(|d| d.disk.as_deref() == Some("UpToDate"));
-        if !peers_grown || !up_to_date {
+        if !peers_ready || !up_to_date {
             return Ok(Resize::Waiting);
         }
         let name = s.vol.name_any();
-        tracing::info!(volume = name, from_kib = current_kib, "growing DRBD device");
-        self.drbd_cmd(&argv::wait_connect(&name), DEFAULT_TIMEOUT)
-            .await?;
-        self.drbd_cmd(&argv::resize(&name), DEFAULT_TIMEOUT).await?;
+        tracing::info!(volume = name, from = current, "growing DRBD device");
+        self.drbd_cmd(&argv::resize(&name), DRBD_TIMEOUT).await?;
         Ok(Resize::Done)
     }
 
     /// Spec.resolve: the non-survivor discards its data once per epoch; the
     /// survivor reconnects its StandAlone diskful connections. Returns true
-    /// when this pass must not adjust.
+    /// when this pass changed a connection.
     async fn resolve(&mut self, s: &Step<'_>, rv: &Resolve, r: &Resource) -> Result<bool, String> {
         let name = s.vol.name_any();
         // Only while the controller's latched SplitBrain holds: a resolve
@@ -1195,7 +1202,7 @@ impl Reconciler {
                         .any(|x| &x.node == peer && x.role == Role::Diskful);
                 if diskful_peer && c.state == "StandAlone" {
                     tracing::info!(volume = name, peer, "survivor reconnecting");
-                    self.drbd_cmd(&argv::connect_peer(&name, peer), DEFAULT_TIMEOUT)
+                    self.drbd_cmd(&argv::connect_peer(&name, peer), DRBD_TIMEOUT)
                         .await?;
                     connected = true;
                 }
@@ -1225,9 +1232,9 @@ impl Reconciler {
             survivor = rv.survivor,
             "discarding local data to resolve split brain"
         );
-        self.drbd_cmd(&argv::disconnect(&name), DEFAULT_TIMEOUT)
+        self.drbd_cmd(&argv::disconnect(&name), DRBD_TIMEOUT)
             .await?;
-        self.drbd_cmd(&argv::connect_discard(&name), DEFAULT_TIMEOUT)
+        self.drbd_cmd(&argv::connect_discard(&name), DRBD_TIMEOUT)
             .await?;
         self.resolved.insert(key);
         Ok(true)
@@ -1249,31 +1256,77 @@ impl Reconciler {
         Ok(())
     }
 
-    /// Retried while a resync blocks it; the backup
-    /// file follows a success and is restored after a failure.
-    async fn adjust(&self, name: &str) -> Result<(), String> {
+    /// Adjusts only when drbdadm's dry run lists commands: the dry run
+    /// compares the file with the kernel's state, so no list of states
+    /// is kept here.
+    ///
+    /// A plan that comes back after a successful adjust does not converge
+    /// (a StandAlone after an auth mismatch, a disk failing on attach): it
+    /// is retried on a doubling wait from `repeat_backoff` up to
+    /// [`REPEAT_MAX`] and reported in lastError meanwhile. A new or empty
+    /// plan starts over.
+    /// Ok(Some) carries the backoff message of a held adjust.
+    async fn adjust_if_needed(
+        &mut self,
+        s: &Step<'_>,
+        name: &str,
+    ) -> Result<Option<String>, String> {
+        let planned = self
+            .drbd_cmd(&argv::adjust_dry_run(name), DRBD_TIMEOUT)
+            .await
+            .map_err(|e| format!("adjust {name} (dry run): {e}"))?;
+        let planned = planned.trim().to_owned();
+        if planned.is_empty() {
+            self.repeats.remove(name);
+            return Ok(None);
+        }
+        let now = tokio::time::Instant::now();
+        let repeat = self
+            .repeats
+            .get(name)
+            .filter(|r| r.plan == planned)
+            .cloned();
+        if let Some(r) = &repeat
+            && now < r.next
+        {
+            return Ok(Some(format!(
+                "adjust {name} does not converge: drbdadm plans the same commands after each adjust ({}); tried {} times, next in {} s",
+                planned.lines().next().unwrap_or_default(),
+                r.times,
+                (r.next - now).as_secs()
+            )));
+        }
+        tracing::info!(volume = name, planned, "adjusting");
+        if s.res.is_none() {
+            self.probe_port(s.mine).await?;
+        }
         let argv = argv::adjust(name);
-        let mut attempt = 0;
-        let result = loop {
-            match run_any(self.lvm.exec(), &argv, DEFAULT_TIMEOUT).await {
-                Ok(o) if o.exit_code == Some(0) => break Ok(()),
-                Ok(o)
-                    if attempt < self.drbd.adjust_retry.len() && o.stderr.contains(RESYNC_BUSY) =>
-                {
-                    tokio::time::sleep(self.drbd.adjust_retry[attempt]).await;
-                    attempt += 1;
+        let mut retries = self.drbd.adjust_retry.iter();
+        loop {
+            match run_any(self.lvm.exec(), &argv, DRBD_TIMEOUT).await {
+                Ok(o) if o.exit_code == Some(0) => {
+                    let times = repeat.map_or(0, |r| r.times + 1);
+                    let wait = self
+                        .drbd
+                        .repeat_backoff
+                        .saturating_mul(1 << times.min(10))
+                        .min(REPEAT_MAX);
+                    self.repeats.insert(
+                        name.to_owned(),
+                        Repeat {
+                            plan: planned,
+                            times,
+                            next: tokio::time::Instant::now() + wait,
+                        },
+                    );
+                    return Ok(None);
                 }
-                Ok(o) => break Err(failure(&argv, &o).to_string()),
-                Err(e) => break Err(e.to_string()),
-            }
-        };
-        match result {
-            Ok(()) => self.drbd.files.backup(name),
-            Err(e) => {
-                if let Err(re) = self.drbd.files.restore_backup(name) {
-                    tracing::warn!(volume = name, error = %re, "backup restore failed");
-                }
-                Err(format!("adjust {name}: {e}"))
+                Ok(o) if o.stderr.contains(RESYNC_BUSY) => match retries.next() {
+                    Some(d) => tokio::time::sleep(*d).await,
+                    None => return Err(format!("adjust {name}: {}", failure(&argv, &o))),
+                },
+                Ok(o) => return Err(format!("adjust {name}: {}", failure(&argv, &o))),
+                Err(e) => return Err(format!("adjust {name}: {e}")),
             }
         }
     }
@@ -1284,8 +1337,9 @@ impl Reconciler {
         if !drbd::derive(res).sync_unknown {
             return None;
         }
-        let argv = crate::exec::argv(&["drbdsetup", "status", "--json", name]);
-        let out = run_ok(self.lvm.exec(), &argv, DEFAULT_TIMEOUT).await.ok()?;
+        let out = run_ok(self.lvm.exec(), &argv::status_json(name), DRBD_TIMEOUT)
+            .await
+            .ok()?;
         drbd::json_sync_percent(&out.stdout)
     }
 
@@ -1300,20 +1354,23 @@ impl Reconciler {
         match phase {
             SnapshotPhase::Suspending if !r.suspended_by_user() => {
                 tracing::info!(volume, "suspending IO for a snapshot");
-                self.drbd_cmd(&argv::suspend_io(volume), DEFAULT_TIMEOUT)
+                self.drbd_cmd(&argv::suspend_io(volume), DRBD_TIMEOUT)
                     .await
+                    .map(|_| ())
             }
             SnapshotPhase::Resuming if r.suspended_by_user() => {
                 tracing::info!(volume, "resuming IO after a snapshot");
-                self.drbd_cmd(&argv::resume_io(volume), DEFAULT_TIMEOUT)
+                self.drbd_cmd(&argv::resume_io(volume), DRBD_TIMEOUT)
                     .await
+                    .map(|_| ())
             }
             _ => Ok(()),
         }
     }
 
     /// Status of the replicated volumes events2 touched since the last call,
-    /// from the last pass facts; no host work besides the sysfs size.
+    /// from the last pass facts; no host work besides the sysfs size. A
+    /// volume whose first data waits on its peers asks for a pass.
     pub async fn refresh(&mut self, volumes: &[Arc<Volume>]) -> Vec<StatusWrite> {
         let dirty = match self.drbd.tracker.lock() {
             Ok(mut t) if t.is_available() => t.take_dirty(),
@@ -1321,6 +1378,9 @@ impl Reconciler {
         };
         let mut writes = Vec::new();
         for name in dirty {
+            if self.init_started.contains_key(&name) {
+                self.pass_wanted = true;
+            }
             let Some(vol) = volumes.iter().find(|v| v.name_any() == name) else {
                 continue;
             };
@@ -1338,6 +1398,11 @@ impl Reconciler {
         }
         writes
     }
+
+    /// Whether a refresh saw a change a pass must act on; clears the flag.
+    pub fn take_pass_wanted(&mut self) -> bool {
+        std::mem::take(&mut self.pass_wanted)
+    }
 }
 
 /// The inputs of one replica's pass.
@@ -1345,10 +1410,30 @@ struct Step<'a> {
     vol: &'a Volume,
     a: &'a Assignment,
     mine: &'a AssignedReplica,
-    versions: &'a ToolVersions,
+    features: Features,
     minor: u32,
     res: Option<&'a Resource>,
     prev: Option<&'a ReplicaStatus>,
+}
+
+impl Step<'_> {
+    /// The previous pass left this replica's loss on record.
+    fn prev_lost(&self) -> bool {
+        self.prev
+            .and_then(|p| p.last_error.as_deref())
+            .is_some_and(is_lost)
+    }
+
+    fn initialized(&self) -> bool {
+        self.vol
+            .status
+            .as_ref()
+            .is_some_and(|st| st.initialized_at.is_some())
+    }
+
+    fn initial_node(&self) -> bool {
+        self.a.initial_up_to_date_node.as_deref() == Some(self.mine.node.as_str())
+    }
 }
 
 #[cfg(test)]

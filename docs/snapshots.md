@@ -72,7 +72,7 @@ Rules:
 
 - A local restore (`replicas: 1`) uses one of the nodes holding the snapshot.
 - A replicated restore needs `replicas` equal to the number of nodes holding the snapshot.
-  It comes up without a full sync, because every copy is identical.
+  The first node restores the snapshot; DRBD copies it in full to the other replicas, which start empty.
 - The requested size may be larger than the snapshot; it may not be smaller.
 - Pins that point away from the snapshot's nodes or Pools fail the restore with reason `RestoreNodeConflict`.
 

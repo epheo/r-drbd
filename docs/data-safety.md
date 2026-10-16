@@ -26,13 +26,15 @@ These are the guarantees.
 - r-drbd touches only LVs inside the thin pool of a Pool.
   An LV with the expected name elsewhere in the VG is an error, never resized or removed.
 - LVs are deactivated before removal, so an LV still in use fails loudly instead of being torn away.
-- DRBD metadata is wiped before an LV is removed, so a later volume reusing the name never inherits it.
+- The DRBD metadata on an LV belongs to the Volume and node named in an LVM tag on that LV.
+  A later volume reusing the name never takes over an old LV's metadata.
 - Thin pool zeroing is turned on, so a new LV never exposes blocks of a deleted one.
 - Values from the API (VG and thin pool names, Volume and Snapshot names) are validated and can never reach an LVM or DRBD command as an option.
 
 ## Replication
 
 - Writes are synchronous (DRBD protocol C): acknowledged only once every connected replica has them.
+- A new volume skips the first sync only when all its replicas are new and connected; a replica that joins later is copied in full.
 - Quorum is a majority: a replica that loses quorum suspends IO instead of diverging.
 - Nothing is evicted, re-placed or failed over automatically; moving a replica (`spec.evict`) or resolving a split brain (`spec.resolve`) is always your decision.
 - `spec.evict` refuses to move a replica while it could lose data; see [Operations](operations.md).

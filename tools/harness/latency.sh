@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Provisioning latency of one StorageClass, in seconds, as markdown tables.
-# Usage: latency.sh CLASS [N]   e.g. latency.sh r-drbd-test-local 10
-# Env: CONTEXT (current context), SNAPCLASS (derived from CLASS's provisioner), TIMEOUT (300).
+# Usage: latency.sh CLASS [N]   e.g. latency.sh local 10
+# Env: CONTEXT (current context), SNAPCLASS (for an r-drbd.io class: R_DRBD_SNAPCLASS, default r-drbd), TIMEOUT (300).
 set -uo pipefail
 
 CLASS=${1:?usage: latency.sh CLASS [N]}
@@ -14,7 +14,7 @@ k() { kubectl ${CONTEXT:+--context "$CONTEXT"} "$@"; }
 
 if [ -z "${SNAPCLASS:-}" ]; then
   case "$(k get sc "$CLASS" -o jsonpath='{.provisioner}')" in
-    r-drbd.io) SNAPCLASS=r-drbd-test ;;
+    r-drbd.io) SNAPCLASS=${R_DRBD_SNAPCLASS:-r-drbd} ;;
     *) echo "set SNAPCLASS for $CLASS" >&2; exit 2 ;;
   esac
 fi

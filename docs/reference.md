@@ -12,9 +12,13 @@ Group `r-drbd.io/v1alpha1`, cluster scoped.
 | `spec.tier` | string | Immutable |
 | `spec.vg` | string | LVM name, immutable |
 | `spec.thinPool` | string | LVM name, immutable |
+| `spec.overcommitPercent` | integer | 100 to 1000, default 100, mutable |
+| `spec.reservePercent` | integer | 0 to 50, default 5, mutable |
 | `status.totalBytes` | integer | Thin pool data size |
 | `status.freeBytes` | integer | Thin pool free space |
 | `status.chunkBytes` | integer | Thin pool chunk size |
+| `status.committedBytes` | integer | Sum of the sizes of the volumes placed here |
+| `status.placeableBytes` | integer | Largest new volume placement accepts here now, rounded down to MiB, 0 when placement skips the Pool (see [Pools](pools.md#capacity)) |
 | `status.volumes` | []string | Volumes with a diskful replica here |
 | `status.conditions` | []Condition | `Available` |
 
@@ -24,7 +28,8 @@ Finalizer `r-drbd.io/pool` holds deletion while `status.volumes` is not empty.
 
 Group `r-drbd.io/v1alpha1`, cluster scoped.
 Created by the CSI driver; the name is the PV name.
-Names must match `^[A-Za-z_][A-Za-z0-9_-]{1,47}$`; others end Failed with reason `InvalidName`.
+Names must match `^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$` and must not start with `snapshot` or `pvmove` (LVM reserves them); others end Failed with reason `InvalidName`.
+The pattern is what Kubernetes, LVM and DRBD names all accept; 63 bytes lets `<volume>+<snapshot>` fit LVM's 127-byte LV name.
 
 Spec:
 
@@ -61,6 +66,10 @@ Finalizer `r-drbd.io/volume` holds deletion until every replica is removed.
 
 Group `r-drbd.io/v1alpha1`, cluster scoped.
 Created by the CSI driver; the name is the CSI snapshot name (`snapshot-<uuid>`).
+Names follow the Volume pattern.
+The snapshot LV `<volume>+<snapshot>` must also fit the device-mapper name limit on every node that holds the volume: VG name, `-`, LV name, every `-` counted twice, 127 bytes at most.
+With CSI names (`pvc-<uuid>`, `snapshot-<uuid>`) the LV part takes 96 bytes, so the VG name may take 30 (a VG name with dashes counts them twice).
+A snapshot over the limit ends Failed before any IO is suspended.
 
 | Field | Notes |
 |---|---|
@@ -99,7 +108,7 @@ Volume `QuorumLost`: `NoQuorum`, `Quorate`.
 
 Volume `SplitBrain`: `SplitBrain`, `NoSplitBrain`, `ResolveWithoutSplitBrain`.
 
-Pool `Available`: `ThinPoolReady`, `ThinPoolUnavailable`, `ZeroingDisabled`, `InvalidName`.
+Pool `Available`: `ThinPoolReady`, `ThinPoolUnavailable`, `ZeroingDisabled`, `InvalidName`, `LvmUnsupported` (host LVM older than 2.03.03).
 
 Volume Events: `Evicted`, `EvictionBlocked`, `SplitBrainResolved`.
 
@@ -151,10 +160,10 @@ Other environment:
 
 | Item | Value |
 |---|---|
-| DRBD ports | 7000 to 7999 |
-| DRBD minors | 1000 to 49999 |
+| DRBD ports | 11000 to 11999 |
+| DRBD minors | 50000 to 99999 |
 | DRBD resource name, LV name | Volume name |
-| Snapshot LV name | `<volume>_<snapshot>` |
+| Snapshot LV name | `<volume>+<snapshot>` |
 | Resource files | `/var/lib/r-drbd/<volume>.res` |
 | Include file | `/etc/drbd.d/r-drbd.res` |
 | CSI socket | `/var/lib/kubelet/plugins/r-drbd.io/csi.sock` |

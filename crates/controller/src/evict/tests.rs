@@ -17,13 +17,12 @@ fn rep(node: &str, id: u8, port: u16, role: Role) -> AssignedReplica {
 fn two() -> Assignment {
     Assignment {
         replicas: vec![
-            rep("n1", 0, 7000, Role::Diskful),
-            rep("n2", 1, 7000, Role::Diskful),
-            rep("n3", 2, 7000, Role::Tiebreaker),
+            rep("n1", 0, 11000, Role::Diskful),
+            rep("n2", 1, 11000, Role::Diskful),
+            rep("n3", 2, 11000, Role::Tiebreaker),
         ],
-        minor: Some(1000),
+        minor: Some(50000),
         secret: Some("s".into()),
-        gi: Some("AA".into()),
         initial_up_to_date_node: Some("n1".into()),
     }
 }
@@ -37,7 +36,9 @@ fn view(node: &str, free: u64) -> placer::PoolView {
         available: true,
         total_bytes: 100 * G,
         free_bytes: free,
-        reserved_bytes: 0,
+        committed_bytes: 0,
+        overcommit_percent: 100,
+        reserve_percent: 5,
         volume_count: 0,
     }
 }
@@ -173,7 +174,7 @@ fn idle_clear_and_wait() {
     c.spec.attachments = vec!["n7".into()];
     assert_eq!(c.decide(), Step::Wait { node: "n7".into() });
     let mut c = Case::new(&["n7"]);
-    c.a.replicas.push(rep("n7", 3, 7000, Role::Diskless));
+    c.a.replicas.push(rep("n7", 3, 11000, Role::Diskless));
     assert_eq!(c.decide(), Step::Wait { node: "n7".into() });
 }
 
@@ -223,7 +224,7 @@ fn blocked_reasons() {
     }
     // replicas 3: one peer UpToDate, the other still syncing.
     let mut c = base();
-    c.a.replicas.push(rep("n5", 3, 7000, Role::Diskful));
+    c.a.replicas.push(rep("n5", 3, 11000, Role::Diskful));
     c.entries.push(ReplicaStatus {
         disk_state: Some("Inconsistent".into()),
         ..up("n5", false)
@@ -266,6 +267,17 @@ fn blocked_reasons() {
     assert_eq!(
         message(&c.decide()),
         "eviction of n2 blocked: no pool for tier fast outside n2"
+    );
+    // The only target is past its capacity policy: the text says so.
+    let mut c = base();
+    c.ready.retain(|n| n != "n3");
+    for v in &mut c.views {
+        v.committed_bytes = 95 * G;
+    }
+    assert_eq!(
+        message(&c.decide()),
+        "eviction of n2 blocked: no pool for tier fast outside n2 \
+         (no room under the capacity policy: p-n4)"
     );
 }
 
@@ -320,7 +332,7 @@ fn node_ids_never_reuse_the_evicted_one() {
     assert_eq!(free_node_id(&gap, 5), Some(0));
     let full = Assignment {
         replicas: (0..=NODE_ID_MAX)
-            .map(|id| rep(&format!("x{id}"), id, 7000, Role::Diskless))
+            .map(|id| rep(&format!("x{id}"), id, 11000, Role::Diskless))
             .collect(),
         ..two()
     };
@@ -330,9 +342,9 @@ fn node_ids_never_reuse_the_evicted_one() {
 #[test]
 fn diskful_to_a_new_node() {
     let mut c = Case::new(&["n2"]);
-    // n4's port 7000 is taken by another volume.
+    // n4's port 11000 is taken by another volume.
     c.used.add(&Assignment {
-        replicas: vec![rep("n4", 0, 7000, Role::Diskful)],
+        replicas: vec![rep("n4", 0, 11000, Role::Diskful)],
         ..two()
     });
     let (next, diskful, event) = moved(c.decide());
@@ -354,23 +366,20 @@ fn diskful_to_a_new_node() {
     assert_eq!(
         got,
         [
-            ("n1", 0, Some(7000), Role::Diskful, Some("p-n1")),
-            ("n3", 2, Some(7000), Role::Tiebreaker, None),
-            ("n4", 3, Some(7001), Role::Diskful, Some("p-n4")),
+            ("n1", 0, Some(11000), Role::Diskful, Some("p-n1")),
+            ("n3", 2, Some(11000), Role::Tiebreaker, None),
+            ("n4", 3, Some(11001), Role::Diskful, Some("p-n4")),
         ]
     );
     // The DRBD parameters stay.
-    assert_eq!(
-        (next.minor, &next.secret, &next.gi),
-        (c.a.minor, &c.a.secret, &c.a.gi)
-    );
+    assert_eq!((next.minor, &next.secret), (c.a.minor, &c.a.secret));
 }
 
 #[test]
 fn tiebreaker_takes_over() {
     // Only the tiebreaker's node has a free pool.
     let mut c = Case::new(&["n2"]);
-    c.views = vec![view("n1", G), view("n2", G), view("n3", G)];
+    c.views = vec![view("n1", 50 * G), view("n2", 50 * G), view("n3", 50 * G)];
     c.ready = vec!["n1".into(), "n2".into(), "n3".into()];
     let (next, diskful, event) = moved(c.decide());
     assert_eq!(diskful, Some(("n3".into(), "p-n3".into())));
@@ -384,8 +393,8 @@ fn tiebreaker_takes_over() {
     assert_eq!(
         got,
         [
-            ("n1", 0, Some(7000), Role::Diskful),
-            ("n3", 2, Some(7000), Role::Diskful),
+            ("n1", 0, Some(11000), Role::Diskful),
+            ("n3", 2, Some(11000), Role::Diskful),
         ]
     );
     // With n5 ready and empty, it becomes the new tiebreaker; the
@@ -399,7 +408,7 @@ fn tiebreaker_takes_over() {
     let t = next.replicas.last().unwrap();
     assert_eq!(
         (t.node.as_str(), t.node_id, t.port, t.role),
-        ("n5", 3, Some(7000), Role::Tiebreaker)
+        ("n5", 3, Some(11000), Role::Tiebreaker)
     );
     // A stale n5 is not taken.
     c.stale = vec!["n5"];

@@ -1,13 +1,18 @@
 # lvm
 
-Pure crate: argument vectors for the thin LVM commands the agent runs, parsers for their reports, LV naming.
-Thin paths only; thick LVM is out of scope.
+Pure crate: argv for every LVM command the agent runs, JSON report parsers, LV names.
+Thin pools only.
+
+Modules:
+- `cmd`: argv builders; one static `--config` on every lvm command (no LV scanning, DRBD devices rejected).
+- `report`: serde parsers for the `lvs` and `vgs` JSON reports in bytes; errors name the report, the field and the raw value.
+- `names`: volume and snapshot LV names (`<volume>+<snapshot>`), the LVM charset, and the checks lvcreate would fail on (reserved names, device-mapper name length).
 
 Tests under tests/:
-- argv_exact: every argv builder keeps the exact argument order, with and without a PV filter, including the `--units k` position difference between lvs and vgs.
-- filter: PvFilter from an empty and a two-PV list matches the expected string.
-- parse_lvs: an 11-field sample with empty pool_lv, data_percent and origin; comma decimals accepted; wrong field counts ignored; parse errors carry the expected messages.
-- parse_vgs: the 7-field thin sample; empty data_percent reads as 100.
-- thin_free: 1048576 KiB pool at 25.5 percent gives 781189.
+- cmd: exact argv of every builder, options before positional names.
+- report: rows from real JSON output, field errors, percent forms, thin pool free bytes, errors from the JSON log.
+- names: snapshot LV length bound, LVM charset, reserved names, device-mapper length as measured on a host.
 
-Dependencies allowed: thiserror only.
+Dependencies:
+- serde, serde_json: the JSON reports.
+- thiserror: report errors.

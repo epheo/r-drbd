@@ -360,6 +360,7 @@ dependencies = [
  "getrandom 0.3.4",
  "k8s-openapi",
  "kube",
+ "lvm",
  "model",
  "placer",
  "prost-types",
@@ -504,6 +505,7 @@ dependencies = [
 name = "drbd-config"
 version = "0.1.0"
 dependencies = [
+ "ring",
  "thiserror",
 ]
 
@@ -1331,6 +1333,8 @@ dependencies = [
 name = "lvm"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

@@ -1,17 +1,27 @@
-use lvm::PvFilter;
+use lvm::filter::rejects_drbd;
 
 #[test]
-fn empty_pv_list_gives_none() {
-    assert_eq!(PvFilter::from_pvs(&[]), PvFilter(None));
-}
-
-#[test]
-fn two_pvs_match_spec_example() {
-    let pvs = vec!["/dev/sdb".to_owned(), "/dev/sdc".to_owned()];
+fn first_match_decides() {
+    assert_eq!(rejects_drbd(r#"["a|.*|"]"#), Some(false));
+    assert_eq!(rejects_drbd(r#"["r|^/dev/drbd|", "a|.*|"]"#), Some(true));
+    assert_eq!(rejects_drbd(r#"["r|/dev/drbd.*|"]"#), Some(true));
+    assert_eq!(rejects_drbd(r#"["r#drbd#"]"#), Some(true), "any delimiter");
+    // An accept before the reject wins.
+    assert_eq!(rejects_drbd(r#"["a|.*|", "r|^/dev/drbd|"]"#), Some(false));
+    // Character classes are not evaluated.
+    assert_eq!(rejects_drbd(r#"["r|^/dev/drbd[0-9]|"]"#), None);
+    // One name rejected, the other undecided: rejected.
+    assert_eq!(rejects_drbd(r#"["r|^/dev/drbd0$|"]"#), Some(true));
+    // One name accepted keeps the device.
     assert_eq!(
-        PvFilter::from_pvs(&pvs),
-        PvFilter(Some(
-            "devices { filter=['a|/dev/sdb|','a|/dev/sdc|','r|.*|'] }".to_owned()
-        ))
+        rejects_drbd(r#"["a|by-res|", "r|^/dev/drbd|"]"#),
+        Some(false)
     );
+    assert_eq!(
+        rejects_drbd(r#"["r|^/dev/sd|"]"#),
+        Some(false),
+        "no name decided"
+    );
+    assert_eq!(rejects_drbd("[]"), Some(false));
+    assert_eq!(rejects_drbd(r#"["x|y|"]"#), None);
 }

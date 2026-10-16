@@ -5,11 +5,11 @@ One leader, one reflector per kind, one reconcile loop that walks every object i
 
 ## Modules
 
-- `lib`: `Config`, `Error`, `run`, `run_with_client`, `run_until`, `valid_name`; the reconcile loop and the finalizer and status-apply helpers.
+- `lib`: `Config`, `Error`, `run`, `run_with_client`, `run_until`, `valid_name`, `valid_volume_name`; the reconcile loop and the finalizer and status-apply helpers.
 - `leader`: acquire, renew and release the `r-drbd-controller` Lease; expiry judged from the contender's own observation.
 - `store`: reflectors for Pool, Volume, Snapshot, core Node and the namespace's Leases (agent heartbeats), plus a change counter waiters block on; Lease renewals wake the loop only when a node's freshness changes.
 - `wait`: bounded waits on store state for the CSI calls.
-- `alloc`: pure allocation of node ids, minors, ports, secret and day-0 generation id.
+- `alloc`: pure allocation of node ids, minors, ports and the shared secret.
 - `pool`: Pool finalizer and `status.volumes`.
 - `volume`: placement (replicated restore from the snapshot holders), assignment write (no fileSystem seed on restores), diskless entries converged to `spec.attachments`, status aggregation (Ready, Degraded, QuorumLost, SplitBrain, NodeUnreachable), `spec.resolve`, deletion.
 - `snapshot`: the snapshot round state machine and deletion.
@@ -30,6 +30,7 @@ One leader, one reflector per kind, one reconcile loop that walks every object i
 
 - `model`: the CRD types this controller reconciles.
 - `placer`: placement and tiebreaker rules, kept pure in their own crate.
+- `lvm`: LV names and the checks LVM makes on them, so a bad snapshot or volume name fails at admission.
 - `csi`: generated CSI v1 service traits and messages.
 - `kube` (client, runtime, rustls-tls, ring): API access, watchers and reflectors without openssl or aws-lc.
 - `k8s-openapi`: core types (Node, Lease, PVC) and metav1 time.
@@ -41,7 +42,7 @@ One leader, one reflector per kind, one reconcile loop that walks every object i
 - `serde`, `serde_json`: patch bodies built as JSON so server-side apply claims only controller fields.
 - `thiserror`: error types with context.
 - `tracing`: structured logs.
-- `getrandom`: the DRBD shared secret and generation id, straight from the OS.
+- `getrandom`: the DRBD shared secret, straight from the OS.
 - `base64`: encoding of the shared secret.
 - `tracing-subscriber` (optional, `dev-bin` only): log output of the dev binary.
 

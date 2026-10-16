@@ -1,13 +1,10 @@
 //! Placement of volume replicas and the quorum tiebreaker.
 //!
 //! Pure crate, deliberately small: distinct nodes, tier or pool or node
-//! filter, capacity with a fixed thin oversubscription ratio, most free
+//! filter, capacity from the pool's own policy (see `room`), most free
 //! space first, deterministic ties.
 
 #![forbid(unsafe_code)]
-
-/// Thin pools may be oversubscribed up to this ratio of their total size.
-pub const THIN_OVERSUBSCRIPTION_RATIO: u64 = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolView {
@@ -19,8 +16,10 @@ pub struct PoolView {
     pub total_bytes: u64,
     pub free_bytes: u64,
     /// Sum of the sizes of volumes already placed in this pool.
-    pub reserved_bytes: u64,
+    pub committed_bytes: u64,
     pub volume_count: u32,
+    pub overcommit_percent: u32,
+    pub reserve_percent: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +35,10 @@ pub struct Request {
     /// loss or a split-brain resolve); they are kept and not chosen again.
     /// Duplicates are collapsed; order is irrelevant.
     pub existing: Vec<String>,
+    /// The pinned pool already holds this volume's blocks (a restore from
+    /// its snapshot): the volume has nowhere else to go, so capacity is not
+    /// checked there. It still counts in `committed_bytes` afterwards.
+    pub holds_data: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,23 +87,43 @@ pub enum Reason {
     NoCapacity,
 }
 
-/// Thin pools: estimate =
-/// min(free * ratio, total * ratio - reserved) in saturating u64; a pool fits
-/// when estimate >= size and estimate >= ceil(total / 10) (a minimum
-/// free space of 10 percent). A pool with total 0 never fits.
-pub fn fits(pool: &PoolView, size_bytes: u64) -> bool {
+/// Largest volume the pool accepts now:
+///
+/// ```text
+/// reserve = ceil(total * reserve_percent / 100)
+/// promise = floor((total - reserve) * overcommit_percent / 100) - committed
+/// actual  = free - reserve
+/// room    = min(promise, actual), never below 0; 0 when total is 0
+/// ```
+///
+/// `promise` bounds what the volumes may claim once fully written.
+/// `actual` bounds the new volume by the data blocks free today: snapshots
+/// and earlier overcommit consume blocks that `committed` does not count, and
+/// a new volume must be writable in full without touching the reserve.
+pub fn room(pool: &PoolView) -> u64 {
+    let actual = u128::from(pool.free_bytes).saturating_sub(reserve(pool));
+    u64::try_from(u128::from(promise(pool)).min(actual)).unwrap_or(u64::MAX)
+}
+
+/// The `promise` term of `room` alone: what may still be committed, 0 when
+/// total is 0 or the committed sizes already exceed the policy.
+pub fn promise(pool: &PoolView) -> u64 {
     if pool.total_bytes == 0 {
-        return false;
+        return 0;
     }
-    let estimate = pool
-        .free_bytes
-        .saturating_mul(THIN_OVERSUBSCRIPTION_RATIO)
-        .min(
-            pool.total_bytes
-                .saturating_mul(THIN_OVERSUBSCRIPTION_RATIO)
-                .saturating_sub(pool.reserved_bytes),
-        );
-    estimate >= size_bytes && estimate >= pool.total_bytes.div_ceil(10)
+    let usable = u128::from(pool.total_bytes).saturating_sub(reserve(pool));
+    let promise = (usable * u128::from(pool.overcommit_percent) / 100)
+        .saturating_sub(u128::from(pool.committed_bytes));
+    u64::try_from(promise).unwrap_or(u64::MAX)
+}
+
+fn reserve(pool: &PoolView) -> u128 {
+    (u128::from(pool.total_bytes) * u128::from(pool.reserve_percent)).div_ceil(100)
+}
+
+/// A pool with total 0 (capacity not reported yet) never fits.
+pub fn fits(pool: &PoolView, size_bytes: u64) -> bool {
+    pool.total_bytes > 0 && size_bytes <= room(pool)
 }
 
 /// Diskful placement: filter pools, order by free bytes descending then
@@ -196,7 +219,7 @@ fn reject(req: &Request, pool: &PoolView) -> Option<Reason> {
         Some(Reason::NotThePinnedNode)
     } else if req.existing.contains(&pool.node) {
         Some(Reason::NodeAlreadyHolds)
-    } else if !fits(pool, req.size_bytes) {
+    } else if !((req.holds_data && req.pool.is_some()) || fits(pool, req.size_bytes)) {
         Some(Reason::NoCapacity)
     } else {
         None

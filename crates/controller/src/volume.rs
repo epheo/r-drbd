@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 use crate::alloc::{self, Entropy, Used};
 use crate::pool::Usage;
 use crate::store::{Stores, node_ready};
-use crate::{Ctx, Memory, apply_status, has_finalizer, set_finalizer, valid_name};
+use crate::{Ctx, Memory, apply_status, has_finalizer, set_finalizer, valid_volume_name};
 
 pub mod reason {
     pub const INVALID_NAME: &str = "InvalidName";
@@ -754,7 +754,7 @@ impl Placing {
             .iter_mut()
             .find(|p| p.node == node && p.name == pool)
         {
-            view.reserved_bytes = view.reserved_bytes.saturating_add(size);
+            view.committed_bytes = view.committed_bytes.saturating_add(size);
             view.volume_count = view.volume_count.saturating_add(1);
         }
     }
@@ -769,28 +769,10 @@ impl Placing {
     }
 }
 
-/// Placer input: capacity from the agents, readiness from the core Node,
-/// reservations from every assignment.
 fn pool_views(pools: &[Arc<Pool>], usage: &Usage, ready_nodes: &[String]) -> Vec<placer::PoolView> {
     pools
         .iter()
-        .map(|p| {
-            let name = p.name_any();
-            let held = usage.get(&(p.spec.node.clone(), name.clone()));
-            let status = p.status.as_ref();
-            placer::PoolView {
-                node: p.spec.node.clone(),
-                tier: p.spec.tier.clone(),
-                node_ready: ready_nodes.binary_search(&p.spec.node).is_ok(),
-                available: p.metadata.deletion_timestamp.is_none()
-                    && status.is_some_and(|s| condition::is_true(&s.conditions, types::AVAILABLE)),
-                total_bytes: status.and_then(|s| s.total_bytes).unwrap_or(0),
-                free_bytes: status.and_then(|s| s.free_bytes).unwrap_or(0),
-                reserved_bytes: held.map_or(0, |h| h.iter().map(|(_, size)| size).sum()),
-                volume_count: held.map_or(0, |h| u32::try_from(h.len()).unwrap_or(u32::MAX)),
-                name,
-            }
-        })
+        .map(|p| crate::pool::view(p, usage, ready_nodes))
         .collect()
 }
 
@@ -878,11 +860,14 @@ async fn reconcile(
         set_finalizer(api, v, FINALIZER_VOLUME, true).await;
         return;
     }
-    if !valid_name(&name) {
+    if !valid_volume_name(&name) {
         let ready = Cond::new(
             FALSE,
             reason::INVALID_NAME,
-            format!("name must match {}", model::keys::NAME_PATTERN),
+            format!(
+                "name must match {} and not start with snapshot or pvmove (LVM reserves them)",
+                model::keys::NAME_PATTERN
+            ),
         );
         write(
             memory,
@@ -1444,8 +1429,25 @@ fn assign(placing: &Placing, v: &Volume, diskful: &[placer::Chosen]) -> Placemen
     }
 }
 
+/// The volume's LV name in each chosen Pool's VG, as LVM would take it
+/// (device-mapper length with the VG): a name that does not fit fails
+/// here, not on every agent pass.
+fn lv_name_fits(ctx: &Ctx<'_>, v: &Volume, diskful: &[placer::Chosen]) -> Option<Placement> {
+    let lv = lvm::names::volume_lv(&v.name_any());
+    diskful.iter().find_map(|c| {
+        let pool = ctx.stores.pool(&c.pool)?;
+        let e = lvm::names::check_new_lv(&pool.spec.vg, &lv).err()?;
+        Some(Placement::Fail(Cond::new(
+            FALSE,
+            reason::INVALID_NAME,
+            format!("pool {}: {e}", c.pool),
+        )))
+    })
+}
+
 fn place(ctx: &Ctx<'_>, placing: &Placing, v: &Volume) -> Placement {
     let (mut node, mut pool) = (v.spec.node.clone(), v.spec.pool.clone());
+    let mut holds_data = false;
     if let Some(src) = &v.spec.source {
         let holders = match restore_holders(
             v,
@@ -1455,17 +1457,20 @@ fn place(ctx: &Ctx<'_>, placing: &Placing, v: &Volume) -> Placement {
             Ok(h) => h,
             Err(p) => return p,
         };
+        // Holders are never gated by capacity: each one already holds the
+        // restore's blocks and has nowhere else to go.
         if v.spec.replicas >= 2 {
             // Every replica restores from its own copy of the snapshot.
             let diskful: Vec<placer::Chosen> = holders
                 .into_iter()
                 .map(|(node, pool)| placer::Chosen { node, pool })
                 .collect();
-            return assign(placing, v, &diskful);
+            return lv_name_fits(ctx, v, &diskful).unwrap_or_else(|| assign(placing, v, &diskful));
         }
         if let Some((n, p)) = holders.into_iter().next() {
             node = Some(n);
             pool = Some(p);
+            holds_data = true;
         }
     }
     let req = placer::Request {
@@ -1475,9 +1480,12 @@ fn place(ctx: &Ctx<'_>, placing: &Placing, v: &Volume) -> Placement {
         pool,
         node,
         existing: Vec::new(),
+        holds_data,
     };
     match placer::place(&req, &placing.views) {
-        placer::Outcome::Placed { diskful, .. } => assign(placing, v, &diskful),
+        placer::Outcome::Placed { diskful, .. } => {
+            lv_name_fits(ctx, v, &diskful).unwrap_or_else(|| assign(placing, v, &diskful))
+        }
         placer::Outcome::AlreadyPlaced => Placement::Wait(Cond::new(FALSE, reason::PLACING, "")),
         // Pending, not Failed: placement is retried whenever Pools or Nodes change.
         placer::Outcome::Insufficient { missing, rejected } => {
@@ -1522,7 +1530,6 @@ mod tests {
                 .collect(),
             minor: None,
             secret: None,
-            gi: None,
             initial_up_to_date_node: None,
         }
     }
@@ -2027,19 +2034,18 @@ mod tests {
     fn attachments_converge() {
         let mut two = two_with_tb();
         for (i, r) in two.replicas.iter_mut().enumerate() {
-            r.port = Some(7000 + u16::try_from(i).unwrap());
+            r.port = Some(11000 + u16::try_from(i).unwrap());
         }
         let other = Assignment {
             replicas: vec![AssignedReplica {
                 node: "n4".into(),
                 pool: Some("p".into()),
                 node_id: 0,
-                port: Some(7000),
+                port: Some(11000),
                 role: Role::Diskful,
             }],
-            minor: Some(1001),
+            minor: Some(50001),
             secret: None,
-            gi: None,
             initial_up_to_date_node: None,
         };
         let used = Used::from_assignments([&two, &other]);
@@ -2061,7 +2067,7 @@ mod tests {
                 added.role,
                 &added.pool
             ),
-            ("n4", 3, Some(7001), Role::Diskless, &None)
+            ("n4", 3, Some(11001), Role::Diskless, &None)
         );
         assert_eq!(a.replicas[..3], two.replicas[..]);
         assert_eq!(
@@ -2264,7 +2270,7 @@ mod tests {
     #[test]
     fn initialized_signal() {
         let mut two = two_with_tb();
-        two.minor = Some(1000);
+        two.minor = Some(50000);
         let init = |r: &[ReplicaStatus], nodes: &Nodes<'_>| {
             let st = status(VolumePhase::Provisioning, r.to_vec());
             aggregate_nodes(G, &two, Some(&st), nodes, &BTreeSet::new(), None).initialized

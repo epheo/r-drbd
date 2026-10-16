@@ -150,7 +150,7 @@ async fn publish_appends_diskless_and_unpublish_removes() {
     let added = a.replicas.iter().find(|r| r.node == "n4").unwrap();
     assert_eq!(
         (added.role, added.node_id, added.port, added.pool.as_deref()),
-        (Role::Diskless, 3, Some(7000), None)
+        (Role::Diskless, 3, Some(11000), None)
     );
     assert_eq!(a.replicas[..3], diskful_before[..]);
     assert_eq!(phase_of(&v), VolumePhase::Ready);
@@ -659,6 +659,9 @@ async fn replicated_restore_from_acks() {
     })
     .await;
 
+    // Both holders too full for a new volume: each holds the data already.
+    support::pool_capacity(&client, "p1", "n1", 100 * GIB, 0).await;
+    support::pool_capacity(&client, "p2", "n2", 100 * GIB, 0).await;
     let mut spec = volume_spec(GIB, 2, "fast");
     spec.source = Some(VolumeSource {
         snapshot: "snap".into(),
@@ -681,8 +684,8 @@ async fn replicated_restore_from_acks() {
     );
     assert_eq!(a.initial_up_to_date_node.as_deref(), Some("n1"));
     assert_ne!(a.minor, src.spec.assignment.as_ref().unwrap().minor);
-    assert!(a.secret.is_some() && a.gi.is_some());
-    assert!(a.replicas.iter().all(|r| r.port == Some(7001)));
+    assert!(a.secret.is_some());
+    assert!(a.replicas.iter().all(|r| r.port == Some(11001)));
     // The snapshot records the marker; the restore waits for its agents.
     let snap = support::get_snapshot(&client, "snap").await.unwrap();
     assert_eq!(snap.status.unwrap().file_system.as_deref(), Some("xfs"));
@@ -969,11 +972,11 @@ async fn evict_stale_diskful_to_a_fourth_node() {
     // A new node id, never n1's 0; the lowest free port on n4.
     assert_eq!(
         (added.role, added.pool.as_deref(), added.node_id, added.port),
-        (Role::Diskful, Some("p4"), 3, Some(7000))
+        (Role::Diskful, Some("p4"), 3, Some(11000))
     );
     assert_eq!(role_of(&v, "n2"), Some(Role::Diskful));
     assert_eq!(role_of(&v, "n3"), Some(Role::Tiebreaker));
-    assert_eq!((a.minor, &a.gi), (before.minor, &before.gi));
+    assert_eq!(a.minor, before.minor);
     // n1 leaves spec.evict, its stale entry leaves the status.
     let v = volume_where(&client, "rep", |v| {
         v.spec.evict.is_empty() && entry_of(v, "n1").is_none()
@@ -1232,16 +1235,11 @@ async fn evict_keeps_running_workloads() {
     };
     assert_eq!(s.code, 422);
     assert!(!controller::volume::patch_not_applied(&s), "{s:?}");
-    assert!(
-        get_volume(&client, "rep")
-            .await
-            .unwrap()
-            .status
-            .unwrap()
-            .replicas
-            .len()
-            >= 3
-    );
+    // The fake agents report after the assignment moves, so wait for it.
+    volume_where(&client, "rep", |v| {
+        v.status.as_ref().is_some_and(|s| s.replicas.len() >= 3)
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

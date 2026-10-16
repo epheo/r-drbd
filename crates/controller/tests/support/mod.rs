@@ -415,6 +415,17 @@ pub async fn set_node_ready(client: &Client, name: &str, ready: bool) {
 
 /// A Pool with capacity and Available reported as its agent would.
 pub async fn pool(client: &Client, name: &str, node: &str, tier: &str, free: u64) {
+    pool_with_vg(client, name, node, tier, free, "vg").await;
+}
+
+pub async fn pool_with_vg(
+    client: &Client,
+    name: &str,
+    node: &str,
+    tier: &str,
+    free: u64,
+    vg: &str,
+) {
     let api: Api<Pool> = Api::all(client.clone());
     api.create(
         &PostParams::default(),
@@ -423,20 +434,28 @@ pub async fn pool(client: &Client, name: &str, node: &str, tier: &str, free: u64
             PoolSpec {
                 node: node.into(),
                 tier: tier.into(),
-                vg: "vg".into(),
+                vg: vg.into(),
                 thin_pool: "thin".into(),
+                overcommit_percent: model::DEFAULT_OVERCOMMIT_PERCENT,
+                reserve_percent: model::DEFAULT_RESERVE_PERCENT,
             },
         ),
     )
     .await
     .expect("create pool");
+    pool_capacity(client, name, node, free * 2, free).await;
+}
+
+/// The agent's capacity report for a Pool.
+pub async fn pool_capacity(client: &Client, name: &str, node: &str, total: u64, free: u64) {
+    let api: Api<Pool> = Api::all(client.clone());
     let now = k8s_openapi::jiff::Timestamp::now().to_string();
     let status = json!({
         "apiVersion": "r-drbd.io/v1alpha1",
         "kind": "Pool",
         "metadata": { "name": name },
         "status": {
-            "totalBytes": free * 2,
+            "totalBytes": total,
             "freeBytes": free,
             "chunkBytes": 65536,
             "conditions": [{

@@ -9,12 +9,20 @@ On every node that runs the agent (by default, every node):
 
 On every node that stores data, also:
 
-- lvm2 with a thin pool in a volume group.
+- lvm2 2.03.03 or newer, with a thin pool in a volume group.
+  Older LVM does not know `scan_lvs`; the agent then marks its Pools Available False, reason `LvmUnsupported`.
 - xfsprogs.
+- The host's own LVM must not scan DRBD devices or LVs. Either:
+  - a devices file (`use_devicesfile = 1`, the default on recent distributions) that lists only the host's real PVs; or
+  - in lvm.conf, `global_filter` rejecting `/dev/drbd` and `scan_lvs = 0`.
+
+  Why: a volume can hold a guest's own LVM. Without these rules, udev's pvscan autoactivation can activate that guest VG through `/dev/drbdN` on the host.
+  That holds the DRBD device open and runs the guest VG twice, on the host and in the guest.
+  The agent's own commands never scan them, whatever the host config; it logs a warning, once the node has a Pool, when the host's rules miss this or cannot be verified.
 
 Cluster:
 
-- TCP ports 7000 to 7999 open between nodes for DRBD.
+- TCP ports 11000 to 11999 open between nodes for DRBD.
 - For replicated volumes, 3 nodes: DRBD quorum needs a third vote.
   The third node can be a diskless tiebreaker with no Pool.
 - For snapshots, the external-snapshotter CRDs and snapshot controller.

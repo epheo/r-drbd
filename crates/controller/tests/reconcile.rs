@@ -63,10 +63,16 @@ async fn pool_finalizer_and_volumes() {
 
     let agent = FakeAgent::new(&client, "n1");
     ready_local(&client, &agent, "v1", GIB).await;
+    // Pool total 200 GiB, free 100 GiB, default reserve 5 percent (10 GiB):
+    // the free side binds, 100 - 10.
     support::eventually(Duration::from_secs(20), || async {
-        get_pool(&client, "p1")
-            .await
-            .filter(|p| p.status.as_ref().is_some_and(|s| s.volumes == ["v1"]))
+        get_pool(&client, "p1").await.filter(|p| {
+            p.status.as_ref().is_some_and(|s| {
+                s.volumes == ["v1"]
+                    && s.committed_bytes == Some(GIB)
+                    && s.placeable_bytes == Some(90 * GIB)
+            })
+        })
     })
     .await;
 
@@ -126,10 +132,7 @@ async fn placement_and_allocation() {
             .all(|r| r.port.is_some_and(|p| PORT_RANGE.contains(&p)))
     );
     assert!(a.minor.is_some_and(|m| MINOR_RANGE.contains(&m)));
-    assert_eq!(a.secret.as_deref().map(str::len), Some(20));
-    let gi = a.gi.clone().unwrap();
-    assert_eq!(gi.len(), 16);
-    assert_eq!(u64::from_str_radix(&gi, 16).unwrap() & 1, 0);
+    assert_eq!(a.secret.as_deref().map(str::len), Some(44));
     assert_eq!(a.initial_up_to_date_node.as_deref(), Some("n1"));
 
     create_volume(&client, "rep-b", volume_spec(GIB, 2, "fast")).await;
@@ -159,9 +162,7 @@ async fn placement_and_allocation() {
         (l.replicas[0].node.as_str(), l.replicas[0].pool.as_deref()),
         ("n2", Some("p2"))
     );
-    assert!(
-        l.minor.is_none() && l.secret.is_none() && l.gi.is_none() && l.replicas[0].port.is_none()
-    );
+    assert!(l.minor.is_none() && l.secret.is_none() && l.replicas[0].port.is_none());
 
     // Two volumes created at once still get distinct minors.
     create_volume(&client, "burst-1", volume_spec(GIB, 2, "fast")).await;
@@ -235,17 +236,16 @@ async fn invalid_name_fails() {
     let (_env, client, _ctl) = setup(&assets, |_| {}).await;
     node(&client, "n1", true).await;
     pool(&client, "p1", "n1", "fast", 100 * GIB).await;
-    create_volume(&client, "bad.name", volume_spec(GIB, 1, "fast")).await;
-    let v = volume_where(&client, "bad.name", |v| phase_of(v) == VolumePhase::Failed).await;
+    // A valid Kubernetes name, one byte past the LV name bound.
+    let bad = "a".repeat(64);
+    create_volume(&client, &bad, volume_spec(GIB, 1, "fast")).await;
+    let v = volume_where(&client, &bad, |v| phase_of(v) == VolumePhase::Failed).await;
     assert_eq!(ready_reason(&v).as_deref(), Some("InvalidName"));
     assert!(v.spec.assignment.is_none());
     // Deletion is not blocked: there is nothing on any node.
-    delete_volume(&client, "bad.name").await;
+    delete_volume(&client, &bad).await;
     support::eventually(Duration::from_secs(20), || async {
-        get_volume(&client, "bad.name")
-            .await
-            .is_none()
-            .then_some(())
+        get_volume(&client, &bad).await.is_none().then_some(())
     })
     .await;
 }
@@ -378,6 +378,41 @@ async fn delete_blocked_by_stale_generation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn volume_lv_name_too_long_for_its_vg_fails_at_placement() {
+    let assets = require_envtest!();
+    let (_env, client, _ctl) = setup(&assets, |_| {}).await;
+    node(&client, "n1", true).await;
+    let vg = "g".repeat(90);
+    support::pool_with_vg(&client, "p1", "n1", "fast", 50 * GIB, &vg).await;
+    // 63 bytes, 31 dashes: 94 device-mapper bytes, with the VG over 127.
+    let vol = format!("v{}", "-v".repeat(31));
+    create_volume(&client, &vol, volume_spec(GIB, 1, "fast")).await;
+    let v = volume_where(&client, &vol, |v| phase_of(v) == VolumePhase::Failed).await;
+    assert_eq!(ready_reason(&v).as_deref(), Some("InvalidName"));
+    assert!(v.spec.assignment.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_lv_name_too_long_fails_before_any_round() {
+    let assets = require_envtest!();
+    let (_env, client, _ctl) = setup(&assets, |_| {}).await;
+    node(&client, "n1", true).await;
+    pool(&client, "p1", "n1", "fast", 50 * GIB).await;
+    // Valid names, but every dash doubles in the device-mapper name.
+    let vol = format!("v{}", "-v".repeat(31));
+    let snap = format!("s{}", "-s".repeat(31));
+    let mut spec = volume_spec(GIB, 1, "fast");
+    spec.node = Some("n1".into());
+    create_volume(&client, &vol, spec).await;
+    volume_where(&client, &vol, |v| v.spec.assignment.is_some()).await;
+    create_snapshot(&client, &snap, &vol).await;
+    let s = snapshot_where(&client, &snap, |s| snap_phase(s) == SnapshotPhase::Failed).await;
+    let e = s.status.unwrap().last_error.unwrap();
+    assert!(e.starts_with("pool p1: LV name vg/"), "{e}");
+    assert!(e.contains("device-mapper"), "{e}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_local_and_restore() {
     let assets = require_envtest!();
     let (_env, client, _ctl) = setup(&assets, |_| {}).await;
@@ -410,7 +445,9 @@ async fn snapshot_local_and_restore() {
     let s = snapshot_where(&client, "snap1", |s| snap_phase(s) == SnapshotPhase::Ready).await;
     assert!(s.status.unwrap().created_at.is_some());
 
-    // Restore lands where the snapshot lives, not on the emptier n2.
+    // Restore lands where the snapshot lives, not on the emptier n2, even
+    // with p1 too full for a new volume: it holds the data already.
+    support::pool_capacity(&client, "p1", "n1", 100 * GIB, 0).await;
     let mut spec = volume_spec(GIB, 1, "fast");
     spec.source = Some(VolumeSource {
         snapshot: "snap1".into(),
@@ -677,7 +714,6 @@ async fn assignment_write_conflict() {
         }],
         minor: None,
         secret: None,
-        gi: None,
         initial_up_to_date_node: None,
     };
     assert!(!controller::volume::write_assignment(&api, &stale, &a).await);
@@ -908,7 +944,6 @@ async fn taking_without_start_gets_one() {
         }],
         minor: None,
         secret: None,
-        gi: None,
         initial_up_to_date_node: None,
     };
     assert!(controller::volume::write_assignment(&vols, &v, &a).await);
@@ -947,4 +982,25 @@ async fn taking_without_start_gets_one() {
         started.elapsed()
     );
     assert!(s.status.unwrap().last_error.unwrap().contains("within 3 s"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pool_policy_defaults_from_the_api_server() {
+    let assets = require_envtest!();
+    let (_env, client, _ctl) = setup(&assets, |_| {}).await;
+    let ar = kube::api::ApiResource::erase::<Pool>(&());
+    let api: Api<kube::api::DynamicObject> = Api::all_with(client.clone(), &ar);
+    let obj: kube::api::DynamicObject = serde_json::from_value(json!({
+        "apiVersion": "r-drbd.io/v1alpha1",
+        "kind": "Pool",
+        "metadata": { "name": "bare" },
+        "spec": { "node": "n1", "tier": "fast", "vg": "vg", "thinPool": "thin" },
+    }))
+    .unwrap();
+    let got = api
+        .create(&kube::api::PostParams::default(), &obj)
+        .await
+        .expect("create pool");
+    assert_eq!(got.data["spec"]["overcommitPercent"], 100);
+    assert_eq!(got.data["spec"]["reservePercent"], 5);
 }

@@ -14,8 +14,8 @@ spec:
     spec:
       serviceAccountName: r-drbd-agent
       priorityClassName: system-node-critical
-      # The agent drains a running pass and in-flight CSI calls for up to 60 s each.
-      terminationGracePeriodSeconds: 90
+      # Above the agent's shutdown (60 s drain, 90 s LVM change wait, 5 s CSI); the only hard stop for a stuck LVM change.
+      terminationGracePeriodSeconds: 200
       hostNetwork: true
       hostPID: true
       dnsPolicy: ClusterFirstWithHostNet

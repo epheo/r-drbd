@@ -24,6 +24,8 @@ fn pool() -> Arc<Pool> {
             tier: "test".into(),
             vg: VG.into(),
             thin_pool: THIN.into(),
+            overcommit_percent: model::DEFAULT_OVERCOMMIT_PERCENT,
+            reserve_percent: model::DEFAULT_RESERVE_PERCENT,
         },
     );
     p.metadata.generation = Some(1);
@@ -54,7 +56,6 @@ fn volume(name: &str, size: u64, replicas: u32) -> Volume {
                 }],
                 minor: None,
                 secret: None,
-                gi: None,
                 initial_up_to_date_node: None,
             }),
         },
@@ -83,7 +84,6 @@ fn deleting<T: kube::Resource>(mut o: T) -> T {
 }
 
 fn reads(x: &ScriptedExec, rows: &[String]) {
-    expect_pvdisplay(x);
     expect_lvs(x, rows);
     expect_vgs(x);
 }
@@ -152,14 +152,10 @@ async fn pool_available_with_capacity() {
 #[tokio::test]
 async fn pool_unavailable_carries_stderr_and_drops_capacity() {
     let x = Arc::new(ScriptedExec::new());
-    let none = lvm::PvFilter(None);
-    let lvs = lvm::argv::lvs(&none, &[VG.to_owned()]);
-    let gone = || fail("  Volume group \"vg1\" not found");
-    let empty = || crate::exec::scripted::code(5, "", "");
-    x.expect(lvm::argv::pvdisplay_for_vg(VG), empty())
-        .expect(lvs.clone(), gone())
-        .expect(lvm::argv::pvdisplay_for_vg(VG), empty())
-        .expect(lvs, gone());
+    x.expect(
+        lvm::cmd::lvs(VG),
+        report_fail("Volume group \"vg1\" not found"),
+    );
     let w = run(&x, vec![], vec![]).await;
     let body = w[0].body();
     let cond = &body["status"]["conditions"][0];
@@ -169,6 +165,25 @@ async fn pool_unavailable_carries_stderr_and_drops_capacity() {
         "lvs: exit 5: Volume group \"vg1\" not found"
     );
     assert!(body["status"].get("totalBytes").is_none());
+}
+
+#[tokio::test]
+async fn unsupported_lvm_makes_pools_unavailable() {
+    let x = Arc::new(ScriptedExec::new());
+    let mut r = Reconciler::new(NODE, x.clone());
+    r.set_lvm_unsupported(Some("LVM too old".into()));
+    let w = r
+        .pass(&[pool()], &[Arc::new(volume("pvc-1", GIB, 1))], &[])
+        .await;
+    assert!(x.seen.lock().unwrap().is_empty());
+    let cond = &w[0].body()["status"]["conditions"][0];
+    assert_eq!(cond["status"], "False");
+    assert_eq!(cond["reason"], "LvmUnsupported");
+    assert_eq!(cond["message"], "LVM too old");
+    assert_eq!(
+        volume_writes(&w)[0].1.last_error.as_deref(),
+        Some("LVM too old")
+    );
 }
 
 #[tokio::test]
@@ -267,6 +282,8 @@ async fn pool_unchanged_writes_nothing() {
         free_bytes: Some(cap.free_bytes),
         chunk_bytes: Some(cap.chunk_bytes),
         volumes: vec!["owned-by-controller".into()],
+        committed_bytes: None,
+        placeable_bytes: None,
         conditions: vec![available.clone()],
         observed_generation: Some(1),
     });
@@ -282,12 +299,8 @@ async fn pool_unchanged_writes_nothing() {
 async fn create() {
     let x = Arc::new(ScriptedExec::new());
     reads(&x, &[]);
-    x.expect(
-        lvm::argv::lvcreate_thin(&filter(), VG, THIN, "pvc-1", GIB_KIB),
-        ok(""),
-    )
-    .expect(lvm::argv::activate(&filter(), VG, "pvc-1"), ok(""));
-    expect_lvs(&x, &[lv_row("pvc-1", GIB_KIB, "Vwi-a-tz--", "")]);
+    x.expect(lvm::cmd::create_thin(VG, THIN, "pvc-1", GIB, &[]), ok(""));
+    expect_lvs(&x, &[lv_row("pvc-1", GIB_KIB, St::Active)]);
     let w = run(&x, vec![volume("pvc-1", GIB, 1)], vec![]).await;
     assert_eq!(
         volume_writes(&w),
@@ -308,42 +321,22 @@ async fn create_rounds_up_to_extent() {
     reads(&x, &[]);
     let want = GIB_KIB + 4096;
     x.expect(
-        lvm::argv::lvcreate_thin(&filter(), VG, THIN, "pvc-1", want),
+        lvm::cmd::create_thin(VG, THIN, "pvc-1", want * 1024, &[]),
         ok(""),
-    )
-    .expect(lvm::argv::activate(&filter(), VG, "pvc-1"), ok(""));
-    expect_lvs(&x, &[lv_row("pvc-1", want, "Vwi-a-tz--", "")]);
+    );
+    expect_lvs(&x, &[lv_row("pvc-1", want, St::Active)]);
     run(&x, vec![volume("pvc-1", GIB + 1, 1)], vec![]).await;
 }
 
 #[tokio::test]
 async fn restore_then_grow() {
     let x = Arc::new(ScriptedExec::new());
-    let snap_lv = lv_row("pvc-1_snap-1", GIB_KIB, "Vri---tz-k", "pvc-1");
+    let snap_lv = lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive);
     reads(&x, std::slice::from_ref(&snap_lv));
-    x.expect(
-        lvm::argv::restore_thin(&filter(), VG, "pvc-1_snap-1", "pvc-2"),
-        ok(""),
-    )
-    .expect(lvm::argv::activate(&filter(), VG, "pvc-2"), ok(""));
-    expect_lvs(
-        &x,
-        &[
-            snap_lv.clone(),
-            lv_row("pvc-2", GIB_KIB, "Vwi-a-tz--", "pvc-1_snap-1"),
-        ],
-    );
-    x.expect(
-        lvm::argv::lvresize(&filter(), VG, "pvc-2", 2 * GIB_KIB),
-        ok(""),
-    );
-    expect_lvs(
-        &x,
-        &[
-            snap_lv,
-            lv_row("pvc-2", 2 * GIB_KIB, "Vwi-a-tz--", "pvc-1_snap-1"),
-        ],
-    );
+    x.expect(lvm::cmd::restore(VG, "pvc-1+snap-1", "pvc-2", &[]), ok(""));
+    expect_lvs(&x, &[snap_lv.clone(), lv_row("pvc-2", GIB_KIB, St::Active)]);
+    x.expect(lvm::cmd::extend(VG, "pvc-2", 2 * GIB), ok(""));
+    expect_lvs(&x, &[snap_lv, lv_row("pvc-2", 2 * GIB_KIB, St::Active)]);
     let mut v = volume("pvc-2", 2 * GIB, 1);
     v.spec.source = Some(VolumeSource {
         snapshot: "snap-1".into(),
@@ -379,7 +372,7 @@ async fn restore_without_snapshot_lv_is_an_error_not_an_empty_lv() {
     assert!(!e.present);
     assert_eq!(
         e.last_error.as_deref(),
-        Some("snapshot LV vg1/pvc-1_snap-1 not found on this node")
+        Some("snapshot LV vg1/pvc-1+snap-1 not found on this node")
     );
     assert_eq!(e.observed_generation, None);
 }
@@ -387,12 +380,9 @@ async fn restore_without_snapshot_lv_is_an_error_not_an_empty_lv() {
 #[tokio::test]
 async fn grow_only() {
     let x = Arc::new(ScriptedExec::new());
-    reads(&x, &[lv_row("pvc-1", GIB_KIB, "Vwi-a-tz--", "")]);
-    x.expect(
-        lvm::argv::lvresize(&filter(), VG, "pvc-1", 2 * GIB_KIB),
-        ok(""),
-    );
-    expect_lvs(&x, &[lv_row("pvc-1", 2 * GIB_KIB, "Vwi-aotz--", "")]);
+    reads(&x, &[lv_row("pvc-1", GIB_KIB, St::Active)]);
+    x.expect(lvm::cmd::extend(VG, "pvc-1", 2 * GIB), ok(""));
+    expect_lvs(&x, &[lv_row("pvc-1", 2 * GIB_KIB, St::Open)]);
     let w = run(&x, vec![volume("pvc-1", 2 * GIB, 1)], vec![]).await;
     let mut want = entry("pvc-1", 2 * GIB_KIB, Some(3));
     want.in_use = true;
@@ -402,7 +392,7 @@ async fn grow_only() {
 #[tokio::test]
 async fn adopt_existing_larger_never_shrinks() {
     let x = Arc::new(ScriptedExec::new());
-    reads(&x, &[lv_row("pvc-1", 2 * GIB_KIB, "Vwi-a-tz--", "")]);
+    reads(&x, &[lv_row("pvc-1", 2 * GIB_KIB, St::Active)]);
     let w = run(&x, vec![volume("pvc-1", GIB, 1)], vec![]).await;
     assert_eq!(
         volume_writes(&w),
@@ -413,9 +403,9 @@ async fn adopt_existing_larger_never_shrinks() {
 #[tokio::test]
 async fn adopt_inactive_activates() {
     let x = Arc::new(ScriptedExec::new());
-    reads(&x, &[lv_row("pvc-1", GIB_KIB, "Vwi---tz--", "")]);
-    x.expect(lvm::argv::activate(&filter(), VG, "pvc-1"), ok(""));
-    expect_lvs(&x, &[lv_row("pvc-1", GIB_KIB, "Vwi-a-tz--", "")]);
+    reads(&x, &[lv_row("pvc-1", GIB_KIB, St::Inactive)]);
+    x.expect(lvm::cmd::activate(VG, "pvc-1"), ok(""));
+    expect_lvs(&x, &[lv_row("pvc-1", GIB_KIB, St::Active)]);
     let w = run(&x, vec![volume("pvc-1", GIB, 1)], vec![]).await;
     assert_eq!(
         volume_writes(&w),
@@ -426,7 +416,7 @@ async fn adopt_inactive_activates() {
 #[tokio::test]
 async fn unchanged_entry_writes_nothing() {
     let x = Arc::new(ScriptedExec::new());
-    reads(&x, &[lv_row("pvc-1", GIB_KIB, "Vwi-a-tz--", "")]);
+    reads(&x, &[lv_row("pvc-1", GIB_KIB, St::Active)]);
     let mut v = volume("pvc-1", GIB, 1);
     v.status = Some(VolumeStatus {
         replicas: vec![entry("pvc-1", GIB_KIB, Some(3))],
@@ -439,9 +429,10 @@ async fn unchanged_entry_writes_nothing() {
 #[tokio::test]
 async fn delete() {
     let x = Arc::new(ScriptedExec::new());
-    reads(&x, &[lv_row("pvc-1", GIB_KIB, "Vwi-a-tz--", "")]);
-    x.expect(lvm::argv::deactivate(&filter(), VG, "pvc-1"), ok(""))
-        .expect(lvm::argv::lvremove(&filter(), VG, "pvc-1"), ok(""));
+    let row = lv_row("pvc-1", GIB_KIB, St::Active);
+    reads(&x, std::slice::from_ref(&row));
+    expect_lvs(&x, &[row]);
+    x.expect(lvm::cmd::remove(VG, "pvc-1"), ok(""));
     expect_lvs(&x, &[]);
     let w = run(&x, vec![deleting(volume("pvc-1", GIB, 1))], vec![]).await;
     assert_eq!(
@@ -461,10 +452,10 @@ async fn delete() {
 async fn failing_create_sets_last_error() {
     let x = Arc::new(ScriptedExec::new());
     reads(&x, &[]);
-    let create = lvm::argv::lvcreate_thin(&filter(), VG, THIN, "pvc-1", GIB_KIB);
-    x.expect(create.clone(), fail("  Insufficient free space"));
-    expect_pvdisplay(&x);
-    x.expect(create, fail("  Insufficient free space"));
+    x.expect(
+        lvm::cmd::create_thin(VG, THIN, "pvc-1", GIB, &[]),
+        fail("  Insufficient free space"),
+    );
     expect_lvs(&x, &[]);
     let w = run(&x, vec![volume("pvc-1", GIB, 1)], vec![]).await;
     let (_, e) = &volume_writes(&w)[0];
@@ -512,7 +503,7 @@ async fn replicated_without_drbd_and_foreign_volumes() {
     assert!(!v[0].1.present);
     assert_eq!(
         v[0].1.last_error.as_deref(),
-        Some("drbd-utils not found on this node")
+        Some("drbd-utils or the DRBD module not found on this node")
     );
     assert_eq!(snapshot_acks(&w), vec![]);
 }
@@ -520,16 +511,13 @@ async fn replicated_without_drbd_and_foreign_volumes() {
 #[tokio::test]
 async fn snapshot_taking() {
     let x = Arc::new(ScriptedExec::new());
-    reads(&x, &[lv_row("pvc-1", GIB_KIB, "Vwi-a-tz--", "")]);
-    x.expect(
-        lvm::argv::snapshot_thin(&filter(), VG, "pvc-1", "pvc-1_snap-1"),
-        ok(""),
-    );
+    reads(&x, &[lv_row("pvc-1", GIB_KIB, St::Active)]);
+    x.expect(lvm::cmd::snapshot(VG, "pvc-1", "pvc-1+snap-1"), ok(""));
     expect_lvs(
         &x,
         &[
-            lv_row("pvc-1", GIB_KIB, "Vwi-a-tz--", ""),
-            lv_row("pvc-1_snap-1", GIB_KIB, "Vri-a-tz-k", "pvc-1"),
+            lv_row("pvc-1", GIB_KIB, St::Active),
+            lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive),
         ],
     );
     let w = run(
@@ -559,8 +547,8 @@ async fn snapshot_taking_existing_lv_is_adopted() {
     reads(
         &x,
         &[
-            lv_row("pvc-1", GIB_KIB, "Vwi-a-tz--", ""),
-            lv_row("pvc-1_snap-1", GIB_KIB, "Vri---tz-k", "pvc-1"),
+            lv_row("pvc-1", GIB_KIB, St::Active),
+            lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive),
         ],
     );
     let w = run(
@@ -575,8 +563,10 @@ async fn snapshot_taking_existing_lv_is_adopted() {
 #[tokio::test]
 async fn snapshot_deleting_after_volume_is_gone() {
     let x = Arc::new(ScriptedExec::new());
-    reads(&x, &[lv_row("pvc-1_snap-1", GIB_KIB, "Vri---tz-k", "")]);
-    x.expect(lvm::argv::lvremove(&filter(), VG, "pvc-1_snap-1"), ok(""));
+    let snap_lv = lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive);
+    reads(&x, std::slice::from_ref(&snap_lv));
+    expect_lvs(&x, &[snap_lv]);
+    x.expect(lvm::cmd::remove(VG, "pvc-1+snap-1"), ok(""));
     expect_lvs(&x, &[]);
     let mut s = deleting(snapshot("snap-1", "pvc-1", SnapshotPhase::Ready));
     if let Some(st) = s.status.as_mut() {
@@ -610,7 +600,7 @@ async fn snapshot_deleting_not_ours_is_ignored() {
 #[tokio::test]
 async fn snapshot_suspend_of_local_volume_is_an_error() {
     let x = Arc::new(ScriptedExec::new());
-    reads(&x, &[lv_row("pvc-1", GIB_KIB, "Vwi-a-tz--", "")]);
+    reads(&x, &[lv_row("pvc-1", GIB_KIB, St::Active)]);
     let w = run(
         &x,
         vec![volume("pvc-1", GIB, 1)],
@@ -627,7 +617,7 @@ async fn snapshot_suspend_of_local_volume_is_an_error() {
 
 #[test]
 fn replica_entry_shape() {
-    let rows = lvm::report::lvs(&lv_row("pvc-1", 4096, "Vwi---tz--", "")).unwrap();
+    let rows = lvm::report::parse_lvs(&json("lv", &[lv_row("pvc-1", 4096, St::Inactive)])).unwrap();
     let e = replica_entry(NODE, rows.first(), Some(7), None);
     assert!(e.present);
     assert_eq!(e.device_path, None, "inactive LV has no device path");
@@ -638,18 +628,14 @@ fn replica_entry_shape() {
 }
 
 fn foreign_row(name: &str, pool_lv: &str) -> String {
-    format!("  {name};/dev/{VG}/{name};{GIB_KIB}.00;{VG};{pool_lv};0.00;-wi-a-----;;0.00;1;\n")
+    lv_in(name, GIB_KIB, pool_lv, St::Active)
 }
 
 #[tokio::test]
 async fn pool_without_zeroing_gets_it() {
     let x = Arc::new(ScriptedExec::new());
-    expect_pvdisplay(&x);
-    x.expect(
-        lvm::argv::lvs(&filter(), &[VG.to_owned()]),
-        ok(&pool_row().replace("twi-a-tz--", "twi-a-t---")),
-    )
-    .expect(lvm::argv::thinpool_zero(&filter(), VG, THIN), ok(""));
+    x.expect(lvm::cmd::lvs(VG), ok(&json("lv", &[pool_row_zero(false)])))
+        .expect(lvm::cmd::enable_zeroing(VG, THIN), ok(""));
     expect_lvs(&x, &[]);
     expect_vgs(&x);
     let w = run(&x, vec![], vec![]).await;
@@ -659,15 +645,11 @@ async fn pool_without_zeroing_gets_it() {
 #[tokio::test]
 async fn pool_zeroing_failure_is_unavailable() {
     let x = Arc::new(ScriptedExec::new());
-    expect_pvdisplay(&x);
-    let lvs_out = pool_row().replace("twi-a-tz--", "twi-a-t---");
-    let zero = lvm::argv::thinpool_zero(&filter(), VG, THIN);
-    x.expect(lvm::argv::lvs(&filter(), &[VG.to_owned()]), ok(&lvs_out))
-        .expect(zero.clone(), fail("  denied"));
-    expect_pvdisplay(&x);
-    x.expect(zero, fail("  denied"));
+    let lvs_out = json("lv", &[pool_row_zero(false)]);
+    x.expect(lvm::cmd::lvs(VG), ok(&lvs_out))
+        .expect(lvm::cmd::enable_zeroing(VG, THIN), fail("  denied"));
     // Orphan scan re-reads after the invalidation.
-    x.expect(lvm::argv::lvs(&filter(), &[VG.to_owned()]), ok(&lvs_out));
+    x.expect(lvm::cmd::lvs(VG), ok(&lvs_out));
     let w = run(&x, vec![], vec![]).await;
     let body = w[0].body();
     let cond = &body["status"]["conditions"][0];
@@ -717,8 +699,8 @@ async fn foreign_snapshot_lv_is_never_removed() {
     reads(
         &x,
         &[
-            lv_row("pvc-1", GIB_KIB, "Vwi-a-tz--", ""),
-            foreign_row("pvc-1_snap-1", ""),
+            lv_row("pvc-1", GIB_KIB, St::Active),
+            foreign_row("pvc-1+snap-1", ""),
         ],
     );
     let w = run(
@@ -735,8 +717,8 @@ async fn foreign_snapshot_lv_is_never_removed() {
 #[tokio::test]
 async fn foreign_restore_source_is_an_error() {
     let x = Arc::new(ScriptedExec::new());
-    reads(&x, &[foreign_row("pvc-1_snap-1", "")]);
-    expect_lvs(&x, &[foreign_row("pvc-1_snap-1", "")]);
+    reads(&x, &[foreign_row("pvc-1+snap-1", "")]);
+    expect_lvs(&x, &[foreign_row("pvc-1+snap-1", "")]);
     let mut v = volume("pvc-2", GIB, 1);
     v.spec.source = Some(VolumeSource {
         snapshot: "snap-1".into(),
@@ -757,7 +739,7 @@ async fn foreign_restore_source_is_an_error() {
 #[tokio::test]
 async fn restore_across_pools_is_an_error() {
     let x = Arc::new(ScriptedExec::new());
-    let snap_lv = lv_row("pvc-1_snap-1", GIB_KIB, "Vri---tz-k", "pvc-1");
+    let snap_lv = lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive);
     reads(&x, std::slice::from_ref(&snap_lv));
     expect_lvs(&x, &[snap_lv]);
     let mut v = volume("pvc-2", GIB, 1);
@@ -782,26 +764,15 @@ async fn restore_across_pools_is_an_error() {
     );
 }
 
-#[tokio::test]
-async fn delete_inactive_skips_deactivate() {
-    let x = Arc::new(ScriptedExec::new());
-    reads(&x, &[lv_row("pvc-1", GIB_KIB, "Vwi---tz--", "")]);
-    x.expect(lvm::argv::lvremove(&filter(), VG, "pvc-1"), ok(""));
-    expect_lvs(&x, &[]);
-    let w = run(&x, vec![deleting(volume("pvc-1", GIB, 1))], vec![]).await;
-    assert!(!volume_writes(&w)[0].1.present);
-}
-
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn failed_delete_keeps_observed_generation() {
     let x = Arc::new(ScriptedExec::new());
-    let row = lv_row("pvc-1", GIB_KIB, "Vwi-aotz--", "");
+    let row = lv_row("pvc-1", GIB_KIB, St::Open);
     reads(&x, std::slice::from_ref(&row));
-    let deact = lvm::argv::deactivate(&filter(), VG, "pvc-1");
-    x.expect(deact.clone(), fail("  Logical volume in use."));
-    expect_pvdisplay(&x);
-    x.expect(deact, fail("  Logical volume in use."));
-    expect_lvs(&x, std::slice::from_ref(&row));
+    // Every look at the open flag before giving up, then the re-read.
+    for _ in 0..5 {
+        expect_lvs(&x, std::slice::from_ref(&row));
+    }
     let mut v = deleting(volume("pvc-1", GIB, 1));
     v.metadata.generation = Some(4);
     v.status = Some(VolumeStatus {
@@ -814,7 +785,7 @@ async fn failed_delete_keeps_observed_generation() {
     assert_eq!(e.observed_generation, Some(3));
     assert_eq!(
         e.last_error.as_deref(),
-        Some("lvchange: exit 5: Logical volume in use.")
+        Some("lvremove: vg1/pvc-1 is open: still in use after 3s")
     );
 }
 
@@ -824,12 +795,13 @@ async fn phase_deleting_without_deletion_timestamp() {
     reads(
         &x,
         &[
-            lv_row("pvc-1", GIB_KIB, "Vwi-a-tz--", ""),
-            lv_row("pvc-1_snap-1", GIB_KIB, "Vri---tz-k", "pvc-1"),
+            lv_row("pvc-1", GIB_KIB, St::Active),
+            lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive),
         ],
     );
-    x.expect(lvm::argv::lvremove(&filter(), VG, "pvc-1_snap-1"), ok(""));
-    expect_lvs(&x, &[lv_row("pvc-1", GIB_KIB, "Vwi-a-tz--", "")]);
+    expect_lvs(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
+    x.expect(lvm::cmd::remove(VG, "pvc-1+snap-1"), ok(""));
+    expect_lvs(&x, &[lv_row("pvc-1", GIB_KIB, St::Active)]);
     let w = run(
         &x,
         vec![volume("pvc-1", GIB, 1)],
@@ -882,7 +854,7 @@ async fn missing_lv_of_restored_volume_is_not_recreated() {
         ..VolumeStatus::default()
     });
     let snaps = || vec![snapshot("snap-1", "pvc-0", SnapshotPhase::Ready)];
-    let snap_lv = lv_row("pvc-0_snap-1", GIB_KIB, "Vri---tz-k", "pvc-0");
+    let snap_lv = lv_row("pvc-0+snap-1", GIB_KIB, St::Inactive);
     let w = run(&x, vec![v.clone()], snaps()).await;
     let (_, e) = &volume_writes(&w)[0];
     assert!(!e.present);
@@ -916,20 +888,10 @@ async fn missing_lv_of_restored_volume_is_not_recreated() {
 #[tokio::test]
 async fn failed_restore_stays_retryable() {
     let x = Arc::new(ScriptedExec::new());
-    let snap_lv = lv_row("pvc-0_snap-1", GIB_KIB, "Vri---tz-k", "pvc-0");
+    let snap_lv = lv_row("pvc-0+snap-1", GIB_KIB, St::Inactive);
     reads(&x, std::slice::from_ref(&snap_lv));
-    x.expect(
-        lvm::argv::restore_thin(&filter(), VG, "pvc-0_snap-1", "pvc-1"),
-        ok(""),
-    )
-    .expect(lvm::argv::activate(&filter(), VG, "pvc-1"), ok(""));
-    expect_lvs(
-        &x,
-        &[
-            snap_lv.clone(),
-            lv_row("pvc-1", GIB_KIB, "Vwi-a-tz--", "pvc-0_snap-1"),
-        ],
-    );
+    x.expect(lvm::cmd::restore(VG, "pvc-0+snap-1", "pvc-1", &[]), ok(""));
+    expect_lvs(&x, &[snap_lv.clone(), lv_row("pvc-1", GIB_KIB, St::Active)]);
     let mut v = volume("pvc-1", GIB, 1);
     v.spec.source = Some(VolumeSource {
         snapshot: "snap-1".into(),
@@ -955,20 +917,10 @@ async fn failed_restore_stays_retryable() {
 #[tokio::test]
 async fn seeded_marker_does_not_block_restore() {
     let x = Arc::new(ScriptedExec::new());
-    let snap_lv = lv_row("pvc-1_snap-1", GIB_KIB, "Vri---tz-k", "pvc-1");
+    let snap_lv = lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive);
     reads(&x, std::slice::from_ref(&snap_lv));
-    x.expect(
-        lvm::argv::restore_thin(&filter(), VG, "pvc-1_snap-1", "pvc-2"),
-        ok(""),
-    )
-    .expect(lvm::argv::activate(&filter(), VG, "pvc-2"), ok(""));
-    expect_lvs(
-        &x,
-        &[
-            snap_lv,
-            lv_row("pvc-2", GIB_KIB, "Vwi-a-tz--", "pvc-1_snap-1"),
-        ],
-    );
+    x.expect(lvm::cmd::restore(VG, "pvc-1+snap-1", "pvc-2", &[]), ok(""));
+    expect_lvs(&x, &[snap_lv, lv_row("pvc-2", GIB_KIB, St::Active)]);
     let mut v = volume("pvc-2", GIB, 1);
     v.spec.source = Some(VolumeSource {
         snapshot: "snap-1".into(),
@@ -993,12 +945,8 @@ async fn seeded_marker_does_not_block_restore() {
 async fn marker_without_prior_presence_creates() {
     let x = Arc::new(ScriptedExec::new());
     reads(&x, &[]);
-    x.expect(
-        lvm::argv::lvcreate_thin(&filter(), VG, THIN, "pvc-1", GIB_KIB),
-        ok(""),
-    )
-    .expect(lvm::argv::activate(&filter(), VG, "pvc-1"), ok(""));
-    expect_lvs(&x, &[lv_row("pvc-1", GIB_KIB, "Vwi-a-tz--", "")]);
+    x.expect(lvm::cmd::create_thin(VG, THIN, "pvc-1", GIB, &[]), ok(""));
+    expect_lvs(&x, &[lv_row("pvc-1", GIB_KIB, St::Active)]);
     let mut v = volume("pvc-1", GIB, 1);
     v.status = Some(VolumeStatus {
         file_system: Some("xfs".into()),
@@ -1025,13 +973,10 @@ async fn lv_lost_survives_a_transient_error() {
 
     // lvs fails: the loss must survive it.
     let x = Arc::new(ScriptedExec::new());
-    let lvs = lvm::argv::lvs(&lvm::PvFilter(None), &[VG.to_owned()]);
-    let gone = || fail("  Volume group \"vg1\" not found");
-    let empty = || crate::exec::scripted::code(5, "", "");
-    x.expect(lvm::argv::pvdisplay_for_vg(VG), empty())
-        .expect(lvs.clone(), gone())
-        .expect(lvm::argv::pvdisplay_for_vg(VG), empty())
-        .expect(lvs, gone());
+    x.expect(
+        lvm::cmd::lvs(VG),
+        report_fail("Volume group \"vg1\" not found"),
+    );
     if let Some(st) = v.status.as_mut() {
         st.replicas = vec![lost.clone()];
     }
@@ -1091,13 +1036,4 @@ fn lv_lost_is_never_double_wrapped() {
     };
     assert_eq!(keep_lost(Some(&healthy), "x".into()), "x");
     assert_eq!(keep_lost(None, "x".into()), "x");
-}
-
-#[test]
-fn sticky_md_check_unwraps_a_transient_wrap() {
-    let md = "metadata of another volume on the LV";
-    assert_eq!(unwrap_rebuild(&format!("{LV_LOST}; {md}")), md);
-    assert_eq!(unwrap_rebuild(&format!("{LV_LOST}; rebuild: {md}")), md);
-    assert_eq!(unwrap_rebuild(LV_LOST), LV_LOST);
-    assert_eq!(unwrap_rebuild(md), md);
 }

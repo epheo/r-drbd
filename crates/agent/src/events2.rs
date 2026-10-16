@@ -134,8 +134,8 @@ pub fn parse_line(line: &str) -> Result<Option<Line>, ParseError> {
     }))
 }
 
-/// A `call helper` or `response helper` line. The fixed [`Line`] model has
-/// no helper object, so these parse separately.
+/// A `call helper` or `response helper` line: no object type after the
+/// action, so it parses apart from [`Line`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelperLine {
     pub call: bool,
@@ -295,26 +295,41 @@ pub enum TrackError {
     Parse(#[from] ParseError),
     #[error("{kind} not tracked: {name}")]
     Unknown { kind: &'static str, name: String },
+    /// State is built from the dump alone; a change seen before its end
+    /// makes the dump unreliable, so the stream starts over.
+    #[error("change before the end of the initial dump")]
+    BeforeDump,
 }
 
 /// What one applied line changed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Applied {
-    /// Resources whose state changed (several when the dump gate replays).
+    /// Resources whose state changed (every tracked one when the dump ends).
     pub resources: Vec<String>,
     /// The end-of-dump marker made the state available.
     pub became_available: bool,
 }
 
+/// Consecutive streams ended by a change during the dump before the
+/// tracker queues such changes instead: a host whose dump keeps racing
+/// changes would otherwise never get state.
+pub const QUEUE_AFTER_RESTARTS: u32 = 3;
+/// Bound on the queued changes; more ends the stream again.
+pub const QUEUE_MAX: usize = 4096;
+
 /// Tracked DRBD state for all resources on this node. Unavailable until the
 /// initial dump ends; [`Tracker::reset`] on every stream restart
-/// clears everything.
+/// clears everything but the split-brain marks it can carry over.
 #[derive(Debug, Default)]
 pub struct Tracker {
     available: bool,
-    queued: Vec<Line>,
     resources: BTreeMap<String, Resource>,
     dirty: BTreeSet<String>,
+    /// (resource, connection) marked split brain before the last restart.
+    split_brain_before: BTreeSet<(String, String)>,
+    /// Streams in a row ended by a change before the dump end.
+    before_dump_restarts: u32,
+    queued: Vec<Line>,
 }
 
 impl Tracker {
@@ -335,12 +350,29 @@ impl Tracker {
         std::mem::take(&mut self.dirty)
     }
 
+    /// The dump shows no split-brain helper call, so a connection marked
+    /// before the restart keeps its mark when the new dump still shows it
+    /// StandAlone; anything else in the dump drops the mark.
     pub fn reset(&mut self) {
         let names: Vec<String> = self.resources.keys().cloned().collect();
+        self.split_brain_before = self
+            .resources
+            .iter()
+            .flat_map(|(r, res)| {
+                res.connections
+                    .iter()
+                    .filter(|(_, c)| c.split_brain)
+                    .map(move |(c, _)| (r.clone(), c.clone()))
+            })
+            .collect();
         self.available = false;
-        self.queued.clear();
         self.resources.clear();
+        self.queued.clear();
         self.dirty.extend(names);
+    }
+
+    pub fn before_dump_restarts(&self) -> u32 {
+        self.before_dump_restarts
     }
 
     /// Parse and apply one raw line.
@@ -349,12 +381,12 @@ impl Tracker {
             return Ok(self.helper(&h));
         }
         match parse_line(raw)? {
-            Some(line) => self.apply(line),
+            Some(line) => self.apply(&line),
             None => Ok(Applied::default()),
         }
     }
 
-    /// Live events, never queued; a helper for an object not tracked is
+    /// Live events only; a helper for an object not tracked is
     /// dropped (the dump will show its state).
     fn helper(&mut self, h: &HelperLine) -> Applied {
         let hit = h.helper == "split-brain"
@@ -373,29 +405,47 @@ impl Tracker {
         }
     }
 
-    /// Before the end-of-dump marker only `exists` lines apply; the rest
-    /// queue in order and replay when the marker arrives.
-    pub fn apply(&mut self, line: Line) -> Result<Applied, TrackError> {
+    /// Before the end-of-dump marker only `exists` lines are accepted; a
+    /// change ends the stream, or after [`QUEUE_AFTER_RESTARTS`] such ends
+    /// in a row waits in a bounded queue for the dump end.
+    pub fn apply(&mut self, line: &Line) -> Result<Applied, TrackError> {
         if line.object == Object::EndOfDump {
             if self.available {
                 return Ok(Applied::default());
             }
             self.available = true;
-            let mut applied = Applied {
-                became_available: true,
-                ..Applied::default()
-            };
-            for l in std::mem::take(&mut self.queued) {
-                applied.resources.extend(self.apply_now(&l)?);
+            for (r, c) in std::mem::take(&mut self.split_brain_before) {
+                if let Some(conn) = self
+                    .resources
+                    .get_mut(&r)
+                    .and_then(|x| x.connections.get_mut(&c))
+                    .filter(|x| x.state == "StandAlone")
+                {
+                    conn.split_brain = true;
+                }
             }
-            return Ok(applied);
+            let queued = std::mem::take(&mut self.queued);
+            if queued.is_empty() {
+                self.before_dump_restarts = 0;
+            }
+            for l in &queued {
+                self.apply_now(l)?;
+            }
+            return Ok(Applied {
+                resources: self.resources.keys().cloned().collect(),
+                became_available: true,
+            });
         }
         if !self.available && line.action != Action::Exists {
-            self.queued.push(line);
+            if self.before_dump_restarts < QUEUE_AFTER_RESTARTS || self.queued.len() >= QUEUE_MAX {
+                self.before_dump_restarts = self.before_dump_restarts.saturating_add(1);
+                return Err(TrackError::BeforeDump);
+            }
+            self.queued.push(line.clone());
             return Ok(Applied::default());
         }
         Ok(Applied {
-            resources: self.apply_now(&line)?.into_iter().collect(),
+            resources: self.apply_now(line)?.into_iter().collect(),
             became_available: false,
         })
     }
@@ -636,7 +686,7 @@ mod tests {
             }
         );
 
-        let l = parse_line("change device name:r0 volume:0 minor:1999 backing_dev:/dev/vg/lv disk:UpToDate client:no quorum:no")
+        let l = parse_line("change device name:r0 volume:0 minor:51999 backing_dev:/dev/vg/lv disk:UpToDate client:no quorum:no")
             .unwrap()
             .unwrap();
         assert_eq!(l.action, Action::Change);
@@ -649,12 +699,12 @@ mod tests {
         );
         // Split at the first colon only.
         let l = parse_line(
-            "exists path name:r0 peer-node-id:1 conn-name:ghost local:ipv4:10.0.0.1:7000",
+            "exists path name:r0 peer-node-id:1 conn-name:ghost local:ipv4:10.0.0.1:11000",
         )
         .unwrap()
         .unwrap();
         assert_eq!(l.object, Object::Ignored);
-        assert_eq!(l.fields[3], (s("local"), s("ipv4:10.0.0.1:7000")));
+        assert_eq!(l.fields[3], (s("local"), s("ipv4:10.0.0.1:11000")));
 
         let l =
             parse_line("destroy peer-device name:r0 peer-node-id:1 conn-name:ghost volume:0 junk")
@@ -705,35 +755,28 @@ mod tests {
     const DUMP: &[&str] = &[
         "exists resource name:r0 role:Secondary suspended:quorum force-io-failures:no may_promote:no promotion_score:0",
         "exists connection name:r0 peer-node-id:1 conn-name:ghost connection:Connecting role:Unknown",
-        "exists device name:r0 volume:0 minor:1999 backing_dev:/dev/vg/r0 disk:UpToDate client:no open:no quorum:no",
+        "exists device name:r0 volume:0 minor:51999 backing_dev:/dev/vg/r0 disk:UpToDate client:no open:no quorum:no",
         "exists peer-device name:r0 peer-node-id:1 conn-name:ghost volume:0 replication:Off peer-disk:DUnknown peer-client:no resync-suspended:no",
-        "exists path name:r0 peer-node-id:1 conn-name:ghost local:ipv4:192.0.2.2:7999 peer:ipv4:192.0.2.1:7999 established:no",
+        "exists path name:r0 peer-node-id:1 conn-name:ghost local:ipv4:192.0.2.2:11999 peer:ipv4:192.0.2.1:11999 established:no",
     ];
 
     #[test]
-    fn initial_dump_gate_and_replay() {
+    fn initial_dump_only() {
         let mut t = Tracker::default();
         for l in DUMP {
             t.feed(l).unwrap();
         }
-        // Arrives during the dump: queued, not applied.
-        let a = t
-            .feed("change resource name:r0 role:Primary suspended:no")
-            .unwrap();
-        assert_eq!(a, Applied::default());
         assert!(!t.is_available());
-        assert_eq!(t.resource("r0").unwrap().role.as_deref(), Some("Secondary"));
-
         let a = t.feed("exists -").unwrap();
         assert!(a.became_available);
         assert_eq!(a.resources, vec![s("r0")]);
         let r = t.resource("r0").unwrap();
-        assert_eq!(r.role.as_deref(), Some("Primary"));
-        assert_eq!(r.suspended, Vec::<String>::new());
+        assert_eq!(r.role.as_deref(), Some("Secondary"));
+        assert_eq!(r.suspended, vec![s("quorum")]);
         assert_eq!(r.connections["ghost"].peer_node_id, Some(1));
         assert_eq!(r.connections["ghost"].state, "Connecting");
         assert_eq!(r.devices[&0].disk.as_deref(), Some("UpToDate"));
-        assert_eq!(r.devices[&0].minor, Some(1999));
+        assert_eq!(r.devices[&0].minor, Some(51999));
         assert_eq!(r.devices[&0].quorum, Some(false));
         assert_eq!(
             r.peer_devices[&(s("ghost"), 0)].replication.as_deref(),
@@ -744,6 +787,60 @@ mod tests {
             vec![s("r0")]
         );
         assert!(t.take_dirty().is_empty());
+        // A second marker changes nothing.
+        assert_eq!(t.feed("exists -").unwrap(), Applied::default());
+    }
+
+    #[test]
+    fn change_during_the_dump_ends_the_stream_then_queues() {
+        let mut t = Tracker::default();
+        for n in 1..=QUEUE_AFTER_RESTARTS {
+            t.reset();
+            t.feed(DUMP[0]).unwrap();
+            assert_eq!(
+                t.feed("change resource name:r0 role:Primary"),
+                Err(TrackError::BeforeDump)
+            );
+            assert_eq!(t.before_dump_restarts(), n);
+            assert_eq!(t.resource("r0").unwrap().role.as_deref(), Some("Secondary"));
+        }
+        // Racing for the third time in a row: queued and replayed.
+        t.reset();
+        t.feed(DUMP[0]).unwrap();
+        t.feed("change resource name:r0 role:Primary").unwrap();
+        assert_eq!(t.resource("r0").unwrap().role.as_deref(), Some("Secondary"));
+        t.feed("exists -").unwrap();
+        assert_eq!(t.resource("r0").unwrap().role.as_deref(), Some("Primary"));
+        assert_eq!(t.before_dump_restarts(), QUEUE_AFTER_RESTARTS);
+        // A clean dump starts the count over.
+        t.reset();
+        t.feed("exists -").unwrap();
+        assert_eq!(t.before_dump_restarts(), 0);
+    }
+
+    #[test]
+    fn split_brain_mark_survives_a_restart_while_standalone() {
+        let mut t = Tracker::default();
+        for l in DUMP {
+            t.feed(l).unwrap();
+        }
+        t.feed("exists -").unwrap();
+        t.feed("call helper name:r0 peer-node-id:1 conn-name:ghost helper:split-brain")
+            .unwrap();
+        t.feed("change connection name:r0 conn-name:ghost connection:StandAlone")
+            .unwrap();
+        t.reset();
+        t.feed(DUMP[0]).unwrap();
+        t.feed("exists connection name:r0 peer-node-id:1 conn-name:ghost connection:StandAlone")
+            .unwrap();
+        t.feed("exists -").unwrap();
+        assert!(t.resource("r0").unwrap().connections["ghost"].split_brain);
+        // Connecting in the next dump: the mark is gone.
+        t.reset();
+        t.feed(DUMP[0]).unwrap();
+        t.feed(DUMP[1]).unwrap();
+        t.feed("exists -").unwrap();
+        assert!(!t.resource("r0").unwrap().connections["ghost"].split_brain);
     }
 
     #[test]

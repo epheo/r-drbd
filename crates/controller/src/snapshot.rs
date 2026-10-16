@@ -331,7 +331,7 @@ async fn reconcile(
         .await;
         return None;
     }
-    let (Some(v), Some(_)) = (volume.as_deref(), assignment) else {
+    let (Some(v), Some(a)) = (volume.as_deref(), assignment) else {
         let error = format!("volume {} not found or not placed yet", s.spec.volume);
         let phase = if current.phase == SnapshotPhase::Pending {
             SnapshotPhase::Pending
@@ -350,6 +350,23 @@ async fn reconcile(
         .await;
         return None;
     };
+    // Before any suspend: a snapshot LV name LVM would refuse in some
+    // replica's VG fails the snapshot here, not in Taking with IO suspended.
+    if current.phase == SnapshotPhase::Pending
+        && let Some(error) = lv_name_problem(ctx, &a, &s.spec.volume, &name)
+    {
+        write(
+            api,
+            s,
+            Owned {
+                phase: SnapshotPhase::Failed,
+                last_error: Some(error),
+                ..current
+            },
+        )
+        .await;
+        return None;
+    }
     // A bounded phase without a start (written by hand or by an older
     // controller): the bound starts now, persisted so it does not slide.
     if bound(ctx, current.phase).is_some() && current.phase_since.is_none() {
@@ -366,6 +383,27 @@ async fn reconcile(
         return bound(ctx, current.phase);
     }
     step(ctx, memory, api, s, v, &diskful, current).await
+}
+
+/// Why the snapshot LV cannot be made in the VG of some diskful replica.
+/// A Pool not in the store yet is skipped; the agents check again before
+/// they suspend.
+fn lv_name_problem(
+    ctx: &Ctx<'_>,
+    a: &model::Assignment,
+    volume: &str,
+    snapshot: &str,
+) -> Option<String> {
+    let lv = lvm::names::snapshot_lv(volume, snapshot);
+    a.replicas
+        .iter()
+        .filter(|r| r.role == Role::Diskful)
+        .filter_map(|r| ctx.stores.pool(r.pool.as_deref()?))
+        .find_map(|p| {
+            lvm::names::check_new_lv(&p.spec.vg, &lv)
+                .err()
+                .map(|e| format!("pool {}: {e}", p.name_any()))
+        })
 }
 
 /// One state machine step for a snapshot whose volume is placed.

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use drbd_config::{ToolVersions, Version};
+use drbd_config::Features;
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
 use k8s_openapi::api::core::v1::Node;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta};
@@ -22,6 +22,9 @@ pub struct Tools {
     pub lvm: Option<String>,
     pub drbd_utils: Option<String>,
     pub drbd_kernel: Option<String>,
+    /// Optional resource file settings drbdsetup knows; probed only when
+    /// drbd-utils are present.
+    pub drbd_features: Features,
 }
 
 impl Tools {
@@ -36,29 +39,25 @@ impl Tools {
         .collect()
     }
 
-    /// For the DRBD renderer: both versions or nothing.
-    pub fn drbd_versions(&self) -> Option<ToolVersions> {
-        Some(ToolVersions {
-            kernel: parse_version(self.drbd_kernel.as_deref()?)?,
-            utils: parse_version(self.drbd_utils.as_deref()?)?,
-        })
+    /// DRBD work needs the tools and the loaded module (drbdadm prints the
+    /// kernel version only when the module is loaded).
+    pub fn drbd(&self) -> Option<Features> {
+        (self.drbd_utils.is_some() && self.drbd_kernel.is_some()).then_some(self.drbd_features)
     }
 }
 
 /// First `X.Y.Z` token in `s`: `2.03.41(2)-RHEL10` gives `2.03.41`.
 pub fn version_token(s: &str) -> Option<&str> {
     s.split(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .find(|tok| parse_version(tok).is_some())
+        .find(|tok| is_version(tok))
 }
 
-pub fn parse_version(tok: &str) -> Option<Version> {
-    let mut it = tok.split('.');
-    let v = Version {
-        major: it.next()?.parse().ok()?,
-        minor: it.next()?.parse().ok()?,
-        patch: it.next()?.parse().ok()?,
-    };
-    it.next().is_none().then_some(v)
+fn is_version(tok: &str) -> bool {
+    let parts: Vec<&str> = tok.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn drbdadm_field(stdout: &str, key: &str) -> Option<String> {
@@ -148,8 +147,25 @@ pub async fn probe(exec: &dyn Exec) -> Tools {
         }
         Err(e) => tracing::info!(error = %e, "drbd-utils not found"),
     }
+    if tools.drbd_utils.is_some() {
+        tools.drbd_features = probe_features(exec).await;
+    }
     tracing::info!(?tools, "tool probe");
     tools
+}
+
+/// Reads the usage text of the drbdsetup commands that own each optional
+/// setting: what the installed tools accept, not what a version implies.
+async fn probe_features(exec: &dyn Exec) -> Features {
+    let mut texts: [String; 3] = Default::default();
+    for (text, (command, _)) in texts.iter_mut().zip(crate::drbd::FEATURE_PROBES) {
+        match run_any(exec, &crate::drbd::argv::help(command), DEFAULT_TIMEOUT).await {
+            // drbdsetup help exits non-zero on some versions; the text decides.
+            Ok(out) => *text = format!("{}{}", out.stdout, out.stderr),
+            Err(e) => tracing::warn!(command, error = %e, "drbdsetup help failed"),
+        }
+    }
+    crate::drbd::features([&texts[0], &texts[1], &texts[2]])
 }
 
 /// Server-side apply of the r-drbd.io annotations this agent owns; a tool
@@ -281,6 +297,7 @@ mod tests {
             Some("2.03.41")
         );
         assert_eq!(version_token("none 1.2"), None);
+        assert_eq!(version_token("1.2.3.4 9.35.0"), Some("9.35.0"));
         assert_eq!(
             drbdadm_field(DRBDADM, "DRBD_KERNEL_VERSION").as_deref(),
             Some("9.2.16")
@@ -294,15 +311,27 @@ mod tests {
             &["lvm", "version"],
             ok("  LVM version:     2.03.41(2)-RHEL10 (2026-05-15)\n  Library version: 1.02.215\n"),
         )
-        .expect_s(&["drbdadm", "--version"], ok(DRBDADM));
+        .expect_s(&["drbdadm", "--version"], ok(DRBDADM))
+        .expect_s(
+            &["drbdsetup", "help", "peer-device-options"],
+            ok("    [--resync-without-replication={yes|no}] [--peer-tiebreaker={yes|no}]\n"),
+        )
+        .expect_s(
+            &["drbdsetup", "help", "attach"],
+            ok("    [--rs-discard-granularity=(0 ... 1048576)] [--bitmap={yes|no}]\n"),
+        )
+        .expect_s(
+            &["drbdsetup", "help", "resource-options"],
+            ok("    [--quorum={off|majority|all}|(1 ... 32)]\n"),
+        );
         let tools = probe(&x).await;
         x.assert_done();
         assert_eq!(
-            tools.drbd_versions().map(|v| v.kernel),
-            Some(Version {
-                major: 9,
-                minor: 2,
-                patch: 16
+            tools.drbd(),
+            Some(Features {
+                tiebreaker: true,
+                discard_granularity: true,
+                suspended_primary_outdated: false,
             })
         );
         assert_eq!(

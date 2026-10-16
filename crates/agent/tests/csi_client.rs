@@ -26,7 +26,7 @@ async fn drive() {
     };
     let volume = env("CSI_VOLUME").expect("CSI_VOLUME");
     let step = env("CSI_STEP").unwrap_or_else(|| "up".into());
-    let mnt = env("CSI_MNT").unwrap_or_else(|| "/var/lib/rdrbd-dev/mnt".into());
+    let mnt = env("CSI_MNT").unwrap_or_else(|| "/var/tmp/r-drbd-hosttest/mnt".into());
     let staging = format!("{mnt}/staging/{volume}");
     let target = format!("{mnt}/pods/{volume}/mount");
 

@@ -236,10 +236,21 @@ fn move_diskful(i: &Input<'_>, gone: &AssignedReplica) -> Step {
         pool: i.spec.pool.clone(),
         node: None,
         existing: Vec::new(),
+        holds_data: false,
     };
+    let mut full: Vec<String> = Vec::new();
     let chosen = match placer::place(&req, &pools) {
         placer::Outcome::Placed { diskful, .. } => diskful.into_iter().next(),
-        _ => None,
+        placer::Outcome::Insufficient { rejected, .. } => {
+            full.extend(
+                rejected
+                    .iter()
+                    .filter(|r| r.reason == placer::Reason::NoCapacity)
+                    .map(|r| r.pool.clone()),
+            );
+            None
+        }
+        placer::Outcome::AlreadyPlaced => None,
     };
     let Some(chosen) = chosen else {
         // Departing nodes are skipped only until their agent drops the old
@@ -257,6 +268,12 @@ fn move_diskful(i: &Input<'_>, gone: &AssignedReplica) -> Step {
         let mut why = format!("no pool for tier {} outside {node}", i.spec.tier);
         if !leaving.is_empty() {
             why = format!("{why} (departing: {})", leaving.join(", "));
+        }
+        if !full.is_empty() {
+            why = format!(
+                "{why} (no room under the capacity policy: {})",
+                full.join(", ")
+            );
         }
         return blocked(node, why);
     };

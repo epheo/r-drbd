@@ -98,7 +98,7 @@ CSI calls wait for Ready up to 30 s, then return an error; the CSI sidecars retr
 ## Deleting
 
 Deleting the PVC (reclaim policy Delete) deletes the Volume.
-Each agent takes DRBD down, wipes its metadata and removes the LV.
+Each agent takes DRBD down and removes the LV.
 The Volume's finalizer stays until every replica reports it gone.
 
 A replica on an unreachable node keeps the Volume in Deleting until that node comes back.

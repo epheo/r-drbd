@@ -9,23 +9,69 @@ use tokio::process::{Child, Command};
 
 use crate::{Exec, ExecError, ExecMode, Output};
 
-/// Defaults: wait 45 s, then SIGTERM and 15 s, then SIGKILL and 5 s.
+/// Kernel-facing tools (drbdadm, blockdev, blkid, mount): milliseconds,
+/// unless a device or a DRBD state change holds them for tens of seconds.
+/// Past a minute the device is stuck and the next pass retries.
+/// Stopping them leaves nothing half done, so the grace is short.
 pub const DEFAULT_TIMEOUT: ExecMode = ExecMode::Timeout {
-    wait: Duration::from_secs(45),
-    term: Duration::from_secs(15),
+    wait: Duration::from_secs(60),
+    term: Duration::from_secs(10),
     kill: Duration::from_secs(5),
 };
 
-/// mkfs on a large thin LV with -K writes only metadata, but leave room.
+/// lvs and vgs read one VG's metadata from a few devices and wait only on
+/// the VG lock. The agent runs one LVM command at a time, so only an
+/// outside command holds that lock; 30 s means the VG is stuck.
+pub const LVM_REPORT_TIMEOUT: ExecMode = ExecMode::Timeout {
+    wait: Duration::from_secs(30),
+    term: Duration::from_secs(10),
+    kill: Duration::from_secs(5),
+};
+
+/// lvcreate, lvextend, lvremove and lvchange suspend and resume the thin
+/// pool, commit its metadata with synchronous writes and wait for udev;
+/// on a pool busy with writes each step queues behind them.
+/// `Finish`: a SIGKILL while the pool is suspended leaves every LV in it
+/// hanging, so the process is never killed; 90 s bounds only how long the
+/// caller waits for it.
+pub const LVM_CHANGE_TIMEOUT: ExecMode = ExecMode::Finish {
+    wait: LVM_CHANGE_WAIT,
+};
+pub const LVM_CHANGE_WAIT: Duration = Duration::from_secs(90);
+
+/// After a `Finish` process exits, how long a grandchild may hold its pipes.
+const FINISH_PIPE_DRAIN: Duration = Duration::from_secs(5);
+
+/// mkfs.xfs -K skips the discard but still writes the log (up to 2 GiB) and
+/// every AG header, through DRBD protocol C at replication link speed:
+/// 2 GiB at a degraded 10 MB/s is about 200 s, doubled for margin.
+/// Stopping it is harmless: the mkfs label marks the format unfinished.
 pub const MKFS_TIMEOUT: ExecMode = ExecMode::Timeout {
-    wait: Duration::from_secs(300),
-    term: Duration::from_secs(15),
+    wait: Duration::from_secs(420),
+    term: Duration::from_secs(10),
     kill: Duration::from_secs(5),
 };
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct TokioExec {
     prefix: Vec<String>,
+    /// Count of `Finish` processes still running.
+    finishing: Arc<tokio::sync::watch::Sender<usize>>,
+}
+
+impl Default for TokioExec {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+/// Counts one `Finish` process until it is reaped, whatever ends the task.
+struct Finishing(Arc<tokio::sync::watch::Sender<usize>>);
+
+impl Drop for Finishing {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n = n.saturating_sub(1));
+    }
 }
 
 impl TokioExec {
@@ -35,7 +81,46 @@ impl TokioExec {
     pub fn new(prefix: Option<Vec<String>>) -> Self {
         Self {
             prefix: prefix.unwrap_or_default(),
+            finishing: Arc::new(tokio::sync::watch::channel(0).0),
         }
+    }
+
+    async fn finish(&self, cmd: Spawn, wait: Duration) -> Result<Output, ExecError> {
+        let argv = cmd.argv.clone();
+        self.finishing.send_modify(|n| *n += 1);
+        let guard = Finishing(self.finishing.clone());
+        let (pid_tx, pid_rx) = tokio::sync::oneshot::channel();
+        // Spawned: dropping this future drops only the JoinHandle, never the
+        // task that owns and reaps the child.
+        let mut task = tokio::spawn(async move {
+            let _guard = guard;
+            cmd.finish(pid_tx).await
+        });
+        if let Ok(joined) = tokio::time::timeout(wait, &mut task).await {
+            return joined.unwrap_or_else(|e| {
+                Err(ExecError::Spawn(
+                    argv[0].clone(),
+                    std::io::Error::other(e.to_string()),
+                ))
+            });
+        }
+        // LVM defers SIGTERM while devices are suspended. The command may
+        // still complete after this error; callers re-read on the next pass.
+        if let Ok(pid) = pid_rx.await
+            && let Some(pid) = rustix::process::Pid::from_raw(pid)
+        {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+        }
+        tracing::warn!(argv = ?argv, ?wait, "command still running after its wait, left to finish");
+        Err(ExecError::Timeout(wait, argv.join(" ")))
+    }
+
+    /// True once no `Finish` process runs, false if some still do after `limit`.
+    pub async fn wait_idle(&self, limit: Duration) -> bool {
+        let mut rx = self.finishing.subscribe();
+        tokio::time::timeout(limit, rx.wait_for(|n| *n == 0))
+            .await
+            .is_ok_and(|r| r.is_ok())
     }
 }
 
@@ -48,28 +133,86 @@ impl Exec for TokioExec {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty argv"),
             ));
         };
-        let ExecMode::Timeout { wait, term, kill } = mode else {
-            return Err(ExecError::Spawn(
-                program,
+        let (spawn_program, spawn_args) = match self.prefix.split_first() {
+            Some((first, rest)) => (first.clone(), [rest, argv].concat()),
+            None => (program, argv[1..].to_vec()),
+        };
+        let cmd = Spawn {
+            argv: argv.to_vec(),
+            program: spawn_program,
+            args: spawn_args,
+        };
+        match mode {
+            ExecMode::Timeout { wait, term, kill } => cmd.supervise(wait, term, kill).await,
+            ExecMode::Finish { wait } => self.finish(cmd, wait).await,
+            _ => Err(ExecError::Spawn(
+                argv[0].clone(),
                 std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     format!("exec mode {mode:?} is not implemented yet"),
                 ),
-            ));
-        };
+            )),
+        }
+    }
+}
+
+/// One command: the argv logs and errors name, and what is spawned.
+struct Spawn {
+    argv: Vec<String>,
+    program: String,
+    args: Vec<String>,
+}
+
+impl Spawn {
+    /// Runs to the end, never signalled from here; the pid goes out first.
+    async fn finish(self, pid_tx: tokio::sync::oneshot::Sender<i32>) -> Result<Output, ExecError> {
+        let name = self.argv[0].clone();
         let started = Instant::now();
-        let (spawn_program, spawn_args) = match self.prefix.split_first() {
-            Some((first, rest)) => (first, [rest, argv].concat()),
-            None => (&program, argv[1..].to_vec()),
+        let mut child = Command::new(&self.program)
+            .args(&self.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(false)
+            .spawn()
+            .map_err(|e| ExecError::Spawn(name.clone(), e))?;
+        if let Some(pid) = child.id().and_then(|id| i32::try_from(id).ok()) {
+            let _ = pid_tx.send(pid);
+        }
+        let stdout = Pipe::spawn(child.stdout.take());
+        let stderr = Pipe::spawn(child.stderr.take());
+        let status = child.wait().await.map_err(|e| {
+            stdout.abort();
+            stderr.abort();
+            ExecError::Spawn(name, e)
+        })?;
+        let out = Output {
+            exit_code: status.code(),
+            stdout: stdout.finish(FINISH_PIPE_DRAIN).await,
+            stderr: stderr.finish(FINISH_PIPE_DRAIN).await,
+            duration: started.elapsed(),
         };
-        let mut child = Command::new(spawn_program)
-            .args(&spawn_args)
+        tracing::debug!(argv = ?self.argv, exit = ?out.exit_code, duration = ?out.duration, "exec");
+        Ok(out)
+    }
+
+    async fn supervise(
+        self,
+        wait: Duration,
+        term: Duration,
+        kill: Duration,
+    ) -> Result<Output, ExecError> {
+        let argv = self.argv;
+        let name = argv[0].clone();
+        let started = Instant::now();
+        let mut child = Command::new(&self.program)
+            .args(&self.args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| ExecError::Spawn(program.clone(), e))?;
+            .map_err(|e| ExecError::Spawn(name.clone(), e))?;
         let stdout = Pipe::spawn(child.stdout.take());
         let stderr = Pipe::spawn(child.stderr.take());
 
@@ -88,7 +231,7 @@ impl Exec for TokioExec {
             Err(e) => {
                 stdout.abort();
                 stderr.abort();
-                return Err(ExecError::Spawn(program, e));
+                return Err(ExecError::Spawn(name, e));
             }
         };
         // A grandchild can keep the pipes open after the child exits.
@@ -365,6 +508,52 @@ mod tests {
             Err(ExecError::Timeout(_, cmd)) => assert_eq!(cmd, "sleep 30"),
             r => panic!("timeout expected: {r:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn finish_outlives_a_dropped_caller_and_its_wait() {
+        let dir = std::env::temp_dir().join(format!("r-drbd-finish-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let x = TokioExec::default();
+        let mode = ExecMode::Finish {
+            wait: Duration::from_secs(10),
+        };
+        // Dropped caller.
+        let done = dir.join("done");
+        let script = format!("sleep 0.5; touch {}", done.display());
+        let cut = tokio::time::timeout(
+            Duration::from_millis(100),
+            x.run(&argv(&["sh", "-c", &script]), mode),
+        )
+        .await;
+        assert!(cut.is_err(), "caller dropped before the end");
+        assert!(!x.wait_idle(Duration::from_millis(10)).await);
+        assert!(x.wait_idle(Duration::from_secs(5)).await);
+        assert!(done.exists(), "the process ran to its end");
+
+        // Past its wait, ignoring SIGTERM: a Timeout error, never a kill.
+        let late = dir.join("late");
+        let script = format!("trap '' TERM; sleep 0.5; touch {}", late.display());
+        let mode = ExecMode::Finish {
+            wait: Duration::from_millis(100),
+        };
+        let r = x.run(&argv(&["sh", "-c", &script]), mode).await;
+        assert!(matches!(r, Err(ExecError::Timeout(..))), "{r:?}");
+        assert!(x.wait_idle(Duration::from_secs(5)).await);
+        assert!(late.exists(), "still completed after the error");
+
+        // The same under Timeout is killed with the caller.
+        let gone = dir.join("gone");
+        let script = format!("sleep 0.5; touch {}", gone.display());
+        let _ = tokio::time::timeout(
+            Duration::from_millis(100),
+            x.run(&argv(&["sh", "-c", &script]), DEFAULT_TIMEOUT),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!gone.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

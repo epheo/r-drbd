@@ -48,7 +48,7 @@ fn equal_free_same_node_then_pool_name() {
     let pools = [
         pool("z", "n1", 10 * GIB),
         pool("m", "n1", 10 * GIB),
-        pool("q", "n2", 5 * GIB),
+        pool("q", "n2", 6 * GIB),
     ];
     assert_eq!(
         chosen(place(&request(2), &pools)),

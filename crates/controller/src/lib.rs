@@ -103,15 +103,19 @@ impl Error {
 /// host; same rule as model::keys::NAME_PATTERN, written out because the
 /// crate takes no regex dependency.
 pub fn valid_name(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    let Some((first, rest)) = bytes.split_first() else {
-        return false;
-    };
-    (2..=48).contains(&bytes.len())
-        && (first.is_ascii_alphabetic() || *first == b'_')
-        && rest
-            .iter()
-            .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+    let b = name.as_bytes();
+    let end = |c: &u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    (1..=63).contains(&b.len())
+        && b.first().is_some_and(end)
+        && b.last().is_some_and(end)
+        && b.iter().all(|c| end(c) || *c == b'-' || *c == b'.')
+}
+
+/// A Volume name is also the start of every LV name made from it, so the
+/// prefixes LVM reserves fail here, at admission. Snapshot names come after
+/// the separator, so `snapshot-<uuid>` stays valid for them.
+pub fn valid_volume_name(name: &str) -> bool {
+    valid_name(name) && lvm::names::reserved_prefix(name).is_none()
 }
 
 /// Connects with the in-cluster or kubeconfig credentials and runs until
@@ -429,29 +433,49 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::valid_name;
+    use super::{valid_name, valid_volume_name};
 
     #[test]
     fn names() {
+        assert_eq!(
+            model::keys::NAME_PATTERN,
+            "^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$",
+            "valid_name follows the pattern by hand"
+        );
+        // The pattern's length is the LV name cap.
+        assert!(valid_name(&"a".repeat(lvm::names::NAME_MAX)));
+        assert!(!valid_name(&"a".repeat(lvm::names::NAME_MAX + 1)));
+        // LVM's reserved substrings all need `_`, which no name holds.
+        for part in lvm::names::reserved_parts() {
+            assert!(!valid_name(&format!("a{part}")), "{part}");
+        }
+        for bad in ["snapshot", "snapshot-1", "pvmove0"] {
+            assert!(valid_name(bad) && !valid_volume_name(bad), "{bad}");
+        }
+        assert!(valid_volume_name("pvc-1") && valid_volume_name("vol-snapshot"));
         for ok in [
             "pvc-0a1b2c3d-4e5f-6789-abcd-ef0123456789",
-            "_x",
-            "ab",
-            "A_b-9",
-            &"a".repeat(48),
+            "snapshot-0a1b2c3d-4e5f-6789-abcd-ef0123456789",
+            "a",
+            "1abc",
+            "a.b",
+            "a-9",
+            &"a".repeat(63),
         ] {
             assert!(valid_name(ok), "{ok}");
         }
         for bad in [
             "",
-            "a",
-            "1abc",
             "-abc",
-            "a.b",
+            "abc-",
+            ".a",
+            "A",
+            "a_b",
+            "a+b",
             "a b",
             "a/b",
             "\u{e9}1",
-            &"a".repeat(49),
+            &"a".repeat(64),
         ] {
             assert!(!valid_name(bad), "{bad}");
         }
