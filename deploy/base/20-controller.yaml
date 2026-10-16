@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: r-drbd-controller
+  namespace: r-drbd-system
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: r-drbd-controller}
+  template:
+    metadata:
+      labels: {app: r-drbd-controller}
+    spec:
+      serviceAccountName: r-drbd-controller
+      priorityClassName: system-cluster-critical
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: controller
+          image: ghcr.io/epheo/r-drbd:latest
+          imagePullPolicy: IfNotPresent
+          args: ["controller"]
+          env:
+            - name: CSI_ENDPOINT
+              value: unix:///csi/csi.sock
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: RUST_LOG
+              value: info
+          resources:
+            requests: {cpu: 20m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          volumeMounts:
+            - {name: socket-dir, mountPath: /csi}
+        - name: csi-provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v6.3.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --feature-gates=Topology=true
+            - --extra-create-metadata
+            - --default-fstype=xfs
+            - --leader-election=false
+            - --timeout=60s
+            - --v=2
+          volumeMounts:
+            - {name: socket-dir, mountPath: /csi}
+        - name: csi-attacher
+          image: registry.k8s.io/sig-storage/csi-attacher:v4.13.0
+          args: ["--csi-address=/csi/csi.sock", "--leader-election=false", "--timeout=60s", "--v=2"]
+          volumeMounts:
+            - {name: socket-dir, mountPath: /csi}
+        - name: csi-resizer
+          image: registry.k8s.io/sig-storage/csi-resizer:v2.2.1
+          args: ["--csi-address=/csi/csi.sock", "--leader-election=false", "--timeout=60s", "--v=2"]
+          volumeMounts:
+            - {name: socket-dir, mountPath: /csi}
+        - name: csi-snapshotter
+          image: registry.k8s.io/sig-storage/csi-snapshotter:v8.6.0
+          args: ["--csi-address=/csi/csi.sock", "--leader-election=false", "--timeout=60s", "--v=2"]
+          volumeMounts:
+            - {name: socket-dir, mountPath: /csi}
+      volumes:
+        - name: socket-dir
+          emptyDir: {}

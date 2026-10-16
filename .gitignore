@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+/captures/*.pcap
+# private: design notes, specs, workflow
+/docs/internal/
+# private: lab hosts, overlays and scripts
+/lab/

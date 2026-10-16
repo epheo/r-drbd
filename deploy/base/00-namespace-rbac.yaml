@@ -1,0 +1,152 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: r-drbd-system
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: r-drbd-controller
+  namespace: r-drbd-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: r-drbd-agent
+  namespace: r-drbd-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: r-drbd-controller
+rules:
+  - apiGroups: ["r-drbd.io"]
+    resources: ["pools", "volumes", "snapshots"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["r-drbd.io"]
+    resources: ["pools/status", "volumes/status", "snapshots/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["nodes", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  # csi-resizer lists pods to find the ones using a PVC being expanded.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # csi-provisioner, csi-attacher, csi-resizer and csi-snapshotter sidecars
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims/status"]
+    verbs: ["patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments/status"]
+    verbs: ["patch"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotclasses", "volumesnapshots"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotcontents"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotcontents/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: ["groupsnapshot.storage.k8s.io"]
+    resources: ["volumegroupsnapshotclasses", "volumegroupsnapshotcontents", "volumegroupsnapshotcontents/status"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: r-drbd-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: r-drbd-controller
+subjects:
+  - kind: ServiceAccount
+    name: r-drbd-controller
+    namespace: r-drbd-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: r-drbd-agent
+rules:
+  - apiGroups: ["r-drbd.io"]
+    resources: ["pools", "volumes", "snapshots"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["r-drbd.io"]
+    resources: ["pools/status", "volumes/status", "snapshots/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: r-drbd-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: r-drbd-agent
+subjects:
+  - kind: ServiceAccount
+    name: r-drbd-agent
+    namespace: r-drbd-system
+---
+# Leases for the controller election and the agent heartbeats, sidecar leader election too.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: r-drbd-leases
+  namespace: r-drbd-system
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: r-drbd-leases
+  namespace: r-drbd-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: r-drbd-leases
+subjects:
+  - kind: ServiceAccount
+    name: r-drbd-controller
+    namespace: r-drbd-system
+  - kind: ServiceAccount
+    name: r-drbd-agent
+    namespace: r-drbd-system
+---
+# MicroShift and OpenShift gate host namespaces and privileged containers
+# behind SCCs; the role is absent on plain Kubernetes and the binding dangles.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: r-drbd-agent-scc-privileged
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:privileged
+subjects:
+  - kind: ServiceAccount
+    name: r-drbd-agent
+    namespace: r-drbd-system

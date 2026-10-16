@@ -1,0 +1,19 @@
+[package]
+name = "csi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "CSI v1 gRPC types and services generated from the Apache-2.0 csi.proto"
+
+[dependencies]
+prost = "0.14.4"
+prost-types = "0.14.4"
+tonic = { version = "0.14.6", default-features = false, features = ["codegen", "server", "router"] }
+tonic-prost = "0.14.6"
+
+[build-dependencies]
+protox = "0.10.0"
+tonic-prost-build = { version = "0.14.6", default-features = false }
+
+[lints]
+workspace = true

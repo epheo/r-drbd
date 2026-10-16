@@ -1,0 +1,4 @@
+# Dev image from a locally built static binary.
+FROM scratch
+COPY r-drbd /r-drbd
+ENTRYPOINT ["/r-drbd"]

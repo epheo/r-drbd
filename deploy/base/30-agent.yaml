@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: r-drbd-agent
+  namespace: r-drbd-system
+spec:
+  selector:
+    matchLabels: {app: r-drbd-agent}
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels: {app: r-drbd-agent}
+    spec:
+      serviceAccountName: r-drbd-agent
+      priorityClassName: system-node-critical
+      # The agent drains a running pass and in-flight CSI calls for up to 60 s each.
+      terminationGracePeriodSeconds: 90
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: agent
+          image: ghcr.io/epheo/r-drbd:latest
+          imagePullPolicy: IfNotPresent
+          args: ["agent"]
+          securityContext:
+            privileged: true
+          env:
+            # Every external command re-execs the binary into the host mount
+            # namespace, so the host tools match the kernel module; the agent itself stays in the container
+            # and reads host paths through the mounts below.
+            - name: R_DRBD_HOST_NS
+              value: /proc/1/ns
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - name: CSI_ENDPOINT
+              value: unix:///csi/csi.sock
+            - name: RUST_LOG
+              value: info
+          # No memory limit: the page cache of mkfs and lvm writes by the
+          # host tools is charged to this cgroup, and an OOM kill mid mkfs
+          # leaves a half-made file system (seen at 96Mi).
+          resources:
+            requests: {cpu: 20m, memory: 24Mi}
+          volumeMounts:
+            - {name: plugin-dir, mountPath: /csi}
+            - {name: kubelet-dir, mountPath: /var/lib/kubelet, mountPropagation: HostToContainer}
+            - {name: dev, mountPath: /dev, mountPropagation: HostToContainer}
+            - {name: res-dir, mountPath: /var/lib/r-drbd}
+            - {name: drbd-d, mountPath: /etc/drbd.d}
+        - name: csi-node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/r-drbd.io/csi.sock
+            - --v=2
+          volumeMounts:
+            - {name: plugin-dir, mountPath: /csi}
+            - {name: registration-dir, mountPath: /registration}
+      volumes:
+        - name: plugin-dir
+          hostPath: {path: /var/lib/kubelet/plugins/r-drbd.io, type: DirectoryOrCreate}
+        - name: registration-dir
+          hostPath: {path: /var/lib/kubelet/plugins_registry, type: Directory}
+        - name: kubelet-dir
+          hostPath: {path: /var/lib/kubelet, type: Directory}
+        - name: dev
+          hostPath: {path: /dev, type: Directory}
+        - name: res-dir
+          hostPath: {path: /var/lib/r-drbd, type: DirectoryOrCreate}
+        - name: drbd-d
+          hostPath: {path: /etc/drbd.d, type: DirectoryOrCreate}

@@ -1,0 +1,13 @@
+[licenses]
+allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "MPL-2.0", "CDLA-Permissive-2.0", "OpenSSL"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+deny = [
+  { name = "openssl-sys", reason = "rustls with ring only" },
+  { name = "aws-lc-sys", reason = "ring is the only crypto backend" },
+]
+
+[advisories]
+yanked = "deny"
