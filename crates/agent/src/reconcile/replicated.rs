@@ -492,7 +492,93 @@ impl Reconciler {
             Some(r) if r.devices.contains_key(&VOLUME) => self.sectors(facts.minor).await.ok(),
             _ => None,
         };
-        drbd::entry(&self.node, now.as_ref(), facts, sectors, fallback)
+        let mut entry = drbd::entry(&self.node, now.as_ref(), facts, sectors, fallback);
+        entry.unreachable_peers = self.peers.reported(name, tokio::time::Instant::now());
+        entry
+    }
+
+    /// Feeds the connection states of this node's replica to the stuck
+    /// connection watch.
+    fn observe_peers(&mut self, vol: &Volume, a: &Assignment, res: Option<&Resource>) {
+        let name = vol.name_any();
+        let entries = vol.status.as_ref().map(|s| s.replicas.as_slice());
+        let up = |node: &str| {
+            entries
+                .unwrap_or_default()
+                .iter()
+                .any(|e| e.node == node && e.present)
+        };
+        let seen = res
+            .into_iter()
+            .flat_map(|r| &r.connections)
+            .filter_map(|(peer, c)| {
+                let r = a.replicas.iter().find(|r| &r.node == peer)?;
+                let target = drbd::socket(peer, r.port, &self.addresses).ok()?;
+                Some((
+                    peer.clone(),
+                    crate::peer::Seen {
+                        state: c.state.clone(),
+                        target,
+                        peer_up: up(peer),
+                    },
+                ))
+            })
+            .collect();
+        self.peers
+            .observe(&name, &seen, tokio::time::Instant::now());
+    }
+
+    /// Probes the connections stuck past the window, all at once so a
+    /// firewall that drops costs one timeout per pass, not one per
+    /// volume; then refreshes the writes of the volumes they changed.
+    pub(super) async fn probe_peers(&mut self, vols: &[&Volume], writes: &mut Vec<StatusWrite>) {
+        if let Ok(t) = self.drbd.tracker.lock() {
+            self.peers.retain(|v| t.resource(v).is_some());
+        }
+        let due = self.peers.due(tokio::time::Instant::now());
+        if due.is_empty() {
+            return;
+        }
+        let probes = due.iter().map(|(_, _, target)| {
+            let (host, target) = (self.drbd.host.clone(), *target);
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    host.connect(target, crate::peer::PROBE_TIMEOUT)
+                })
+                .await
+                .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+            }
+        });
+        let results = futures::future::join_all(probes).await;
+        let mut changed = std::collections::BTreeSet::new();
+        let now = tokio::time::Instant::now();
+        for ((volume, peer, target), r) in due.into_iter().zip(results) {
+            let Some(p) = self.peers.record(&volume, &peer, target, &r, now) else {
+                continue;
+            };
+            tracing::warn!(
+                volume,
+                peer,
+                %target,
+                result = ?p.result,
+                error = p.error.as_deref().unwrap_or_default(),
+                "DRBD connection stuck; probed the peer's port"
+            );
+            changed.insert(volume);
+        }
+        for name in changed {
+            let Some(vol) = vols.iter().find(|v| v.name_any() == name) else {
+                continue;
+            };
+            let Some(facts) = self.facts.get(&name).cloned() else {
+                continue;
+            };
+            writes.retain(|w| !matches!(w, StatusWrite::Volume { name: n, .. } if *n == name));
+            let entry = self.current_entry(&name, &facts).await;
+            if self.prev_entry(vol).as_ref() != Some(&entry) {
+                writes.push(StatusWrite::Volume { name, entry });
+            }
+        }
     }
 
     async fn drbd_up(
@@ -531,6 +617,8 @@ impl Reconciler {
                 facts.last_error = Some(e);
             }
         }
+        let res = self.tracked(&name);
+        self.observe_peers(step.vol, step.a, res.as_ref());
         let entry = self.current_entry(&name, &facts).await;
         self.facts.insert(name.clone(), facts);
         (prev != Some(&entry)).then_some(StatusWrite::Volume { name, entry })
@@ -1389,6 +1477,10 @@ impl Reconciler {
             };
             if vol.metadata.deletion_timestamp.is_some() {
                 continue;
+            }
+            if let Some(a) = &vol.spec.assignment {
+                let res = self.tracked(&name);
+                self.observe_peers(vol, a, res.as_ref());
             }
             let prev = self.prev_entry(vol);
             let entry = self.current_entry(&name, &facts).await;

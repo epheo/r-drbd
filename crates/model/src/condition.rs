@@ -8,6 +8,7 @@ pub mod types {
     pub const DEGRADED: &str = "Degraded";
     pub const QUORUM_LOST: &str = "QuorumLost";
     pub const SPLIT_BRAIN: &str = "SplitBrain";
+    pub const PEER_UNREACHABLE: &str = "PeerUnreachable";
     pub const AVAILABLE: &str = "Available";
 }
 

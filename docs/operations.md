@@ -24,6 +24,7 @@ Useful Volume status fields:
 | `replicas[].peers` | Connection state to each peer |
 | `replicas[].quorum` | Whether this replica has quorum |
 | `replicas[].lastError` | Last failed command on that node |
+| `replicas[].unreachablePeers` | Peers this node's DRBD has not reached for a while, with a TCP probe result |
 
 Conditions:
 
@@ -33,6 +34,7 @@ Conditions:
 | `Degraded` | Usable, but not every replica is healthy; the reason and message name the node |
 | `QuorumLost` | A replica in use has no quorum; IO there is suspended until quorum returns |
 | `SplitBrain` | Two replicas diverged; the message names them |
+| `PeerUnreachable` | A DRBD connection between two running nodes does not come up; the message names both nodes, the address and the likely cause |
 
 Degraded reasons: `ReplicaMissing`, `ReplicaNotUpToDate`, `ReplicaDisconnected`, `NodeUnreachable`, `Resizing`.
 
@@ -126,6 +128,36 @@ Errors:
 
 - `InvalidSurvivor`: the survivor holds no diskful replica.
 - `ResolveWithoutSplitBrain`: there is no split brain; nothing is discarded; remove `spec.resolve`.
+
+## Replicas never connect: `PeerUnreachable`
+
+A replicated Volume stuck in Provisioning, or Degraded with `ReplicaDisconnected`, while every node is up, usually means DRBD traffic is blocked between nodes.
+
+    kubectl get volume pvc-<uuid> -o jsonpath='{.status.conditions[?(@.type=="PeerUnreachable")]}'
+
+How it is detected:
+
+- A connection that stays out of Connected for 20 s, or keeps dropping, while both agents run and both replicas are up, counts as stuck.
+- The stuck side's agent then opens a TCP connection to the peer's DRBD address and port, at most every 5 minutes, and records the result in `replicas[].unreachablePeers`.
+- The controller turns `PeerUnreachable` True within about a minute and emits a Warning Event `PeerUnreachable`; a Normal Event `PeersReachable` follows when it clears.
+- It clears once the connection has held Connected for 10 s, at the agent's next pass (up to 30 s later).
+- It stays False for a node whose agent is down (that is `NodeUnreachable`), for a node in `spec.evict`, and for a StandAlone or split pair (that is `SplitBrain`).
+
+Example message:
+
+    node1 cannot reach node2 at 10.0.0.2:11003: rejected by a firewall; open TCP 11000-11999 between nodes
+
+Reasons and what to check:
+
+| Reason | Probe saw | Check |
+|---|---|---|
+| `Firewall` | ICMP prohibited or unreachable, or a local filter | Open TCP 11000 to 11999 between nodes, both directions |
+| `Timeout` | No answer in 3 s | A firewall that drops, or a routing problem between the addresses |
+| `NotListening` | Connection refused | The Node InternalIP is the address DRBD should use on that host; a firewall that answers with a TCP reset looks the same |
+| `Unknown` | The port answers, or the probe failed | The kernel log (`dmesg`) on both nodes; the agent logs |
+
+The message lists every stuck connection; the reason is the most actionable one.
+A probe of a port where DRBD listens adds one line to that node's kernel log ("Error receiving initial packet") and changes nothing in DRBD.
 
 ## A lost backing LV
 

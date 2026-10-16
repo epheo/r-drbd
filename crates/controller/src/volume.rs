@@ -50,14 +50,23 @@ pub mod reason {
     /// Event reasons of spec.evict.
     pub const EVICTED: &str = "Evicted";
     pub const EVICTION_BLOCKED: &str = "EvictionBlocked";
+    /// PeerUnreachable reasons, from the stuck side's probe of the peer.
+    pub const PEERS_REACHABLE: &str = "PeersReachable";
+    pub const FIREWALL: &str = "Firewall";
+    pub const NOT_LISTENING: &str = "NotListening";
+    pub const TIMEOUT: &str = "Timeout";
+    pub const UNKNOWN: &str = "Unknown";
+    /// Event reasons of PeerUnreachable transitions.
+    pub const PEER_UNREACHABLE: &str = "PeerUnreachable";
 }
 
 /// Condition types the controller owns on a Volume.
-const OWNED_TYPES: [&str; 4] = [
+const OWNED_TYPES: [&str; 5] = [
     types::READY,
     types::DEGRADED,
     types::QUORUM_LOST,
     types::SPLIT_BRAIN,
+    types::PEER_UNREACHABLE,
 ];
 
 /// One controller-owned condition before it gets a timestamp.
@@ -86,6 +95,7 @@ pub struct Summary {
     pub degraded: Cond,
     pub quorum_lost: Cond,
     pub split_brain: Cond,
+    pub peer_unreachable: Cond,
     /// Pairs to keep latched for the next pass.
     pub split_pairs: BTreeSet<Pair>,
     /// The phase is Ready: every diskful replica present and UpToDate,
@@ -111,12 +121,13 @@ impl Summary {
         self.ready = ready;
     }
 
-    fn conds(&self) -> [(&'static str, &Cond); 4] {
+    fn conds(&self) -> [(&'static str, &Cond); 5] {
         [
             (types::READY, &self.ready),
             (types::DEGRADED, &self.degraded),
             (types::QUORUM_LOST, &self.quorum_lost),
             (types::SPLIT_BRAIN, &self.split_brain),
+            (types::PEER_UNREACHABLE, &self.peer_unreachable),
         ]
     }
 }
@@ -127,6 +138,8 @@ pub struct Nodes<'a> {
     pub ready: &'a dyn Fn(&str) -> bool,
     /// The agent Lease is fresh; false means its entries are unknown.
     pub reachable: &'a dyn Fn(&str) -> bool,
+    /// The volume's spec.evict: those nodes' connections are expected to break.
+    pub evicting: &'a [String],
 }
 
 impl std::fmt::Debug for Nodes<'_> {
@@ -305,6 +318,98 @@ fn drbd_conditions(
     (quorum, split, pairs)
 }
 
+/// The stuck connections an agent probed, worst cause first. A record
+/// counts only when both ends have a fresh agent, report their resource
+/// up and are not in spec.evict, and the pair is not split: a down node is
+/// NodeUnreachable's news, an evicted node is expected to drop, and a
+/// StandAlone connection is SplitBrain's.
+fn peer_unreachable(
+    assignment: &Assignment,
+    entries: &HashMap<&str, &model::ReplicaStatus>,
+    nodes: &Nodes<'_>,
+    split_pairs: &BTreeSet<Pair>,
+) -> Cond {
+    let assigned = |n: &str| assignment.replicas.iter().any(|r| r.node == n);
+    let up = |n: &str| {
+        assigned(n)
+            && (nodes.reachable)(n)
+            && !nodes.evicting.iter().any(|e| e == n)
+            && entries.get(n).is_some_and(|e| e.present)
+    };
+    let stand_alone = |a: &str, b: &str| {
+        entries
+            .get(a)
+            .is_some_and(|e| eq(e.peers.get(b), "StandAlone"))
+    };
+    let mut found: Vec<(u8, &'static str, String)> = Vec::new();
+    for e in entries.values().filter(|e| up(&e.node)) {
+        for p in &e.unreachable_peers {
+            let (a, b) = (e.node.as_str(), p.node.as_str());
+            if !up(b) || split_pairs.contains(&pair(a, b)) || stand_alone(a, b) || stand_alone(b, a)
+            {
+                continue;
+            }
+            let (rank, why, what) = probe_cause(p);
+            let at = match p.address.parse::<std::net::IpAddr>() {
+                Ok(ip) => std::net::SocketAddr::new(ip, p.port).to_string(),
+                Err(_) => format!("{}:{}", p.address, p.port),
+            };
+            found.push((rank, why, format!("{a} cannot reach {b} at {at}: {what}")));
+        }
+    }
+    found.sort();
+    match found.first() {
+        None => Cond::new(FALSE, reason::PEERS_REACHABLE, ""),
+        Some((_, why, _)) => Cond::new(
+            TRUE,
+            why,
+            found
+                .iter()
+                .map(|(_, _, m)| m.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+        ),
+    }
+}
+
+/// Rank (most actionable first), reason and words for one probe result.
+fn probe_cause(p: &model::PeerProbe) -> (u8, &'static str, String) {
+    use model::ProbeResult as R;
+    let range = model::keys::PORT_RANGE;
+    let open = format!("open TCP {}-{} between nodes", range.start(), range.end());
+    match p.result {
+        R::Filtered => (
+            0,
+            reason::FIREWALL,
+            format!("rejected by a firewall; {open}"),
+        ),
+        R::TimedOut => (
+            1,
+            reason::TIMEOUT,
+            format!("no answer, packets dropped (often a firewall); {open}"),
+        ),
+        R::Refused => (
+            2,
+            reason::NOT_LISTENING,
+            "connection refused: nothing listens there, or a firewall resets".to_owned(),
+        ),
+        R::Accepted => (
+            3,
+            reason::UNKNOWN,
+            "the port answers but DRBD does not connect; see the kernel log on both nodes"
+                .to_owned(),
+        ),
+        R::Failed => (
+            3,
+            reason::UNKNOWN,
+            format!(
+                "probe failed: {}",
+                p.error.as_deref().unwrap_or("no error text")
+            ),
+        ),
+    }
+}
+
 /// Status aggregation, pure. Provisioning until every assigned replica is
 /// present on a Ready node, every diskful one UpToDate and, for DRBD,
 /// connected to every other diskful one; afterwards a gap is Degraded,
@@ -322,6 +427,7 @@ pub fn aggregate(
         &Nodes {
             ready: node_ready,
             reachable: &|_| true,
+            evicting: &[],
         },
         &BTreeSet::new(),
         None,
@@ -398,6 +504,7 @@ pub fn aggregate_nodes(
     let g = gaps(assignment, &diskful, &entries, nodes);
     let (quorum_lost, split_brain, split_pairs) =
         drbd_conditions(&diskful, &entries, nodes, latched);
+    let peer_unreachable = peer_unreachable(assignment, &entries, nodes, &split_pairs);
     let (usable_bytes, primary) =
         known_values(assignment, &diskful, &entries, status, nodes, generation);
     let node_list = (!diskful.is_empty()).then(|| diskful.join(","));
@@ -475,6 +582,7 @@ pub fn aggregate_nodes(
         degraded,
         quorum_lost,
         split_brain,
+        peer_unreachable,
         split_pairs,
         initialized: phase == VolumePhase::Ready,
         usable_bytes,
@@ -825,6 +933,7 @@ impl Health {
             &Nodes {
                 ready: &|n| self.ready.contains(n),
                 reachable: &|n| !self.unreachable.contains(n),
+                evicting: &v.spec.evict,
             },
             latched,
             v.metadata.generation,
@@ -889,6 +998,7 @@ async fn reconcile(
         } else if let Some(uid) = &v.metadata.uid {
             memory.resolving.remove(uid);
         }
+        peer_event(ctx, memory, v, &summary.peer_unreachable).await;
         let wanted = Owned::wanted(v, summary.phase, &summary.conds(), Some(&summary));
         write(memory, api, v, wanted).await;
         return;
@@ -1091,6 +1201,53 @@ async fn evict_step(
             }
         }
     }
+}
+
+/// The Event a PeerUnreachable change is due: a Warning when it turns
+/// True or its reason changes, a Normal one when it turns False. `last` is
+/// the reason last announced, empty for False.
+pub fn peer_transition(last: &str, now: &Cond) -> Option<(&'static str, String)> {
+    let key = if now.status == TRUE { now.reason } else { "" };
+    if key == last {
+        return None;
+    }
+    Some(if key.is_empty() {
+        ("Normal", "no stuck DRBD connection to report".to_owned())
+    } else {
+        ("Warning", now.message.clone())
+    })
+}
+
+/// One Event per PeerUnreachable transition. Memory, seeded from the
+/// stored condition after a restart, keeps a lagging store copy from
+/// repeating it.
+async fn peer_event(ctx: &Ctx<'_>, memory: &mut Memory, v: &Volume, now: &Cond) {
+    let Some(uid) = v.metadata.uid.clone() else {
+        return;
+    };
+    let last = memory
+        .peer_unreachable
+        .get(&uid)
+        .cloned()
+        .unwrap_or_else(|| {
+            v.status
+                .as_ref()
+                .and_then(|s| condition::get(&s.conditions, types::PEER_UNREACHABLE))
+                .filter(|c| c.status == TRUE)
+                .map(|c| c.reason.clone())
+                .unwrap_or_default()
+        });
+    if let Some((kind, message)) = peer_transition(&last, now) {
+        if kind == "Warning" {
+            warn!(volume = v.name_any(), message, "peer unreachable");
+            crate::warning_event(ctx.client, v, reason::PEER_UNREACHABLE, &message).await;
+        } else {
+            info!(volume = v.name_any(), "peers reachable again");
+            crate::event(ctx.client, v, reason::PEERS_REACHABLE, &message).await;
+        }
+    }
+    let key = if now.status == TRUE { now.reason } else { "" };
+    memory.peer_unreachable.insert(uid, key.to_owned());
 }
 
 /// Status entries no agent will remove (crate::evict::orphan_entries).
@@ -1835,6 +1992,139 @@ mod tests {
         ]
     }
 
+    fn probe(peer: &str, result: model::ProbeResult) -> model::PeerProbe {
+        let t = Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH);
+        model::PeerProbe {
+            node: peer.into(),
+            address: format!("10.0.0.{}", &peer[1..]),
+            port: 11003,
+            since: t.clone(),
+            result,
+            probed_at: t,
+            error: None,
+        }
+    }
+
+    fn peer_cond(r: Vec<ReplicaStatus>, nodes: &Nodes<'_>, latched: &BTreeSet<Pair>) -> Cond {
+        aggregate_nodes(
+            G,
+            &two_with_tb(),
+            Some(&status(VolumePhase::Provisioning, r)),
+            nodes,
+            latched,
+            None,
+        )
+        .peer_unreachable
+    }
+
+    #[test]
+    fn peer_unreachable_rule() {
+        use model::ProbeResult as R;
+        let all = Nodes {
+            ready: &|_| true,
+            reachable: &|_| true,
+            evicting: &[],
+        };
+        let none = BTreeSet::new();
+        let c = peer_cond(healthy(), &all, &none);
+        assert_eq!((c.status, c.reason), (FALSE, reason::PEERS_REACHABLE));
+
+        let mut r = healthy();
+        r[0].peers.insert("n2".into(), "Connecting".into());
+        r[0].unreachable_peers = vec![probe("n2", R::Filtered)];
+        let c = peer_cond(r.clone(), &all, &none);
+        assert_eq!((c.status, c.reason), (TRUE, reason::FIREWALL));
+        assert_eq!(
+            c.message,
+            "n1 cannot reach n2 at 10.0.0.2:11003: rejected by a firewall; open TCP 11000-11999 between nodes"
+        );
+
+        // The worst cause names the reason; every finding is listed.
+        r[2].unreachable_peers = vec![probe("n1", R::Refused)];
+        r[1].unreachable_peers = vec![probe("n1", R::TimedOut)];
+        let c = peer_cond(r.clone(), &all, &none);
+        assert_eq!(c.reason, reason::FIREWALL);
+        assert_eq!(
+            c.message.matches("cannot reach").count(),
+            3,
+            "{}",
+            c.message
+        );
+        r[0].unreachable_peers.clear();
+        assert_eq!(peer_cond(r.clone(), &all, &none).reason, reason::TIMEOUT);
+        r[1].unreachable_peers.clear();
+        assert_eq!(
+            peer_cond(r.clone(), &all, &none).reason,
+            reason::NOT_LISTENING
+        );
+        r[2].unreachable_peers = vec![probe("n1", R::Accepted)];
+        assert_eq!(peer_cond(r.clone(), &all, &none).reason, reason::UNKNOWN);
+
+        let mut r = healthy();
+        r[0].peers.insert("n2".into(), "Connecting".into());
+        r[0].unreachable_peers = vec![probe("n2", R::TimedOut)];
+        assert_eq!(peer_cond(r.clone(), &all, &none).status, TRUE);
+        // A stale Lease on either end: NodeUnreachable's business.
+        for down in ["n1", "n2"] {
+            let nodes = Nodes {
+                ready: &|_| true,
+                reachable: &|n| n != down,
+                evicting: &[],
+            };
+            assert_eq!(peer_cond(r.clone(), &nodes, &none).status, FALSE, "{down}");
+        }
+        // An end in spec.evict.
+        for gone in ["n1", "n2"] {
+            let evicting = [gone.to_owned()];
+            let nodes = Nodes {
+                ready: &|_| true,
+                reachable: &|_| true,
+                evicting: &evicting,
+            };
+            assert_eq!(peer_cond(r.clone(), &nodes, &none).status, FALSE, "{gone}");
+        }
+        // The peer's resource not up yet.
+        let mut q = r.clone();
+        q[1].present = false;
+        assert_eq!(peer_cond(q, &all, &none).status, FALSE);
+        // A split pair, latched or StandAlone on either side.
+        let split = BTreeSet::from([pair("n1", "n2")]);
+        assert_eq!(peer_cond(r.clone(), &all, &split).status, FALSE);
+        for side in [0, 1] {
+            let mut q = r.clone();
+            let peer = if side == 0 { "n2" } else { "n1" };
+            q[side].peers.insert(peer.into(), "StandAlone".into());
+            assert_eq!(peer_cond(q, &all, &none).status, FALSE, "{side}");
+        }
+        // An IPv6 address keeps its brackets.
+        let mut q = r.clone();
+        q[0].unreachable_peers[0].address = "fd00::2".into();
+        assert!(
+            peer_cond(q, &all, &none)
+                .message
+                .contains("[fd00::2]:11003"),
+            "ipv6"
+        );
+    }
+
+    #[test]
+    fn peer_events_once_per_transition() {
+        let t = Cond::new(TRUE, reason::FIREWALL, "m");
+        let f = Cond::new(FALSE, reason::PEERS_REACHABLE, "");
+        assert_eq!(peer_transition("", &f), None);
+        assert_eq!(peer_transition("", &t), Some(("Warning", "m".to_owned())));
+        assert_eq!(peer_transition(reason::FIREWALL, &t), None);
+        let timeout = Cond::new(TRUE, reason::TIMEOUT, "n");
+        assert_eq!(
+            peer_transition(reason::FIREWALL, &timeout),
+            Some(("Warning", "n".to_owned()))
+        );
+        assert_eq!(
+            peer_transition(reason::FIREWALL, &f).map(|(k, _)| k),
+            Some("Normal")
+        );
+    }
+
     #[test]
     fn quorum_and_split_brain() {
         let two = two_with_tb();
@@ -1891,6 +2181,7 @@ mod tests {
             &Nodes {
                 ready: &|_| true,
                 reachable: &|n| n != "n2",
+                evicting: &[],
             },
             &BTreeSet::new(),
             None,
@@ -1904,6 +2195,7 @@ mod tests {
         let nodes = Nodes {
             ready: &|_| true,
             reachable: &|n| n != "n2",
+            evicting: &[],
         };
         let s = aggregate_nodes(
             G,
@@ -2162,6 +2454,7 @@ mod tests {
             &Nodes {
                 ready: &|_| true,
                 reachable: &|n| n != "n2",
+                evicting: &[],
             },
             &BTreeSet::new(),
             None,
@@ -2206,6 +2499,7 @@ mod tests {
         let all = Nodes {
             ready: &|_| true,
             reachable: &|_| true,
+            evicting: &[],
         };
         let with = |a: &str, b: &str| {
             let mut r = healthy();
@@ -2245,6 +2539,7 @@ mod tests {
             &Nodes {
                 ready: &|_| true,
                 reachable: &|n| n != "n1",
+                evicting: &[],
             },
             &latched,
             None,
@@ -2278,6 +2573,7 @@ mod tests {
         let all = Nodes {
             ready: &|_| true,
             reachable: &|_| true,
+            evicting: &[],
         };
         let mut r = healthy();
         r[0].disk_state = Some("Inconsistent".into());
@@ -2296,6 +2592,7 @@ mod tests {
         let stale = Nodes {
             ready: &|_| true,
             reachable: &|n| n != "n2",
+            evicting: &[],
         };
         assert!(!init(&r, &stale));
         // Ready while resizing still counts.
@@ -2361,6 +2658,7 @@ mod tests {
         let all = Nodes {
             ready: &|_| true,
             reachable: &|_| true,
+            evicting: &[],
         };
         let s = aggregate_nodes(G, &two, Some(&st), &all, &BTreeSet::new(), Some(4));
         assert_eq!(s.primary.as_deref(), Some("n2"));
@@ -2389,6 +2687,7 @@ mod tests {
         let all = Nodes {
             ready: &|_| true,
             reachable: &|_| true,
+            evicting: &[],
         };
         for order in [[1, 3], [3, 1]] {
             let mut list: Vec<ReplicaStatus> = r.clone();
@@ -2409,6 +2708,7 @@ mod tests {
             &Nodes {
                 ready: &|_| true,
                 reachable: &|n| n != "n0",
+                evicting: &[],
             },
             &BTreeSet::new(),
             Some(4),

@@ -58,7 +58,7 @@ r-drbd never moves a replica on its own; you ask for it with `spec.evict` (see [
 Every object reports typed, watchable status.
 
 - Pool: capacity, chunk size, the Volumes using it, an `Available` condition.
-- Volume: phase, primary node, usable size, one entry per replica (disk state, sync progress, peers, quorum, device path, last error) and conditions `Ready`, `Degraded`, `QuorumLost`, `SplitBrain`.
+- Volume: phase, primary node, usable size, one entry per replica (disk state, sync progress, peers, quorum, device path, last error) and conditions `Ready`, `Degraded`, `QuorumLost`, `SplitBrain`, `PeerUnreachable`.
 - Snapshot: phase, size, and one acknowledgement per node.
 
 Each agent writes only its own replica entries.

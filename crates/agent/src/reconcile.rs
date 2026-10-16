@@ -256,6 +256,8 @@ pub struct Reconciler {
     invalid_pools: HashSet<String>,
     /// Why the host's LVM cannot serve Pools, from the startup check.
     lvm_unsupported: Option<String>,
+    /// Connections out of Connected, per volume and peer.
+    peers: crate::peer::Watch,
 }
 
 impl Reconciler {
@@ -281,6 +283,7 @@ impl Reconciler {
             dropped_logged: HashSet::new(),
             invalid_pools: HashSet::new(),
             lvm_unsupported: None,
+            peers: crate::peer::Watch::default(),
         }
     }
 
@@ -344,6 +347,7 @@ impl Reconciler {
                 writes.push(w);
             }
         }
+        self.probe_peers(&vols, &mut writes).await;
 
         let mut snaps: Vec<&Snapshot> = snapshots.iter().map(AsRef::as_ref).collect();
         snaps.sort_by_key(|s| s.name_any());

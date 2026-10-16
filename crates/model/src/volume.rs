@@ -253,4 +253,44 @@ pub struct ReplicaStatus {
     pub observed_generation: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Peers whose DRBD connection has stayed out of Connected for a while,
+    /// with what a TCP connect to their DRBD port found.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 32))]
+    #[x_kube(merge_strategy = ListMerge::Map(vec!["node".into()]))]
+    pub unreachable_peers: Vec<PeerProbe>,
+}
+
+/// One stuck connection seen from the reporting replica.
+#[derive(KubeSchema, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerProbe {
+    #[schemars(length(min = 1, max = 253))]
+    pub node: String,
+    /// The peer's DRBD address and port, as probed.
+    #[schemars(length(max = 45))]
+    pub address: String,
+    pub port: u16,
+    /// When this agent saw the connection leave Connected.
+    pub since: k8s_openapi::apimachinery::pkg::apis::meta::v1::Time,
+    pub result: ProbeResult,
+    pub probed_at: k8s_openapi::apimachinery::pkg::apis::meta::v1::Time,
+    /// The OS error of a Failed probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 256))]
+    pub error: Option<String>,
+}
+
+/// What a TCP connect to a peer's DRBD port found.
+#[derive(JsonSchema, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeResult {
+    /// Connection refused: nothing listens, or a firewall answers with a reset.
+    Refused,
+    /// ICMP unreachable or prohibited, or a local filter: a firewall.
+    Filtered,
+    /// No answer: packets dropped on the way.
+    TimedOut,
+    /// The port takes TCP; DRBD fails above it.
+    Accepted,
+    Failed,
 }

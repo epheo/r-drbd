@@ -1286,3 +1286,85 @@ async fn evict_waits_for_the_snapshot_round() {
     let v = volume_where(&client, "rep", |v| role_of(v, "n2").is_none()).await;
     assert_eq!(role_of(&v, "n4"), Some(Role::Diskful));
 }
+
+fn stuck(node: &str, peer: &str, result: model::ProbeResult) -> ReplicaStatus {
+    let mut e = healthy(node, &[], None);
+    e.disk_state = Some("Inconsistent".into());
+    e.peers.insert(peer.into(), "Connecting".into());
+    let t = k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+        k8s_openapi::jiff::Timestamp::from_second(1_800_000_000).unwrap(),
+    );
+    e.unreachable_peers = vec![model::PeerProbe {
+        node: peer.into(),
+        address: "192.0.2.2".into(),
+        port: 11000,
+        since: t.clone(),
+        result,
+        probed_at: t,
+        error: None,
+    }];
+    e
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_unreachable_while_provisioning() {
+    let assets = require_envtest!();
+    let (_env, client, _cfg, _ctl) = setup_with(&assets, |c| c.lease_stale = SHORT_STALE).await;
+    cluster(&client).await;
+    let [a1, a2, a3] = ["n1", "n2", "n3"].map(|n| FakeAgent::new(&client, n));
+    create_volume(&client, "rep", volume_spec(GIB, 2, "fast")).await;
+    volume_where(&client, "rep", |v| v.spec.assignment.is_some()).await;
+    a1.report("rep", stuck("n1", "n2", model::ProbeResult::Filtered))
+        .await;
+    let mut s2 = healthy("n2", &[], None);
+    s2.peers.insert("n1".into(), "Connecting".into());
+    a2.report("rep", s2.clone()).await;
+    let fired = |v: &Volume| {
+        cond(v, types::PEER_UNREACHABLE)
+            .is_some_and(|c| c.status == "True" && c.reason == "Firewall")
+    };
+    let v = volume_where(&client, "rep", fired).await;
+    assert_eq!(phase_of(&v), VolumePhase::Provisioning);
+    assert_eq!(
+        cond(&v, types::PEER_UNREACHABLE).unwrap().message,
+        "n1 cannot reach n2 at 192.0.2.2:11000: rejected by a firewall; open TCP 11000-11999 between nodes"
+    );
+    let warned = support::eventually(Duration::from_secs(10), || async {
+        let ev = events_of(&client, "rep", "PeerUnreachable").await;
+        (!ev.is_empty()).then_some(ev)
+    })
+    .await;
+    assert_eq!(warned[0].type_.as_deref(), Some("Warning"));
+
+    // A node down is not a firewall.
+    support::agent_lease(&client, "n2", Duration::from_secs(3600), true).await;
+    volume_where(&client, "rep", |v| {
+        cond_is(v, types::PEER_UNREACHABLE, "False")
+    })
+    .await;
+    support::agent_lease(&client, "n2", Duration::ZERO, false).await;
+    volume_where(&client, "rep", fired).await;
+
+    // Repeated reports of the same cause do not repeat the Event.
+    a1.report("rep", stuck("n1", "n2", model::ProbeResult::Filtered))
+        .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(events_of(&client, "rep", "PeerUnreachable").await.len(), 2);
+
+    // Connected: False, with one Normal Event.
+    a1.report("rep", healthy("n1", &["n2"], None)).await;
+    a2.report("rep", healthy("n2", &["n1"], None)).await;
+    a3.ready("rep").await;
+    let v = volume_where(&client, "rep", |v| {
+        cond_is(v, types::PEER_UNREACHABLE, "False") && phase_of(v) == VolumePhase::Ready
+    })
+    .await;
+    assert_eq!(
+        cond(&v, types::PEER_UNREACHABLE).unwrap().reason,
+        "PeersReachable"
+    );
+    support::eventually(Duration::from_secs(10), || async {
+        (events_of(&client, "rep", "PeersReachable").await.len() == 2).then_some(())
+    })
+    .await;
+}

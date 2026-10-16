@@ -52,13 +52,14 @@ Status:
 | Field | Notes |
 |---|---|
 | `phase` | Pending, Provisioning, Ready, Degraded, Failed, Deleting |
-| `conditions` | `Ready`, `Degraded`, `QuorumLost`, `SplitBrain` |
+| `conditions` | `Ready`, `Degraded`, `QuorumLost`, `SplitBrain`, `PeerUnreachable` |
 | `usableBytes` | Size every replica provides |
 | `primary` | Node where the device is open |
 | `nodes` | Comma separated diskful nodes |
 | `initializedAt` | First time the volume was Ready |
 | `fileSystem` | File system the node plugin created or inherited |
-| `replicas[]` | `node`, `present`, `diskState`, `syncPercent`, `peers`, `inUse`, `quorum`, `devicePath`, `allocatedBytes`, `sizeBytes`, `observedGeneration`, `lastError` |
+| `replicas[]` | `node`, `present`, `diskState`, `syncPercent`, `peers`, `inUse`, `quorum`, `devicePath`, `allocatedBytes`, `sizeBytes`, `observedGeneration`, `lastError`, `unreachablePeers` |
+| `replicas[].unreachablePeers[]` | Stuck DRBD connections from this node: `node`, `address`, `port`, `since`, `result` (Refused, Filtered, TimedOut, Accepted, Failed), `probedAt`, `error` |
 
 Finalizer `r-drbd.io/volume` holds deletion until every replica is removed.
 
@@ -108,9 +109,19 @@ Volume `QuorumLost`: `NoQuorum`, `Quorate`.
 
 Volume `SplitBrain`: `SplitBrain`, `NoSplitBrain`, `ResolveWithoutSplitBrain`.
 
+Volume `PeerUnreachable`:
+
+| Reason | Meaning |
+|---|---|
+| `PeersReachable` | No stuck connection between running replicas |
+| `Firewall` | The probe was rejected (ICMP prohibited or unreachable); open TCP 11000 to 11999 between nodes |
+| `Timeout` | The probe got no answer: packets dropped |
+| `NotListening` | The probe was refused: nothing listens at that address and port |
+| `Unknown` | The port answers but DRBD does not connect, or the probe failed |
+
 Pool `Available`: `ThinPoolReady`, `ThinPoolUnavailable`, `ZeroingDisabled`, `InvalidName`, `LvmUnsupported` (host LVM older than 2.03.03).
 
-Volume Events: `Evicted`, `EvictionBlocked`, `SplitBrainResolved`.
+Volume Events: `Evicted`, `EvictionBlocked`, `SplitBrainResolved`, `PeerUnreachable` (Warning), `PeersReachable`.
 
 ## CSI driver
 

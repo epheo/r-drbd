@@ -910,3 +910,187 @@ async fn drbd_attachment_then_promoted() {
         delete(&h, m).await;
     }
 }
+
+/// The test-only nft table; dropped even when the test fails.
+const FW_TABLE: &str = "rw-peer-probe";
+
+struct Firewall;
+
+impl Firewall {
+    /// Rejects TCP to a and b's DRBD ports as a firewall does, and drops
+    /// TCP to 127.0.0.3:11992. Only loopback addresses, in its own table.
+    fn block() -> Self {
+        Self::remove();
+        let rules = format!(
+            "table inet {FW_TABLE} {{\n chain input {{\n  type filter hook input priority -300; policy accept;\n  ip daddr {{ 127.0.0.1, 127.0.0.2 }} tcp dport {{ {}, {} }} reject with icmpx type admin-prohibited\n  ip daddr 127.0.0.3 tcp dport 11992 drop\n }}\n}}\n",
+            A.port, B.port
+        );
+        let mut child = std::process::Command::new("nft")
+            .args(["-f", "-"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("nft");
+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), rules.as_bytes()).unwrap();
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success(), "nft -f");
+        Self
+    }
+
+    fn remove() {
+        let _ = std::process::Command::new("nft")
+            .args(["delete", "table", "inet", FW_TABLE])
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+impl Drop for Firewall {
+    fn drop(&mut self) {
+        Self::remove();
+    }
+}
+
+impl Member {
+    /// A pass that sees `others` reported too, under the names this
+    /// member gives them.
+    async fn pass_seeing(
+        &mut self,
+        pools: &[Arc<Pool>],
+        others: &[(&str, ReplicaStatus)],
+    ) -> Vec<StatusWrite> {
+        let mut v = self.current();
+        let st = v.status.get_or_insert_with(Default::default);
+        for (name, e) in others {
+            let mut e = e.clone();
+            (*name).clone_into(&mut e.node);
+            st.replicas.push(e);
+        }
+        let w = self.rec.pass(pools, &[Arc::new(v)], &[]).await;
+        for x in &w {
+            if let StatusWrite::Volume { name, entry } = x
+                && name == self.res
+            {
+                self.entry = Some(entry.clone());
+            }
+        }
+        w
+    }
+
+    fn stuck(&self) -> Vec<model::PeerProbe> {
+        self.entry
+            .as_ref()
+            .map(|e| e.unreachable_peers.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// A peer that stands for one whose resource is up.
+fn up_entry(node: &str) -> ReplicaStatus {
+    ReplicaStatus {
+        node: node.into(),
+        present: true,
+        ..ReplicaStatus::default()
+    }
+}
+
+/// Both DRBD ports rejected by a test firewall: each side reports the
+/// other Filtered once the window passed; the record goes once they
+/// connect; a peer with nothing listening is Refused. Also the raw
+/// probe against a dropping rule and a closed port.
+#[tokio::test]
+#[ignore = "needs root, DRBD 9 and the test VG"]
+async fn drbd_blocked_port_is_reported() {
+    use agent::drbd::Host as _;
+    use model::ProbeResult;
+    if !enabled() {
+        return;
+    }
+    drbd_clean(EVERY).await;
+    let fw = Firewall::block();
+    let probe = |addr: &str| {
+        agent::peer::classify(
+            &agent::drbd::RealHost.connect(addr.parse().unwrap(), agent::peer::PROBE_TIMEOUT),
+        )
+        .0
+    };
+    assert_eq!(probe("127.0.0.3:11992"), ProbeResult::TimedOut);
+    assert_eq!(probe("127.0.0.4:11993"), ProbeResult::Refused);
+    assert_eq!(probe("127.0.0.2:11991"), ProbeResult::Filtered);
+
+    let h = start().await;
+    let pools = [pool(&h.node)];
+    let mut g = group(&h, GIB, &[A, B], &[], None);
+    let [a, b] = &mut g[..] else { unreachable!() };
+    let started = tokio::time::Instant::now();
+    loop {
+        let eb = b.entry.clone().unwrap_or_else(|| up_entry("x"));
+        let ea = a.entry.clone().unwrap_or_else(|| up_entry("x"));
+        a.pass_seeing(&pools, &[("m1", eb)]).await;
+        b.pass_seeing(&pools, &[("m0", ea)]).await;
+        if !a.stuck().is_empty() && !b.stuck().is_empty() {
+            break;
+        }
+        assert!(
+            started.elapsed() < agent::peer::STUCK + Duration::from_secs(30),
+            "no stuck report: a {:?} b {:?}",
+            a.entry,
+            b.entry
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    println!("reported after {:?}", started.elapsed());
+    assert!(started.elapsed() >= agent::peer::STUCK);
+    for (m, peer, port) in [(&*a, "m1", B.port), (&*b, "m0", A.port)] {
+        let p = m.stuck();
+        println!("{}: {p:?}", m.res);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].node, peer);
+        assert_eq!(p[0].port, port);
+        assert_eq!(p[0].result, ProbeResult::Filtered, "{}", m.res);
+    }
+
+    drop(fw);
+    let open = tokio::time::Instant::now();
+    loop {
+        let eb = b.entry.clone().unwrap();
+        let ea = a.entry.clone().unwrap();
+        a.pass_seeing(&pools, &[("m1", eb)]).await;
+        b.pass_seeing(&pools, &[("m0", ea)]).await;
+        if a.stuck().is_empty() && b.stuck().is_empty() {
+            break;
+        }
+        assert!(
+            open.elapsed() < agent::peer::STABLE + Duration::from_secs(40),
+            "still reported: a {:?} b {:?}",
+            a.stuck(),
+            b.stuck()
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    println!("cleared {:?} after the firewall went", open.elapsed());
+    {
+        let t = h.tracker.lock().unwrap();
+        assert!(connected(&t, "rw-a") && connected(&t, "rw-b"));
+    }
+
+    // b down: nothing listens on its port.
+    assert_eq!(sh(&["drbdsetup", "down", "rw-b"]).await.exit_code, Some(0));
+    let down = tokio::time::Instant::now();
+    loop {
+        a.pass_seeing(&pools, &[("m1", up_entry("x"))]).await;
+        if !a.stuck().is_empty() {
+            break;
+        }
+        assert!(
+            down.elapsed() < agent::peer::STUCK + Duration::from_secs(30),
+            "no stuck report"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert_eq!(a.stuck()[0].result, ProbeResult::Refused);
+
+    for m in [&mut *a, &mut *b] {
+        delete(&h, m).await;
+    }
+    assert!(!lv_names(&lvm()).await.iter().any(|n| n.starts_with("rw-")));
+}

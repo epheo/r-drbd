@@ -56,6 +56,7 @@ fn sizes_used_here() {
 struct FakeHost {
     sectors: Mutex<u64>,
     port_busy: bool,
+    probes: AtomicU32,
 }
 
 impl Host for FakeHost {
@@ -64,6 +65,10 @@ impl Host for FakeHost {
     }
     fn port_in_use(&self, _: IpAddr, _: u16) -> bool {
         self.port_busy
+    }
+    fn connect(&self, _: std::net::SocketAddr, _: Duration) -> std::io::Result<()> {
+        self.probes.fetch_add(1, Ordering::Relaxed);
+        Err(std::io::ErrorKind::HostUnreachable.into())
     }
 }
 
@@ -1587,4 +1592,60 @@ async fn snapshot_of_a_replica_rebuilt_this_pass_is_refused() {
                 .iter()
                 .any(|c| c.iter().any(|w| w.contains("+snap-1")))
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stuck_connection_is_probed_and_reported() {
+    let mut lines = healthy();
+    lines[1] = "exists connection name:pvc-1 peer-node-id:1 conn-name:n2 connection:Connecting role:Unknown".into();
+    let mut rig = Rig::new(&lines, up_host());
+    let x = rig.x.clone();
+    let peer = ReplicaStatus {
+        node: "n2".into(),
+        present: true,
+        ..ReplicaStatus::default()
+    };
+    let vol = with_entries(volume(GIB), vec![reported(), peer]);
+    reads(&x, &[lv(LV_KIB)]);
+    rig.expect_check();
+    rig.expect_sweep();
+    dry(&x, "");
+    let writes = rig.pass(std::slice::from_ref(&vol), &[]).await;
+    assert_eq!(entry_of(&writes).unreachable_peers, vec![]);
+    assert_eq!(rig.host.probes.load(Ordering::Relaxed), 0);
+
+    tokio::time::advance(crate::peer::STUCK).await;
+    reads_again(&x, &[lv(LV_KIB)]);
+    dry(&x, "");
+    let writes = rig.pass(std::slice::from_ref(&vol), &[]).await;
+    let e = entry_of(&writes);
+    assert_eq!(rig.host.probes.load(Ordering::Relaxed), 1);
+    let [p] = e.unreachable_peers.as_slice() else {
+        panic!("one stuck peer expected: {e:?}");
+    };
+    assert_eq!(p.node, "n2");
+    assert_eq!((p.address.as_str(), p.port), ("10.0.0.2", 11000));
+    assert_eq!(p.result, model::ProbeResult::Filtered);
+
+    // Rate limited: the next pass reports the same and probes nothing.
+    let vol = with_entries(
+        volume(GIB),
+        vec![e.clone(), vol.status.clone().unwrap().replicas[1].clone()],
+    );
+    reads_again(&x, &[lv(LV_KIB)]);
+    dry(&x, "");
+    let writes = rig.pass(std::slice::from_ref(&vol), &[]).await;
+    assert!(writes.iter().all(|x| x.name() != "pvc-1"), "{writes:?}");
+    assert_eq!(rig.host.probes.load(Ordering::Relaxed), 1);
+
+    // Connected and held: the record goes.
+    rig.feed(&["change connection name:pvc-1 conn-name:n2 connection:Connected role:Secondary"]);
+    // Not held yet: a flap keeps the record.
+    let writes = rig.rec.refresh(&[Arc::new(vol.clone())]).await;
+    assert_eq!(entry_of(&writes).unreachable_peers.len(), 1);
+    tokio::time::advance(crate::peer::STABLE).await;
+    reads_again(&x, &[lv(LV_KIB)]);
+    dry(&x, "");
+    let writes = rig.pass(&[vol], &[]).await;
+    assert_eq!(entry_of(&writes).unreachable_peers, vec![]);
 }

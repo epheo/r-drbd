@@ -63,6 +63,8 @@ pub trait Host: Send + Sync + std::fmt::Debug {
     /// Bind test with SO_REUSEADDR; an address not assigned here
     /// falls back to the wildcard.
     fn port_in_use(&self, addr: IpAddr, port: u16) -> bool;
+    /// A TCP connect, closed at once.
+    fn connect(&self, addr: SocketAddr, timeout: Duration) -> std::io::Result<()>;
 }
 
 #[derive(Debug, Default)]
@@ -90,6 +92,10 @@ impl Host for RealHost {
             }
             Err(_) => true,
         }
+    }
+
+    fn connect(&self, addr: SocketAddr, timeout: Duration) -> std::io::Result<()> {
+        std::net::TcpStream::connect_timeout(&addr, timeout).map(drop)
     }
 }
 
@@ -291,7 +297,7 @@ pub fn peers<'a>(a: &'a Assignment, me: &'a AssignedReplica) -> Vec<&'a Assigned
         .collect()
 }
 
-fn socket(
+pub(crate) fn socket(
     node: &str,
     port: Option<u16>,
     addresses: &BTreeMap<String, IpAddr>,
@@ -541,6 +547,7 @@ pub fn entry(
         size_bytes,
         observed_generation: facts.observed_generation,
         last_error: facts.last_error.clone(),
+        unreachable_peers: Vec::new(),
     }
 }
 

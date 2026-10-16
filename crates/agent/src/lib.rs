@@ -14,6 +14,7 @@ pub mod drbd;
 pub mod events2;
 pub mod exec;
 pub mod node;
+pub mod peer;
 pub mod reconcile;
 pub mod retry;
 pub mod storage;

@@ -199,6 +199,9 @@ pub(crate) struct Memory {
     /// Per Volume uid: the EvictionBlocked text last sent as an Event, so a
     /// block that lasts emits one Event per reason, not one per pass.
     pub(crate) evict_blocked: HashMap<String, String>,
+    /// Per Volume uid: the PeerUnreachable reason last sent as an Event,
+    /// empty for False.
+    pub(crate) peer_unreachable: HashMap<String, String>,
 }
 
 impl Memory {
@@ -293,6 +296,9 @@ async fn pass(ctx: &Ctx<'_>, memory: &mut Memory) -> Option<Duration> {
     memory.resolving.retain(|uid| seen.contains_key(uid));
     memory.initialized.retain(|uid, _| seen.contains_key(uid));
     memory.evict_blocked.retain(|uid, _| seen.contains_key(uid));
+    memory
+        .peer_unreachable
+        .retain(|uid, _| seen.contains_key(uid));
     let snapshots: HashSet<String> = ctx
         .stores
         .snapshots

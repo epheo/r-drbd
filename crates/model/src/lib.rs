@@ -19,8 +19,8 @@ pub use condition::Condition;
 pub use pool::{DEFAULT_OVERCOMMIT_PERCENT, DEFAULT_RESERVE_PERCENT, Pool, PoolSpec, PoolStatus};
 pub use snapshot::{Snapshot, SnapshotAck, SnapshotPhase, SnapshotSpec, SnapshotStatus};
 pub use volume::{
-    AccessMode, AssignedReplica, Assignment, ReplicaStatus, Resolve, Role, Volume, VolumePhase,
-    VolumeSource, VolumeSpec, VolumeStatus,
+    AccessMode, AssignedReplica, Assignment, PeerProbe, ProbeResult, ReplicaStatus, Resolve, Role,
+    Volume, VolumePhase, VolumeSource, VolumeSpec, VolumeStatus,
 };
 
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
