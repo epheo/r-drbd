@@ -123,8 +123,19 @@ pub fn parse_system_state(stdout: &str) -> Option<bool> {
     }
 }
 
+/// When systemd stops the container's scope it signals every process in
+/// it, the probe just spawned included, until the scope holds no new ones;
+/// a moment later a new child runs.
+const KILLED_RETRY: Duration = Duration::from_millis(300);
+
 async fn local(exec: &dyn Exec, argv: &[String], parse: fn(&str) -> Option<bool>) -> Answer {
-    match run_any(exec, argv, PROBE_MODE).await {
+    let mut out = run_any(exec, argv, PROBE_MODE).await;
+    if matches!(&out, Ok(o) if o.exit_code.is_none()) {
+        tracing::info!(argv = ?argv, "probe killed by a signal, trying again");
+        tokio::time::sleep(KILLED_RETRY).await;
+        out = run_any(exec, argv, PROBE_MODE).await;
+    }
+    match out {
         Ok(out) => match parse(&out.stdout) {
             Some(true) => Answer::Yes,
             Some(false) => Answer::No,

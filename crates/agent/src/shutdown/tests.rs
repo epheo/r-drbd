@@ -354,6 +354,23 @@ async fn api_only_when_both_local_probes_fail() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn probe_killed_by_a_signal_runs_again() {
+    let killed = || {
+        Ok(crate::Output {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            duration: Duration::ZERO,
+        })
+    };
+    let x = ScriptedExec::new();
+    x.expect(system_state_argv(), killed())
+        .expect(system_state_argv(), code(1, "stopping\n", ""));
+    assert_eq!(probe_system_state(&x).await, Answer::Yes);
+    x.assert_done();
+}
+
+#[tokio::test(start_paused = true)]
 async fn detection_is_bounded() {
     struct Hung;
     #[async_trait::async_trait]
