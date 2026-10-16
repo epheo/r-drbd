@@ -72,6 +72,7 @@ With graceful node shutdown on (see install), a reboot or power-off releases eve
 - If so, it waits briefly for running CSI calls, flushes each mounted file system it owns (`sync -f`, skipped on a device with suspended I/O), then forces every Primary it owns to Secondary (`drbdsetup secondary --force`).
   A pod stuck on suspended I/O then gets I/O errors instead of holding the shutdown; the peers stay UpToDate.
 - A volume still in use when the node goes down is flushed when it can be and then cut like a crash; the clean result needs graceful node shutdown.
+- Without graceful node shutdown, systemd stops the agent together with everything else, and drbd-utils' `drbd-graceful-disconnect.service`, when loaded, disconnects an in-use Primary within a fraction of a second, before the agent can act: its peers turn Outdated until the node returns.
 - An agent update or a pod delete is not a shutdown and demotes nothing.
   On hosts without systemd, that check waits up to 4 s for the pod.
 
