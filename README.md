@@ -11,14 +11,14 @@ Kubernetes CRDs are the API; one static binary runs as the controller and as a p
 - Pools are per-node objects grouped by tier; placement by tier, or pinned to a node or pool with PVC annotations.
 - Typed, watchable status: primary node, per-replica disk state, sync progress and peers, with Ready, Degraded, QuorumLost and SplitBrain conditions.
 - Explicit repair actions on the Volume: `spec.resolve` for split brain, `spec.evict` to move a replica off a dead or retired node.
-- Safe by default: an existing file system is never reformatted, a lost LV is never silently recreated empty, LVs outside its thin pool are never touched, every wait is bounded.
+- Safe by default: an existing file system is never reformatted, a lost LV is never silently recreated empty, LVs outside its thin pool are never touched, a disk with a signature is never written, every wait is bounded.
 - No operator, no REST API, no database: the Kubernetes API server is the only control path.
 - Small footprint: a static binary on a scratch image; about 10 MiB of memory per process at idle.
 
 ## Requirements
 
 - Kubernetes, OpenShift or MicroShift; the external-snapshotter CRDs and snapshot controller for snapshots.
-- On every storage node: the DRBD 9 kernel module, lvm2 with a thin pool, xfsprogs. drbd-utils comes in the image.
+- On every storage node: the DRBD 9 kernel module, lvm2, xfsprogs, and a thin pool in a VG or blank disks the agent builds one from. drbd-utils comes in the image.
 - TCP ports 11000 to 11999 open between nodes for DRBD.
 - 3 nodes for replicated volumes: DRBD quorum needs a third vote, which can come from a node without storage.
 - Graceful node shutdown on in kubelet (`shutdownGracePeriod`, `shutdownGracePeriodCriticalPods`), so pods release their volumes before a node goes down.
@@ -31,7 +31,7 @@ Install the CRDs and the controller and agent:
     podman run --rm ghcr.io/epheo/r-drbd:latest crds | kubectl apply -f -
     kubectl apply -k deploy/base
 
-Declare a thin pool on a node:
+Declare a thin pool on a node (or list blank disks in `devices` and let the agent build it, see docs/pools.md):
 
     apiVersion: r-drbd.io/v1alpha1
     kind: Pool

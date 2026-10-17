@@ -6,10 +6,11 @@ Entry point: `agent::run(Config)`; `src/bin/agent-dev.rs` (feature `dev-bin`) is
 
 Modules:
 - `exec`: tokio process runner behind `Exec` (stdin null, Timeout mode with SIGTERM then SIGKILL).
-- `storage`: thin LVM through the lvm crate argv builders and parsers; separate timeouts for reports and changes; remove waits a bounded time for an open LV.
+- `storage`: thin LVM through the lvm crate argv builders and parsers; separate timeouts for reports and changes; remove waits a bounded time for an open LV. `storage::plan`: pure next step of a Pool built from devices (build, growth, removal) and the metadata size rule.
+- `devices`: checks on the disks a Pool lists (by-id link, sysfs, host mount table, exclusive open, host wipefs), one state per path.
 - `node`: tool probe (versions, and the optional DRBD settings `drbdsetup help` lists), Node annotations, heartbeat Lease.
 - `watch`: reflectors for Pool, Volume, Snapshot and every Node (peers' InternalIPs are DRBD addresses); a trigger that coalesces changes over 250 ms and fires every 30 s.
-- `reconcile`: one pass (pools, volumes by name, snapshots), host work first, then server-side apply of this node's status entries only, skipped when unchanged; `reconcile::replicated` is the DRBD path, and `refresh` rewrites the entries of volumes events2 touched without a full pass.
+- `reconcile`: one pass (pools, volumes by name, snapshots), host work first, then server-side apply of this node's status entries only, skipped when unchanged; `reconcile::replicated` is the DRBD path, `reconcile::devices` the build, growth and removal of Pools from devices, and `refresh` rewrites the entries of volumes events2 touched without a full pass.
 - `events2`: line parser and tracked state, built from the initial dump only (a change before its end restarts the stream); cleared on every restart, so resources destroyed while the stream was down do not linger.
 - `drbd`: command lines, ownership tags, resource files (checked by drbdadm, then renamed into place), state derivation into the status contract, the `drbdsetup events2 all` process with its restart backoff.
 - `csi`: Identity and Node services on the Unix socket.
@@ -21,6 +22,7 @@ Rules:
 - Adjust runs only when `drbdadm --dry-run adjust` plans commands, and never during a split brain (the helper call, carried over an events2 restart while still StandAlone, or the Volume's SplitBrain condition), a snapshot round's suspend or a resolve in flight. A plan that comes back after a successful adjust is retried on a doubling wait (30 s to 10 min) and reported in lastError.
 - Every new diskful replica gets just-created metadata. Before initializedAt the initialUpToDateNode makes the first data current: without a sync once every diskful peer is connected and Inconsistent, or after a bounded wait when DRBD reports quorum, no replica was rebuilt and no status ever showed data; as the sync source for a restore, whose LV it restores again if lost before initializedAt.
 - Bitmap slots of node ids no longer assigned are freed with forget-peer, read from the superblock once per spec generation and retried until clean.
+- A Pool's VG is built or grown only from paths checked Blank in the same pass, right before each step; a VG without the tag `r-drbd.pool.<pool>` is never changed; no LVM command passes `--yes` or `--force` for it, and wipefs runs only with `--no-act`.
 - Metadata ownership is the LVM tag `r-drbd.md.<volume uid>.<node id>`; `r-drbd.new` marks an LV that never held data; anything else is stale or refused, never adopted.
 
 Tests:
@@ -36,5 +38,5 @@ Dependencies:
 - tracing: logs; tracing-subscriber only behind `dev-bin`.
 - serde, serde_json: apply bodies, `drbdsetup status --json`.
 - thiserror, async-trait: errors and the `Exec` trait.
-- rustix (fs): statvfs for NodeGetVolumeStats.
+- rustix (fs): statvfs for NodeGetVolumeStats, the exclusive open of a listed disk.
 - dev only: tonic (channel), hyper-util, tower for the test CSI client; tokio test-util for paused-time tests.

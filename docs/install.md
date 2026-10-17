@@ -11,7 +11,7 @@ On every node that runs the agent (by default, every node):
 
 On every node that stores data, also:
 
-- lvm2 2.03.03 or newer, with a thin pool in a volume group.
+- lvm2 2.03.03 or newer, and either a thin pool in a volume group, or blank disks the agent builds one from.
   Older LVM does not know `scan_lvs`; the agent then marks its Pools Available False, reason `LvmUnsupported`.
 - xfsprogs.
 - The host's own LVM must not scan DRBD devices or LVs. Either:
@@ -110,11 +110,21 @@ Then declare it:
       vg: data
       thinPool: thin
 
+Or let the agent build the VG and thin pool from blank disks:
+
+    spec:
+      node: node1
+      tier: nvme
+      vg: r-drbd-nvme
+      thinPool: thin
+      devices:
+        - /dev/disk/by-id/nvme-Example_SSD_2TB_S7KH0000000001
+
 Wait for it to be available:
 
     kubectl get pools
 
-See [Pools](pools.md) for details.
+See [Pools](pools.md) for details, and for how to find by-id paths.
 
 ## Use a StorageClass
 

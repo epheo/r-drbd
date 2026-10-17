@@ -14,15 +14,21 @@ Group `r-drbd.io/v1alpha1`, cluster scoped.
 | `spec.thinPool` | string | LVM name, immutable |
 | `spec.overcommitPercent` | integer | 100 to 1000, default 100, mutable |
 | `spec.reservePercent` | integer | 0 to 50, default 5, mutable |
+| `spec.devices` | []string | `/dev/disk/by-id/<name>` paths, at most 64, no duplicates; append only; present or absent from creation on |
+| `spec.chunkSize` | quantity | Power of two, 64Ki to 1Gi; devices only; immutable; absent means 64Ki |
+| `spec.reclaimPolicy` | string | `Retain` or `Delete`; devices only; mutable; absent means `Retain` |
 | `status.totalBytes` | integer | Thin pool data size |
 | `status.freeBytes` | integer | Thin pool free space |
 | `status.chunkBytes` | integer | Thin pool chunk size |
 | `status.committedBytes` | integer | Sum of the sizes of the volumes placed here |
 | `status.placeableBytes` | integer | Largest new volume placement accepts here now, rounded down to MiB, 0 when placement skips the Pool (see [Pools](pools.md#capacity)) |
 | `status.volumes` | []string | Volumes with a diskful replica here |
-| `status.conditions` | []Condition | `Available` |
+| `status.devices[]` | object | Devices mode, per listed path: `path`, `state`, `sizeBytes`, `model`, `serial`, `message` |
+| `status.conditions` | []Condition | `Available`; `Released` under `reclaimPolicy: Delete` once deleted |
 
-Finalizer `r-drbd.io/pool` holds deletion while `status.volumes` is not empty.
+Device `state`: `Member`, `Blank`, `NotEmpty`, `Busy`, `NotADisk`, `Missing` (see [Pools](pools.md#what-the-agent-checks)).
+
+Finalizer `r-drbd.io/pool` holds deletion while `status.volumes` is not empty, and under `reclaimPolicy: Delete` until `Released` is True.
 
 ## Volume
 
@@ -119,7 +125,11 @@ Volume `PeerUnreachable`:
 | `NotListening` | The probe was refused: nothing listens at that address and port, or a firewall answers with a TCP reset |
 | `Unknown` | The port answers but DRBD does not connect, or the probe failed |
 
-Pool `Available`: `ThinPoolReady`, `ThinPoolUnavailable`, `ZeroingDisabled`, `InvalidName`, `LvmUnsupported` (host LVM older than 2.03.03).
+Pool `Available`: `ThinPoolReady`, `ThinPoolUnavailable`, `ZeroingDisabled`, `InvalidName`, `LvmUnsupported` (host LVM older than 2.03.03); devices mode also `DeviceNotEmpty`, `DeviceBusy`, `DeviceMissing`, `NotADisk`, `VolumeGroupNotOwned`, `Building` (a step failed, named in the message).
+
+Pool `Released`: `Removed` (True: thin pool, VG and PV labels removed), `Blocked` (False: something else is in the VG, or the VG is not the Pool's; nothing removed), `RemoveFailed` (False: an LVM command failed, retried on the next pass).
+
+Pool Events: `DeviceNotUsable` (Warning: an appended path is not blank and stays out of the pool).
 
 Volume Events: `Evicted`, `EvictionBlocked`, `SplitBrainResolved`, `PeerUnreachable` (Warning), `PeersReachable`.
 
