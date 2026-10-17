@@ -3,7 +3,7 @@
 //! rules and the printer columns.
 
 use kube::CustomResourceExt;
-use model::{Pool, Snapshot, Volume, VolumeSpec};
+use model::{NodeDisks, Pool, Snapshot, Volume, VolumeSpec};
 use serde_json::{Value, json};
 
 fn schema(crd: &Value) -> &Value {
@@ -15,7 +15,7 @@ fn to_json<T: serde::Serialize>(t: &T) -> Value {
 }
 
 #[test]
-fn three_cluster_scoped_crds_with_status() {
+fn four_cluster_scoped_crds_with_status() {
     let crds = model::crds();
     let names: Vec<_> = crds
         .iter()
@@ -26,7 +26,8 @@ fn three_cluster_scoped_crds_with_status() {
         [
             "pools.r-drbd.io",
             "volumes.r-drbd.io",
-            "snapshots.r-drbd.io"
+            "snapshots.r-drbd.io",
+            "nodedisks.r-drbd.io"
         ]
     );
     for crd in &crds {
@@ -42,7 +43,7 @@ fn three_cluster_scoped_crds_with_status() {
         assert!(
             v.additional_printer_columns
                 .as_ref()
-                .is_some_and(|c| c.len() >= 3)
+                .is_some_and(|c| c.len() >= 2)
         );
     }
 }
@@ -247,5 +248,40 @@ fn pool_devices_mode_schema() {
     assert_eq!(
         rows["items"]["properties"]["state"]["enum"],
         json!(["Missing", "NotADisk", "Member", "Busy", "NotEmpty", "Blank"])
+    );
+}
+
+#[test]
+fn nodedisks_rows_keyed_by_path_with_blank_column() {
+    let crd = to_json(&NodeDisks::crd());
+    let disks = &schema(&crd)["properties"]["status"]["properties"]["disks"];
+    assert_eq!(disks["x-kubernetes-list-map-keys"], json!(["path"]));
+    let required = &disks["items"]["required"];
+    assert_eq!(required, &json!(["name", "path", "state"]));
+    let cols = &crd["spec"]["versions"][0]["additionalPrinterColumns"];
+    assert_eq!(cols[0]["jsonPath"], ".status.blank");
+    assert_eq!(cols[1]["name"], "Age");
+
+    let status = model::NodeDisksStatus {
+        blank: 1,
+        disks: vec![model::DiskStatus {
+            path: "/dev/disk/by-id/wwn-0x5000".into(),
+            name: "sdb".into(),
+            links: vec!["/dev/disk/by-id/wwn-0x5000".into()],
+            state: model::DeviceState::Member,
+            pool: Some("p1".into()),
+            size_bytes: Some(1 << 30),
+            model: None,
+            serial: None,
+            message: None,
+        }],
+    };
+    assert_eq!(
+        to_json(&status),
+        json!({"blank": 1, "disks": [{
+            "path": "/dev/disk/by-id/wwn-0x5000", "name": "sdb",
+            "links": ["/dev/disk/by-id/wwn-0x5000"], "state": "Member",
+            "pool": "p1", "sizeBytes": 1_073_741_824u64,
+        }]})
     );
 }

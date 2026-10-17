@@ -1,4 +1,4 @@
-//! The r-drbd.io v1alpha1 API: Pool, Volume and Snapshot.
+//! The r-drbd.io v1alpha1 API: Pool, Volume, Snapshot and NodeDisks.
 //!
 //! Spec is desired state, status is observed state. Agents write only
 //! their own entries of list fields with server-side apply, which is why
@@ -11,11 +11,13 @@
 
 pub mod condition;
 pub mod keys;
+pub mod nodedisks;
 pub mod pool;
 pub mod snapshot;
 pub mod volume;
 
 pub use condition::Condition;
+pub use nodedisks::{DiskStatus, NodeDisks, NodeDisksSpec, NodeDisksStatus};
 pub use pool::{
     DEFAULT_OVERCOMMIT_PERCENT, DEFAULT_RESERVE_PERCENT, DeviceState, DeviceStatus, Pool, PoolSpec,
     PoolStatus, ReclaimPolicy,
@@ -34,5 +36,10 @@ pub const VERSION: &str = "v1alpha1";
 
 /// All CRDs, in install order.
 pub fn crds() -> Vec<CustomResourceDefinition> {
-    vec![Pool::crd(), Volume::crd(), Snapshot::crd()]
+    vec![
+        Pool::crd(),
+        Volume::crd(),
+        Snapshot::crd(),
+        NodeDisks::crd(),
+    ]
 }
