@@ -125,11 +125,11 @@ Volume `PeerUnreachable`:
 | `NotListening` | The probe was refused: nothing listens at that address and port, or a firewall answers with a TCP reset |
 | `Unknown` | The port answers but DRBD does not connect, or the probe failed |
 
-Pool `Available`: `ThinPoolReady`, `ThinPoolUnavailable`, `ZeroingDisabled`, `InvalidName`, `LvmUnsupported` (host LVM older than 2.03.03); devices mode also `DeviceNotEmpty`, `DeviceBusy`, `DeviceMissing`, `NotADisk`, `VolumeGroupNotOwned`, `Building` (a step failed, named in the message).
+Pool `Available`: `ThinPoolReady`, `ThinPoolUnavailable`, `ZeroingDisabled`, `InvalidName`, `LvmUnsupported` (host LVM older than 2.03.03); devices mode also `DeviceNotEmpty`, `DeviceBusy`, `DeviceMissing`, `NotADisk`, `VolumeGroupNotOwned`, `Building` (a build step failed, named in the message; a failed growth step keeps the Pool Available and puts the error in the message).
 
-Pool `Released`: `Removed` (True: thin pool, VG and PV labels removed), `Blocked` (False: something else is in the VG, or the VG is not the Pool's; nothing removed), `RemoveFailed` (False: an LVM command failed, retried on the next pass).
+Pool `Released`: `Removed` (True: thin pool, VG and PV labels removed), `RemoveBlocked` (False: something else is in the VG, the VG is not the Pool's, or it misses a PV; nothing removed), `RemoveFailed` (False: an LVM command failed, retried on the next pass).
 
-Pool Events: `DeviceNotUsable` (Warning: an appended path is not blank and stays out of the pool).
+Pool Events: `DeviceNotUsable` (Warning: an appended path is not blank and stays out of the pool), `PoolNotGrown` (Warning: a growth step failed, or the metadata maximum leaves VG space out of the pool).
 
 Volume Events: `Evicted`, `EvictionBlocked`, `SplitBrainResolved`, `PeerUnreachable` (Warning), `PeersReachable`.
 

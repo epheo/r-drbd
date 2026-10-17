@@ -12,6 +12,7 @@ On every node that runs the agent (by default, every node):
 On every node that stores data, also:
 
 - lvm2 2.03.03 or newer, and either a thin pool in a volume group, or blank disks the agent builds one from.
+  For blank disks with `use_devicesfile = 1`, the devices file must exist (`vgimportdevices --all` makes it).
   Older LVM does not know `scan_lvs`; the agent then marks its Pools Available False, reason `LvmUnsupported`.
 - xfsprogs.
 - The host's own LVM must not scan DRBD devices or LVs. Either:

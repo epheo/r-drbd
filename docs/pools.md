@@ -89,6 +89,7 @@ Before any change, on every pass, each listed path gets one state in `status.dev
 | `Missing` | The path does not resolve |
 
 When several apply, the first in this order wins: Missing, NotADisk, Member, Busy, NotEmpty, Blank.
+A second by-id name of a disk already listed (its `wwn-` and its `nvme-` link) is `NotADisk`, naming the first.
 Each row also shows the disk's size, model and serial, so you can tell which disk is which.
 
 How:
@@ -105,10 +106,14 @@ To reuse a disk with old data, wipe it yourself first (`wipefs -a`), deliberatel
    One bad path stops the whole Pool, Available False with the reason of the worst row; nothing is created.
 2. `vgcreate` with the tag `r-drbd.pool.<pool name>`.
    It runs without `--yes` or `--force`, so LVM's own refusal of a disk with a signature is a second guard.
+   With `use_devicesfile = 1` the devices file must already exist: otherwise vgcreate would create it with only the new disks, and every other VG of the host, the root VG included, would drop out of LVM's view.
+   The agent then refuses (reason `Building`); run `vgimportdevices --all` on the node first.
 3. The thin pool takes all the space, with metadata sized as below and zeroing on.
 4. From there the Pool works like any other.
 
 Every step is checked again right before it runs, and is safe to repeat: an agent restart between two steps resumes from what is on the disk.
+A crash inside vgcreate itself can leave PV labels without a VG; those disks then read `NotEmpty` (`LVM2_member`).
+Run `pvremove` on them and the build goes on.
 
 A VG of that name that exists without the tag is never adopted or touched: Available False, reason `VolumeGroupNotOwned`.
 A VG you made by hand belongs in a Pool without `devices`.
@@ -122,6 +127,7 @@ Metadata comes first: a pool whose data outgrows its metadata fails as a whole.
 Volumes keep running throughout.
 
 An appended path that is not `Blank` is left out: the Pool keeps its capacity and stays Available, the row says why, and a Warning Event `DeviceNotUsable` on the Pool says it once.
+A growth step that fails also leaves the Pool serving at its current size: the `Available` message holds the error, a Warning Event `PoolNotGrown` says it once, and the next pass tries again.
 
 ### Metadata size
 
@@ -132,6 +138,9 @@ An appended path that is not `Blank` is left out: the Pool keeps its capacity an
 - LVM caps thin pool metadata near 15.81 GiB.
   When the rule exceeds it at creation, the chunk doubles until it fits; `status.chunkBytes` shows the chunk used.
   At 64 KiB that happens above about 15.7 TiB of data.
+- The chunk never changes after creation, so growth stops at what capped metadata covers by the rule: about 15.7 TiB at 64 KiB, twice that per doubling of the chunk.
+  The rest of the VG stays out of the thin pool; the `Available` message and a `PoolNotGrown` Event say how much.
+  Plan large Pools with a larger `chunkSize`.
 - Examples at 64 KiB: 100 GiB of data gets 164 MiB, 15 TiB about 15 GiB.
 
 ### Failures
@@ -140,6 +149,7 @@ A disk of the VG that disappears makes the VG partial: Available False, reason `
 DRBD detaches the replicas on that node on IO errors, and their Volumes turn Degraded.
 There is no RAID inside a node: one disk failure loses this node's replicas, and the other nodes keep the data.
 Replacing a disk means a new Pool: move the replicas off with `spec.evict` (see [Operations](operations.md)), then delete the Pool.
+Under `reclaimPolicy: Delete` a VG with a missing PV is never removed, so `Released` stays False: switch the Pool to `Retain` first, then clean up the VG and the remaining disks by hand.
 
 ### Finding by-id paths
 
