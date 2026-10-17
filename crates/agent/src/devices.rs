@@ -15,7 +15,7 @@ use crate::exec::{DEFAULT_TIMEOUT, run_ok};
 
 /// Kernel name prefixes of block devices that are not whole disks, with
 /// what to call them. Multipath maps are dm devices: out of scope.
-const NOT_DISKS: [(&str, &str); 8] = [
+const NOT_DISKS: [(&str, &str); 11] = [
     ("loop", "a loop device"),
     ("ram", "a RAM disk"),
     ("zram", "a zram device"),
@@ -24,6 +24,9 @@ const NOT_DISKS: [(&str, &str); 8] = [
     ("drbd", "a DRBD device"),
     ("sr", "an optical drive"),
     ("nbd", "a network block device"),
+    ("rbd", "a Ceph RBD device"),
+    ("zd", "a ZFS volume"),
+    ("nullb", "a null block device"),
 ];
 
 /// A partition of the disk, from sysfs.
@@ -376,9 +379,18 @@ pub async fn check(
     pvs: &BTreeMap<PathBuf, String>,
     vg: &str,
 ) -> Vec<Checked> {
-    let mut out = Vec::with_capacity(paths.len());
+    let mut out: Vec<Checked> = Vec::with_capacity(paths.len());
     for path in paths {
         let mut f = disks.facts(path);
+        // Two by-id names of one disk (wwn- and nvme-): only the first counts.
+        let first = f.dev.as_ref().ok().and_then(|n| {
+            out.iter()
+                .find(|c| c.node.as_ref() == Some(n))
+                .map(|c| c.row.path.clone())
+        });
+        if let Some(first) = first {
+            f.sys = Err(format!("the same disk as {first}"));
+        }
         let pv_vg = f
             .dev
             .as_ref()
@@ -659,6 +671,9 @@ mod tests {
             ("drbd50000", "a DRBD device"),
             ("zram0", "a zram device"),
             ("sr0", "an optical drive"),
+            ("rbd0", "a Ceph RBD device"),
+            ("zd16", "a ZFS volume"),
+            ("nullb0", "a null block device"),
         ] {
             let f = disk(name);
             assert_eq!(
@@ -741,6 +756,25 @@ mod tests {
         assert_eq!(
             m.as_deref(),
             Some("signatures unknown: wipefs: exit 1: denied")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_alias_of_a_listed_disk_is_not_a_second_disk() {
+        let disks = FakeDisks::default();
+        disks
+            .set("/dev/disk/by-id/nvme-x", disk("nvme0n1"))
+            .set("/dev/disk/by-id/wwn-x", disk("nvme0n1"));
+        let x = ScriptedExec::new();
+        x.expect(wipefs_argv("/dev/nvme0n1"), ok(WIPEFS_BLANK));
+        let paths = ["/dev/disk/by-id/nvme-x", "/dev/disk/by-id/wwn-x"].map(str::to_owned);
+        let rows = check(&x, &disks, &paths, &BTreeMap::new(), "vg1").await;
+        x.assert_done();
+        assert_eq!(rows[0].row.state, DeviceState::Blank);
+        assert_eq!(rows[1].row.state, DeviceState::NotADisk);
+        assert_eq!(
+            rows[1].row.message.as_deref(),
+            Some("the same disk as /dev/disk/by-id/nvme-x")
         );
     }
 
