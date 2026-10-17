@@ -48,7 +48,7 @@ pub(crate) const REASON_VG_NOT_OWNED: &str = "VolumeGroupNotOwned";
 pub(crate) const REASON_BUILDING: &str = "Building";
 // Released, reclaimPolicy Delete.
 const REASON_REMOVED: &str = "Removed";
-const REASON_REMOVE_BLOCKED: &str = "Blocked";
+const REASON_REMOVE_BLOCKED: &str = "RemoveBlocked";
 const REASON_REMOVE_FAILED: &str = "RemoveFailed";
 const NO_DRBD_LOCAL: &str = "replicas 1 volume: no DRBD to suspend or resume";
 pub(crate) const LV_LOST: &str = model::keys::LV_LOST;
@@ -353,6 +353,8 @@ pub struct Reconciler {
     disks: Arc<dyn HostDisks>,
     /// Per Pool, the paths last announced by a DeviceNotUsable Event.
     device_events: HashMap<String, BTreeMap<String, DeviceState>>,
+    /// Per Pool, the note last announced by a PoolNotGrown Event.
+    pool_notes: HashMap<String, String>,
 }
 
 impl Reconciler {
@@ -383,6 +385,7 @@ impl Reconciler {
             peer_leases: None,
             disks: Arc::new(SysDisks::default()),
             device_events: HashMap::new(),
+            pool_notes: HashMap::new(),
         }
     }
 
@@ -482,8 +485,12 @@ impl Reconciler {
             (None, None) if pool.spec.devices.is_some() => {
                 let out = self.devices_pool(reads, pool).await;
                 let gate = out.gate.clone();
-                if let Err((_, why)) = &gate {
-                    self.unready_pools.insert(pool.name_any(), why.clone());
+                if out.unready {
+                    let why = match &gate {
+                        Err((_, why)) => why.clone(),
+                        Ok(()) => "its thin pool is not built".into(),
+                    };
+                    self.unready_pools.insert(pool.name_any(), why);
                 }
                 built = Some(out);
                 match gate {
@@ -495,7 +502,14 @@ impl Reconciler {
         };
         let generation = pool.metadata.generation;
         let (status, reason, message) = match &probed {
-            Ok(_) => (condition::TRUE, REASON_READY, String::new()),
+            Ok(_) => (
+                condition::TRUE,
+                REASON_READY,
+                built
+                    .as_ref()
+                    .and_then(|o| o.note.clone())
+                    .unwrap_or_default(),
+            ),
             Err((reason, e)) => (condition::FALSE, *reason, e.clone()),
         };
         let capacity = probed.map_err(|(_, e)| e);

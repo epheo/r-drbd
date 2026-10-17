@@ -21,6 +21,28 @@ const C: &str = "/dev/disk/by-id/virtio-c";
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
 
+/// The devices file check before vgcreate and vgextend: in use, present.
+trait DevicesFile {
+    fn expect_devices_file(&self) -> &Self;
+}
+
+impl DevicesFile for ScriptedExec {
+    fn expect_devices_file(&self) -> &Self {
+        self.expect(
+            lvm::cmd::host_setting("devices/use_devicesfile"),
+            ok("use_devicesfile=1\n"),
+        )
+        .expect(
+            lvm::cmd::host_setting("devices/devicesfile"),
+            ok("devicesfile=\"system.devices\"\n"),
+        )
+        .expect(
+            crate::storage::devices_file_argv("/etc/lvm/devices/system.devices"),
+            ok(""),
+        )
+    }
+}
+
 fn pool(devices: &[&str]) -> Pool {
     let mut p = Pool::new(
         POOL,
@@ -125,6 +147,7 @@ async fn blank_disks_build_vg_then_thin_pool() {
         .expect(lvm::cmd::pvs_all(), pvs(&[]))
         .expect(wipefs_argv("/dev/vdd"), ok(WIPEFS_BLANK))
         .expect(wipefs_argv("/dev/vde"), ok(WIPEFS_BLANK))
+        .expect_devices_file()
         .expect(lvm::cmd::vgcreate(VG, TAG, &[A.into(), B.into()]), ok(""));
     // Look 2: the tagged VG, members need no wipefs.
     x.expect(lvm::cmd::vgs_all(), vgs(&[(free, free, TAG)]))
@@ -231,6 +254,7 @@ async fn growth_extends_then_grows_and_warns_once() {
         .expect(lvm::cmd::pvs_all(), pvs(&[("/dev/vdd", VG)]))
         .expect(wipefs_argv("/dev/vde"), ok(WIPEFS_BLANK))
         .expect(wipefs_argv("/dev/vdf"), ok(WIPEFS_XFS))
+        .expect_devices_file()
         .expect(lvm::cmd::vgextend(VG, &[B.into()]), ok(""));
     let both = [("/dev/vdd", VG), ("/dev/vde", VG)];
     x.expect(lvm::cmd::vgs_all(), vgs(&[(8 * GIB, 4 * GIB, TAG)]))
@@ -293,6 +317,7 @@ async fn failed_step_reports_building() {
     x.expect(lvm::cmd::vgs_all(), vgs(&[]))
         .expect(lvm::cmd::pvs_all(), pvs(&[]))
         .expect(wipefs_argv("/dev/vdd"), ok(WIPEFS_BLANK))
+        .expect_devices_file()
         .expect(
             lvm::cmd::vgcreate(VG, TAG, &[A.into()]),
             fail("WARNING: xfs signature detected on /dev/vdd at offset 0. Wipe it? [y/n]: [n]\n  Aborted wiping of xfs.\n"),
@@ -425,7 +450,7 @@ async fn delete_with_another_lv_removes_nothing() {
         released(&s),
         Some((
             "False".into(),
-            "Blocked".into(),
+            "RemoveBlocked".into(),
             "volume group vg1 holds LV keep: nothing removed".into()
         ))
     );
@@ -462,7 +487,7 @@ async fn deleting_never_builds() {
     p.status.as_mut().unwrap().volumes = vec!["pvc-1".into()];
     let (w, _) = run(&x, disks(), p).await;
     let (st, reason, msg) = released(&status(&w)).unwrap();
-    assert_eq!((st.as_str(), reason.as_str()), ("False", "Blocked"));
+    assert_eq!((st.as_str(), reason.as_str()), ("False", "RemoveBlocked"));
     assert_eq!(msg, "volumes still placed here: pvc-1: nothing removed");
 }
 
@@ -570,7 +595,7 @@ async fn deleting_a_pool_on_a_foreign_vg_runs_reports_only() {
             ("False", "VolumeGroupNotOwned")
         );
         if policy == ReclaimPolicy::Delete {
-            assert_eq!(released(&s).unwrap().1, "Blocked");
+            assert_eq!(released(&s).unwrap().1, "RemoveBlocked");
         }
         for argv in x.seen.lock().unwrap().iter() {
             assert!(
@@ -579,4 +604,199 @@ async fn deleting_a_pool_on_a_foreign_vg_runs_reports_only() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn no_vgcreate_without_the_devices_file_in_use() {
+    let x = Arc::new(ScriptedExec::new());
+    x.expect(lvm::cmd::vgs_all(), vgs(&[]))
+        .expect(lvm::cmd::pvs_all(), pvs(&[]))
+        .expect(wipefs_argv("/dev/vdd"), ok(WIPEFS_BLANK))
+        .expect(
+            lvm::cmd::host_setting("devices/use_devicesfile"),
+            ok("use_devicesfile=1\n"),
+        )
+        .expect(
+            lvm::cmd::host_setting("devices/devicesfile"),
+            ok("devicesfile=\"system.devices\"\n"),
+        )
+        .expect(
+            crate::storage::devices_file_argv("/etc/lvm/devices/system.devices"),
+            crate::exec::scripted::code(1, "", ""),
+        );
+    let (w, _) = run(&x, disks(), pool(&[A])).await;
+    let (st, reason, msg) = available(&status(&w));
+    assert_eq!((st.as_str(), reason.as_str()), ("False", "Building"));
+    assert!(
+        msg.contains("/etc/lvm/devices/system.devices does not exist"),
+        "{msg}"
+    );
+    assert!(msg.contains("vgimportdevices --all"), "{msg}");
+}
+
+/// A Pool deleted under Delete whose VG is gone and whose disk A still
+/// carries its PV label.
+fn orphan_look(x: &ScriptedExec) {
+    x.expect(lvm::cmd::vgs_all(), vgs(&[]))
+        .expect(lvm::cmd::pvs_all(), pvs(&[("/dev/vdd", "")]))
+        .expect(
+            wipefs_argv("/dev/vdd"),
+            ok(r#"{"signatures": [{"device": "vdd", "offset": "0x218", "type": "LVM2_member", "uuid": "x", "label": null}]}"#),
+        );
+}
+
+#[tokio::test]
+async fn failed_pvremove_is_retried_never_released() {
+    let mut p = deleting(pool(&[A]), ReclaimPolicy::Delete, &[A]);
+    let x = Arc::new(ScriptedExec::new());
+    orphan_look(&x);
+    x.expect(lvm::cmd::pvremove(&[A.into()]), fail("  denied\n"));
+    x.expect(
+        lvm::cmd::lvs(VG),
+        crate::storage::fixtures::report_fail("Volume group \"vg1\" not found"),
+    );
+    let (w, mut r) = run(&x, disks(), p.clone()).await;
+    let s = status(&w);
+    let (st, reason, _) = released(&s).unwrap();
+    assert_eq!((st.as_str(), reason.as_str()), ("False", "RemoveFailed"));
+    // The row stays Member, so the next pass knows the label is ours.
+    assert_eq!(s["devices"][0]["state"], "Member");
+
+    p.status.as_mut().unwrap().devices = serde_json::from_value(s["devices"].clone()).unwrap();
+    orphan_look(&x);
+    x.expect(lvm::cmd::pvremove(&[A.into()]), fail("  denied\n"));
+    x.expect(
+        lvm::cmd::lvs(VG),
+        crate::storage::fixtures::report_fail("Volume group \"vg1\" not found"),
+    );
+    let w = r.pass(&[Arc::new(p)], &[], &[]).await;
+    x.assert_done();
+    let (st, reason, _) = released(&status(&w)).unwrap();
+    assert_eq!((st.as_str(), reason.as_str()), ("False", "RemoveFailed"));
+}
+
+#[tokio::test]
+async fn an_orphan_pv_never_a_member_is_left_alone() {
+    let x = Arc::new(ScriptedExec::new());
+    orphan_look(&x);
+    let p = deleting(pool(&[A]), ReclaimPolicy::Delete, &[]);
+    let (w, _) = run(&x, disks(), p).await;
+    let s = status(&w);
+    assert_eq!(released(&s).unwrap().0, "True");
+    assert_eq!(s["devices"][0]["state"], "NotEmpty");
+    assert!(!x.seen.lock().unwrap().iter().any(|a| a[0] == "pvremove"));
+}
+
+#[tokio::test]
+async fn failed_growth_keeps_the_pool_serving() {
+    use model::{AssignedReplica, Assignment, Role, Volume, VolumeSpec};
+    let mut v = Volume::new(
+        "pvc-1",
+        VolumeSpec {
+            size_bytes: GIB,
+            replicas: 1,
+            tier: "test".into(),
+            pool: None,
+            node: None,
+            access_mode: model::AccessMode::default(),
+            attachments: vec![],
+            evict: vec![],
+            source: None,
+            resolve: None,
+            assignment: Some(Assignment {
+                replicas: vec![AssignedReplica {
+                    node: NODE.into(),
+                    pool: Some(POOL.into()),
+                    node_id: 0,
+                    port: None,
+                    role: Role::Diskful,
+                }],
+                minor: None,
+                secret: None,
+                initial_up_to_date_node: None,
+            }),
+        },
+    );
+    v.metadata.generation = Some(1);
+    let x = Arc::new(ScriptedExec::new());
+    let data = 4 * GIB - 136 * MIB;
+    x.expect(lvm::cmd::vgs_all(), vgs(&[(4 * GIB, 0, TAG)]))
+        .expect(lvm::cmd::thin_pools(VG), thin_pools(Some((data, 68 * MIB))))
+        .expect(lvm::cmd::pvs_all(), pvs(&[("/dev/vdd", VG)]))
+        .expect(wipefs_argv("/dev/vde"), ok(WIPEFS_BLANK))
+        .expect_devices_file()
+        .expect(
+            lvm::cmd::vgextend(VG, &[B.into()]),
+            fail("  Device /dev/vde excluded by a filter.\n"),
+        );
+    // The usual probe, then the volume finds its LV in the pool.
+    x.expect(
+        lvm::cmd::lvs(VG),
+        ok(&crate::storage::fixtures::lvs_out(&[lv_row(
+            "pvc-1",
+            1 << 20,
+            St::Active,
+        )])),
+    );
+    crate::storage::fixtures::expect_vgs(&x);
+    let mut r = Reconciler::new(NODE, x.clone()).with_disks(disks());
+    let w = r
+        .pass(&[Arc::new(pool(&[A, B]))], &[Arc::new(v)], &[])
+        .await;
+    x.assert_done();
+    let s = status(&w);
+    let (st, _, msg) = available(&s);
+    assert_eq!(st, "True");
+    assert!(
+        msg.starts_with(&format!("vgextend with {B}: vgextend: exit 5:")),
+        "{msg}"
+    );
+    assert!(
+        s["devices"][1]["message"]
+            .as_str()
+            .unwrap()
+            .contains("excluded by a filter")
+    );
+    let ev: Vec<_> = w
+        .iter()
+        .filter(|w| matches!(w, StatusWrite::Event { .. }))
+        .map(|w| w.body()["reason"].clone())
+        .collect();
+    assert_eq!(ev, ["PoolNotGrown"]);
+    let entry = w
+        .iter()
+        .find_map(|w| match w {
+            StatusWrite::Volume { entry, .. } => Some(entry.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(entry.present && entry.last_error.is_none(), "{entry:?}");
+}
+
+#[tokio::test]
+async fn unreadable_host_keeps_a_built_pool_on_the_usual_probe() {
+    let x = Arc::new(ScriptedExec::new());
+    x.expect(lvm::cmd::vgs_all(), fail("  lvmlockd busy\n"));
+    probe(&x);
+    let mut p = pool(&[A]);
+    p.status = Some(PoolStatus {
+        devices: vec![model::DeviceStatus {
+            path: A.into(),
+            state: DeviceState::Member,
+            size_bytes: None,
+            model: None,
+            serial: None,
+            message: None,
+        }],
+        ..PoolStatus::default()
+    });
+    let (w, r) = run(&x, disks(), p).await;
+    assert_eq!(available(&status(&w)).0, "True");
+    assert!(r.unready_pools.is_empty());
+    // Never built: not even the probe.
+    let x = Arc::new(ScriptedExec::new());
+    x.expect(lvm::cmd::vgs_all(), fail("  lvmlockd busy\n"));
+    let (w, r) = run(&x, disks(), pool(&[A])).await;
+    assert_eq!(available(&status(&w)).0, "False");
+    assert!(r.unready_pools.contains_key(POOL));
 }

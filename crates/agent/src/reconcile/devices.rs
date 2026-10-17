@@ -11,11 +11,12 @@ use model::condition;
 use model::{DeviceState, DeviceStatus, Pool, ReclaimPolicy};
 
 use super::{
-    REASON_BUILDING, REASON_REMOVE_BLOCKED, REASON_REMOVE_FAILED, REASON_REMOVED,
-    REASON_UNAVAILABLE, REASON_VG_NOT_OWNED, Reads, Reconciler, StatusWrite,
+    REASON_BUILDING, REASON_DEVICE_MISSING, REASON_REMOVE_BLOCKED, REASON_REMOVE_FAILED,
+    REASON_REMOVED, REASON_UNAVAILABLE, REASON_VG_NOT_OWNED, Reads, Reconciler, StatusWrite,
 };
 use crate::devices::{self, Checked};
 use crate::exec::CmdError;
+use crate::storage;
 use crate::storage::plan::{self, Blocked, Release, Seen, Step, Target};
 
 /// More steps than a build and a growth take; a loop past it is a bug.
@@ -28,6 +29,11 @@ pub(super) struct Outcome {
     pub rows: Option<Vec<DeviceStatus>>,
     /// Err: Available False with this reason; Ok: the usual probe decides.
     pub gate: Result<(), (&'static str, String)>,
+    /// No LV may be made or looked for: the VG is absent or not ours, or
+    /// it has no thin pool. Only then can none of the Pool's LVs exist.
+    pub unready: bool,
+    /// The message of Available when the probe makes it True.
+    pub note: Option<String>,
     /// (status, reason, message) of Released, under reclaimPolicy Delete.
     pub released: Option<(&'static str, &'static str, String)>,
     pub events: Vec<StatusWrite>,
@@ -38,6 +44,8 @@ impl Default for Outcome {
         Self {
             rows: None,
             gate: Ok(()),
+            unready: false,
+            note: None,
             released: None,
             events: Vec::new(),
         }
@@ -56,6 +64,14 @@ struct Look {
 impl Look {
     fn rows(&self) -> Vec<DeviceStatus> {
         self.checked.iter().map(|c| c.row.clone()).collect()
+    }
+
+    /// The VG is ours and holds the thin pool: the Pool serves.
+    fn built(&self, t: &Target<'_>) -> bool {
+        self.vg
+            .as_ref()
+            .is_some_and(|v| v.tags.iter().any(|g| g == t.tag))
+            && self.thin.as_ref().is_some_and(|l| l.thin_pool)
     }
 
     /// Listed paths that are PVs without a VG and were `members`.
@@ -86,6 +102,26 @@ impl Look {
                 ),
             )
         })
+    }
+}
+
+/// The host could not be read: for a Pool that showed a member, the usual
+/// probe decides, as for a Pool on an existing VG, and the rows stay. One
+/// that never did can hold no LV yet.
+fn look_failed(pool: &Pool, error: String) -> Outcome {
+    tracing::warn!(pool = pool.name_any(), %error, "pool devices unreadable");
+    let built_once = pool
+        .status
+        .as_ref()
+        .is_some_and(|s| s.devices.iter().any(|d| d.state == DeviceState::Member));
+    if built_once {
+        return Outcome::default();
+    }
+    // Not even the probe: the VG might not be ours.
+    Outcome {
+        gate: Err((REASON_UNAVAILABLE, error)),
+        unready: true,
+        ..Outcome::default()
     }
 }
 
@@ -141,6 +177,7 @@ impl Reconciler {
             Err(e) => {
                 return Outcome {
                     gate: Err((REASON_UNAVAILABLE, e)),
+                    unready: true,
                     ..Outcome::default()
                 };
             }
@@ -160,13 +197,11 @@ impl Reconciler {
             match self.look(pool, &paths).await {
                 Ok(l) => Outcome {
                     rows: Some(l.rows()),
+                    unready: !l.built(&t),
                     gate: l.foreign(&t).map_or(Ok(()), Err),
                     ..Outcome::default()
                 },
-                Err(e) => Outcome {
-                    gate: Err((REASON_UNAVAILABLE, e)),
-                    ..Outcome::default()
-                },
+                Err(e) => look_failed(pool, e),
             }
         };
         self.device_events(pool, out)
@@ -184,12 +219,10 @@ impl Reconciler {
             // Checks right before every step, in the same pass.
             let look = match self.look(pool, paths).await {
                 Ok(l) => l,
-                Err(e) => {
-                    out.gate = Err((REASON_UNAVAILABLE, e));
-                    return out;
-                }
+                Err(e) => return look_failed(pool, e),
             };
-            let rows = look.rows();
+            let built = look.built(t);
+            let mut rows = look.rows();
             let seen = Seen {
                 vg: look.vg.as_ref(),
                 thin: look.thin.as_ref(),
@@ -198,30 +231,67 @@ impl Reconciler {
             let step = plan::plan(t, &seen);
             out.rows = Some(rows.clone());
             let step = match step {
-                Ok(Step::Ready) => return out,
+                Ok(Step::Ready) => {
+                    if let (Some(vg), Some(thin)) = (&look.vg, &look.thin) {
+                        out.note = plan::unused(vg, thin);
+                    }
+                    return out;
+                }
                 Ok(s) => s,
+                // A partial VG may still serve what it holds: Available
+                // False, the Pool's LVs stay in reach.
+                Err(b) if built && b.reason == REASON_DEVICE_MISSING => {
+                    out.gate = Err((b.reason, b.message));
+                    return out;
+                }
+                Err(Blocked { message, .. }) if built => {
+                    out.note = Some(message);
+                    return out;
+                }
                 Err(Blocked { reason, message }) => {
                     out.gate = Err((reason, message));
+                    out.unready = true;
                     return out;
                 }
             };
             tracing::info!(pool = pool.name_any(), step = step.name(), "building pool");
             let res = self.run_step(t, &step).await;
             reads.invalidate(t.vg);
-            if let Err(e) = res {
-                out.gate = Err((REASON_BUILDING, format!("{}: {e}", step.name())));
+            let Err(e) = res else { continue };
+            let message = format!("{}: {e}", step.name());
+            tracing::warn!(pool = pool.name_any(), error = %message, "pool step failed");
+            if !built {
+                out.gate = Err((REASON_BUILDING, message));
+                out.unready = true;
                 return out;
             }
+            // A failed growth leaves the built Pool serving as it was.
+            if let Step::Vgextend(added) = &step {
+                for r in rows.iter_mut().filter(|r| added.contains(&r.path)) {
+                    r.message = Some(message.clone());
+                }
+                out.rows = Some(rows);
+            }
+            out.note = Some(message);
+            return out;
         }
-        out.gate = Err((
-            REASON_BUILDING,
-            format!("still building after {MAX_STEPS} steps"),
-        ));
+        out.note = Some(format!("still building after {MAX_STEPS} steps"));
         out
     }
 
     async fn run_step(&self, t: &Target<'_>, step: &Step) -> Result<(), CmdError> {
         let (vg, thin) = (t.vg, t.thin);
+        if matches!(step, Step::Vgcreate(_) | Step::Vgextend(_)) {
+            let missing = storage::devices_file_missing(self.lvm.exec()).await?;
+            if let Some(path) = missing {
+                return Err(CmdError::new(
+                    "lvm",
+                    format!(
+                        "use_devicesfile is 1 but {path} does not exist: this command would create it with only the new disks and hide every other VG of the host; run `vgimportdevices --all` on the node first"
+                    ),
+                ));
+            }
+        }
         match step {
             Step::Vgcreate(d) => self.lvm.vgcreate(vg, t.tag, d).await,
             Step::CreateThinPool {
@@ -234,7 +304,8 @@ impl Reconciler {
             }
             Step::Vgextend(d) => self.lvm.vgextend(vg, d).await,
             Step::GrowMetadata(b) => self.lvm.extend_pool_metadata(vg, thin, *b).await,
-            Step::GrowData => self.lvm.extend_pool_data(vg, thin).await,
+            Step::GrowData(None) => self.lvm.extend_pool_data(vg, thin).await,
+            Step::GrowData(Some(b)) => self.lvm.extend_pool_data_to(vg, thin, *b).await,
             Step::Ready => Ok(()),
         }
     }
@@ -277,7 +348,16 @@ impl Reconciler {
                     return out;
                 }
             };
-            out.rows = Some(look.rows());
+            let orphans = look.orphans(&members);
+            // An ex-member whose label is still there stays Member in the
+            // written rows, or a failed pvremove would be forgotten.
+            let mut rows = look.rows();
+            for r in rows.iter_mut().filter(|r| orphans.contains(&r.path)) {
+                r.state = DeviceState::Member;
+                r.message = Some("PV label left after the VG was removed: pvremove pending".into());
+            }
+            out.rows = Some(rows);
+            out.unready = !look.built(t);
             if let Some(e) = look.foreign(t) {
                 out.gate = Err(e);
             }
@@ -307,7 +387,6 @@ impl Reconciler {
             } else {
                 Vec::new()
             };
-            let orphans = look.orphans(&members);
             let step = match plan::release(t, look.vg.as_ref(), &lvs, &orphans) {
                 Ok(Release::Done) => {
                     out.released = Some((
@@ -319,6 +398,7 @@ impl Reconciler {
                         REASON_UNAVAILABLE,
                         "removed: reclaimPolicy Delete".to_owned(),
                     ));
+                    out.unready = true;
                     return out;
                 }
                 Ok(s) => s,
@@ -347,13 +427,35 @@ impl Reconciler {
         out
     }
 
+    /// The Events of [`Self::device_events`] for `pool` did not reach the
+    /// API: forget them so the next pass sends them again.
+    pub(crate) fn events_unsent(&mut self, pool: &str) {
+        self.device_events.remove(pool);
+        self.pool_notes.remove(pool);
+    }
+
     /// One Warning Event per path that cannot join a built Pool, when its
-    /// state changes; the row says it on every pass.
+    /// state changes, and one per new note; rows and Available say it on
+    /// every pass.
     fn device_events(&mut self, pool: &Pool, mut out: Outcome) -> Outcome {
         let name = pool.name_any();
         if out.gate.is_err() || pool.metadata.deletion_timestamp.is_some() {
             self.device_events.remove(&name);
+            self.pool_notes.remove(&name);
             return out;
+        }
+        if out.note != self.pool_notes.get(&name).cloned() {
+            if let Some(n) = &out.note {
+                out.events.push(StatusWrite::Event {
+                    name: name.clone(),
+                    uid: pool.metadata.uid.clone(),
+                    reason: "PoolNotGrown".into(),
+                    message: n.clone(),
+                });
+                self.pool_notes.insert(name.clone(), n.clone());
+            } else {
+                self.pool_notes.remove(&name);
+            }
         }
         let Some(rows) = &out.rows else {
             return out;

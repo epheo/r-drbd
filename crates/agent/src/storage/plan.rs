@@ -117,10 +117,14 @@ pub struct Seen<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
     Vgcreate(Vec<String>),
-    CreateThinPool { chunk_bytes: u64, meta_bytes: u64 },
+    CreateThinPool {
+        chunk_bytes: u64,
+        meta_bytes: u64,
+    },
     Vgextend(Vec<String>),
     GrowMetadata(u64),
-    GrowData,
+    /// `None`: all free space; `Some`: up to this data size.
+    GrowData(Option<u64>),
     Ready,
 }
 
@@ -135,7 +139,8 @@ impl Step {
             } => format!("thin pool create, chunk {chunk_bytes} B, metadata {meta_bytes} B"),
             Self::Vgextend(d) => format!("vgextend with {}", d.join(", ")),
             Self::GrowMetadata(b) => format!("metadata grow to {b} B"),
-            Self::GrowData => "data grow".into(),
+            Self::GrowData(None) => "data grow".into(),
+            Self::GrowData(Some(b)) => format!("data grow to {b} B"),
             Self::Ready => "ready".into(),
         }
     }
@@ -245,20 +250,51 @@ pub fn plan(t: &Target<'_>, s: &Seen<'_>) -> Result<Step, Blocked> {
     if !blank.is_empty() {
         return Ok(Step::Vgextend(blank));
     }
-    if vg.free_bytes >= vg.extent_bytes.max(1) {
-        // Metadata first: a pool whose data outgrows its metadata fails whole.
-        let want = metadata_bytes(
-            pool.size_bytes + vg.free_bytes,
-            pool.chunk_bytes,
-            vg.extent_bytes,
-        )
-        .min(meta_max(vg.extent_bytes));
-        if want > pool.metadata_bytes {
-            return Ok(Step::GrowMetadata(want));
-        }
-        return Ok(Step::GrowData);
+    if pool.chunk_bytes == 0 {
+        return Err(blocked(
+            REASON_UNAVAILABLE,
+            format!("thin pool {} reports chunk size 0: growth skipped", t.thin),
+        ));
+    }
+    let ext = vg.extent_bytes.max(1);
+    if vg.free_bytes < ext {
+        return Ok(Step::Ready);
+    }
+    // Metadata first: a pool whose data outgrows its metadata fails whole.
+    let target = pool.size_bytes + vg.free_bytes;
+    let rule = metadata_bytes(target, pool.chunk_bytes, vg.extent_bytes);
+    let want = rule.min(meta_max(vg.extent_bytes));
+    if want > pool.metadata_bytes {
+        return Ok(Step::GrowMetadata(want));
+    }
+    if rule <= pool.metadata_bytes {
+        return Ok(Step::GrowData(None));
+    }
+    // The chunk is fixed: past LVM's metadata maximum, data grows only as
+    // far as the metadata covers by the rule.
+    let covered = covered_data(pool.metadata_bytes, pool.chunk_bytes, ext).min(target);
+    if covered >= pool.size_bytes + ext {
+        return Ok(Step::GrowData(Some(covered)));
     }
     Ok(Step::Ready)
+}
+
+/// Data bytes `meta` covers by the rule at `chunk`, in whole extents.
+pub fn covered_data(meta: u64, chunk: u64, extent: u64) -> u64 {
+    let data = meta.saturating_sub(META_BASE) / META_PER_CHUNK * chunk;
+    data / extent.max(1) * extent.max(1)
+}
+
+/// Why VG space stays out of a pool that has nothing left to do.
+pub fn unused(vg: &VgFull, pool: &PoolLv) -> Option<String> {
+    (vg.free_bytes >= vg.extent_bytes.max(1)).then(|| {
+        format!(
+            "{} bytes of the volume group stay out of the thin pool: its metadata is at LVM's maximum, which covers {} bytes of data at chunk {} B",
+            vg.free_bytes,
+            covered_data(pool.metadata_bytes, pool.chunk_bytes, vg.extent_bytes),
+            pool.chunk_bytes
+        )
+    })
 }
 
 /// Rows that keep the Pool as it is but cannot join it.
@@ -561,7 +597,7 @@ mod tests {
         let meta_done = pool(4_148_166_656, 72 * MIB);
         assert_eq!(
             plan_of(Some(&after_meta), Some(&meta_done), &d),
-            Ok(Step::GrowData)
+            Ok(Step::GrowData(None))
         );
         // Less than an extent free is nothing to grow.
         let crumbs = vg(8 * GIB, EXT - 1, TAG);
@@ -573,10 +609,36 @@ mod tests {
         let d = [row(A, Member), row(B, NotEmpty), row(C, Missing)];
         assert_eq!(plan_of(Some(&full), Some(&built), &d), Ok(Step::Ready));
         assert_eq!(stuck(&d).len(), 2);
-        // Metadata never grows past LVM's maximum.
+        // Metadata never grows past LVM's maximum, and data only as far as
+        // that metadata covers: 16124 MiB / 64 B * 64 KiB is about 15.7 TiB.
         let huge = vg(40 * TIB, 20 * TIB, TAG);
-        let capped = pool(20 * TIB, meta_max(EXT));
-        assert_eq!(plan_of(Some(&huge), Some(&capped), &[]), Ok(Step::GrowData));
+        let below = pool(10 * TIB, 10_304 * MIB);
+        assert_eq!(
+            plan_of(Some(&huge), Some(&below), &[]),
+            Ok(Step::GrowMetadata(meta_max(EXT)))
+        );
+        let capped = pool(10 * TIB, meta_max(EXT));
+        let covered = covered_data(meta_max(EXT), K64, EXT);
+        assert_eq!(covered, 16_124 * TIB / 1024);
+        assert_eq!(
+            plan_of(Some(&huge), Some(&capped), &[]),
+            Ok(Step::GrowData(Some(covered)))
+        );
+        // Grown that far: the rest stays out, said once the pool is ready.
+        let rest = vg(40 * TIB, 40 * TIB - covered - 2 * meta_max(EXT), TAG);
+        let full = pool(covered, meta_max(EXT));
+        assert_eq!(plan_of(Some(&rest), Some(&full), &[]), Ok(Step::Ready));
+        let note = unused(&rest, &full).unwrap();
+        assert!(note.contains("metadata is at LVM's maximum"), "{note}");
+        assert_eq!(unused(&vg(8 * GIB, 0, TAG), &full), None);
+        // A pool report with chunk 0 blocks growth instead of dividing by it.
+        let mut odd = pool(GIB, 68 * MIB);
+        odd.chunk_bytes = 0;
+        let e = plan_of(Some(&grown), Some(&odd), &[]).unwrap_err();
+        assert_eq!(
+            e.message,
+            "thin pool thin reports chunk size 0: growth skipped"
+        );
     }
 
     #[test]
