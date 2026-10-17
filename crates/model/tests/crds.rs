@@ -262,8 +262,11 @@ fn nodedisks_rows_keyed_by_path_with_blank_column() {
     assert_eq!(cols[0]["jsonPath"], ".status.blank");
     assert_eq!(cols[1]["name"], "Age");
 
+    assert_eq!(crd["spec"]["names"]["shortNames"], json!(["nd"]));
     let status = model::NodeDisksStatus {
         blank: 1,
+        message: None,
+        watch: Some(model::DiskWatch::Uevent),
         disks: vec![model::DiskStatus {
             path: "/dev/disk/by-id/wwn-0x5000".into(),
             name: "sdb".into(),
@@ -278,7 +281,7 @@ fn nodedisks_rows_keyed_by_path_with_blank_column() {
     };
     assert_eq!(
         to_json(&status),
-        json!({"blank": 1, "disks": [{
+        json!({"blank": 1, "watch": "uevent", "disks": [{
             "path": "/dev/disk/by-id/wwn-0x5000", "name": "sdb",
             "links": ["/dev/disk/by-id/wwn-0x5000"], "state": "Member",
             "pool": "p1", "sizeBytes": 1_073_741_824u64,

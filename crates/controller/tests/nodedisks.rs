@@ -5,8 +5,12 @@ mod support;
 
 use k8s_openapi::api::core::v1::Node;
 use kube::{Api, ResourceExt};
-use model::{DeviceState, DiskStatus, NodeDisks};
+use model::{DeviceState, DiskStatus, DiskWatch, NodeDisks};
 use support::Env;
+
+fn status(rows: Vec<DiskStatus>) -> model::NodeDisksStatus {
+    agent::inventory::status(rows, &std::collections::BTreeSet::new(), DiskWatch::Uevent)
+}
 
 fn row(name: &str, state: DeviceState, pool: Option<&str>) -> DiskStatus {
     DiskStatus {
@@ -37,7 +41,7 @@ async fn nodedisks_written_on_change_only() {
         .unwrap();
     let api: Api<NodeDisks> = Api::all(client.clone());
 
-    let first = agent::inventory::status(vec![
+    let first = status(vec![
         row("a", DeviceState::Blank, None),
         row("b", DeviceState::Blank, None),
     ]);
@@ -63,7 +67,7 @@ async fn nodedisks_written_on_change_only() {
     assert_eq!(api.get("n1").await.unwrap().resource_version(), rv);
 
     // A disk joins a Pool and another is unplugged: the row goes.
-    let next = agent::inventory::status(vec![row("a", DeviceState::Member, Some("p1"))]);
+    let next = status(vec![row("a", DeviceState::Member, Some("p1"))]);
     assert_eq!(
         agent::inventory::write(&client, "n1", &next).await,
         Ok(true)

@@ -8,11 +8,12 @@ use std::time::Duration;
 
 use kube::{Client, ResourceExt};
 
+use crate::devices::{HostDisks, SysDisks};
 use crate::events2::Tracker;
 use crate::exec::TokioExec;
 use crate::reconcile::{DrbdEnv, Reconciler};
 use crate::watch::{self, Trigger};
-use crate::{Exec, csi, drbd, node, shutdown};
+use crate::{Exec, csi, drbd, inventory, node, shutdown};
 
 const DRBD_CONF_DIR: &str = "/etc/drbd.d";
 const DRBD_INCLUDE_FILE: &str = "r-drbd.res";
@@ -125,12 +126,12 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
     if events.is_none() {
         tracing::warn!("DRBD not found: replicated volumes cannot be served on this node");
     }
-    let reconciler = Reconciler::new(cfg.node.clone(), exec.clone()).with_drbd(DrbdEnv::new(
-        features,
-        cfg.res_dir.clone(),
-        tracker.clone(),
-    ));
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let inv = spawn_inventory(&cfg.node, &client, &exec, &stores, &stop_rx);
+    let reconciler = Reconciler::new(cfg.node.clone(), exec.clone())
+        .with_drbd(DrbdEnv::new(features, cfg.res_dir.clone(), tracker.clone()))
+        .with_disks(inv.disks.clone())
+        .with_disk_lock(inv.lock.clone());
 
     let socket = csi::socket_path(&cfg.csi_endpoint);
     let listener = csi::bind(&socket)?;
@@ -160,6 +161,8 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
         Triggers {
             pass: trigger,
             changes,
+            disks: inv.wakes,
+            ready: inv.ready,
         },
         stop_rx,
     ));
@@ -196,10 +199,60 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
         csi_task.abort();
     }
     heartbeat.abort();
+    inv.task.abort();
     if let Some(e) = events {
         e.abort();
     }
     result
+}
+
+/// The NodeDisks task and what the reconciler shares with it.
+struct Inventory {
+    disks: Arc<dyn HostDisks>,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    wakes: tokio::sync::mpsc::UnboundedSender<inventory::Wake>,
+    ready: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+fn spawn_inventory(
+    node: &str,
+    client: &Client,
+    exec: &Arc<dyn Exec>,
+    stores: &watch::Stores,
+    stop: &tokio::sync::watch::Receiver<bool>,
+) -> Inventory {
+    let sys = SysDisks::default();
+    let mountinfo = sys.mountinfo.clone();
+    let disks: Arc<dyn HostDisks> = Arc::new(sys);
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let pools = stores.pools.clone();
+    let scanner = inventory::Scanner::new(
+        node.to_owned(),
+        exec.clone(),
+        disks.clone(),
+        lock.clone(),
+        Box::new(move || pools.state()),
+        inventory::events::start(&tx, &mountinfo),
+    );
+    let (ready, mut ready_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(inventory::run(
+        client.clone(),
+        scanner,
+        async move {
+            let _ = ready_rx.wait_for(|r| *r).await;
+        },
+        rx,
+        stop.clone(),
+    ));
+    Inventory {
+        disks,
+        lock,
+        wakes: tx,
+        ready,
+        task,
+    }
 }
 
 /// The host LVM check, logged. Runs once this node has a Pool, until a
@@ -229,6 +282,11 @@ struct Triggers {
     pass: Arc<Trigger>,
     /// events2 lines: a status refresh of the touched volumes only.
     changes: Arc<Trigger>,
+    /// The NodeDisks inventory, after a Pool device change.
+    disks: tokio::sync::mpsc::UnboundedSender<crate::inventory::Wake>,
+    /// The caches are ready, for the inventory: kube's `wait_until_ready`
+    /// wakes only the last of several waiters.
+    ready: tokio::sync::watch::Sender<bool>,
 }
 
 /// Passes and refreshes run to completion; `stop` is only looked at between them.
@@ -244,10 +302,10 @@ async fn reconcile_loop(
         r = stores.ready() => r.map_err(|e| Error::Watch(e.to_string()))?,
         () = stopped(&mut stop) => return Ok(()),
     }
+    triggers.ready.send_replace(true);
     let node = rec.node().to_owned();
     tracing::info!(node, "caches ready, reconciling");
     let mut lvm_checked = false;
-    let mut disks_due = tokio::time::Instant::now();
     loop {
         rec.set_addresses(addresses(&stores));
         rec.set_peer_leases(peer_leases(&stores));
@@ -261,19 +319,8 @@ async fn reconcile_loop(
         for pool in apply(&client, &node, writes).await {
             rec.events_unsent(&pool);
         }
-        // In the loop, not beside it: its exclusive open never meets a
-        // vgcreate of this agent on the same disk.
-        if rec.take_disks_changed() || tokio::time::Instant::now() >= disks_due {
-            disks_due = tokio::time::Instant::now() + crate::inventory::EVERY;
-            let status = rec.disk_inventory().await;
-            match crate::inventory::write(&client, &node, &status).await {
-                Ok(true) => tracing::info!(blank = status.blank, "NodeDisks updated"),
-                Ok(false) => {}
-                Err(error) => {
-                    tracing::warn!(%error, "NodeDisks write failed, retried next pass");
-                    disks_due = tokio::time::Instant::now();
-                }
-            }
+        if rec.take_disks_changed() {
+            let _ = triggers.disks.send(crate::inventory::Wake::Lvm);
         }
         // Fixed per pass so a stream of refreshes cannot push the resync out.
         let resync = tokio::time::Instant::now() + watch::RESYNC;

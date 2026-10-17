@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use kube::ResourceExt;
 use lvm::report::{PoolLv, VgFull};
 use model::condition;
-use model::{DeviceState, DeviceStatus, NodeDisksStatus, Pool, ReclaimPolicy};
+use model::{DeviceState, DeviceStatus, Pool, ReclaimPolicy};
 
 use super::{
     REASON_BUILDING, REASON_DEVICE_MISSING, REASON_REMOVE_BLOCKED, REASON_REMOVE_FAILED,
@@ -16,7 +16,6 @@ use super::{
 };
 use crate::devices::{self, Checked};
 use crate::exec::CmdError;
-use crate::inventory;
 use crate::storage;
 use crate::storage::plan::{self, Blocked, Release, Seen, Step, Target};
 
@@ -154,8 +153,7 @@ impl Reconciler {
             .into_iter()
             .map(|p| (devices::resolved(&p.name), p.vg.unwrap_or_default()))
             .collect();
-        let checked =
-            devices::check(self.lvm.exec(), self.disks.as_ref(), paths, &pvs, vg_name).await;
+        let checked = devices::check(self.lvm.exec(), &self.disks, paths, &pvs, vg_name).await;
         Ok(Look {
             vg,
             thin,
@@ -189,6 +187,8 @@ impl Reconciler {
             self.release(reads, pool, &paths, &t).await
         } else {
             // Retained: look only, never build what is going away.
+            let disk_lock = self.disk_lock.clone();
+            let _held = disk_lock.lock().await;
             match self.look(pool, &paths).await {
                 Ok(l) => Outcome {
                     rows: Some(l.rows()),
@@ -199,26 +199,15 @@ impl Reconciler {
                 Err(e) => look_failed(pool, e),
             }
         };
-        let before = pool.status.as_ref().map(|s| &s.devices);
-        if out.rows.is_some() && out.rows.as_ref() != before {
+        // Against the rows seen last, not the status: a failing status
+        // write must not wake the inventory every pass.
+        if let Some(rows) = &out.rows
+            && self.device_rows.get(&pool.name_any()) != Some(rows)
+        {
+            self.device_rows.insert(pool.name_any(), rows.clone());
             self.disks_changed = true;
         }
         self.device_events(pool, out)
-    }
-
-    /// The node's disks for its NodeDisks. Without LVM reports a PV shows
-    /// as NotEmpty by its signature, or Busy while active.
-    pub async fn disk_inventory(&self) -> NodeDisksStatus {
-        let reports = async {
-            let pvs = self.lvm.pvs_all().await?;
-            let vgs = self.lvm.vgs_all().await?;
-            Ok::<_, CmdError>(inventory::Lvm::from_reports(&pvs, &vgs))
-        };
-        let lvm = reports.await.unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "disk inventory without LVM reports");
-            inventory::Lvm::default()
-        });
-        inventory::status(inventory::scan(self.lvm.exec(), self.disks.as_ref(), &lvm).await)
     }
 
     /// A Pool's disks changed since the last call: NodeDisks is due.
@@ -235,6 +224,10 @@ impl Reconciler {
     ) -> Outcome {
         let mut out = Outcome::default();
         for _ in 0..MAX_STEPS {
+            // Each look and its step under the disk lock: the inventory's
+            // exclusive open never meets our open or a vgcreate.
+            let disk_lock = self.disk_lock.clone();
+            let _held = disk_lock.lock().await;
             // Checks right before every step, in the same pass.
             let look = match self.look(pool, paths).await {
                 Ok(l) => l,
@@ -275,7 +268,7 @@ impl Reconciler {
             };
             tracing::info!(pool = pool.name_any(), step = step.name(), "building pool");
             let res = self.run_step(t, &step).await;
-            self.disks_changed = true;
+            self.disks_changed |= res.is_ok();
             reads.invalidate(t.vg);
             let Err(e) = res else { continue };
             let message = format!("{}: {e}", step.name());
@@ -361,6 +354,8 @@ impl Reconciler {
             .map(|d| d.path.as_str())
             .collect();
         for _ in 0..MAX_STEPS {
+            let disk_lock = self.disk_lock.clone();
+            let _held = disk_lock.lock().await;
             let look = match self.look(pool, paths).await {
                 Ok(l) => l,
                 Err(e) => {
@@ -429,7 +424,7 @@ impl Reconciler {
             };
             tracing::info!(pool = pool.name_any(), step = ?step, "releasing pool");
             let res = self.run_release(t, &step).await;
-            self.disks_changed = true;
+            self.disks_changed |= res.is_ok();
             reads.invalidate(t.vg);
             if let Err(e) = res {
                 out.released = Some((

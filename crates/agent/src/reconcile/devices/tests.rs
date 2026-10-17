@@ -806,34 +806,17 @@ async fn unreadable_host_keeps_a_built_pool_on_the_usual_probe() {
 }
 
 #[tokio::test]
-async fn inventory_names_the_pool_of_a_tagged_vg() {
-    let d = FakeDisks::default();
-    d.set("/dev/vdd", disk("vdd"))
-        .set(A, disk("vdd"))
-        .set("/dev/vde", disk("vde"));
+async fn pool_disk_work_waits_for_the_inventory() {
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    let held = lock.clone().lock_owned().await;
     let x = Arc::new(ScriptedExec::new());
-    x.expect(lvm::cmd::pvs_all(), pvs(&[("/dev/vdd", VG)]))
-        .expect(lvm::cmd::vgs_all(), vgs(&[(4 * GIB, 0, TAG)]))
-        .expect(wipefs_argv("/dev/vde"), ok(WIPEFS_BLANK));
-    let r = Reconciler::new(NODE, x.clone()).with_disks(Arc::new(d));
-    let s = r.disk_inventory().await;
-    x.assert_done();
-    assert_eq!(s.blank, 1);
-    assert_eq!(s.disks[0].path, A);
-    assert_eq!(s.disks[0].state, DeviceState::Member);
-    assert_eq!(s.disks[0].pool.as_deref(), Some(POOL));
-    assert_eq!(s.disks[1].state, DeviceState::Blank);
-}
-
-#[tokio::test]
-async fn inventory_without_lvm_reports_still_lists_disks() {
-    let d = FakeDisks::default();
-    d.set("/dev/vde", disk("vde"));
-    let x = Arc::new(ScriptedExec::new());
-    x.expect(lvm::cmd::pvs_all(), fail("lvm not found"))
-        .expect(wipefs_argv("/dev/vde"), ok(WIPEFS_BLANK));
-    let r = Reconciler::new(NODE, x.clone()).with_disks(Arc::new(d));
-    let s = r.disk_inventory().await;
-    x.assert_done();
-    assert_eq!(s.blank, 1);
+    let mut r = Reconciler::new(NODE, x.clone())
+        .with_disks(disks())
+        .with_disk_lock(lock);
+    let p = Arc::new(pool(&[A]));
+    let pass = r.pass(std::slice::from_ref(&p), &[], &[]);
+    let waited = tokio::time::timeout(std::time::Duration::from_millis(100), pass).await;
+    assert!(waited.is_err(), "the pass went on under a held disk lock");
+    assert!(x.seen.lock().unwrap().is_empty());
+    drop(held);
 }

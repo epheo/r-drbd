@@ -14,6 +14,7 @@ use crate::pool::DeviceState;
     version = "v1alpha1",
     kind = "NodeDisks",
     plural = "nodedisks",
+    shortname = "nd",
     status = "NodeDisksStatus",
     derive = "PartialEq",
     printcolumn = r#"{"name":"Blank","type":"integer","jsonPath":".status.blank"}"#,
@@ -27,9 +28,26 @@ pub struct NodeDisksSpec {}
 pub struct NodeDisksStatus {
     /// Disks in state Blank; a printer column cannot count.
     pub blank: u32,
+    /// Set when the list is incomplete: rows capped, or the scan ran out
+    /// of time before every disk was checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// How the agent learns of disk changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<DiskWatch>,
     #[serde(default)]
     #[x_kube(merge_strategy = ListMerge::Map(vec!["path".into()]))]
     pub disks: Vec<DiskStatus>,
+}
+
+#[derive(JsonSchema, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DiskWatch {
+    /// Kernel uevents and mount table changes: rows follow within seconds,
+    /// with a full check every hour.
+    Uevent,
+    /// No uevent socket: a full check every 5 minutes.
+    Poll,
 }
 
 /// One whole disk of the node.

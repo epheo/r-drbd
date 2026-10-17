@@ -357,6 +357,10 @@ pub struct Reconciler {
     pool_notes: HashMap<String, String>,
     /// A Pool step ran or a Pool's device rows changed.
     disks_changed: bool,
+    /// Per Pool, the device rows of the last pass.
+    device_rows: HashMap<String, Vec<DeviceStatus>>,
+    /// Shared with the NodeDisks inventory.
+    disk_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Reconciler {
@@ -389,7 +393,15 @@ impl Reconciler {
             device_events: HashMap::new(),
             pool_notes: HashMap::new(),
             disks_changed: false,
+            device_rows: HashMap::new(),
+            disk_lock: Arc::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_disk_lock(mut self, lock: Arc<tokio::sync::Mutex<()>>) -> Self {
+        self.disk_lock = lock;
+        self
     }
 
     #[must_use]

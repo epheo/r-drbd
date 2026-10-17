@@ -16,7 +16,7 @@ use crate::exec::{DEFAULT_TIMEOUT, run_ok};
 
 /// Kernel name prefixes of block devices that are not whole disks, with
 /// what to call them. Multipath maps are dm devices: out of scope.
-const NOT_DISKS: [(&str, &str); 11] = [
+const NOT_DISKS: [(&str, &str); 12] = [
     ("loop", "a loop device"),
     ("ram", "a RAM disk"),
     ("zram", "a zram device"),
@@ -28,6 +28,7 @@ const NOT_DISKS: [(&str, &str); 11] = [
     ("rbd", "a Ceph RBD device"),
     ("zd", "a ZFS volume"),
     ("nullb", "a null block device"),
+    ("fd", "a floppy drive"),
 ];
 
 /// A partition of the disk, from sysfs.
@@ -65,6 +66,8 @@ pub struct Facts {
     /// `Err` with the error when the exclusive open failed; tried only on
     /// a disk that may be claimed, see [`check`].
     pub exclusive: Result<(), String>,
+    /// udev marks it a path of a multipath map, claimed or about to be.
+    pub multipath: bool,
 }
 
 /// The host's disks as the agent sees them; a trait so tests need no disks.
@@ -76,11 +79,44 @@ pub trait HostDisks: Send + Sync + std::fmt::Debug {
     fn whole_disks(&self) -> Vec<String>;
     /// The by-id links, sorted, by the kernel name they resolve to.
     fn by_id(&self) -> BTreeMap<String, Vec<String>>;
+    /// Whether the host's udev database can be read, which multipath
+    /// path detection needs.
+    fn udev_readable(&self) -> bool;
+}
+
+/// What a kernel name says the device is when it is not a whole disk.
+fn not_a_disk(name: &str) -> Option<&'static str> {
+    // mmcblk0boot0 is no partition in sysfs, yet a boot area of mmcblk0.
+    if name.starts_with("mmcblk") && name.contains("boot") {
+        return Some("an eMMC boot partition");
+    }
+    NOT_DISKS
+        .iter()
+        .find(|(p, _)| name.starts_with(p))
+        .map(|(_, what)| *what)
 }
 
 /// Not a kernel name of a whole disk, whatever sysfs says.
 pub fn not_a_disk_name(name: &str) -> bool {
-    NOT_DISKS.iter().any(|(p, _)| name.starts_with(p))
+    not_a_disk(name).is_some()
+}
+
+/// The exclusive open on a blocking thread: an open can wait on the device.
+pub async fn open_exclusive_blocking(
+    disks: &std::sync::Arc<dyn HostDisks>,
+    node: &Path,
+) -> Result<(), String> {
+    let (d, n) = (disks.clone(), node.to_owned());
+    tokio::task::spawn_blocking(move || d.exclusive(&n))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()))
+}
+
+/// `E:DM_MULTIPATH_DEVICE_PATH=1` in a udev database entry.
+pub fn udev_multipath(entry: &str) -> bool {
+    entry
+        .lines()
+        .any(|l| l.trim() == "E:DM_MULTIPATH_DEVICE_PATH=1")
 }
 
 /// The real host: /dev and /sys are the host's in the agent pod, and with
@@ -90,6 +126,8 @@ pub struct SysDisks {
     pub sys: PathBuf,
     pub mountinfo: PathBuf,
     pub by_id: PathBuf,
+    /// The host's udev database, through init's root: not mounted in the pod.
+    pub udev: PathBuf,
 }
 
 impl Default for SysDisks {
@@ -98,6 +136,7 @@ impl Default for SysDisks {
             sys: "/sys".into(),
             mountinfo: "/proc/1/mountinfo".into(),
             by_id: "/dev/disk/by-id".into(),
+            udev: "/proc/1/root/run/udev/data".into(),
         }
     }
 }
@@ -111,6 +150,7 @@ impl HostDisks for SysDisks {
                 sys: Err(String::new()),
                 mounts: Vec::new(),
                 exclusive: Ok(()),
+                multipath: false,
             };
         };
         let sys = block_name(node).and_then(|name| read_sys(&self.sys, &name));
@@ -119,11 +159,16 @@ impl HostDisks for SysDisks {
             // Without the table a mount still fails the exclusive open.
             _ => Vec::new(),
         };
+        let multipath = sys.as_ref().is_ok_and(|s| {
+            std::fs::read_to_string(self.udev.join(format!("b{}", s.dev)))
+                .is_ok_and(|e| udev_multipath(&e))
+        });
         Facts {
             dev,
             sys,
             mounts,
             exclusive: Ok(()),
+            multipath,
         }
     }
 
@@ -131,12 +176,22 @@ impl HostDisks for SysDisks {
         open_exclusive(node)
     }
 
+    /// Hidden devices too are left out: NVMe multipath paths under their
+    /// shared namespace disk.
     fn whole_disks(&self) -> Vec<String> {
         let base = self.sys.join("class/block");
         dir_names(&base)
             .into_iter()
-            .filter(|n| !not_a_disk_name(n) && !base.join(n).join("partition").exists())
+            .filter(|n| {
+                !not_a_disk_name(n)
+                    && !base.join(n).join("partition").exists()
+                    && read_trim(&base.join(n).join("hidden")).as_deref() != Some("1")
+            })
             .collect()
+    }
+
+    fn udev_readable(&self) -> bool {
+        std::fs::read_dir(&self.udev).is_ok()
     }
 
     fn by_id(&self) -> BTreeMap<String, Vec<String>> {
@@ -341,11 +396,14 @@ pub fn classify_early(
             Some(format!("{name} is a partition")),
         ));
     }
-    if let Some((_, what)) = NOT_DISKS.iter().find(|(p, _)| name.starts_with(p)) {
+    if let Some(what) = not_a_disk(name) {
         return Some((DeviceState::NotADisk, Some(format!("{name} is {what}"))));
     }
     if sys.read_only {
         return Some((DeviceState::NotADisk, Some(format!("{name} is read-only"))));
+    }
+    if sys.size_bytes == 0 {
+        return Some((DeviceState::NotADisk, Some(format!("{name} has no medium"))));
     }
     if pv_vg == Some(vg) {
         return Some((DeviceState::Member, None));
@@ -362,6 +420,9 @@ pub fn classify_early(
         .collect();
     if !holders.is_empty() {
         busy.push(format!("held by {}", holders.join(", ")));
+    }
+    if f.multipath {
+        busy.push("a multipath path".into());
     }
     if let Err(e) = &f.exclusive {
         busy.push(format!("exclusive open failed: {e}"));
@@ -417,7 +478,7 @@ pub struct Checked {
 /// (empty for an orphan PV).
 pub async fn check(
     exec: &dyn Exec,
-    disks: &dyn HostDisks,
+    disks: &std::sync::Arc<dyn HostDisks>,
     paths: &[String],
     pvs: &BTreeMap<PathBuf, String>,
     vg: &str,
@@ -450,7 +511,7 @@ pub async fn check(
             ))
         );
         if !settled && let Ok(node) = &f.dev {
-            f.exclusive = disks.exclusive(node);
+            f.exclusive = open_exclusive_blocking(disks, node).await;
         }
         let early = classify_early(&f, pv_vg, vg);
         let (state, message) = if let Some(s) = early {
@@ -528,6 +589,7 @@ pub(crate) mod fake {
             }),
             mounts: Vec::new(),
             exclusive: Ok(()),
+            multipath: false,
         }
     }
 
@@ -550,6 +612,7 @@ pub(crate) mod fake {
                     sys: Err(String::new()),
                     mounts: Vec::new(),
                     exclusive: Ok(()),
+                    multipath: false,
                 })
         }
 
@@ -562,6 +625,10 @@ pub(crate) mod fake {
                 .values()
                 .find(|f| f.dev.as_deref().ok() == Some(node))
                 .map_or(Ok(()), |f| f.exclusive.clone())
+        }
+
+        fn udev_readable(&self) -> bool {
+            true
         }
 
         /// The scripted paths directly under /dev.
@@ -715,9 +782,20 @@ mod tests {
         let t = std::env::temp_dir().join(format!("r-drbd-disks-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&t);
         let block = t.join("sys/class/block");
-        for n in ["vda", "nvme0n1", "loop0", "dm-0", "sr0", "zram0"] {
+        for n in [
+            "vda",
+            "nvme0n1",
+            "loop0",
+            "dm-0",
+            "sr0",
+            "zram0",
+            "fd0",
+            "nvme1c1n1",
+        ] {
             std::fs::create_dir_all(block.join(n)).unwrap();
         }
+        std::fs::write(block.join("nvme1c1n1/hidden"), "1\n").unwrap();
+        std::fs::write(block.join("nvme0n1/hidden"), "0\n").unwrap();
         // In real sysfs a partition is also listed at the top level.
         std::fs::create_dir_all(block.join("vda1")).unwrap();
         std::fs::write(block.join("vda1/partition"), "1\n").unwrap();
@@ -740,6 +818,7 @@ mod tests {
             sys: t.join("sys"),
             mountinfo: t.join("mountinfo"),
             by_id: by_id.clone(),
+            udev: t.join("udev"),
         };
         assert_eq!(d.whole_disks(), ["nvme0n1", "vda"]);
         let l = |n: &str| by_id.join(n).display().to_string();
@@ -838,6 +917,36 @@ mod tests {
             ))
         );
 
+        // No medium, an eMMC boot area, a floppy.
+        let mut f = disk("sdz");
+        f.sys.as_mut().unwrap().size_bytes = 0;
+        assert_eq!(
+            early(&f, None),
+            Some((DeviceState::NotADisk, Some("sdz has no medium".into())))
+        );
+        for (name, what) in [
+            ("mmcblk0boot0", "an eMMC boot partition"),
+            ("fd0", "a floppy drive"),
+        ] {
+            assert_eq!(
+                early(&disk(name), None),
+                Some((DeviceState::NotADisk, Some(format!("{name} is {what}"))))
+            );
+        }
+        assert!(!not_a_disk_name("mmcblk0"));
+
+        // A multipath path is Busy before any open.
+        let mut f = disk("sdc");
+        f.multipath = true;
+        assert_eq!(
+            early(&f, None),
+            Some((DeviceState::Busy, Some("a multipath path".into())))
+        );
+        assert!(udev_multipath(
+            "S:disk/by-id/x\nE:DM_MULTIPATH_DEVICE_PATH=1\nE:ID_SERIAL=x\n"
+        ));
+        assert!(!udev_multipath("E:DM_MULTIPATH_DEVICE_PATH=0\n"));
+
         // Anything else needs the signatures.
         assert_eq!(early(&disk("vdd"), None), None);
         assert_eq!(early(&disk("nvme0n1"), Some("")), None);
@@ -893,7 +1002,8 @@ mod tests {
         let x = ScriptedExec::new();
         x.expect(wipefs_argv("/dev/nvme0n1"), ok(WIPEFS_BLANK));
         let paths = ["/dev/disk/by-id/nvme-x", "/dev/disk/by-id/wwn-x"].map(str::to_owned);
-        let rows = check(&x, &disks, &paths, &BTreeMap::new(), "vg1").await;
+        let dyn_disks: std::sync::Arc<dyn HostDisks> = std::sync::Arc::new(disks);
+        let rows = check(&x, &dyn_disks, &paths, &BTreeMap::new(), "vg1").await;
         x.assert_done();
         assert_eq!(rows[0].row.state, DeviceState::Blank);
         assert_eq!(rows[1].row.state, DeviceState::NotADisk);
@@ -905,7 +1015,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_runs_wipefs_only_where_it_decides() {
-        let disks = FakeDisks::default();
+        let disks = std::sync::Arc::new(FakeDisks::default());
         disks
             .set("/dev/disk/by-id/a", disk("vdd"))
             .set("/dev/disk/by-id/b", disk("vde"))
@@ -915,7 +1025,8 @@ mod tests {
             .expect(wipefs_argv("/dev/vdf"), code(1, "", "wipefs: error"));
         let pvs = BTreeMap::from([(PathBuf::from("/dev/vdd"), "vg1".to_owned())]);
         let paths = ["a", "b", "c", "gone"].map(|p| format!("/dev/disk/by-id/{p}"));
-        let rows = check(&x, &disks, &paths, &pvs, "vg1").await;
+        let dyn_disks: std::sync::Arc<dyn HostDisks> = disks.clone();
+        let rows = check(&x, &dyn_disks, &paths, &pvs, "vg1").await;
         x.assert_done();
         // Never on the member, nor on a path that does not resolve.
         assert_eq!(

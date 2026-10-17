@@ -17,7 +17,7 @@ pub mod snapshot;
 pub mod volume;
 
 pub use condition::Condition;
-pub use nodedisks::{DiskStatus, NodeDisks, NodeDisksSpec, NodeDisksStatus};
+pub use nodedisks::{DiskStatus, DiskWatch, NodeDisks, NodeDisksSpec, NodeDisksStatus};
 pub use pool::{
     DEFAULT_OVERCOMMIT_PERCENT, DEFAULT_RESERVE_PERCENT, DeviceState, DeviceStatus, Pool, PoolSpec,
     PoolStatus, ReclaimPolicy,
