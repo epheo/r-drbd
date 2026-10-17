@@ -105,6 +105,25 @@ impl Look {
     }
 }
 
+/// Up to three PVs with their VG, for the devices-file refusal.
+fn pv_list(pvs: &BTreeMap<PathBuf, String>) -> String {
+    let mut s: Vec<String> = pvs
+        .iter()
+        .take(3)
+        .map(|(p, vg)| {
+            if vg.is_empty() {
+                format!("{} without a VG", p.display())
+            } else {
+                format!("{} of {vg}", p.display())
+            }
+        })
+        .collect();
+    if pvs.len() > 3 {
+        s.push("...".to_owned());
+    }
+    s.join(", ")
+}
+
 /// The host could not be read: for a Pool that showed a member, the usual
 /// probe decides, as for a Pool on an existing VG, and the rows stay. One
 /// that never did can hold no LV yet.
@@ -267,7 +286,7 @@ impl Reconciler {
                 }
             };
             tracing::info!(pool = pool.name_any(), step = step.name(), "building pool");
-            let res = self.run_step(t, &step).await;
+            let res = self.run_step(t, &look.pvs, &step).await;
             self.disks_changed |= res.is_ok();
             reads.invalidate(t.vg);
             let Err(e) = res else { continue };
@@ -292,17 +311,39 @@ impl Reconciler {
         out
     }
 
-    async fn run_step(&self, t: &Target<'_>, step: &Step) -> Result<(), CmdError> {
+    async fn run_step(
+        &self,
+        t: &Target<'_>,
+        host_pvs: &BTreeMap<PathBuf, String>,
+        step: &Step,
+    ) -> Result<(), CmdError> {
         let (vg, thin) = (t.vg, t.thin);
         if matches!(step, Step::Vgcreate(_) | Step::Vgextend(_)) {
             let missing = storage::devices_file_missing(self.lvm.exec()).await?;
             if let Some(path) = missing {
-                return Err(CmdError::new(
-                    "lvm",
-                    format!(
-                        "use_devicesfile is 1 but {path} does not exist: this command would create it with only the new disks and hide every other VG of the host; run `vgimportdevices --all` on the node first"
-                    ),
-                ));
+                // Without the file LVM sees every PV; the command creates
+                // the file holding only its own disks. What counts is the
+                // host's PVs on disks and partitions: our view leaves out
+                // DRBD devices and LVs on purpose, the host must not scan
+                // them either, so a file without them is the wanted state.
+                // With none to hide, the new file lists exactly the host's
+                // PVs. The advice never says --all: on a host without a
+                // filter that would import guest PVs found on DRBD devices.
+                if !host_pvs.is_empty() {
+                    return Err(CmdError::new(
+                        "lvm",
+                        format!(
+                            "use_devicesfile is 1 but {path} does not exist: this command would create it with only the new disks and hide the host's {} PV(s) ({}); add them to a devices file first, `vgimportdevices <vg>` per VG or `lvmdevices --adddev <device>` for a PV without one, never `--all` on a host whose DRBD devices may hold guest LVM",
+                            host_pvs.len(),
+                            pv_list(host_pvs)
+                        ),
+                    ));
+                }
+                tracing::info!(
+                    vg,
+                    path,
+                    "no devices file and no PV on the host: lvm creates the file with the new disks"
+                );
             }
         }
         match step {

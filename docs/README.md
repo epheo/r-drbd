@@ -7,6 +7,7 @@ You declare thin pools as Pool objects, and claim volumes through a StorageClass
 
 - [Concepts](concepts.md): the objects, the two roles, how a volume is placed.
 - [Install](install.md): host requirements, manifests, first Pool and StorageClass.
+- [OpenShift](openshift.md): the DRBD module through Kernel Module Management, graceful shutdown, the install, upgrades.
 - [Pools](pools.md): declaring thin pools or building them from blank disks, tiers, capacity, removal.
 - [Disks](disks.md): what runs on a disk, the limits, and every corner case of building from disks and of NodeDisks.
 - [Volumes](volumes.md): StorageClass parameters, placement pins, access modes, resize.

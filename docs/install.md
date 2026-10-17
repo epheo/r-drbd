@@ -6,22 +6,26 @@ On every node that runs the agent (by default, every node):
 
 - DRBD 9 kernel module loaded.
   drbd-utils is not needed on the host: the image carries its own.
-  Recommended: module option `usermode_helper=disabled`.
-  r-drbd sets no DRBD handlers, so the kernel's calls to `/sbin/drbdadm` do nothing for it, and they fail on hosts without drbd-utils.
+  An agent that starts before the module is loaded serves the node without replication, records a `DrbdModuleMissing` Event on the Node, and restarts by itself within ten seconds of the module appearing.
+  r-drbd sets no DRBD handlers, so the kernel's calls to its helper (`/sbin/drbdadm` by default) do nothing for it.
+  When that helper does not exist on the host, the agent sets the module parameter `usermode_helper` to `disabled`, which ends the failed calls.
+  When a host drbd-utils provides it, the agent leaves it alone; set the module option `usermode_helper=disabled` yourself if the host runs no DRBD resources of its own.
 
 On every node that stores data, also:
 
 - lvm2 2.03.03 or newer, and either a thin pool in a volume group, or blank disks the agent builds one from.
-  For blank disks with `use_devicesfile = 1`, the devices file must exist (`vgimportdevices --all` makes it).
+  With `use_devicesfile = 1`, a host that already has PVs needs its devices file before the agent builds from blank disks; a host without any PV needs nothing.
+  Make it with `vgimportdevices <vg>` for each VG of the host, not `--all`: without the file, LVM also sees PVs inside volumes attached through DRBD.
   Older LVM does not know `scan_lvs`; the agent then marks its Pools Available False, reason `LvmUnsupported`.
 - xfsprogs.
 - The host's own LVM must not scan DRBD devices or LVs. Either:
-  - a devices file (`use_devicesfile = 1`, the default on recent distributions) that lists only the host's real PVs; or
+  - a devices file (`use_devicesfile = 1`, the default on recent distributions) that lists only the host's real PVs; an empty file is enough, LVM adds what it creates; or
   - in lvm.conf, `global_filter` rejecting `/dev/drbd` and `scan_lvs = 0`.
 
+  The setting alone is not enough: with `use_devicesfile = 1` and no file, LVM scans every device as if the setting were off.
   Why: a volume can hold a guest's own LVM. Without these rules, udev's pvscan autoactivation can activate that guest VG through `/dev/drbdN` on the host.
   That holds the DRBD device open and runs the guest VG twice, on the host and in the guest.
-  The agent's own commands never scan them, whatever the host config; it logs a warning, once the node has a Pool, when the host's rules miss this or cannot be verified.
+  The agent's own commands never scan them, whatever the host config; it logs a warning at start, on every node, when the host's rules miss this or cannot be verified.
 
 Cluster:
 
@@ -69,6 +73,7 @@ Host paths it writes:
 - `/etc/drbd.d/r-drbd.res`: the include for that directory.
 - `/var/lib/drbd`, `/run/drbd`: drbd-utils state and locks, shared with any host drbd-utils.
 - `/var/lib/kubelet/plugins/r-drbd.io/`: the CSI socket.
+- `/sys/module/drbd/parameters/usermode_helper`: set to `disabled` when the helper it names does not exist on the host.
 
 ## Install the manifests
 
@@ -84,6 +89,7 @@ Everything runs in namespace `r-drbd-system`.
 
 OpenShift and MicroShift: `deploy/base/00-namespace-rbac.yaml` already binds the privileged SCC to the agent's service account.
 On plain Kubernetes that binding is harmless: its role does not exist.
+OpenShift hosts have no DRBD module and cannot take one by package; see [OpenShift](openshift.md).
 
 Air-gapped clusters: the manifests pull `ghcr.io/epheo/r-drbd` and the CSI sidecars from `registry.k8s.io`.
 Mirror them and patch the images with a kustomize overlay.

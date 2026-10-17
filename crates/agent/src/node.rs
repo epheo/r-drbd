@@ -1,5 +1,6 @@
 //! Node-level duties: startup tool probe, Node annotations, heartbeat Lease.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -291,6 +292,92 @@ pub async fn check_graceful(exec: &dyn Exec, events: &dyn NodeEvents, every: Dur
     }
 }
 
+/// A node where an operator builds and loads the module (OpenShift with
+/// Kernel Module Management) can bring it up after the agent. An agent
+/// without it looks again this often, and restarts once it is there.
+pub const MODULE_RECHECK: Duration = Duration::from_secs(10);
+
+pub const MODULE_MISSING: &str = "DRBD kernel module not loaded: replicated volumes cannot be served on this node; the agent restarts by itself once it is loaded";
+
+/// Init's root: the host's file system, for files the pod does not mount.
+pub const HOST_ROOT: &str = "/proc/1/root";
+/// The DRBD module's helper path, read and set through sysfs.
+pub const HELPER_PARAM: &str = "sys/module/drbd/parameters/usermode_helper";
+
+/// drbdadm prints the kernel version only when the module is loaded.
+pub async fn module_loaded(exec: &dyn Exec) -> bool {
+    match run_any(exec, &argv(&["drbdadm", "--version"]), DEFAULT_TIMEOUT).await {
+        Ok(out) => drbdadm_field(&out.stdout, "DRBD_KERNEL_VERSION").is_some(),
+        Err(_) => false,
+    }
+}
+
+/// An agent started without the module keeps looking, and a Node Event
+/// says why replication is off. Returns once the module is loaded: the
+/// caller restarts the agent, whose DRBD side is fixed at start.
+pub async fn watch_for_module(exec: &dyn Exec, events: &dyn NodeEvents, every: Duration) {
+    tracing::warn!("{MODULE_MISSING}");
+    events.warn("DrbdModuleMissing", MODULE_MISSING).await;
+    loop {
+        tokio::time::sleep(every).await;
+        if module_loaded(exec).await {
+            tracing::warn!(
+                "DRBD module loaded after start: restarting to serve replicated volumes"
+            );
+            return;
+        }
+    }
+}
+
+/// r-drbd sets no handlers, so the kernel's helper calls do nothing for
+/// it, and on a host without drbdadm each one fails with a warning in
+/// the kernel log; `disabled` ends them. A helper that exists stays: it
+/// may serve the host's own resources. Existence is asked on the host,
+/// where its symlinks resolve; an unknown answer leaves it alone.
+pub async fn disable_dead_helper(exec: &dyn Exec, host_root: &Path) {
+    let param = host_root.join(HELPER_PARAM);
+    let Ok(current) = std::fs::read_to_string(&param) else {
+        return;
+    };
+    let helper = current.trim();
+    if helper.is_empty() || helper == "disabled" {
+        return;
+    }
+    match run_any(exec, &argv(&["test", "-e", helper]), CHECK_TIMEOUT).await {
+        Ok(out) if out.exit_code == Some(1) => {}
+        Ok(out) if out.exit_code == Some(0) => {
+            tracing::info!(
+                helper,
+                "DRBD usermode helper exists on the host, left as is"
+            );
+            return;
+        }
+        Ok(out) => {
+            tracing::warn!(
+                helper,
+                exit = ?out.exit_code,
+                "DRBD usermode helper not checked, left as is"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(helper, error = %e, "DRBD usermode helper not checked, left as is");
+            return;
+        }
+    }
+    match std::fs::write(&param, "disabled") {
+        Ok(()) => tracing::info!(
+            helper,
+            "DRBD usermode helper absent on the host: set to disabled"
+        ),
+        Err(e) => tracing::warn!(
+            helper,
+            error = %e,
+            "DRBD usermode helper absent on the host and could not be disabled"
+        ),
+    }
+}
+
 /// `lvm version` and, when installed, `drbdadm --version`.
 pub async fn probe(exec: &dyn Exec) -> Tools {
     let mut tools = Tools::default();
@@ -547,6 +634,68 @@ mod tests {
         x.assert_done();
         assert_eq!(ev.reasons(), ["GracefulShutdownOff", "GracefulShutdownOff"]);
         assert_eq!(ev.0.lock().unwrap()[0].1, GRACEFUL_OFF);
+    }
+
+    const NO_MODULE: &str = "DRBDADM_BUILDTAG=GIT-hash:\\ abc\nDRBDADM_API_VERSION=2\nDRBDADM_VERSION_CODE=0x092100\nDRBDADM_VERSION=9.33.0\n";
+
+    #[tokio::test(start_paused = true)]
+    async fn late_module_reported_once_then_returns() {
+        let x = ScriptedExec::new();
+        let version = argv(&["drbdadm", "--version"]);
+        x.expect(version.clone(), ok(NO_MODULE))
+            .expect(version, ok(DRBDADM));
+        let ev = Recorded::default();
+        watch_for_module(&x, &ev, MODULE_RECHECK).await;
+        x.assert_done();
+        assert_eq!(ev.reasons(), ["DrbdModuleMissing"]);
+        assert_eq!(ev.0.lock().unwrap()[0].1, MODULE_MISSING);
+    }
+
+    #[tokio::test]
+    async fn dead_helper_disabled_live_helper_kept() {
+        let root = std::env::temp_dir().join(format!("r-drbd-helper-{}", std::process::id()));
+        let param = root.join(HELPER_PARAM);
+        std::fs::create_dir_all(param.parent().unwrap()).unwrap();
+        let x = ScriptedExec::new();
+        // No module: nothing to read, nothing asked, nothing written.
+        disable_dead_helper(&x, &root).await;
+        assert!(!param.exists());
+        // The default helper, absent on the host.
+        std::fs::write(&param, "/sbin/drbdadm\n").unwrap();
+        x.expect(
+            argv(&["test", "-e", "/sbin/drbdadm"]),
+            crate::exec::scripted::code(1, "", ""),
+        );
+        disable_dead_helper(&x, &root).await;
+        assert_eq!(std::fs::read_to_string(&param).unwrap(), "disabled");
+        // Already disabled: stays, nothing asked.
+        disable_dead_helper(&x, &root).await;
+        assert_eq!(std::fs::read_to_string(&param).unwrap(), "disabled");
+        // A helper the host has (its symlinks resolve there): left to it.
+        std::fs::write(&param, "/usr/sbin/drbdadm\n").unwrap();
+        x.expect(argv(&["test", "-e", "/usr/sbin/drbdadm"]), ok(""));
+        disable_dead_helper(&x, &root).await;
+        assert_eq!(
+            std::fs::read_to_string(&param).unwrap(),
+            "/usr/sbin/drbdadm\n"
+        );
+        // Unknown, a failed spawn or an odd exit code: left alone too.
+        x.expect(
+            argv(&["test", "-e", "/usr/sbin/drbdadm"]),
+            Err("spawn test: no such file".into()),
+        )
+        .expect(
+            argv(&["test", "-e", "/usr/sbin/drbdadm"]),
+            crate::exec::scripted::code(127, "", "test: not found"),
+        );
+        disable_dead_helper(&x, &root).await;
+        disable_dead_helper(&x, &root).await;
+        assert_eq!(
+            std::fs::read_to_string(&param).unwrap(),
+            "/usr/sbin/drbdadm\n"
+        );
+        x.assert_done();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]
