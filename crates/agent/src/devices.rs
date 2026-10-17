@@ -58,13 +58,16 @@ pub struct Facts {
     pub sys: Result<Sys, String>,
     /// Mount points of the disk and its partitions.
     pub mounts: Vec<String>,
-    /// `Err` with the error when the exclusive open failed.
+    /// `Err` with the error when the exclusive open failed; tried only on
+    /// a disk that may be claimed, see [`check`].
     pub exclusive: Result<(), String>,
 }
 
 /// The host's disks as the agent sees them; a trait so tests need no disks.
 pub trait HostDisks: Send + Sync + std::fmt::Debug {
+    /// Everything but the exclusive open, left `Ok`.
     fn facts(&self, path: &str) -> Facts;
+    fn exclusive(&self, node: &Path) -> Result<(), String>;
 }
 
 /// The real host: /dev and /sys are the host's in the agent pod, and with
@@ -101,17 +104,16 @@ impl HostDisks for SysDisks {
             // Without the table a mount still fails the exclusive open.
             _ => Vec::new(),
         };
-        let exclusive = if sys.is_ok() {
-            open_exclusive(node)
-        } else {
-            Ok(())
-        };
         Facts {
             dev,
             sys,
             mounts,
-            exclusive,
+            exclusive: Ok(()),
         }
+    }
+
+    fn exclusive(&self, node: &Path) -> Result<(), String> {
+        open_exclusive(node)
     }
 }
 
@@ -376,14 +378,27 @@ pub async fn check(
 ) -> Vec<Checked> {
     let mut out = Vec::with_capacity(paths.len());
     for path in paths {
-        let f = disks.facts(path);
+        let mut f = disks.facts(path);
         let pv_vg = f
             .dev
             .as_ref()
             .ok()
             .and_then(|n| pvs.get(n))
             .map(String::as_str);
-        let (state, message) = if let Some(s) = classify_early(&f, pv_vg, vg) {
+        // Never on a member: while its VG is inactive, our brief exclusive
+        // hold could make an activation's claim on the disk fail.
+        let settled = matches!(
+            classify_early(&f, pv_vg, vg),
+            Some((
+                DeviceState::Missing | DeviceState::NotADisk | DeviceState::Member,
+                _
+            ))
+        );
+        if !settled && let Ok(node) = &f.dev {
+            f.exclusive = disks.exclusive(node);
+        }
+        let early = classify_early(&f, pv_vg, vg);
+        let (state, message) = if let Some(s) = early {
             s
         } else {
             let node = f
@@ -442,6 +457,8 @@ pub(crate) mod fake {
     #[derive(Debug, Default)]
     pub(crate) struct FakeDisks {
         pub(crate) facts: Mutex<HashMap<String, Facts>>,
+        /// Nodes the exclusive open was tried on, in order.
+        pub(crate) opened: Mutex<Vec<std::path::PathBuf>>,
     }
 
     /// A blank whole disk `name` of 4 GiB behind `path`.
@@ -479,6 +496,17 @@ pub(crate) mod fake {
                     mounts: Vec::new(),
                     exclusive: Ok(()),
                 })
+        }
+
+        /// The `exclusive` of the scripted facts of that node.
+        fn exclusive(&self, node: &std::path::Path) -> Result<(), String> {
+            self.opened.lock().unwrap().push(node.to_owned());
+            self.facts
+                .lock()
+                .unwrap()
+                .values()
+                .find(|f| f.dev.as_deref().ok() == Some(node))
+                .map_or(Ok(()), |f| f.exclusive.clone())
         }
     }
 }
@@ -730,6 +758,11 @@ mod tests {
         let paths = ["a", "b", "c", "gone"].map(|p| format!("/dev/disk/by-id/{p}"));
         let rows = check(&x, &disks, &paths, &pvs, "vg1").await;
         x.assert_done();
+        // Never on the member, nor on a path that does not resolve.
+        assert_eq!(
+            *disks.opened.lock().unwrap(),
+            [PathBuf::from("/dev/vde"), PathBuf::from("/dev/vdf")]
+        );
         let states: Vec<_> = rows.iter().map(|r| r.row.state).collect();
         assert_eq!(
             states,
