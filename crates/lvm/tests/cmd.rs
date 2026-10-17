@@ -202,3 +202,121 @@ fn host_probe() {
         None
     );
 }
+
+#[test]
+fn devices_mode_reports() {
+    let head = |p: &str, fields: &str| {
+        v(&[
+            p,
+            "--config",
+            C,
+            "--reportformat",
+            "json",
+            "--units",
+            "b",
+            "--nosuffix",
+            "--binary",
+            "-o",
+            fields,
+        ])
+    };
+    assert_eq!(
+        cmd::vgs_all(),
+        head(
+            "vgs",
+            "vg_name,vg_extent_size,vg_size,vg_free,vg_tags,vg_missing_pv_count"
+        )
+    );
+    assert_eq!(cmd::pvs_all(), head("pvs", "pv_name,vg_name"));
+    let mut want = head("lvs", "lv_name,segtype,lv_size,lv_metadata_size,chunk_size");
+    want.push("vg1".into());
+    assert_eq!(cmd::thin_pools("vg1"), want);
+}
+
+#[test]
+fn devices_mode_changes_never_force() {
+    let devs = v(&["/dev/disk/by-id/a", "/dev/disk/by-id/b"]);
+    let all = [
+        (
+            cmd::vgcreate("vg1", "r-drbd.pool.p1", &devs),
+            v(&[
+                "vgcreate",
+                "--config",
+                C,
+                "--addtag",
+                "r-drbd.pool.p1",
+                "vg1",
+                "/dev/disk/by-id/a",
+                "/dev/disk/by-id/b",
+            ]),
+        ),
+        (
+            cmd::vgextend("vg1", &devs[1..]),
+            v(&["vgextend", "--config", C, "vg1", "/dev/disk/by-id/b"]),
+        ),
+        (
+            cmd::create_thin_pool("vg1", "thin", 65_536, 71_303_168),
+            v(&[
+                "lvcreate",
+                "--config",
+                C,
+                "--type",
+                "thin-pool",
+                "--extents",
+                "100%FREE",
+                "--chunksize",
+                "65536b",
+                "--poolmetadatasize",
+                "71303168b",
+                "--zero",
+                "y",
+                "--name",
+                "thin",
+                "vg1",
+            ]),
+        ),
+        (
+            cmd::extend_pool_metadata("vg1", "thin", 75_497_472),
+            v(&[
+                "lvextend",
+                "--config",
+                C,
+                "--poolmetadatasize",
+                "75497472b",
+                "vg1/thin",
+            ]),
+        ),
+        (
+            cmd::extend_pool_data("vg1", "thin"),
+            v(&[
+                "lvextend",
+                "--config",
+                C,
+                "--extents",
+                "+100%FREE",
+                "vg1/thin",
+            ]),
+        ),
+        (
+            cmd::remove_inactive("vg1", "thin"),
+            v(&["lvremove", "--config", C, "vg1/thin"]),
+        ),
+        (cmd::vgremove("vg1"), v(&["vgremove", "--config", C, "vg1"])),
+        (
+            cmd::pvremove(&devs),
+            v(&[
+                "pvremove",
+                "--config",
+                C,
+                "/dev/disk/by-id/a",
+                "/dev/disk/by-id/b",
+            ]),
+        ),
+    ];
+    for (got, want) in all {
+        assert_eq!(got, want);
+        for forced in ["--yes", "-y", "-f", "-ff", "--force"] {
+            assert!(!got.iter().any(|a| a == forced), "{got:?}");
+        }
+    }
+}
