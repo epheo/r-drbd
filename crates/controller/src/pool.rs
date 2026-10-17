@@ -7,7 +7,7 @@ use std::sync::Arc;
 use kube::{Api, ResourceExt};
 use model::condition::{self, types};
 use model::keys::FINALIZER_POOL;
-use model::{Pool, Role, Volume};
+use model::{Pool, ReclaimPolicy, Role, Volume};
 use serde_json::json;
 
 use crate::store::{Stores, node_ready};
@@ -106,6 +106,16 @@ pub(crate) fn resize_refusal(
         })
 }
 
+/// Under reclaimPolicy Delete the agent removes the VG first and says so
+/// with Released; switching to Retain lets the Pool go at once.
+fn released(p: &Pool) -> bool {
+    p.spec.devices.is_none()
+        || p.spec.reclaim() == ReclaimPolicy::Retain
+        || p.status
+            .as_ref()
+            .is_some_and(|s| condition::is_true(&s.conditions, types::RELEASED))
+}
+
 pub(crate) async fn reconcile_all(ctx: &Ctx<'_>, memory: &Memory) {
     let api: Api<Pool> = Api::all(ctx.client.clone());
     let volumes = Stores::sorted(&ctx.stores.volumes);
@@ -147,7 +157,7 @@ pub(crate) async fn reconcile_all(ctx: &Ctx<'_>, memory: &Memory) {
             }
             let held = pinned.contains(name.as_str())
                 || snapshot_held.contains(&(pool.spec.node.as_str(), name.as_str()));
-            if wanted.is_empty() && current.is_empty() && !held {
+            if wanted.is_empty() && current.is_empty() && !held && released(&pool) {
                 set_finalizer(&api, pool.as_ref(), FINALIZER_POOL, false).await;
                 continue;
             }
