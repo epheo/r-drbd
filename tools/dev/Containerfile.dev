@@ -1,4 +1,10 @@
-# Dev image from a locally built static binary.
+# Dev image from a locally built static binary. drbd-utils comes from the
+# release Containerfile, built once with:
+#   podman build --target drbd-utils -t localhost/r-drbd-utils:dev .
+FROM localhost/r-drbd-utils:dev AS drbd-utils
+
 FROM scratch
+COPY --from=drbd-utils /out/ /
 COPY r-drbd /r-drbd
+ENV PATH=/usr/sbin
 ENTRYPOINT ["/r-drbd"]

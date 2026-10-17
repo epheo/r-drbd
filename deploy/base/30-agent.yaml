@@ -29,9 +29,9 @@ spec:
           securityContext:
             privileged: true
           env:
-            # Every external command re-execs the binary into the host mount
-            # namespace, so the host tools match the kernel module; the agent itself stays in the container
-            # and reads host paths through the mounts below.
+            # lvm, mkfs and mount run in the host mount namespace, drbd-utils
+            # from the image; the agent itself stays in the container and
+            # reads host paths through the mounts below.
             - name: R_DRBD_HOST_NS
               value: /proc/1/ns
             - name: NODE_NAME
@@ -56,6 +56,9 @@ spec:
             - {name: dev, mountPath: /dev, mountPropagation: HostToContainer}
             - {name: res-dir, mountPath: /var/lib/r-drbd}
             - {name: drbd-d, mountPath: /etc/drbd.d}
+            # drbd-utils state and locks, shared with any host drbd-utils.
+            - {name: drbd-lib, mountPath: /var/lib/drbd}
+            - {name: drbd-run, mountPath: /var/run/drbd}
         - name: csi-node-driver-registrar
           image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0
           args:
@@ -78,3 +81,7 @@ spec:
           hostPath: {path: /var/lib/r-drbd, type: DirectoryOrCreate}
         - name: drbd-d
           hostPath: {path: /etc/drbd.d, type: DirectoryOrCreate}
+        - name: drbd-lib
+          hostPath: {path: /var/lib/drbd, type: DirectoryOrCreate}
+        - name: drbd-run
+          hostPath: {path: /run/drbd, type: DirectoryOrCreate}

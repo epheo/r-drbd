@@ -27,7 +27,7 @@ pub struct Config {
     pub csi_endpoint: String,
     /// DRBD resource files, included from /etc/drbd.d/r-drbd.res.
     pub res_dir: PathBuf,
-    /// Prepended to every external command, e.g. `[/proc/self/exe,
+    /// Prepended to every external command but drbd-utils, e.g. `[/proc/self/exe,
     /// host-exec, <ns>, --]` to run tools in the host mount namespace.
     pub host_exec_prefix: Option<Vec<String>>,
     /// This agent's pod, read at shutdown on hosts without systemd.
@@ -112,8 +112,9 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
     let tracker = Arc::new(Mutex::new(Tracker::default()));
     let features = tools.drbd();
     let events = features.is_some().then(|| {
+        // No prefix: drbdsetup runs from the image.
         tokio::spawn(drbd::events2(
-            cfg.host_exec_prefix.clone(),
+            None,
             tracker.clone(),
             drbd::Notify {
                 changes: changes.clone(),

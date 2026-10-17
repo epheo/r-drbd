@@ -50,9 +50,9 @@ enum Role {
     },
 }
 
-/// The agent image is a bare static binary: each external command re-execs
-/// this binary, which moves into the host's IPC and mount namespaces and
-/// execs the host's lvm, drbd-utils or mount. The agent process itself stays in the
+/// The image carries only static binaries: each host command (lvm, mkfs,
+/// mount) re-execs this binary, which moves into the host's IPC and mount
+/// namespaces and execs the host's tool. The agent process itself stays in the
 /// container namespace so the in-cluster credentials remain readable.
 fn host_exec(ns_dir: &str, argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use rustix::thread::{LinkNameSpaceType, move_into_link_name_space};

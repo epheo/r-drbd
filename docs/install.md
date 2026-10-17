@@ -4,8 +4,10 @@
 
 On every node that runs the agent (by default, every node):
 
-- DRBD 9 kernel module loaded, and drbd-utils.
-- `/etc/drbd.d` included from `/etc/drbd.conf` (the drbd-utils default).
+- DRBD 9 kernel module loaded.
+  drbd-utils is not needed on the host: the image carries its own.
+  Recommended: module option `usermode_helper=disabled`.
+  r-drbd sets no DRBD handlers, so the kernel's calls to `/sbin/drbdadm` do nothing for it, and they fail on hosts without drbd-utils.
 
 On every node that stores data, also:
 
@@ -44,23 +46,27 @@ Node shutdown:
   The critical share is the agent's window to release what kubelet could not; keep it at 30 s or more.
   Without it, a node that shuts down with a volume in use can leave the other replicas Outdated until it returns.
   The agent warns, and records a `GracefulShutdownOff` Event on the Node, while kubelet holds no shutdown delay lock; it checks again every hour.
-- drbd-utils' `drbd-graceful-down.service` and `drbd-graceful-disconnect.service` are not needed.
+- If the host has drbd-utils installed, its `drbd-graceful-down.service` and `drbd-graceful-disconnect.service` are not needed.
+  Removing drbd-utils from the host, or masking both units, avoids the cases below.
   With graceful node shutdown on, their shutdown hooks find no Primary in use and do no harm.
+  With it off, the disconnect unit cuts an in-use Primary as the shutdown starts, before the agent can act, and its peers turn Outdated.
   On hosts whose network is run by systemd-networkd or netplan, a network restart can make the disconnect unit cut an in-use Primary and outdate its peers; a NetworkManager restart does not.
   The agent warns once per start, with a `HostDrbdUnits` Event on the Node, when they are loaded.
 
 ## How the agent uses the host
 
-The image holds only the static binary.
+The image holds the static r-drbd binary and a static drbd-utils, with that drbd-utils' GPLv2 source under `/usr/share/src/drbd-utils`.
 The agent runs privileged with hostPID and hostNetwork.
-Each external command enters the host's IPC and mount namespaces and runs the host's own lvm, drbd-utils, xfsprogs and mount.
-So the tool versions are the host's, and the agent reports them as Node annotations:
-`r-drbd.io/drbd-kernel`, `r-drbd.io/drbd-utils`, `r-drbd.io/lvm`.
+drbdadm, drbdsetup and drbdmeta run from the image, with the image's own `/etc/drbd.conf`: it includes the host's `/etc/drbd.d/*.res`, and nothing else from the host's DRBD configuration.
+Every other command enters the host's IPC and mount namespaces and runs the host's own lvm, xfsprogs and mount.
+The agent reports the versions as Node annotations:
+`r-drbd.io/drbd-kernel`, `r-drbd.io/drbd-utils` (the image's), `r-drbd.io/lvm` (the host's).
 
 Host paths it writes:
 
 - `/var/lib/r-drbd/<volume>.res`: DRBD resource files.
 - `/etc/drbd.d/r-drbd.res`: the include for that directory.
+- `/var/lib/drbd`, `/run/drbd`: drbd-utils state and locks, shared with any host drbd-utils.
 - `/var/lib/kubelet/plugins/r-drbd.io/`: the CSI socket.
 
 ## Install the manifests

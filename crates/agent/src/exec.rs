@@ -52,6 +52,10 @@ pub const MKFS_TIMEOUT: ExecMode = ExecMode::Timeout {
     kill: Duration::from_secs(5),
 };
 
+/// Run from the image even when a host prefix is set: the image carries
+/// drbd-utils, so the host needs only the kernel module.
+const IMAGE_TOOLS: [&str; 3] = ["drbdadm", "drbdsetup", "drbdmeta"];
+
 #[derive(Debug, Clone)]
 pub struct TokioExec {
     prefix: Vec<String>,
@@ -133,7 +137,12 @@ impl Exec for TokioExec {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty argv"),
             ));
         };
-        let (spawn_program, spawn_args) = match self.prefix.split_first() {
+        let prefix = if IMAGE_TOOLS.contains(&program.as_str()) {
+            &[][..]
+        } else {
+            &self.prefix[..]
+        };
+        let (spawn_program, spawn_args) = match prefix.split_first() {
             Some((first, rest)) => (first.clone(), [rest, argv].concat()),
             None => (program, argv[1..].to_vec()),
         };
@@ -489,6 +498,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.stdout, "plain\n");
+    }
+
+    #[tokio::test]
+    async fn drbd_tools_skip_the_prefix() {
+        let x = TokioExec::new(Some(argv(&["echo", "PREFIX"])));
+        let r = x
+            .run(&argv(&["drbdsetup", "--version"]), DEFAULT_TIMEOUT)
+            .await;
+        assert!(
+            !matches!(&r, Ok(out) if out.stdout.starts_with("PREFIX")),
+            "{r:?}"
+        );
     }
 
     #[tokio::test]
