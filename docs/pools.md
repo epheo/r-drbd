@@ -84,8 +84,8 @@ Before any change, on every pass, each listed path gets one state in `status.dev
 | `Member` | A PV of this Pool's VG |
 | `Blank` | Whole disk, no signature, no partition, not held, exclusive open succeeds |
 | `NotEmpty` | A signature or a partition table; the message names it, with its offset |
-| `Busy` | Mounted, held by another device (dm, md), or the exclusive open failed |
-| `NotADisk` | A partition, dm, md, loop, drbd, zram, RAM, nbd or optical device, or read-only |
+| `Busy` | Mounted, held by another device (dm, md), a multipath path or not yet settled by udev, or the exclusive open failed or did not return within 10 s |
+| `NotADisk` | A partition, dm, md, loop, drbd, zram, RAM, nbd, RBD, ZFS volume, null block, floppy or optical device, an eMMC boot area, read-only, or size 0 (no medium) |
 | `Missing` | The path does not resolve |
 
 When several apply, the first in this order wins: Missing, NotADisk, Member, Busy, NotEmpty, Blank.
@@ -94,8 +94,9 @@ Each row also shows the disk's size, model and serial, so you can tell which dis
 
 How:
 - the by-id link is resolved, and sysfs gives partitions, holders, read-only flag, size, model and serial;
-- `wipefs --no-act --json` lists signatures, partition tables included; it never writes;
-- the agent opens the disk exclusively and closes it at once: the kernel refuses while anything holds it.
+- the host's udev database says whether the disk is a multipath path (`DM_MULTIPATH_DEVICE_PATH`, decided or still being decided), not ready (`SYSTEMD_READY=0`), or not processed by udev yet;
+- `wipefs --no-act --json` lists signatures, partition tables included; it never writes, and it is not run on a `Busy` disk;
+- the agent opens the disk exclusively and closes it at once: the kernel refuses while anything holds it; an open that does not return within 10 s leaves the disk `Busy` and the agent moves on.
 
 r-drbd never wipes a disk.
 To reuse a disk with old data, wipe it yourself first (`wipefs -a`), deliberately.
@@ -160,8 +161,9 @@ Each agent lists its node's whole disks in a NodeDisks object named after the no
 
 Each row has the `path` to list in a Pool, every by-id link, the kernel name, size, model, serial and the state the checks above give.
 List only `Blank` disks in a Pool; `Member` rows name the Pool that holds them.
-Changes show within seconds: the agent follows kernel uevents and the mount table, and checks every disk again hourly.
-Without a uevent socket it checks every 5 minutes; `status.watch` says which.
+Changes show within seconds for changes the kernel or the mount table reports: a disk plugged or removed, a signature written and the disk closed (mkfs, wipefs, pvcreate, partitioning), a mount or an unmount.
+A writer that never closes the disk, or an exclusive claimer leaving no trace in sysfs, shows at the hourly check of every disk.
+Without a uevent socket, or once it fails, the agent checks every disk every 5 minutes; `status.watch` says which.
 See [Reference](reference.md#nodedisks) for the fields.
 
 While the agent is not running there, from any machine with cluster access:

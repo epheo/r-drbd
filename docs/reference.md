@@ -100,7 +100,7 @@ It claims nothing: a Pool uses only the disks it lists.
 | Field | Type | Notes |
 |---|---|---|
 | `status.blank` | integer | Disks in state `Blank` |
-| `status.watch` | string | `uevent`: changes show within seconds, every disk is checked again hourly; `poll`: no uevent socket, every disk every 5 minutes |
+| `status.watch` | string | `uevent`: changes the kernel or the mount table reports show within seconds, every disk is checked again hourly; `poll`: no uevent socket, or it failed since, every disk every 5 minutes |
 | `status.message` | string | Set when the list is incomplete: more than 512 disks, or disks the last check had no time for |
 | `status.disks[]` | object | Every whole disk of the node; no partition, loop, RAM, zram, dm, md, DRBD, nbd, RBD, ZFS volume, null block, floppy, optical device, eMMC boot area or hidden NVMe multipath path |
 | `status.disks[].path` | string | The path to list in a Pool: the `wwn-` by-id link, else the bus one (`ata-`, `nvme-`, `scsi-`, `virtio-`); `/dev/<name>` without any by-id link |
@@ -118,13 +118,12 @@ It claims nothing: a Pool uses only the disks it lists.
 - a PV of any other VG is `NotEmpty`, naming the VG, even while its LVs hold the disk.
 
 Other differences from a Pool's checks:
-- a disk of size 0 is `NotADisk`, no medium;
-- a disk udev marks as a multipath path is `Busy`;
-- the exclusive open runs only on a disk every other check finds blank, so a disk in use is never opened.
+- `wipefs` and the exclusive open run only on a disk every other check finds blank, so a disk in use is never read or opened;
+- a disk the kernel announced but udev has not processed yet is `Busy`, "udev not settled", and read again a few seconds later.
 
 When the agent reads:
 - every disk at start and hourly (every 5 minutes under `watch: poll`);
-- one disk when the kernel reports a change on it: added, removed, or written and closed (mkfs, wipefs, pvcreate, partitioning);
+- one disk when the kernel reports a change on it: added, removed, or written and closed (mkfs, wipefs, pvcreate, partitioning); a writer that never closes the disk, or an exclusive claimer leaving no trace in sysfs, shows at the hourly check;
 - the cheap facts of every disk (sysfs, mounts) when the mount table or any block device changes, and the signatures of a disk whose facts changed;
 - LVM reports at start, hourly, after a Pool's disks change, and when a disk gains or loses an LVM label.
 So an idle disk, spun down or not, is read at start, hourly and on its own changes only.

@@ -228,18 +228,21 @@ fn spawn_inventory(
     let lock = Arc::new(tokio::sync::Mutex::new(()));
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let pools = stores.pools.clone();
+    let (watch, watcher) = inventory::events::start(&tx, &mountinfo);
     let scanner = inventory::Scanner::new(
         node.to_owned(),
         exec.clone(),
         disks.clone(),
         lock.clone(),
         Box::new(move || pools.state()),
-        inventory::events::start(&tx, &mountinfo),
+        watch,
+        stop.clone(),
     );
     let (ready, mut ready_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(inventory::run(
         client.clone(),
         scanner,
+        watcher,
         async move {
             let _ = ready_rx.wait_for(|r| *r).await;
         },

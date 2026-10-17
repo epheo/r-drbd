@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use super::{Dirty, Pass, SCAN_MAX, Source, preferred, status};
-use crate::devices::{self, Facts, HostDisks, Signature};
+use crate::devices::{self, Facts, HostDisks, Signature, Udev};
 use crate::exec::run_ok;
 use crate::{Exec, ExecMode};
 
@@ -152,12 +152,11 @@ fn decide(f: &Facts, sigs: Option<&Result<Vec<Signature>, String>>, lvm: &Lvm) -
     }
 }
 
-/// wipefs is needed unless sysfs alone settles the disk.
+/// wipefs is needed only when the cheap facts settle nothing: never on a
+/// Busy disk (held, mounted, a multipath path), where a read may hang or
+/// log I/O errors on a standby path.
 fn needs_signatures(f: &Facts) -> bool {
-    !matches!(
-        devices::classify_early(f, None, ""),
-        Some((DeviceState::Missing | DeviceState::NotADisk, _))
-    )
+    devices::classify_early(f, None, "").is_none()
 }
 
 fn has_lvm_signature(e: &Entry) -> bool {
@@ -173,6 +172,7 @@ pub struct Scanner {
     lock: Arc<Mutex<()>>,
     pools: Box<dyn Fn() -> Vec<Arc<Pool>> + Send + Sync>,
     watch: DiskWatch,
+    stop: tokio::sync::watch::Receiver<bool>,
     cache: BTreeMap<String, Entry>,
     lvm: Lvm,
     lvm_warned: bool,
@@ -188,6 +188,7 @@ impl Scanner {
         lock: Arc<Mutex<()>>,
         pools: Box<dyn Fn() -> Vec<Arc<Pool>> + Send + Sync>,
         watch: DiskWatch,
+        stop: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
         Self {
             node,
@@ -196,6 +197,7 @@ impl Scanner {
             lock,
             pools,
             watch,
+            stop,
             cache: BTreeMap::new(),
             lvm: Lvm::default(),
             lvm_warned: false,
@@ -214,6 +216,10 @@ impl Scanner {
 
     pub fn udev_readable(&self) -> bool {
         self.disks.udev_readable()
+    }
+
+    fn stopping(&self) -> bool {
+        *self.stop.borrow()
     }
 
     #[cfg(test)]
@@ -275,11 +281,15 @@ impl Scanner {
     /// new, or whose facts changed.
     async fn refresh(&mut self, names: &[String], dirty: &Dirty) -> Vec<String> {
         self.cache.retain(|n, _| names.contains(n));
+        let table = self.disks.mounts();
         let mut deep = Vec::new();
         for name in names {
-            let d = self.disks.clone();
+            if self.stopping() {
+                break;
+            }
+            let (d, t) = (self.disks.clone(), table.clone());
             let path = format!("/dev/{name}");
-            let Ok(mut f) = tokio::task::spawn_blocking(move || d.facts(&path)).await else {
+            let Ok(mut f) = tokio::task::spawn_blocking(move || d.facts(&path, &t)).await else {
                 continue;
             };
             f.exclusive = Ok(());
@@ -312,7 +322,7 @@ impl Scanner {
             if !needs_signatures(&e.facts) {
                 continue;
             }
-            if Instant::now() >= deadline {
+            if Instant::now() >= deadline || self.stopping() {
                 unchecked.insert(name.clone());
                 continue;
             }
@@ -381,16 +391,26 @@ impl Source for Scanner {
         let links = self.disks.by_id();
         let deep = self.refresh(&names, &dirty).await;
         let (unchecked, stale) = self.read_signatures(&deep).await;
-        if dirty.all || dirty.lvm || stale {
+        if (dirty.all || dirty.lvm || stale) && !self.stopping() {
             self.read_lvm().await;
         }
         let mut rows = Vec::new();
         for name in &names {
+            if self.stopping() {
+                break;
+            }
             let l = links.get(name).cloned().unwrap_or_default();
             if let Some(r) = self.row(name, &l).await {
                 rows.push(r);
             }
         }
+        // udevd was not done with these: read again soon, no uevent will say.
+        let unsettled: BTreeSet<String> = self
+            .cache
+            .iter()
+            .filter(|(_, e)| e.facts.udev == Udev::Unsettled)
+            .map(|(n, _)| n.clone())
+            .collect();
         let s = status(rows, &unchecked, self.watch);
         if let Some(m) = &s.message
             && !self.cut_warned
@@ -401,6 +421,11 @@ impl Source for Scanner {
         Pass {
             status: s,
             unchecked,
+            unsettled,
         }
+    }
+
+    fn set_watch(&mut self, watch: DiskWatch) {
+        self.watch = watch;
     }
 }

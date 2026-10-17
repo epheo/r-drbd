@@ -7,7 +7,7 @@ use model::{Pool, PoolSpec};
 
 use super::*;
 use crate::devices::fake::{FakeDisks, WIPEFS_BLANK, WIPEFS_XFS, disk};
-use crate::devices::{HostDisks, Part, wipefs_argv};
+use crate::devices::{HostDisks, Part, Udev, UdevFlags, wipefs_argv};
 use crate::exec::scripted::{ScriptedExec, code, ok};
 use crate::storage::fixtures::json;
 
@@ -146,6 +146,16 @@ fn vg_owners() {
 }
 
 fn scanner(x: &Arc<ScriptedExec>, d: &Arc<FakeDisks>, pools: Vec<Arc<Pool>>) -> Scanner {
+    let (_never, stop) = tokio::sync::watch::channel(false);
+    scanner_with_stop(x, d, pools, stop)
+}
+
+fn scanner_with_stop(
+    x: &Arc<ScriptedExec>,
+    d: &Arc<FakeDisks>,
+    pools: Vec<Arc<Pool>>,
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> Scanner {
     let disks: Arc<dyn HostDisks> = d.clone();
     Scanner::new(
         NODE.into(),
@@ -154,6 +164,7 @@ fn scanner(x: &Arc<ScriptedExec>, d: &Arc<FakeDisks>, pools: Vec<Arc<Pool>>) -> 
         Arc::default(),
         Box::new(move || pools.clone()),
         DiskWatch::Uevent,
+        stop,
     )
 }
 
@@ -220,10 +231,9 @@ fn host() -> Arc<FakeDisks> {
 async fn first_pass_reads_every_disk() {
     let d = host();
     let x = Arc::new(ScriptedExec::new());
-    x.expect(wipefs_argv("/dev/vda"), ok(WIPEFS_BLANK))
-        .expect(wipefs_argv("/dev/vdb"), ok(WIPEFS_PV))
-        .expect(wipefs_argv("/dev/vdd"), ok(WIPEFS_PV))
-        .expect(wipefs_argv("/dev/vde"), ok(WIPEFS_BLANK))
+    // vda is mounted, vdb and vdd are held: Busy from sysfs and the mount
+    // table, never read; the PV reports place vdb and vdd.
+    x.expect(wipefs_argv("/dev/vde"), ok(WIPEFS_BLANK))
         .expect(wipefs_argv("/dev/vdf"), ok(WIPEFS_XFS))
         .expect(wipefs_argv("/dev/vdg"), ok(WIPEFS_PV))
         .expect(wipefs_argv("/dev/vdi"), ok(WIPEFS_BLANK));
@@ -255,6 +265,7 @@ async fn first_pass_reads_every_disk() {
     assert_eq!(p.status.blank, 1);
     assert_eq!(p.status.watch, Some(DiskWatch::Uevent));
     assert!(p.unchecked.is_empty());
+    assert!(p.unsettled.is_empty());
 }
 
 #[tokio::test]
@@ -262,9 +273,6 @@ async fn later_passes_read_only_what_changed() {
     let d = host();
     let x = Arc::new(ScriptedExec::new());
     for (dev, out) in [
-        ("vda", WIPEFS_BLANK),
-        ("vdb", WIPEFS_PV),
-        ("vdd", WIPEFS_PV),
         ("vde", WIPEFS_BLANK),
         ("vdf", WIPEFS_XFS),
         ("vdg", WIPEFS_PV),
@@ -283,12 +291,12 @@ async fn later_passes_read_only_what_changed() {
     assert_eq!(again.status, first.status);
     assert!(d.opened.lock().unwrap().is_empty());
 
-    // A uevent on vde, and vdf mounted: only those two are read.
+    // A uevent on vde, and vdf mounted: vde is read again, vdf is Busy
+    // from its facts and not read.
     let mut mounted = disk("vdf");
     mounted.mounts = vec!["/mnt/x".into()];
     d.set("/dev/vdf", mounted);
-    x.expect(wipefs_argv("/dev/vde"), ok(WIPEFS_XFS))
-        .expect(wipefs_argv("/dev/vdf"), ok(WIPEFS_XFS));
+    x.expect(wipefs_argv("/dev/vde"), ok(WIPEFS_XFS));
     let mut dirty = Dirty::default();
     dirty.add(Wake::Disk("vde".into()));
     let next = s.pass(dirty).await;
@@ -347,6 +355,67 @@ async fn without_lvm_reports_a_pv_reads_by_its_signature_and_is_never_opened() {
         ["vdb /dev/vdb NotEmpty - signatures: LVM2_member at 0x218"]
     );
     assert!(d.opened.lock().unwrap().is_empty());
+}
+
+/// Multipath paths and disks udevd has not settled are Busy without a
+/// read or an open; an unsettled disk is read again soon.
+#[tokio::test]
+async fn busy_disks_are_never_read() {
+    let d = Arc::new(FakeDisks::default());
+    let mut path = disk("sdb");
+    path.udev = Udev::Settled(UdevFlags {
+        multipath_path: true,
+        not_ready: true,
+    });
+    let mut fresh = disk("sdc");
+    fresh.udev = Udev::Unsettled;
+    let mut held = disk("sdd");
+    held.sys.as_mut().unwrap().holders = vec!["md127".into()];
+    d.set("/dev/sdb", path)
+        .set("/dev/sdc", fresh)
+        .set("/dev/sdd", held);
+    let x = Arc::new(ScriptedExec::new());
+    x.expect(lvm::cmd::pvs_all(), pvs_out(&[]))
+        .expect(lvm::cmd::vgs_all(), vgs_out(&[]));
+    let mut s = scanner(&x, &d, vec![]);
+    let p = s.pass(Dirty::everything()).await;
+    x.assert_done();
+    assert_eq!(
+        summary(&p.status),
+        [
+            "sdb /dev/sdb Busy - a multipath path; not ready (SYSTEMD_READY=0)",
+            "sdc /dev/sdc Busy - udev not settled",
+            "sdd /dev/sdd Busy - held by md127",
+        ]
+    );
+    assert!(d.opened.lock().unwrap().is_empty());
+    assert_eq!(p.unsettled, BTreeSet::from(["sdc".to_owned()]));
+
+    // udevd done: the entry appeared, the facts changed, the disk is read.
+    d.set("/dev/sdc", disk("sdc"));
+    x.expect(wipefs_argv("/dev/sdc"), ok(WIPEFS_BLANK));
+    let mut dirty = Dirty::default();
+    dirty.disks.insert("sdc".into());
+    let p = s.pass(dirty).await;
+    x.assert_done();
+    assert_eq!(p.status.disks[1].state, DeviceState::Blank);
+    assert!(p.unsettled.is_empty());
+}
+
+#[tokio::test]
+async fn a_stopping_agent_ends_the_pass_between_disks() {
+    let d = Arc::new(FakeDisks::default());
+    d.set("/dev/vde", disk("vde")).set("/dev/vdf", disk("vdf"));
+    let x = Arc::new(ScriptedExec::new());
+    let (stop_tx, stop) = tokio::sync::watch::channel(true);
+    let p = scanner_with_stop(&x, &d, vec![], stop)
+        .pass(Dirty::everything())
+        .await;
+    // No facts read, nothing run, nothing opened.
+    x.assert_done();
+    assert_eq!(p.status.disks, Vec::<DiskStatus>::new());
+    assert!(d.opened.lock().unwrap().is_empty());
+    drop(stop_tx);
 }
 
 #[tokio::test]
@@ -452,30 +521,56 @@ fn owned_by_the_node() {
     assert_eq!(o.metadata.name.as_deref(), Some("n1"));
 }
 
-/// Counts passes and keeps what each was asked to read.
-struct CountingSource(Arc<StdMutex<Vec<(Instant, Dirty)>>>);
+/// Counts passes and keeps what each was asked to read; each pass
+/// reports the number of Blank disks set in `blank`.
+struct CountingSource {
+    passes: Arc<StdMutex<Vec<(Instant, Dirty)>>>,
+    watches: Arc<StdMutex<Vec<DiskWatch>>>,
+    blank: Arc<AtomicUsize>,
+    watch: DiskWatch,
+}
 
-#[async_trait::async_trait]
-impl Source for CountingSource {
-    async fn pass(&mut self, dirty: Dirty) -> Pass {
-        self.0.lock().unwrap().push((Instant::now(), dirty));
-        Pass {
-            status: st(vec![]),
-            unchecked: BTreeSet::new(),
+impl CountingSource {
+    fn new() -> Self {
+        Self {
+            passes: Arc::default(),
+            watches: Arc::default(),
+            blank: Arc::default(),
+            watch: DiskWatch::Uevent,
         }
     }
 }
 
-/// Fails its first `fails` writes; keeps when each came.
+#[async_trait::async_trait]
+impl Source for CountingSource {
+    async fn pass(&mut self, dirty: Dirty) -> Pass {
+        self.passes.lock().unwrap().push((Instant::now(), dirty));
+        let rows = (0..self.blank.load(Ordering::SeqCst))
+            .map(|i| row(&format!("sd{i}"), DeviceState::Blank))
+            .collect();
+        Pass {
+            status: status(rows, &BTreeSet::new(), self.watch),
+            unchecked: BTreeSet::new(),
+            unsettled: BTreeSet::new(),
+        }
+    }
+
+    fn set_watch(&mut self, watch: DiskWatch) {
+        self.watch = watch;
+        self.watches.lock().unwrap().push(watch);
+    }
+}
+
+/// Fails its first `fails` writes; keeps when each came and what.
 struct FlakySink {
     fails: AtomicUsize,
-    at: Arc<StdMutex<Vec<Instant>>>,
+    at: Arc<StdMutex<Vec<(Instant, NodeDisksStatus)>>>,
 }
 
 #[async_trait::async_trait]
 impl Sink for FlakySink {
-    async fn write(&self, _: &NodeDisksStatus) -> Result<bool, String> {
-        self.at.lock().unwrap().push(Instant::now());
+    async fn write(&self, s: &NodeDisksStatus) -> Result<bool, String> {
+        self.at.lock().unwrap().push((Instant::now(), s.clone()));
         if self.fails.load(Ordering::SeqCst) > 0 {
             self.fails.fetch_sub(1, Ordering::SeqCst);
             return Err("forbidden".into());
@@ -484,15 +579,20 @@ impl Sink for FlakySink {
     }
 }
 
+fn secs(t0: Instant, v: &[(Instant, NodeDisksStatus)]) -> Vec<u64> {
+    v.iter().map(|(t, _)| (*t - t0).as_secs()).collect()
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_failed_write_is_retried_alone_with_backoff() {
-    let passes = Arc::new(StdMutex::new(Vec::new()));
+    let src = CountingSource::new();
+    let (passes, blank) = (src.passes.clone(), src.blank.clone());
     let writes = Arc::new(StdMutex::new(Vec::new()));
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let t0 = Instant::now();
     let task = tokio::spawn(run_loop(
-        CountingSource(passes.clone()),
+        src,
         FlakySink {
             fails: AtomicUsize::new(3),
             at: writes.clone(),
@@ -501,12 +601,27 @@ async fn a_failed_write_is_retried_alone_with_backoff() {
         FULL_EVERY,
         stop_rx,
     ));
-    tokio::time::sleep(Duration::from_secs(400)).await;
-    let secs = |v: &[Instant]| -> Vec<u64> { v.iter().map(|t| (*t - t0).as_secs()).collect() };
-    // 30 s doubling; no scan in between.
-    assert_eq!(secs(&writes.lock().unwrap()), [0, 30, 90, 210]);
-    assert_eq!(passes.lock().unwrap().len(), 1);
-    assert!(passes.lock().unwrap()[0].1.all);
+    // Wakes during the failures change what is written, not when.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    blank.store(1, Ordering::SeqCst);
+    tx.send(Wake::Disk("sda".into())).unwrap();
+    tokio::time::sleep(Duration::from_secs(40)).await;
+    blank.store(2, Ordering::SeqCst);
+    tx.send(Wake::Disk("sdb".into())).unwrap();
+    tokio::time::sleep(Duration::from_secs(355)).await;
+    {
+        let w = writes.lock().unwrap();
+        // 30 s doubling, and the write that succeeds carries the latest pass.
+        assert_eq!(secs(t0, &w), [0, 30, 90, 210]);
+        assert_eq!(w[3].1.blank, 2);
+        assert_eq!(passes.lock().unwrap().len(), 3);
+    }
+
+    // Same status again: the sink is not called.
+    tx.send(Wake::Refresh).unwrap();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(passes.lock().unwrap().len(), 4);
+    assert_eq!(writes.lock().unwrap().len(), 4);
 
     // A uevent: one pass after the debounce, for that disk only.
     tx.send(Wake::Disk("vdd".into())).unwrap();
@@ -514,20 +629,62 @@ async fn a_failed_write_is_retried_alone_with_backoff() {
     tokio::time::sleep(Duration::from_secs(5)).await;
     {
         let p = passes.lock().unwrap();
-        assert_eq!(p.len(), 2);
-        assert_eq!((p[1].0 - t0).as_secs(), 402);
-        assert_eq!(p[1].1.disks, BTreeSet::from(["vdd".to_owned()]));
-        assert!(!p[1].1.all);
+        assert_eq!(p.len(), 5);
+        assert_eq!((p[4].0 - t0).as_secs(), 407);
+        assert_eq!(p[4].1.disks, BTreeSet::from(["vdd".to_owned()]));
+        assert!(!p[4].1.all);
     }
 
-    // The hourly full pass.
+    // The hourly full pass writes even an unchanged status.
     tokio::time::sleep(FULL_EVERY).await;
     {
         let p = passes.lock().unwrap();
-        assert_eq!(p.len(), 3);
-        assert_eq!((p[2].0 - t0).as_secs(), 3600);
-        assert!(p[2].1.all);
+        assert_eq!(p.len(), 6);
+        assert_eq!((p[5].0 - t0).as_secs(), 3600);
+        assert!(p[5].1.all);
+        assert_eq!(writes.lock().unwrap().len(), 5);
     }
+    stop_tx.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lost_watch_switches_to_polling() {
+    let src = CountingSource::new();
+    let (passes, watches) = (src.passes.clone(), src.watches.clone());
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let t0 = Instant::now();
+    let task = tokio::spawn(run_loop(
+        src,
+        FlakySink {
+            fails: AtomicUsize::new(0),
+            at: writes.clone(),
+        },
+        rx,
+        FULL_EVERY,
+        stop_rx,
+    ));
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    tx.send(Wake::WatchLost).unwrap();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(*watches.lock().unwrap(), [DiskWatch::Poll]);
+    {
+        let w = writes.lock().unwrap();
+        assert_eq!(w.len(), 2);
+        assert_eq!(w[1].1.watch, Some(DiskWatch::Poll));
+    }
+    // Full passes every 5 minutes from then on.
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    let full: Vec<u64> = passes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, d)| d.all)
+        .map(|(t, _)| (*t - t0).as_secs())
+        .collect();
+    assert_eq!(full, [0, 310, 610]);
     stop_tx.send(true).unwrap();
     task.await.unwrap();
 }

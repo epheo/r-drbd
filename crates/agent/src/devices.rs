@@ -8,6 +8,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use model::{DeviceState, DeviceStatus};
 
@@ -66,14 +68,70 @@ pub struct Facts {
     /// `Err` with the error when the exclusive open failed; tried only on
     /// a disk that may be claimed, see [`check`].
     pub exclusive: Result<(), String>,
-    /// udev marks it a path of a multipath map, claimed or about to be.
-    pub multipath: bool,
+    /// What the host's udev database says.
+    pub udev: Udev,
+}
+
+/// The udev database entry of a disk, written once udevd ran its rules.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Udev {
+    /// The database cannot be read from here.
+    #[default]
+    Unknown,
+    /// No entry yet: the kernel announced the disk, udevd is not done.
+    Unsettled,
+    Settled(UdevFlags),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UdevFlags {
+    /// `DM_MULTIPATH_DEVICE_PATH` other than 0: a path of a multipath map,
+    /// claimed or still being decided (`find_multipaths smart` sets 2).
+    pub multipath_path: bool,
+    /// `SYSTEMD_READY=0`: udev tells systemd not to use it yet.
+    pub not_ready: bool,
+}
+
+/// An entry of `/run/udev/data`: `KEY:value` lines, properties under `E:`.
+pub fn parse_udev(entry: &str) -> UdevFlags {
+    let mut f = UdevFlags::default();
+    for l in entry.lines() {
+        match l.trim().split_once('=') {
+            Some(("E:DM_MULTIPATH_DEVICE_PATH", v)) => f.multipath_path |= v.trim() != "0",
+            Some(("E:SYSTEMD_READY", v)) => f.not_ready |= v.trim() == "0",
+            _ => {}
+        }
+    }
+    f
+}
+
+/// The exclusive open waits at most this long: a hung open (SCSI error
+/// recovery, a lost iSCSI session) must not hold the disk lock.
+#[cfg(not(test))]
+pub const OPEN_WAIT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+pub const OPEN_WAIT: Duration = Duration::from_millis(200);
+const OPEN_HUNG: &str = "exclusive open did not return";
+
+fn open_hung() -> String {
+    format!("{OPEN_HUNG} within {OPEN_WAIT:?}")
+}
+
+/// The row message of a failed exclusive open.
+pub fn open_message(e: &str) -> String {
+    if e.starts_with(OPEN_HUNG) {
+        e.to_owned()
+    } else {
+        format!("exclusive open failed: {e}")
+    }
 }
 
 /// The host's disks as the agent sees them; a trait so tests need no disks.
 pub trait HostDisks: Send + Sync + std::fmt::Debug {
+    /// The host mount table, read once per pass; empty when unreadable.
+    fn mounts(&self) -> Arc<str>;
     /// Everything but the exclusive open, left `Ok`.
-    fn facts(&self, path: &str) -> Facts;
+    fn facts(&self, path: &str, mounts: &str) -> Facts;
     fn exclusive(&self, node: &Path) -> Result<(), String>;
     /// Kernel names of the whole disks, sorted: no partition, none of [`NOT_DISKS`].
     fn whole_disks(&self) -> Vec<String>;
@@ -101,22 +159,18 @@ pub fn not_a_disk_name(name: &str) -> bool {
     not_a_disk(name).is_some()
 }
 
-/// The exclusive open on a blocking thread: an open can wait on the device.
+/// The exclusive open on a blocking thread, bounded by [`OPEN_WAIT`]: past
+/// it the disk reads Busy and the thread finishes on its own.
 pub async fn open_exclusive_blocking(
-    disks: &std::sync::Arc<dyn HostDisks>,
+    disks: &Arc<dyn HostDisks>,
     node: &Path,
 ) -> Result<(), String> {
     let (d, n) = (disks.clone(), node.to_owned());
-    tokio::task::spawn_blocking(move || d.exclusive(&n))
-        .await
-        .unwrap_or_else(|e| Err(e.to_string()))
-}
-
-/// `E:DM_MULTIPATH_DEVICE_PATH=1` in a udev database entry.
-pub fn udev_multipath(entry: &str) -> bool {
-    entry
-        .lines()
-        .any(|l| l.trim() == "E:DM_MULTIPATH_DEVICE_PATH=1")
+    let join = tokio::task::spawn_blocking(move || d.exclusive(&n));
+    match tokio::time::timeout(OPEN_WAIT, join).await {
+        Ok(r) => r.unwrap_or_else(|e| Err(e.to_string())),
+        Err(_) => Err(open_hung()),
+    }
 }
 
 /// The real host: /dev and /sys are the host's in the agent pod, and with
@@ -141,8 +195,27 @@ impl Default for SysDisks {
     }
 }
 
+impl SysDisks {
+    fn udev(&self, sys: &Sys) -> Udev {
+        if !self.udev_readable() {
+            return Udev::Unknown;
+        }
+        match std::fs::read_to_string(self.udev.join(format!("b{}", sys.dev))) {
+            Ok(e) => Udev::Settled(parse_udev(&e)),
+            Err(_) => Udev::Unsettled,
+        }
+    }
+}
+
 impl HostDisks for SysDisks {
-    fn facts(&self, path: &str) -> Facts {
+    /// Without the table a mount still fails the exclusive open.
+    fn mounts(&self) -> Arc<str> {
+        std::fs::read_to_string(&self.mountinfo)
+            .unwrap_or_default()
+            .into()
+    }
+
+    fn facts(&self, path: &str, mounts: &str) -> Facts {
         let dev = std::fs::canonicalize(path).map_err(|e| e.to_string());
         let Ok(node) = &dev else {
             return Facts {
@@ -150,25 +223,21 @@ impl HostDisks for SysDisks {
                 sys: Err(String::new()),
                 mounts: Vec::new(),
                 exclusive: Ok(()),
-                multipath: false,
+                udev: Udev::Unknown,
             };
         };
         let sys = block_name(node).and_then(|name| read_sys(&self.sys, &name));
-        let mounts = match (&sys, std::fs::read_to_string(&self.mountinfo)) {
-            (Ok(s), Ok(table)) => mounts_of(&table, s),
-            // Without the table a mount still fails the exclusive open.
-            _ => Vec::new(),
-        };
-        let multipath = sys.as_ref().is_ok_and(|s| {
-            std::fs::read_to_string(self.udev.join(format!("b{}", s.dev)))
-                .is_ok_and(|e| udev_multipath(&e))
-        });
+        let mounts = sys
+            .as_ref()
+            .map(|s| mounts_of(mounts, s))
+            .unwrap_or_default();
+        let udev = sys.as_ref().map(|s| self.udev(s)).unwrap_or_default();
         Facts {
             dev,
             sys,
             mounts,
             exclusive: Ok(()),
-            multipath,
+            udev,
         }
     }
 
@@ -421,11 +490,20 @@ pub fn classify_early(
     if !holders.is_empty() {
         busy.push(format!("held by {}", holders.join(", ")));
     }
-    if f.multipath {
-        busy.push("a multipath path".into());
+    match &f.udev {
+        Udev::Unsettled => busy.push("udev not settled".into()),
+        Udev::Settled(u) => {
+            if u.multipath_path {
+                busy.push("a multipath path".into());
+            }
+            if u.not_ready {
+                busy.push("not ready (SYSTEMD_READY=0)".into());
+            }
+        }
+        Udev::Unknown => {}
     }
     if let Err(e) = &f.exclusive {
-        busy.push(format!("exclusive open failed: {e}"));
+        busy.push(open_message(e));
     }
     if !busy.is_empty() {
         return Some((DeviceState::Busy, Some(busy.join("; "))));
@@ -478,14 +556,15 @@ pub struct Checked {
 /// (empty for an orphan PV).
 pub async fn check(
     exec: &dyn Exec,
-    disks: &std::sync::Arc<dyn HostDisks>,
+    disks: &Arc<dyn HostDisks>,
     paths: &[String],
     pvs: &BTreeMap<PathBuf, String>,
     vg: &str,
 ) -> Vec<Checked> {
     let mut out: Vec<Checked> = Vec::with_capacity(paths.len());
+    let table = disks.mounts();
     for path in paths {
-        let mut f = disks.facts(path);
+        let mut f = disks.facts(path, &table);
         // Two by-id names of one disk (wwn- and nvme-): only the first counts.
         let first = f.dev.as_ref().ok().and_then(|n| {
             out.iter()
@@ -549,10 +628,10 @@ pub async fn check(
 pub(crate) mod fake {
     //! Scripted host disks.
 
-    use std::collections::{BTreeMap, HashMap};
-    use std::sync::Mutex;
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::sync::{Arc, Mutex};
 
-    use super::{Facts, HostDisks, Sys};
+    use super::{Facts, HostDisks, Sys, Udev, UdevFlags};
 
     /// `wipefs --no-act --json` from util-linux 2.40.2 on a blank disk
     /// and on one after mkfs.xfs.
@@ -575,6 +654,8 @@ pub(crate) mod fake {
         pub(crate) facts: Mutex<HashMap<String, Facts>>,
         /// Nodes the exclusive open was tried on, in order.
         pub(crate) opened: Mutex<Vec<std::path::PathBuf>>,
+        /// Nodes whose exclusive open never returns in time.
+        pub(crate) hung: Mutex<HashSet<std::path::PathBuf>>,
     }
 
     /// A blank whole disk `name` of 4 GiB behind `path`.
@@ -589,7 +670,7 @@ pub(crate) mod fake {
             }),
             mounts: Vec::new(),
             exclusive: Ok(()),
-            multipath: false,
+            udev: Udev::Settled(UdevFlags::default()),
         }
     }
 
@@ -601,7 +682,11 @@ pub(crate) mod fake {
     }
 
     impl HostDisks for FakeDisks {
-        fn facts(&self, path: &str) -> Facts {
+        fn mounts(&self) -> Arc<str> {
+            "".into()
+        }
+
+        fn facts(&self, path: &str, _mounts: &str) -> Facts {
             self.facts
                 .lock()
                 .unwrap()
@@ -612,13 +697,18 @@ pub(crate) mod fake {
                     sys: Err(String::new()),
                     mounts: Vec::new(),
                     exclusive: Ok(()),
-                    multipath: false,
+                    udev: Udev::Unknown,
                 })
         }
 
         /// The `exclusive` of the scripted facts of that node.
         fn exclusive(&self, node: &std::path::Path) -> Result<(), String> {
             self.opened.lock().unwrap().push(node.to_owned());
+            if self.hung.lock().unwrap().contains(node) {
+                // Past OPEN_WAIT, short enough for the runtime's shutdown
+                // wait on blocking threads.
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
             self.facts
                 .lock()
                 .unwrap()
@@ -935,21 +1025,52 @@ mod tests {
         }
         assert!(!not_a_disk_name("mmcblk0"));
 
-        // A multipath path is Busy before any open.
-        let mut f = disk("sdc");
-        f.multipath = true;
-        assert_eq!(
-            early(&f, None),
-            Some((DeviceState::Busy, Some("a multipath path".into())))
-        );
-        assert!(udev_multipath(
-            "S:disk/by-id/x\nE:DM_MULTIPATH_DEVICE_PATH=1\nE:ID_SERIAL=x\n"
-        ));
-        assert!(!udev_multipath("E:DM_MULTIPATH_DEVICE_PATH=0\n"));
-
         // Anything else needs the signatures.
         assert_eq!(early(&disk("vdd"), None), None);
         assert_eq!(early(&disk("nvme0n1"), Some("")), None);
+    }
+
+    #[test]
+    fn udev_states() {
+        // A multipath path, decided or not, is Busy before any open; so is
+        // a disk udevd has not processed yet.
+        for (entry, what) in [
+            (
+                "S:disk/by-id/x\nE:DM_MULTIPATH_DEVICE_PATH=1\nE:ID_SERIAL=x\n",
+                "a multipath path",
+            ),
+            ("E:DM_MULTIPATH_DEVICE_PATH=2\n", "a multipath path"),
+            ("E:SYSTEMD_READY=0\n", "not ready (SYSTEMD_READY=0)"),
+        ] {
+            let mut f = disk("sdc");
+            f.udev = Udev::Settled(parse_udev(entry));
+            assert_eq!(
+                early(&f, None),
+                Some((DeviceState::Busy, Some(what.into()))),
+                "{entry}"
+            );
+        }
+        assert_eq!(
+            parse_udev("E:DM_MULTIPATH_DEVICE_PATH=0\nE:SYSTEMD_READY=1\n"),
+            UdevFlags::default()
+        );
+        let mut f = disk("sdc");
+        f.udev = Udev::Unsettled;
+        assert_eq!(
+            early(&f, None),
+            Some((DeviceState::Busy, Some("udev not settled".into())))
+        );
+        let mut f = disk("sdc");
+        f.udev = Udev::Unknown;
+        assert_eq!(early(&f, None), None);
+        assert_eq!(
+            open_message(&open_hung()),
+            "exclusive open did not return within 200ms"
+        );
+        assert_eq!(
+            open_message("Device or resource busy (os error 16)"),
+            "exclusive open failed: Device or resource busy (os error 16)"
+        );
     }
 
     #[test]
@@ -990,6 +1111,62 @@ mod tests {
         assert_eq!(
             m.as_deref(),
             Some("signatures unknown: wipefs: exit 1: denied")
+        );
+    }
+
+    #[test]
+    fn udev_entries() {
+        let t = std::env::temp_dir().join(format!("r-drbd-udev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let db = t.join("udev");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(
+            db.join("b8:16"),
+            "S:disk/by-id/x\nE:DM_MULTIPATH_DEVICE_PATH=2\n",
+        )
+        .unwrap();
+        let sys = |dev: &str| Sys {
+            dev: dev.into(),
+            ..Sys::default()
+        };
+        let d = SysDisks {
+            sys: t.join("sys"),
+            mountinfo: t.join("mountinfo"),
+            by_id: t.join("by-id"),
+            udev: db.clone(),
+        };
+        assert_eq!(
+            d.udev(&sys("8:16")),
+            Udev::Settled(UdevFlags {
+                multipath_path: true,
+                not_ready: false
+            })
+        );
+        assert_eq!(d.udev(&sys("8:32")), Udev::Unsettled);
+        let none = SysDisks {
+            udev: t.join("nowhere"),
+            ..d
+        };
+        assert_eq!(none.udev(&sys("8:16")), Udev::Unknown);
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// A hung open ends the wait, not the pass; the disk reads Busy and
+    /// is not read.
+    #[tokio::test]
+    async fn a_hung_open_reads_busy() {
+        let disks = Arc::new(FakeDisks::default());
+        disks.set("/dev/disk/by-id/a", disk("vdd"));
+        disks.hung.lock().unwrap().insert("/dev/vdd".into());
+        let x = ScriptedExec::new();
+        let dyn_disks: Arc<dyn HostDisks> = disks.clone();
+        let paths = ["/dev/disk/by-id/a".to_owned()];
+        let rows = check(&x, &dyn_disks, &paths, &BTreeMap::new(), "vg1").await;
+        x.assert_done();
+        assert_eq!(rows[0].row.state, DeviceState::Busy);
+        assert_eq!(
+            rows[0].row.message.as_deref(),
+            Some("exclusive open did not return within 200ms")
         );
     }
 

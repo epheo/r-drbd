@@ -1,8 +1,9 @@
-//! The agent's NodeDisks write against a real API server: created owned
-//! by the Node, patched only on change.
+//! The agent's NodeDisks sink against a real API server: created owned
+//! by the Node, read once, then patched.
 
 mod support;
 
+use agent::inventory::{KubeSink, Sink};
 use k8s_openapi::api::core::v1::Node;
 use kube::{Api, ResourceExt};
 use model::{DeviceState, DiskStatus, DiskWatch, NodeDisks};
@@ -27,7 +28,7 @@ fn row(name: &str, state: DeviceState, pool: Option<&str>) -> DiskStatus {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn nodedisks_written_on_change_only() {
+async fn nodedisks_created_then_patched() {
     let assets = require_envtest!();
     let env = Env::start(&assets).await;
     let client = env.client().await;
@@ -45,10 +46,8 @@ async fn nodedisks_written_on_change_only() {
         row("a", DeviceState::Blank, None),
         row("b", DeviceState::Blank, None),
     ]);
-    assert_eq!(
-        agent::inventory::write(&client, "n1", &first).await,
-        Ok(true)
-    );
+    let sink = KubeSink::new(client.clone(), "n1".into());
+    assert_eq!(sink.write(&first).await, Ok(true));
     let o = api.get("n1").await.unwrap();
     let owner = &o.owner_references()[0];
     assert_eq!(
@@ -58,25 +57,21 @@ async fn nodedisks_written_on_change_only() {
     assert_eq!(o.status.as_ref(), Some(&first));
     assert_eq!(o.status.as_ref().unwrap().blank, 2);
 
-    // Same status: no write.
+    // A fresh sink (an agent restart) finds the object as written: no patch.
     let rv = o.resource_version();
-    assert_eq!(
-        agent::inventory::write(&client, "n1", &first).await,
-        Ok(false)
-    );
+    let again = KubeSink::new(client.clone(), "n1".into());
+    assert_eq!(again.write(&first).await, Ok(false));
     assert_eq!(api.get("n1").await.unwrap().resource_version(), rv);
 
     // A disk joins a Pool and another is unplugged: the row goes.
     let next = status(vec![row("a", DeviceState::Member, Some("p1"))]);
-    assert_eq!(
-        agent::inventory::write(&client, "n1", &next).await,
-        Ok(true)
-    );
+    assert_eq!(sink.write(&next).await, Ok(true));
     let s = api.get("n1").await.unwrap().status.unwrap();
     assert_eq!(s, next);
     assert_eq!(s.blank, 0);
 
     // A node without its Node object gets no NodeDisks.
-    let none = agent::inventory::write(&client, "ghost", &first).await;
+    let ghost = KubeSink::new(client.clone(), "ghost".into());
+    let none = ghost.write(&first).await;
     assert!(none.unwrap_err().contains("read node ghost"));
 }
