@@ -16,7 +16,10 @@ pub mod snapshot;
 pub mod volume;
 
 pub use condition::Condition;
-pub use pool::{DEFAULT_OVERCOMMIT_PERCENT, DEFAULT_RESERVE_PERCENT, Pool, PoolSpec, PoolStatus};
+pub use pool::{
+    DEFAULT_OVERCOMMIT_PERCENT, DEFAULT_RESERVE_PERCENT, DeviceState, DeviceStatus, Pool, PoolSpec,
+    PoolStatus, ReclaimPolicy,
+};
 pub use snapshot::{Snapshot, SnapshotAck, SnapshotPhase, SnapshotSpec, SnapshotStatus};
 pub use volume::{
     AccessMode, AssignedReplica, Assignment, PeerProbe, ProbeResult, ReplicaStatus, Resolve, Role,

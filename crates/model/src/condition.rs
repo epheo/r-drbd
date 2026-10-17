@@ -10,6 +10,8 @@ pub mod types {
     pub const SPLIT_BRAIN: &str = "SplitBrain";
     pub const PEER_UNREACHABLE: &str = "PeerUnreachable";
     pub const AVAILABLE: &str = "Available";
+    /// Pool, reclaimPolicy Delete: the agent removed the VG; the finalizer may go.
+    pub const RELEASED: &str = "Released";
 }
 
 pub const TRUE: &str = "True";

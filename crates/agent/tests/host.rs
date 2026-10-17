@@ -331,6 +331,9 @@ fn pool() -> Arc<Pool> {
             thin_pool: THIN.into(),
             overcommit_percent: model::DEFAULT_OVERCOMMIT_PERCENT,
             reserve_percent: model::DEFAULT_RESERVE_PERCENT,
+            devices: None,
+            chunk_size: None,
+            reclaim_policy: None,
         },
     );
     p.metadata.generation = Some(1);

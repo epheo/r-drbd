@@ -26,6 +26,9 @@ fn pool() -> Arc<Pool> {
             thin_pool: THIN.into(),
             overcommit_percent: model::DEFAULT_OVERCOMMIT_PERCENT,
             reserve_percent: model::DEFAULT_RESERVE_PERCENT,
+            devices: None,
+            chunk_size: None,
+            reclaim_policy: None,
         },
     );
     p.metadata.generation = Some(1);
@@ -286,6 +289,7 @@ async fn pool_unchanged_writes_nothing() {
         placeable_bytes: None,
         conditions: vec![available.clone()],
         observed_generation: Some(1),
+        devices: vec![],
     });
     reads(&x, &[]);
     let w = Reconciler::new(NODE, x.clone())

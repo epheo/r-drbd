@@ -80,3 +80,10 @@ pub const NAME_PATTERN: &str = "^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$";
 /// letters, digits, `+ _ . -`, never a leading dash, 1 to 127 characters;
 /// `.` and `..` are rejected by a CEL rule. Enforced again by the agent.
 pub const LVM_NAME_PATTERN: &str = "^[A-Za-z0-9+_.][A-Za-z0-9+_.-]{0,126}$";
+/// Pool.spec.devices items: stable names only, one level under by-id.
+pub const DEVICE_PATTERN: &str = "^/dev/disk/by-id/[^/]+$";
+/// VG tag of a Pool in devices mode: the Pool name, not its uid, so a
+/// Pool recreated after a cluster rebuild finds its VG again.
+pub fn pool_vg_tag(pool: &str) -> String {
+    format!("r-drbd.pool.{pool}")
+}

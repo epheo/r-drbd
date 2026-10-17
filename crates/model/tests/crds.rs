@@ -197,3 +197,55 @@ fn pool_capacity_policy_defaults_ranges_and_mutability() {
         assert!(!required.iter().any(|r| r == optional), "{optional}");
     }
 }
+
+#[test]
+fn pool_devices_mode_schema() {
+    let spec: model::PoolSpec = serde_json::from_value(json!({
+        "node": "n1", "tier": "fast", "vg": "vg", "thinPool": "thin",
+        "devices": ["/dev/disk/by-id/nvme-a"], "chunkSize": "128Ki", "reclaimPolicy": "Delete",
+    }))
+    .unwrap();
+    assert_eq!(spec.reclaim(), model::ReclaimPolicy::Delete);
+    assert_eq!(
+        spec.chunk_size.as_ref().map(|q| q.0.as_str()),
+        Some("128Ki")
+    );
+    // Absent stays absent: the agent applies the defaults.
+    let bare: model::PoolSpec = serde_json::from_value(
+        json!({"node": "n1", "tier": "fast", "vg": "vg", "thinPool": "thin"}),
+    )
+    .unwrap();
+    assert_eq!(bare.reclaim(), model::ReclaimPolicy::Retain);
+    let back = to_json(&bare);
+    for f in ["devices", "chunkSize", "reclaimPolicy"] {
+        assert!(back.get(f).is_none(), "{f}");
+    }
+
+    let crd = to_json(&Pool::crd());
+    let spec = &schema(&crd)["properties"]["spec"];
+    let devices = &spec["properties"]["devices"];
+    assert_eq!(devices["x-kubernetes-list-type"], "set");
+    assert_eq!(devices["maxItems"], 64);
+    assert_eq!(devices["items"]["pattern"], "^/dev/disk/by-id/[^/]+$");
+    assert_eq!(
+        spec["properties"]["reclaimPolicy"]["enum"],
+        json!(["Retain", "Delete"])
+    );
+    assert!(spec["properties"]["chunkSize"].get("default").is_none());
+    let rules = serde_json::to_string(&spec["x-kubernetes-validations"]).unwrap();
+    for m in [
+        "devices mode is fixed at creation",
+        "devices is append only",
+        "chunkSize needs devices",
+        "reclaimPolicy needs devices",
+        "chunkSize is immutable",
+    ] {
+        assert!(rules.contains(m), "missing rule {m}");
+    }
+    let rows = &schema(&crd)["properties"]["status"]["properties"]["devices"];
+    assert_eq!(rows["x-kubernetes-list-map-keys"], json!(["path"]));
+    assert_eq!(
+        rows["items"]["properties"]["state"]["enum"],
+        json!(["Missing", "NotADisk", "Member", "Busy", "NotEmpty", "Blank"])
+    );
+}
