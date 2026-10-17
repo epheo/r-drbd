@@ -1,6 +1,6 @@
 # Reference
 
-`kubectl explain pool.spec`, `volume.spec`, `volume.status` and `snapshot.status` give the same field descriptions from the installed CRDs.
+`kubectl explain pool.spec`, `volume.spec`, `volume.status`, `snapshot.status` and `nodedisks.status` give the same field descriptions from the installed CRDs.
 
 ## Pool
 
@@ -90,6 +90,31 @@ A snapshot over the limit ends Failed before any IO is suspended.
 | `status.lastError` | Why it failed |
 
 Finalizer `r-drbd.io/snapshot` holds deletion until every snapshot LV is removed.
+
+## NodeDisks
+
+Group `r-drbd.io/v1alpha1`, cluster scoped, read-only.
+One per node, named after the node, written by its agent, owned by the Node object, so it goes with the node.
+The agent writes it at start, every 5 minutes and after any change to a Pool's disks, only when something changed.
+It claims nothing: a Pool uses only the disks it lists.
+
+| Field | Type | Notes |
+|---|---|---|
+| `status.blank` | integer | Disks in state `Blank` |
+| `status.disks[]` | object | Every whole disk of the node; no partition, loop, RAM, zram, dm, md, DRBD, nbd, RBD, ZFS volume, null block or optical device |
+| `status.disks[].path` | string | The path to list in a Pool: the `wwn-` by-id link, else the bus one (`ata-`, `nvme-`, `scsi-`, `virtio-`); `/dev/<name>` without any by-id link |
+| `status.disks[].name` | string | Kernel name, as `lsblk` shows it today |
+| `status.disks[].links` | []string | Every by-id link of the disk |
+| `status.disks[].state` | string | As in a Pool's `status.devices` (see [Pools](pools.md#what-the-agent-checks)) |
+| `status.disks[].pool` | string | For `Member`: the Pool whose VG holds the disk, from the VG tag `r-drbd.pool.<pool>` |
+| `status.disks[].sizeBytes`, `model`, `serial` | | From sysfs |
+| `status.disks[].message` | string | What makes the disk not `Blank` |
+
+States differ from a Pool's checks in two ways:
+- a PV of a VG that no Pool built is `NotEmpty`, naming the VG, even while its LVs hold the disk;
+- the exclusive open runs only on a disk every other check finds blank, so a disk in use is never opened.
+
+`kubectl get nodedisks` prints the node and its count of Blank disks.
 
 ## Condition reasons
 

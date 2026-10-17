@@ -111,7 +111,8 @@ Then declare it:
       vg: data
       thinPool: thin
 
-Or let the agent build the VG and thin pool from blank disks:
+Or let the agent build the VG and thin pool from blank disks.
+`kubectl get nodedisks node1 -o yaml` lists the node's disks; take the `path` of `Blank` ones:
 
     spec:
       node: node1
@@ -125,7 +126,7 @@ Wait for it to be available:
 
     kubectl get pools
 
-See [Pools](pools.md) for details, and for how to find by-id paths.
+See [Pools](pools.md) for details.
 
 ## Use a StorageClass
 

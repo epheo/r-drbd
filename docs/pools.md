@@ -151,9 +151,18 @@ There is no RAID inside a node: one disk failure loses this node's replicas, and
 Replacing a disk means a new Pool: move the replicas off with `spec.evict` (see [Operations](operations.md)), then delete the Pool.
 Under `reclaimPolicy: Delete` a VG with a missing PV is never removed, so `Released` stays False: switch the Pool to `Retain` first, then clean up the VG and the remaining disks by hand.
 
-### Finding by-id paths
+### Finding disks
 
-From any machine with cluster access:
+Each agent lists its node's whole disks in a NodeDisks object named after the node:
+
+    kubectl get nodedisks
+    kubectl get nodedisks node1 -o yaml
+
+Each row has the `path` to list in a Pool, every by-id link, the kernel name, size, model, serial and the state the checks above give.
+List only `Blank` disks in a Pool; `Member` rows name the Pool that holds them.
+See [Reference](reference.md#nodedisks) for the fields.
+
+While the agent is not running there, from any machine with cluster access:
 
     kubectl debug node/node1 -it --profile=sysadmin --image=busybox -- ls -l /host/dev/disk/by-id
 
