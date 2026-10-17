@@ -160,6 +160,8 @@ Each agent lists its node's whole disks in a NodeDisks object named after the no
 
 Each row has the `path` to list in a Pool, every by-id link, the kernel name, size, model, serial and the state the checks above give.
 List only `Blank` disks in a Pool; `Member` rows name the Pool that holds them.
+Changes show within seconds: the agent follows kernel uevents and the mount table, and checks every disk again hourly.
+Without a uevent socket it checks every 5 minutes; `status.watch` says which.
 See [Reference](reference.md#nodedisks) for the fields.
 
 While the agent is not running there, from any machine with cluster access:
