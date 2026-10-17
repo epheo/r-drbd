@@ -101,9 +101,12 @@ KMM builds only when the tag is absent, so a Dockerfile change alone does nothin
 
 ## 2. Node settings
 
+    oc patch machineconfigpool worker master --type merge -p '{"spec":{"paused":true}}'
     oc apply -k deploy/openshift/node
+    oc patch machineconfigpool worker master --type merge -p '{"spec":{"paused":false}}'
 
-Two settings per pool, worker and master, in one rollout: the Machine Config Operator reboots each node of the pool once.
+Two settings per pool, worker and master.
+Paused around the apply, the Machine Config Operator renders both into one configuration and reboots each node of the pool once; unpaused, the KubeletConfig can render later and cost a second reboot.
 Do this before the nodes hold data, or during a maintenance window.
 A custom pool needs copies with its own labels, `pools.operator.machineconfiguration.openshift.io/<pool>` on the KubeletConfig and `machineconfiguration.openshift.io/role: <pool>` on the MachineConfig.
 
@@ -113,6 +116,7 @@ A pool that already has a KubeletConfig takes the two fields in that object inst
 
 An LVM devices file, a MachineConfig unit: RHCOS runs LVM with `use_devicesfile = 1` but no devices file, so its LVM scans every block device, DRBD devices included, and a guest's LVM inside a volume would be activated on the host.
 On its first boot the unit imports the node's own PVs into a devices file, or creates an empty one, before the container runtime starts, so no DRBD device is ever scanned by the host.
+It runs after multipath and iSCSI; a PV on a device that appears later than that is not imported and needs `lvmdevices --adddev <device>` once.
 LVM maintains the file from then on, and a Pool's build adds its disks to it.
 The agent warns at start on a node whose LVM still scans DRBD devices.
 

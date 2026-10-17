@@ -23,7 +23,7 @@ spec:
             [Unit]
             Description=LVM devices file, so the host never scans DRBD devices
             ConditionPathExists=!/etc/lvm/devices/system.devices
-            After=local-fs.target
+            After=local-fs.target multipathd.service iscsi.service
             Before=crio.service kubelet.service
 
             [Service]
@@ -51,7 +51,7 @@ spec:
             [Unit]
             Description=LVM devices file, so the host never scans DRBD devices
             ConditionPathExists=!/etc/lvm/devices/system.devices
-            After=local-fs.target
+            After=local-fs.target multipathd.service iscsi.service
             Before=crio.service kubelet.service
 
             [Service]
