@@ -1,6 +1,6 @@
 //! Temporary dev entry point until crates/r-drbd wires the agent role.
 //! Env: NODE_NAME (required), POD_NAMESPACE, CSI_ENDPOINT, R_DRBD_RES_DIR,
-//! R_DRBD_HOST_EXEC_PREFIX (space separated).
+//! R_DRBD_HOST_EXEC_PREFIX (space separated), POD_NAME.
 
 use std::path::PathBuf;
 
@@ -23,6 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok()
             .map(|p| p.split_whitespace().map(str::to_owned).collect::<Vec<_>>())
             .filter(|p| !p.is_empty()),
+        pod: std::env::var("POD_NAME").ok(),
     };
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

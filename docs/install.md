@@ -27,11 +27,27 @@ Cluster:
   The third node can be a diskless tiebreaker with no Pool.
 - For snapshots, the external-snapshotter CRDs and snapshot controller.
 
-Recommended:
+Node shutdown:
 
-- `drbd-graceful-down.service` from drbd-utils, enabled on each node.
-  It takes DRBD down before shutdown, so a Primary with suspended IO cannot hang a reboot.
-  The agent logs a warning at start when the unit is missing.
+- Graceful node shutdown must be on in kubelet, so pods stop and release their volumes before the node goes down.
+  In the KubeletConfiguration:
+
+      shutdownGracePeriod: 90s
+      shutdownGracePeriodCriticalPods: 30s
+
+  On MicroShift, the same two lines under `kubelet:` in a file in /etc/microshift/config.d/, then restart microshift:
+
+      kubelet:
+        shutdownGracePeriod: 90s
+        shutdownGracePeriodCriticalPods: 30s
+
+  The critical share is the agent's window to release what kubelet could not; keep it at 30 s or more.
+  Without it, a node that shuts down with a volume in use can leave the other replicas Outdated until it returns.
+  The agent warns, and records a `GracefulShutdownOff` Event on the Node, while kubelet holds no shutdown delay lock; it checks again every hour.
+- drbd-utils' `drbd-graceful-down.service` and `drbd-graceful-disconnect.service` are not needed.
+  With graceful node shutdown on, their shutdown hooks find no Primary in use and do no harm.
+  On hosts whose network is run by systemd-networkd or netplan, a network restart can make the disconnect unit cut an in-use Primary and outdate its peers; a NetworkManager restart does not.
+  The agent warns once per start, with a `HostDrbdUnits` Event on the Node, when they are loaded.
 
 ## How the agent uses the host
 

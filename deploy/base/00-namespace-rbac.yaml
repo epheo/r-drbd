@@ -94,6 +94,11 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch", "patch"]
+  # Warnings about the node's shutdown setup, as core Events on the Node:
+  # one per node and reason, read to bump its count.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "create", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -132,6 +137,31 @@ subjects:
   - kind: ServiceAccount
     name: r-drbd-controller
     namespace: r-drbd-system
+  - kind: ServiceAccount
+    name: r-drbd-agent
+    namespace: r-drbd-system
+---
+# The agent reads its own pod at shutdown on hosts without systemd.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: r-drbd-agent
+  namespace: r-drbd-system
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: r-drbd-agent
+  namespace: r-drbd-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: r-drbd-agent
+subjects:
   - kind: ServiceAccount
     name: r-drbd-agent
     namespace: r-drbd-system

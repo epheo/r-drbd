@@ -1263,3 +1263,43 @@ async fn plain_volume_keeps_its_uuid() {
     stage_mount(&env).await.unwrap();
     env.x.assert_done();
 }
+
+#[tokio::test]
+async fn closed_gate_refuses_opens_and_serves_releases() {
+    use ::csi::v1::node_server::Node as _;
+    let env = Env::new("gate");
+    let staging = env.path("staging");
+    let target = env.path("pods/uid/mount");
+    let svc = env.svc(Lookup::default());
+    svc.open_gate().close();
+
+    let e = svc
+        .node_stage_volume(Request::new(stage_req(&env, mount_cap("", &[]))))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), tonic::Code::Unavailable);
+    assert_eq!(e.message(), "node shutting down");
+    let e = svc
+        .node_publish_volume(Request::new(publish_req(&env)))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), tonic::Code::Unavailable);
+
+    findmnt(&env.x, &target, true);
+    env.x.expect_s(&["umount", &target], ok(""));
+    svc.node_unpublish_volume(Request::new(NodeUnpublishVolumeRequest {
+        volume_id: "pvc-1".into(),
+        target_path: target,
+    }))
+    .await
+    .unwrap();
+    findmnt(&env.x, &staging, true);
+    env.x.expect_s(&["umount", &staging], ok(""));
+    svc.node_unstage_volume(Request::new(NodeUnstageVolumeRequest {
+        volume_id: "pvc-1".into(),
+        staging_target_path: staging,
+    }))
+    .await
+    .unwrap();
+    env.x.assert_done();
+}

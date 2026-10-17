@@ -31,6 +31,7 @@ use tokio_stream::wrappers::UnixListenerStream;
 use crate::Exec;
 use crate::exec::{CmdError, DEFAULT_TIMEOUT, MKFS_TIMEOUT, argv, failure, run_any, run_ok};
 use crate::run::Error;
+use crate::shutdown::OpenGate;
 
 /// publish_context key the controller fills from the Volume status.
 pub const PUBLISH_DEVICE_PATH: &str = "devicePath";
@@ -292,7 +293,7 @@ pub struct Inflight {
     set: Arc<Mutex<HashSet<String>>>,
 }
 
-struct InflightGuard {
+pub(crate) struct InflightGuard {
     inflight: Inflight,
     volume: String,
 }
@@ -312,6 +313,11 @@ impl Inflight {
             inflight: self.clone(),
             volume: volume.to_owned(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_for_test(&self, volume: &str) -> InflightGuard {
+        self.begin(volume).unwrap()
     }
 
     pub fn is_idle(&self) -> bool {
@@ -345,6 +351,7 @@ struct Inner {
 pub struct NodeService {
     inner: Arc<Inner>,
     inflight: Inflight,
+    opens: OpenGate,
 }
 
 impl std::fmt::Debug for NodeService {
@@ -435,6 +442,7 @@ impl NodeService {
                 device_wait: DEVICE_WAIT,
             }),
             inflight: Inflight::default(),
+            opens: OpenGate::default(),
         }
     }
 
@@ -452,11 +460,26 @@ impl NodeService {
                 device_wait: wait,
             }),
             inflight: self.inflight,
+            opens: self.opens,
         }
     }
 
     pub fn inflight(&self) -> Inflight {
         self.inflight.clone()
+    }
+
+    /// Closing it refuses NodeStage and NodePublish; the unstage and
+    /// unpublish calls kubelet makes while the node goes down still work.
+    pub fn open_gate(&self) -> OpenGate {
+        self.opens.clone()
+    }
+
+    fn admit_open(&self) -> Result<(), Status> {
+        if self.opens.is_closed() {
+            Err(Status::unavailable("node shutting down"))
+        } else {
+            Ok(())
+        }
     }
 
     /// Runs `op` in its own task: a client cancel drops the handler but never
@@ -1024,6 +1047,7 @@ impl Node for NodeService {
         &self,
         req: Request<NodeStageVolumeRequest>,
     ) -> Result<Response<NodeStageVolumeResponse>, Status> {
+        self.admit_open()?;
         let req = req.into_inner();
         let id = req.volume_id.clone();
         self.guarded(&id, move |i| async move { i.stage(req).await })
@@ -1046,6 +1070,7 @@ impl Node for NodeService {
         &self,
         req: Request<NodePublishVolumeRequest>,
     ) -> Result<Response<NodePublishVolumeResponse>, Status> {
+        self.admit_open()?;
         let req = req.into_inner();
         let id = req.volume_id.clone();
         self.guarded(&id, move |i| async move { i.publish(req).await })

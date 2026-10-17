@@ -17,6 +17,7 @@ pub mod node;
 pub mod peer;
 pub mod reconcile;
 pub mod retry;
+pub mod shutdown;
 pub mod storage;
 pub mod watch;
 

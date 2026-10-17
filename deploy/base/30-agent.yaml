@@ -14,7 +14,7 @@ spec:
     spec:
       serviceAccountName: r-drbd-agent
       priorityClassName: system-node-critical
-      # Above the agent's shutdown (60 s drain, 90 s LVM change wait, 5 s CSI); the only hard stop for a stuck LVM change.
+      # Above the agent's shutdown (29 s shutdown guard, 60 s drain, 90 s LVM change wait, 5 s CSI); the only hard stop for a stuck LVM change.
       terminationGracePeriodSeconds: 200
       hostNetwork: true
       hostPID: true
@@ -42,6 +42,9 @@ spec:
               value: unix:///csi/csi.sock
             - name: RUST_LOG
               value: info
+            # Read at shutdown on hosts without systemd. Kept last: overlays patch the entries above by index.
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
           # No memory limit: the page cache of mkfs and lvm writes by the
           # host tools is charged to this cgroup, and an OOM kill mid mkfs
           # leaves a half-made file system (seen at 96Mi).
