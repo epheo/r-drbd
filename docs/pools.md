@@ -84,8 +84,8 @@ Before any change, on every pass, each listed path gets one state in `status.dev
 | `Member` | A PV of this Pool's VG |
 | `Blank` | Whole disk, no signature, no partition, not held, exclusive open succeeds |
 | `NotEmpty` | A signature or a partition table; the message names it, with its offset |
-| `Busy` | Mounted, held by another device (dm, md), or the exclusive open failed |
-| `NotADisk` | A partition, dm, md, loop, drbd, zram, RAM, nbd or optical device, or read-only |
+| `Busy` | Mounted, held by another device (dm, md), a multipath path or not yet settled by udev (up to a minute), or the exclusive open failed, did not return within 10 s, or an earlier one has not returned yet |
+| `NotADisk` | A partition, dm, md, loop, drbd, zram, RAM, nbd, RBD, ZFS volume, null block, floppy or optical device, an eMMC boot area, read-only, or size 0 (no medium) |
 | `Missing` | The path does not resolve |
 
 When several apply, the first in this order wins: Missing, NotADisk, Member, Busy, NotEmpty, Blank.
@@ -94,8 +94,9 @@ Each row also shows the disk's size, model and serial, so you can tell which dis
 
 How:
 - the by-id link is resolved, and sysfs gives partitions, holders, read-only flag, size, model and serial;
-- `wipefs --no-act --json` lists signatures, partition tables included; it never writes;
-- the agent opens the disk exclusively and closes it at once: the kernel refuses while anything holds it.
+- the host's udev database says whether the disk is a multipath path (`DM_MULTIPATH_DEVICE_PATH`, decided or still being decided), not ready (`SYSTEMD_READY=0`), or not processed by udev yet;
+- `wipefs --no-act --json` lists signatures, partition tables included; it never writes, and it is not run on a `Busy` disk;
+- the agent opens the disk exclusively and closes it at once: the kernel refuses while anything holds it; an open that does not return within 10 s leaves the disk `Busy` and the agent moves on.
 
 r-drbd never wipes a disk.
 To reuse a disk with old data, wipe it yourself first (`wipefs -a`), deliberately.
@@ -151,9 +152,21 @@ There is no RAID inside a node: one disk failure loses this node's replicas, and
 Replacing a disk means a new Pool: move the replicas off with `spec.evict` (see [Operations](operations.md)), then delete the Pool.
 Under `reclaimPolicy: Delete` a VG with a missing PV is never removed, so `Released` stays False: switch the Pool to `Retain` first, then clean up the VG and the remaining disks by hand.
 
-### Finding by-id paths
+### Finding disks
 
-From any machine with cluster access:
+Each agent lists its node's whole disks in a NodeDisks object named after the node:
+
+    kubectl get nodedisks
+    kubectl get nodedisks node1 -o yaml
+
+Each row has the `path` to list in a Pool, every by-id link, the kernel name, size, model, serial and the state the checks above give.
+List only `Blank` disks in a Pool; `Member` rows name the Pool that holds them.
+Changes show within seconds for changes the kernel or the mount table reports: a disk plugged or removed, a signature written and the disk closed (mkfs, wipefs, pvcreate, partitioning), a mount or an unmount.
+A writer that never closes the disk, or an exclusive claimer leaving no trace in sysfs, shows at the hourly check of every disk.
+Without a uevent socket, or once it fails, the agent checks every disk every 5 minutes; `status.watch` says which.
+See [Reference](reference.md#nodedisks) for the fields.
+
+While the agent is not running there, from any machine with cluster access:
 
     kubectl debug node/node1 -it --profile=sysadmin --image=busybox -- ls -l /host/dev/disk/by-id
 

@@ -125,12 +125,6 @@ fn look_failed(pool: &Pool, error: String) -> Outcome {
     }
 }
 
-/// A PV name as the agent's /dev resolves it, so it compares with a
-/// resolved by-id link.
-fn resolved(name: &str) -> PathBuf {
-    std::fs::canonicalize(name).unwrap_or_else(|_| PathBuf::from(name))
-}
-
 impl Reconciler {
     async fn look(&self, pool: &Pool, paths: &[String]) -> Result<Look, String> {
         let (vg_name, thin) = (&pool.spec.vg, &pool.spec.thin_pool);
@@ -157,10 +151,9 @@ impl Reconciler {
             .await
             .map_err(|e| e.to_string())?
             .into_iter()
-            .map(|p| (resolved(&p.name), p.vg.unwrap_or_default()))
+            .map(|p| (devices::resolved(&p.name), p.vg.unwrap_or_default()))
             .collect();
-        let checked =
-            devices::check(self.lvm.exec(), self.disks.as_ref(), paths, &pvs, vg_name).await;
+        let checked = devices::check(self.lvm.exec(), &self.disks, paths, &pvs, vg_name).await;
         Ok(Look {
             vg,
             thin,
@@ -194,6 +187,8 @@ impl Reconciler {
             self.release(reads, pool, &paths, &t).await
         } else {
             // Retained: look only, never build what is going away.
+            let disk_lock = self.disk_lock.clone();
+            let _held = disk_lock.lock().await;
             match self.look(pool, &paths).await {
                 Ok(l) => Outcome {
                     rows: Some(l.rows()),
@@ -204,7 +199,20 @@ impl Reconciler {
                 Err(e) => look_failed(pool, e),
             }
         };
+        // Against the rows seen last, not the status: a failing status
+        // write must not wake the inventory every pass.
+        if let Some(rows) = &out.rows
+            && self.device_rows.get(&pool.name_any()) != Some(rows)
+        {
+            self.device_rows.insert(pool.name_any(), rows.clone());
+            self.disks_changed = true;
+        }
         self.device_events(pool, out)
+    }
+
+    /// A Pool's disks changed since the last call: NodeDisks is due.
+    pub fn take_disks_changed(&mut self) -> bool {
+        std::mem::take(&mut self.disks_changed)
     }
 
     async fn build(
@@ -216,6 +224,10 @@ impl Reconciler {
     ) -> Outcome {
         let mut out = Outcome::default();
         for _ in 0..MAX_STEPS {
+            // Each look and its step under the disk lock: the inventory's
+            // exclusive open never meets our open or a vgcreate.
+            let disk_lock = self.disk_lock.clone();
+            let _held = disk_lock.lock().await;
             // Checks right before every step, in the same pass.
             let look = match self.look(pool, paths).await {
                 Ok(l) => l,
@@ -256,6 +268,7 @@ impl Reconciler {
             };
             tracing::info!(pool = pool.name_any(), step = step.name(), "building pool");
             let res = self.run_step(t, &step).await;
+            self.disks_changed |= res.is_ok();
             reads.invalidate(t.vg);
             let Err(e) = res else { continue };
             let message = format!("{}: {e}", step.name());
@@ -341,6 +354,8 @@ impl Reconciler {
             .map(|d| d.path.as_str())
             .collect();
         for _ in 0..MAX_STEPS {
+            let disk_lock = self.disk_lock.clone();
+            let _held = disk_lock.lock().await;
             let look = match self.look(pool, paths).await {
                 Ok(l) => l,
                 Err(e) => {
@@ -409,6 +424,7 @@ impl Reconciler {
             };
             tracing::info!(pool = pool.name_any(), step = ?step, "releasing pool");
             let res = self.run_release(t, &step).await;
+            self.disks_changed |= res.is_ok();
             reads.invalidate(t.vg);
             if let Err(e) = res {
                 out.released = Some((

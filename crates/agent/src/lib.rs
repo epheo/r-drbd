@@ -14,6 +14,7 @@ pub mod devices;
 pub mod drbd;
 pub mod events2;
 pub mod exec;
+pub mod inventory;
 pub mod node;
 pub mod peer;
 pub mod reconcile;

@@ -1,6 +1,6 @@
 # Reference
 
-`kubectl explain pool.spec`, `volume.spec`, `volume.status` and `snapshot.status` give the same field descriptions from the installed CRDs.
+`kubectl explain pool.spec`, `volume.spec`, `volume.status`, `snapshot.status` and `nodedisks.status` give the same field descriptions from the installed CRDs.
 
 ## Pool
 
@@ -90,6 +90,46 @@ A snapshot over the limit ends Failed before any IO is suspended.
 | `status.lastError` | Why it failed |
 
 Finalizer `r-drbd.io/snapshot` holds deletion until every snapshot LV is removed.
+
+## NodeDisks
+
+Group `r-drbd.io/v1alpha1`, cluster scoped, read-only, short name `nd`.
+One per node, named after the node, written by its agent, owned by the Node object, so it goes with the node.
+It claims nothing: a Pool uses only the disks it lists.
+
+| Field | Type | Notes |
+|---|---|---|
+| `status.blank` | integer | Disks in state `Blank` |
+| `status.watch` | string | `uevent`: changes the kernel or the mount table reports show within seconds, every disk is checked again hourly; `poll`: no uevent socket, or it failed since, every disk every 5 minutes |
+| `status.message` | string | Set when the list is incomplete: more than 512 disks, or disks the last check had no time for |
+| `status.disks[]` | object | Every whole disk of the node; no partition, loop, RAM, zram, dm, md, DRBD, nbd, RBD, ZFS volume, null block, floppy, optical device, eMMC boot area or hidden NVMe multipath path |
+| `status.disks[].path` | string | The path to list in a Pool: the `wwn-` by-id link, else the bus one (`ata-`, `nvme-`, `scsi-`, `virtio-`); `/dev/<name>` without any by-id link |
+| `status.disks[].name` | string | Kernel name, as `lsblk` shows it today |
+| `status.disks[].links` | []string | Every by-id link of the disk |
+| `status.disks[].state` | string | As in a Pool's `status.devices` (see [Pools](pools.md#what-the-agent-checks)) |
+| `status.disks[].pool` | string | For `Member`: the Pool whose VG holds the disk |
+| `status.disks[].sizeBytes`, `model`, `serial` | | From sysfs |
+| `status.disks[].message` | string | What makes the disk not `Blank` |
+
+`Member` and the Pool it names:
+- a VG tagged `r-drbd.pool.<pool>` belongs to that Pool on this node;
+- an untagged VG belongs to the Pool on this node without `devices` whose `vg` it is; with several such Pools, the first by name, the others in the message;
+- a VG tagged for a Pool that does not exist on this node, or for two Pools, gives `NotEmpty` saying so;
+- a PV of any other VG is `NotEmpty`, naming the VG, even while its LVs hold the disk.
+
+Other differences from a Pool's checks:
+- `wipefs` and the exclusive open run only on a disk every other check finds blank, so a disk in use is never read or opened;
+- a disk the kernel announced but udev has not processed yet is `Busy`, "udev not settled", and read again a few seconds later; after a minute without a udev entry the other checks decide.
+
+When the agent reads:
+- every disk at start and hourly (every 5 minutes under `watch: poll`);
+- one disk when the kernel reports a change on it: added, removed, or written and closed (mkfs, wipefs, pvcreate, partitioning); a writer that never closes the disk, or an exclusive claimer leaving no trace in sysfs, shows at the hourly check;
+- the cheap facts of every disk (sysfs, mounts) when the mount table or any block device changes, and the signatures of a disk whose facts changed;
+- LVM reports at start, hourly, after a Pool's disks change, and when a disk gains or loses an LVM label.
+So an idle disk, spun down or not, is read at start, hourly and on its own changes only.
+It writes the object only when something changed.
+
+`kubectl get nodedisks` prints the node and its count of Blank disks.
 
 ## Condition reasons
 

@@ -171,7 +171,9 @@ async fn blank_disks_build_vg_then_thin_pool() {
             pvs(&[("/dev/vdd", VG), ("/dev/vde", VG)]),
         );
     probe(&x);
-    let (w, _) = run(&x, disks(), pool(&[A, B])).await;
+    let (w, mut r) = run(&x, disks(), pool(&[A, B])).await;
+    assert!(r.take_disks_changed(), "NodeDisks due after a build");
+    assert!(!r.take_disks_changed());
     let s = status(&w);
     assert_eq!(available(&s).0, "True");
     assert_eq!(s["chunkBytes"], 65_536);
@@ -503,6 +505,7 @@ async fn ready_pool_writes_nothing_when_unchanged() {
     ready(&x);
     let mut p = pool(&[A]);
     let (w, mut r) = run(&x, disks(), p.clone()).await;
+    assert!(r.take_disks_changed(), "rows not written yet");
     let StatusWrite::Pool {
         capacity,
         available,
@@ -526,6 +529,7 @@ async fn ready_pool_writes_nothing_when_unchanged() {
     let w = r.pass(&[Arc::new(p)], &[], &[]).await;
     x.assert_done();
     assert!(w.is_empty(), "{w:?}");
+    assert!(!r.take_disks_changed(), "same rows, no step");
 }
 
 #[tokio::test]
@@ -799,4 +803,20 @@ async fn unreadable_host_keeps_a_built_pool_on_the_usual_probe() {
     let (w, r) = run(&x, disks(), pool(&[A])).await;
     assert_eq!(available(&status(&w)).0, "False");
     assert!(r.unready_pools.contains_key(POOL));
+}
+
+#[tokio::test]
+async fn pool_disk_work_waits_for_the_inventory() {
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    let held = lock.clone().lock_owned().await;
+    let x = Arc::new(ScriptedExec::new());
+    let mut r = Reconciler::new(NODE, x.clone())
+        .with_disks(disks())
+        .with_disk_lock(lock);
+    let p = Arc::new(pool(&[A]));
+    let pass = r.pass(std::slice::from_ref(&p), &[], &[]);
+    let waited = tokio::time::timeout(std::time::Duration::from_millis(100), pass).await;
+    assert!(waited.is_err(), "the pass went on under a held disk lock");
+    assert!(x.seen.lock().unwrap().is_empty());
+    drop(held);
 }
