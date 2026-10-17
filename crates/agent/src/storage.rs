@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lvm::cmd;
-use lvm::report::{self, Lv, Vg};
+use lvm::report::{self, Lv, PoolLv, Pv, Vg, VgFull};
+
+pub mod plan;
 
 use crate::exec::{CmdError, LVM_CHANGE_TIMEOUT, LVM_REPORT_TIMEOUT, run_any};
 use crate::{Exec, Output};
@@ -101,6 +103,79 @@ impl Lvm {
             .into_iter()
             .find(|r| r.name == vg)
             .ok_or_else(|| CmdError::new("vgs", format!("volume group {vg} not in the report")))
+    }
+
+    /// Every VG of the host.
+    pub async fn vgs_all(&self) -> Result<Vec<VgFull>, CmdError> {
+        let out = self.report(&cmd::vgs_all()).await?;
+        report::parse_vgs_all(&out).map_err(|e| CmdError::new("vgs", e.to_string()))
+    }
+
+    /// Every PV the host's LVM sees.
+    pub async fn pvs_all(&self) -> Result<Vec<Pv>, CmdError> {
+        let out = self.report(&cmd::pvs_all()).await?;
+        report::parse_pvs(&out).map_err(|e| CmdError::new("pvs", e.to_string()))
+    }
+
+    /// LVs of `vg` with thin pool sizes.
+    pub async fn thin_pools(&self, vg: &str) -> Result<Vec<PoolLv>, CmdError> {
+        let out = self.report(&cmd::thin_pools(vg)).await?;
+        report::parse_thin_pools(&out).map_err(|e| CmdError::new("lvs", e.to_string()))
+    }
+
+    pub async fn vgcreate(&self, vg: &str, tag: &str, devices: &[String]) -> Result<(), CmdError> {
+        self.change(&cmd::vgcreate(vg, tag, devices)).await
+    }
+
+    pub async fn vgextend(&self, vg: &str, devices: &[String]) -> Result<(), CmdError> {
+        self.change(&cmd::vgextend(vg, devices)).await
+    }
+
+    pub async fn create_thin_pool(
+        &self,
+        vg: &str,
+        thin: &str,
+        chunk_bytes: u64,
+        meta_bytes: u64,
+    ) -> Result<(), CmdError> {
+        self.change(&cmd::create_thin_pool(vg, thin, chunk_bytes, meta_bytes))
+            .await
+    }
+
+    pub async fn extend_pool_metadata(
+        &self,
+        vg: &str,
+        thin: &str,
+        meta_bytes: u64,
+    ) -> Result<(), CmdError> {
+        self.change(&cmd::extend_pool_metadata(vg, thin, meta_bytes))
+            .await
+    }
+
+    pub async fn extend_pool_data(&self, vg: &str, thin: &str) -> Result<(), CmdError> {
+        self.change(&cmd::extend_pool_data(vg, thin)).await
+    }
+
+    pub async fn extend_pool_data_to(
+        &self,
+        vg: &str,
+        thin: &str,
+        bytes: u64,
+    ) -> Result<(), CmdError> {
+        self.change(&cmd::extend_pool_data_to(vg, thin, bytes))
+            .await
+    }
+
+    pub async fn remove_inactive(&self, vg: &str, lv: &str) -> Result<(), CmdError> {
+        self.change(&cmd::remove_inactive(vg, lv)).await
+    }
+
+    pub async fn vgremove(&self, vg: &str) -> Result<(), CmdError> {
+        self.change(&cmd::vgremove(vg)).await
+    }
+
+    pub async fn pvremove(&self, devices: &[String]) -> Result<(), CmdError> {
+        self.change(&cmd::pvremove(devices)).await
     }
 
     /// Thin pool probe and capacity.
@@ -264,6 +339,57 @@ pub async fn probe_host(exec: &dyn Exec) -> HostLvm {
             global_filter.as_deref(),
         ),
     }
+}
+
+/// Where LVM keeps its devices files (lvmdevices(8)).
+const DEVICES_DIR: &str = "/etc/lvm/devices";
+
+/// The devices file LVM would use but that does not exist, if so. With
+/// `use_devicesfile = 1` and no file, vgcreate and vgextend create one
+/// that lists only their new PVs, and every other VG of the host drops
+/// out of LVM's view, the root VG included.
+pub async fn devices_file_missing(exec: &dyn Exec) -> Result<Option<String>, CmdError> {
+    let setting = |key: &'static str| async move {
+        let out = run_any(exec, &cmd::host_setting(key), LVM_REPORT_TIMEOUT).await?;
+        Ok::<_, CmdError>(
+            (out.exit_code == Some(0))
+                .then(|| cmd::parse_host_setting(&out.stdout))
+                .flatten(),
+        )
+    };
+    match setting("devices/use_devicesfile").await?.as_deref() {
+        Some("1") => {}
+        Some(_) => return Ok(None),
+        None => {
+            return Err(CmdError::new(
+                "lvmconfig",
+                "devices/use_devicesfile unreadable",
+            ));
+        }
+    }
+    let name = setting("devices/devicesfile")
+        .await?
+        .map(|n| n.trim_matches('"').to_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "system.devices".to_owned());
+    if name.contains('/') {
+        return Err(CmdError::new(
+            "lvmconfig",
+            format!("devices/devicesfile {name:?} is not a file name"),
+        ));
+    }
+    let path = format!("{DEVICES_DIR}/{name}");
+    let out = run_any(exec, &devices_file_argv(&path), LVM_REPORT_TIMEOUT).await?;
+    match out.exit_code {
+        Some(0) => Ok(None),
+        Some(1) => Ok(Some(path)),
+        _ => Err(crate::exec::failure(&devices_file_argv(&path), &out)),
+    }
+}
+
+/// Runs on the host, where the devices file lives.
+pub fn devices_file_argv(path: &str) -> Vec<String> {
+    vec!["test".to_owned(), "-f".to_owned(), path.to_owned()]
 }
 
 /// With a devices file the host scans only listed devices. Without one it
@@ -696,6 +822,39 @@ mod tests {
             (h.version, h.unsupported, h.warning),
             (Some((2, 3, 41)), None, None)
         );
+    }
+
+    #[tokio::test]
+    async fn devices_file_must_exist_when_used() {
+        let expect = |x: &ScriptedExec, use_df: &str, exists: Option<i32>| {
+            x.expect(
+                lvm::cmd::host_setting("devices/use_devicesfile"),
+                ok(&format!("use_devicesfile={use_df}\n")),
+            );
+            if let Some(code) = exists {
+                x.expect(
+                    lvm::cmd::host_setting("devices/devicesfile"),
+                    ok("devicesfile=\"system.devices\"\n"),
+                )
+                .expect(
+                    devices_file_argv("/etc/lvm/devices/system.devices"),
+                    crate::exec::scripted::code(code, "", ""),
+                );
+            }
+        };
+        let x = ScriptedExec::new();
+        expect(&x, "1", Some(1));
+        assert_eq!(
+            devices_file_missing(&x).await.unwrap().as_deref(),
+            Some("/etc/lvm/devices/system.devices")
+        );
+        let x = ScriptedExec::new();
+        expect(&x, "1", Some(0));
+        assert_eq!(devices_file_missing(&x).await.unwrap(), None);
+        let x = ScriptedExec::new();
+        expect(&x, "0", None);
+        assert_eq!(devices_file_missing(&x).await.unwrap(), None);
+        x.assert_done();
     }
 
     #[tokio::test]

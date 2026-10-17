@@ -256,7 +256,10 @@ async fn reconcile_loop(
         }
         let volumes = stores.volumes.state();
         let snapshots = stores.snapshots.state();
-        apply(&client, &node, rec.pass(&pools, &volumes, &snapshots).await).await;
+        let writes = rec.pass(&pools, &volumes, &snapshots).await;
+        for pool in apply(&client, &node, writes).await {
+            rec.events_unsent(&pool);
+        }
         // Fixed per pass so a stream of refreshes cannot push the resync out.
         let resync = tokio::time::Instant::now() + watch::RESYNC;
         loop {
@@ -314,7 +317,12 @@ fn addresses(stores: &watch::Stores) -> BTreeMap<String, std::net::IpAddr> {
         .collect()
 }
 
-async fn apply(client: &Client, node: &str, writes: Vec<crate::reconcile::StatusWrite>) {
+/// Applies the writes; returns the Pools whose Events did not get through.
+async fn apply(
+    client: &Client,
+    node: &str,
+    writes: Vec<crate::reconcile::StatusWrite>,
+) -> Vec<String> {
     let results = crate::retry::each_with_backoff(
         &writes,
         &crate::retry::BACKOFF,
@@ -323,7 +331,12 @@ async fn apply(client: &Client, node: &str, writes: Vec<crate::reconcile::Status
     )
     .await;
     let mut skipped = 0;
+    let mut unsent = Vec::new();
     for (w, res) in writes.iter().zip(results) {
+        if matches!(w, crate::reconcile::StatusWrite::Event { .. }) && !matches!(res, Some(Ok(())))
+        {
+            unsent.push(w.name().to_owned());
+        }
         match res {
             Some(Err(e)) => {
                 tracing::warn!(object = w.name(), error = %e, "status write failed, retried next pass");
@@ -338,6 +351,7 @@ async fn apply(client: &Client, node: &str, writes: Vec<crate::reconcile::Status
             "API unreachable: remaining status writes left to the next pass"
         );
     }
+    unsent
 }
 
 /// The shutdown guard runs before the drain.

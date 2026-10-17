@@ -181,3 +181,85 @@ fn failed_report_errors_come_from_the_log() {
     assert_eq!(report::log_errors("not json").len(), 0);
     assert_eq!(report::parse_lvs(MISSING_VG).unwrap().len(), 0);
 }
+
+/// vgs_all on a host with a VG of a devices Pool before its thin pool
+/// exists, and another VG.
+const VGS_ALL: &str = r#"  {
+      "report": [
+          {
+              "vg": [
+                  {"vg_name":"vg1", "vg_extent_size":"4194304", "vg_size":"4290772992", "vg_free":"4290772992", "vg_tags":"r-drbd.pool.p1", "vg_missing_pv_count":"0"},
+                  {"vg_name":"other", "vg_extent_size":"4194304", "vg_size":"21470642176", "vg_free":"2105540608", "vg_tags":"", "vg_missing_pv_count":"0"}
+              ]
+          }
+      ]
+      ,
+      "log": [
+          {"log_seq_num":"1", "log_type":"warn", "log_context":"processing", "log_object_type":"vg", "log_object_name":"", "log_object_id":"", "log_object_group":"", "log_object_group_id":"", "log_message":"Please remove the lvm.conf filter, it is ignored with the devices file.", "log_errno":"0", "log_ret_code":"0"}
+      ]
+  }
+"#;
+
+const PVS_ALL: &str = r#"  {
+      "report": [
+          {
+              "pv": [
+                  {"pv_name":"/dev/vdb", "vg_name":"other"},
+                  {"pv_name":"/dev/vdd", "vg_name":""}
+              ]
+          }
+      ]
+  }
+"#;
+
+const THIN_POOLS: &str = r#"  {
+      "report": [
+          {
+              "lv": [
+                  {"lv_name":"thin", "segtype":"thin-pool", "lv_size":"4148166656", "lv_metadata_size":"71303168", "chunk_size":"65536"},
+                  {"lv_name":"pvc-1", "segtype":"thin", "lv_size":"1073741824", "lv_metadata_size":"", "chunk_size":"0"}
+              ]
+          }
+      ]
+  }
+"#;
+
+#[test]
+fn devices_mode_reports() {
+    let vgs = report::parse_vgs_all(VGS_ALL).unwrap();
+    assert_eq!(
+        vgs[0],
+        report::VgFull {
+            name: "vg1".into(),
+            extent_bytes: 4 << 20,
+            size_bytes: 4_290_772_992,
+            free_bytes: 4_290_772_992,
+            tags: vec!["r-drbd.pool.p1".into()],
+            missing_pvs: 0,
+        }
+    );
+    assert_eq!(vgs[1].tags.len(), 0);
+
+    let pvs = report::parse_pvs(PVS_ALL).unwrap();
+    assert_eq!(pvs[0].vg.as_deref(), Some("other"));
+    assert_eq!(
+        (pvs[1].name.as_str(), pvs[1].vg.as_deref()),
+        ("/dev/vdd", None)
+    );
+
+    let lvs = report::parse_thin_pools(THIN_POOLS).unwrap();
+    assert!(lvs[0].thin_pool);
+    assert_eq!(
+        (lvs[0].size_bytes, lvs[0].metadata_bytes, lvs[0].chunk_bytes),
+        (4_148_166_656, 71_303_168, 65_536)
+    );
+    assert!(!lvs[1].thin_pool);
+    assert_eq!(lvs[1].metadata_bytes, 0);
+
+    let e = report::parse_vgs_all(&VGS_ALL.replace(
+        r#""vg_missing_pv_count":"0""#,
+        r#""vg_missing_pv_count":"x""#,
+    ))
+    .unwrap_err();
+    assert!(e.to_string().contains("vg_missing_pv_count"), "{e}");
+}

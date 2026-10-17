@@ -1004,3 +1004,86 @@ async fn pool_policy_defaults_from_the_api_server() {
     assert_eq!(got.data["spec"]["overcommitPercent"], 100);
     assert_eq!(got.data["spec"]["reservePercent"], 5);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pool_delete_policy_waits_for_released() {
+    let assets = require_envtest!();
+    let (_env, client, _ctl) = setup(&assets, |_| {}).await;
+    let ar = kube::api::ApiResource::erase::<Pool>(&());
+    let dynamic: Api<kube::api::DynamicObject> = Api::all_with(client.clone(), &ar);
+    for name in ["del", "ret"] {
+        let obj: kube::api::DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "r-drbd.io/v1alpha1",
+            "kind": "Pool",
+            "metadata": { "name": name },
+            "spec": {
+                "node": "n1", "tier": "fast", "vg": name, "thinPool": "thin",
+                "devices": ["/dev/disk/by-id/virtio-a"], "reclaimPolicy": "Delete",
+            },
+        }))
+        .unwrap();
+        dynamic
+            .create(&kube::api::PostParams::default(), &obj)
+            .await
+            .expect("create pool");
+    }
+    let api = Api::<Pool>::all(client.clone());
+    for name in ["del", "ret"] {
+        support::eventually(Duration::from_secs(20), || async {
+            get_pool(&client, name).await.filter(|p| {
+                p.metadata
+                    .finalizers
+                    .iter()
+                    .flatten()
+                    .any(|f| f == FINALIZER_POOL)
+            })
+        })
+        .await;
+        api.delete(name, &DeleteParams::default())
+            .await
+            .expect("delete pool");
+    }
+    // Empty, but held until the agent says Released.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(get_pool(&client, "del").await.is_some());
+    assert!(get_pool(&client, "ret").await.is_some());
+
+    // Switching to Retain lets it go as today.
+    api.patch(
+        "ret",
+        &PatchParams::default(),
+        &Patch::Merge(json!({ "spec": { "reclaimPolicy": "Retain" } })),
+    )
+    .await
+    .expect("retain");
+    support::eventually(Duration::from_secs(20), || async {
+        get_pool(&client, "ret").await.is_none().then_some(())
+    })
+    .await;
+
+    // Released False changes nothing; True releases the finalizer.
+    let released = |status: &str| {
+        json!({
+            "apiVersion": "r-drbd.io/v1alpha1",
+            "kind": "Pool",
+            "metadata": { "name": "del" },
+            "status": { "conditions": [{
+                "type": "Released", "status": status, "reason": "Test", "message": "",
+                "lastTransitionTime": "2026-01-01T00:00:00Z",
+            }]},
+        })
+    };
+    let ssa = PatchParams::apply(&model::keys::agent_field_manager("n1")).force();
+    api.patch_status("del", &ssa, &Patch::Apply(released("False")))
+        .await
+        .expect("released false");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(get_pool(&client, "del").await.is_some());
+    api.patch_status("del", &ssa, &Patch::Apply(released("True")))
+        .await
+        .expect("released true");
+    support::eventually(Duration::from_secs(20), || async {
+        get_pool(&client, "del").await.is_none().then_some(())
+    })
+    .await;
+}

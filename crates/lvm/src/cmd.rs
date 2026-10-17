@@ -69,18 +69,28 @@ pub const FILTER_IGNORED_NOTICE: &str =
 pub const LV_FIELDS: &str = "lv_name,lv_path,lv_size,segtype,pool_lv,lv_active_locally,lv_device_open,zero,data_percent,chunk_size";
 pub const TAG_FIELDS: &str = "lv_name,lv_tags";
 pub const VG_FIELDS: &str = "vg_name,vg_extent_size";
+/// Every VG of the host, for a Pool built from devices.
+pub const VG_ALL_FIELDS: &str =
+    "vg_name,vg_extent_size,vg_size,vg_free,vg_tags,vg_missing_pv_count";
+pub const PV_FIELDS: &str = "pv_name,vg_name";
+pub const THIN_POOL_FIELDS: &str = "lv_name,segtype,lv_size,lv_metadata_size,chunk_size";
 
 fn lvm<S: AsRef<str>>(program: &str, options: &[S], target: String) -> Vec<String> {
+    lvm_n(program, options, &[target])
+}
+
+fn lvm_n<S: AsRef<str>, T: AsRef<str>>(program: &str, options: &[S], targets: &[T]) -> Vec<String> {
     let mut v = vec![program.to_owned(), "--config".to_owned(), CONFIG.to_owned()];
     v.extend(options.iter().map(|o| o.as_ref().to_owned()));
-    v.push(target);
+    v.extend(targets.iter().map(|t| t.as_ref().to_owned()));
     v
 }
 
 /// JSON, exact bytes without a unit suffix, so serde parses it whole.
 /// `--binary` gives 0 or 1 for two-valued fields instead of words.
-fn report(program: &str, fields: &str, vg: &str) -> Vec<String> {
-    lvm(
+/// No target reports every object the host's LVM sees.
+fn report_n(program: &str, fields: &str, target: Option<&str>) -> Vec<String> {
+    lvm_n(
         program,
         &[
             "--reportformat",
@@ -92,8 +102,12 @@ fn report(program: &str, fields: &str, vg: &str) -> Vec<String> {
             "-o",
             fields,
         ],
-        vg.to_owned(),
+        target.as_slice(),
     )
+}
+
+fn report(program: &str, fields: &str, vg: &str) -> Vec<String> {
+    report_n(program, fields, Some(vg))
 }
 
 pub fn lvs(vg: &str) -> Vec<String> {
@@ -107,6 +121,21 @@ pub fn lv_tags(vg: &str) -> Vec<String> {
 
 pub fn vgs(vg: &str) -> Vec<String> {
     report("vgs", VG_FIELDS, vg)
+}
+
+/// Every VG: a named one that does not exist fails like a broken one.
+pub fn vgs_all() -> Vec<String> {
+    report_n("vgs", VG_ALL_FIELDS, None)
+}
+
+/// Every PV the host's LVM sees, with its VG (empty for an orphan).
+pub fn pvs_all() -> Vec<String> {
+    report_n("pvs", PV_FIELDS, None)
+}
+
+/// LVs of `vg` with the thin pool sizes.
+pub fn thin_pools(vg: &str) -> Vec<String> {
+    report("lvs", THIN_POOL_FIELDS, vg)
 }
 
 fn size(bytes: u64) -> String {
@@ -223,4 +252,86 @@ pub fn device_size(dev: &str) -> Vec<String> {
 /// The stdout of [`device_size`].
 pub fn parse_device_size(stdout: &str) -> Option<u64> {
     stdout.trim().parse().ok()
+}
+
+// Commands of a Pool built from devices. None passes --yes or --force:
+// LVM's own prompts (an existing signature, an active LV) answer no on the
+// agent's stdin, which is /dev/null, and that refusal is a second guard.
+
+/// A VG on blank disks, tagged with the Pool it belongs to.
+pub fn vgcreate(vg: &str, tag: &str, devices: &[String]) -> Vec<String> {
+    let mut targets = vec![vg.to_owned()];
+    targets.extend_from_slice(devices);
+    lvm_n("vgcreate", &["--addtag", tag], &targets)
+}
+
+pub fn vgextend(vg: &str, devices: &[String]) -> Vec<String> {
+    let mut targets = vec![vg.to_owned()];
+    targets.extend_from_slice(devices);
+    lvm_n::<&str, _>("vgextend", &[], &targets)
+}
+
+/// The thin pool takes every free extent. LVM keeps the metadata and its
+/// spare out of `100%FREE` itself.
+pub fn create_thin_pool(vg: &str, thin: &str, chunk_bytes: u64, meta_bytes: u64) -> Vec<String> {
+    lvm(
+        "lvcreate",
+        &[
+            "--type",
+            "thin-pool",
+            "--extents",
+            "100%FREE",
+            "--chunksize",
+            &size(chunk_bytes),
+            "--poolmetadatasize",
+            &size(meta_bytes),
+            "--zero",
+            "y",
+            "--name",
+            thin,
+        ],
+        vg.to_owned(),
+    )
+}
+
+/// Absolute size; LVM grows the metadata spare with it.
+pub fn extend_pool_metadata(vg: &str, thin: &str, meta_bytes: u64) -> Vec<String> {
+    lvm(
+        "lvextend",
+        &["--poolmetadatasize", &size(meta_bytes)],
+        format!("{vg}/{thin}"),
+    )
+}
+
+/// Fails when the VG has no free extent: callers check first.
+pub fn extend_pool_data(vg: &str, thin: &str) -> Vec<String> {
+    lvm(
+        "lvextend",
+        &["--extents", "+100%FREE"],
+        format!("{vg}/{thin}"),
+    )
+}
+
+/// Data up to `bytes`, when the metadata covers no more.
+pub fn extend_pool_data_to(vg: &str, thin: &str, bytes: u64) -> Vec<String> {
+    lvm(
+        "lvextend",
+        &["--size", &size(bytes)],
+        format!("{vg}/{thin}"),
+    )
+}
+
+/// An inactive LV: lvremove asks before removing an active one.
+pub fn remove_inactive(vg: &str, lv: &str) -> Vec<String> {
+    lvm::<&str>("lvremove", &[], format!("{vg}/{lv}"))
+}
+
+/// An empty VG: vgremove asks only when LVs are left.
+pub fn vgremove(vg: &str) -> Vec<String> {
+    lvm::<&str>("vgremove", &[], vg.to_owned())
+}
+
+/// Orphan PVs only: pvremove refuses a PV of a VG without --force.
+pub fn pvremove(devices: &[String]) -> Vec<String> {
+    lvm_n::<&str, _>("pvremove", &[], devices)
 }

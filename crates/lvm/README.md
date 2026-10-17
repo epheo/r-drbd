@@ -4,8 +4,8 @@ Pure crate: argv for every LVM command the agent runs, JSON report parsers, LV n
 Thin pools only.
 
 Modules:
-- `cmd`: argv builders; one static `--config` on every lvm command (no LV scanning, DRBD devices rejected).
-- `report`: serde parsers for the `lvs` and `vgs` JSON reports in bytes; errors name the report, the field and the raw value.
+- `cmd`: argv builders; one static `--config` on every lvm command (no LV scanning, DRBD devices rejected). The commands of a Pool built from devices (vgcreate, vgextend, thin pool create and growth, removal) never pass `--yes` or `--force`.
+- `report`: serde parsers for the `lvs`, `vgs` and `pvs` JSON reports in bytes; errors name the report, the field and the raw value.
 - `names`: volume and snapshot LV names (`<volume>+<snapshot>`), the LVM charset, and the checks lvcreate would fail on (reserved names, device-mapper name length).
 
 Tests under tests/:

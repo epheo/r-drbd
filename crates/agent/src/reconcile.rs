@@ -18,24 +18,38 @@ use kube::{Api, Client, ResourceExt};
 use lvm::report::{Lv, Vg};
 use model::condition::{self, Condition};
 use model::{
-    AssignedReplica, Pool, ReplicaStatus, Role, Snapshot, SnapshotAck, SnapshotPhase, Volume,
+    AssignedReplica, DeviceState, DeviceStatus, Pool, ReplicaStatus, Role, Snapshot, SnapshotAck,
+    SnapshotPhase, Volume,
 };
 use serde_json::json;
 
 use crate::Exec;
+use crate::devices::{HostDisks, SysDisks};
 use crate::drbd::Facts;
 use crate::events2::Tracker;
 use crate::storage::{self, Lvm, PoolCapacity};
 
+mod devices;
 mod replicated;
 pub use replicated::DrbdEnv;
 
 const DISK_UP_TO_DATE: &str = "UpToDate";
 const REASON_READY: &str = "ThinPoolReady";
-const REASON_UNAVAILABLE: &str = "ThinPoolUnavailable";
+pub(crate) const REASON_UNAVAILABLE: &str = "ThinPoolUnavailable";
 const REASON_ZEROING_DISABLED: &str = "ZeroingDisabled";
 const REASON_INVALID_NAME: &str = "InvalidName";
 const REASON_LVM_UNSUPPORTED: &str = "LvmUnsupported";
+// Pools built from devices.
+pub(crate) const REASON_DEVICE_NOT_EMPTY: &str = "DeviceNotEmpty";
+pub(crate) const REASON_DEVICE_BUSY: &str = "DeviceBusy";
+pub(crate) const REASON_DEVICE_MISSING: &str = "DeviceMissing";
+pub(crate) const REASON_NOT_A_DISK: &str = "NotADisk";
+pub(crate) const REASON_VG_NOT_OWNED: &str = "VolumeGroupNotOwned";
+pub(crate) const REASON_BUILDING: &str = "Building";
+// Released, reclaimPolicy Delete.
+const REASON_REMOVED: &str = "Removed";
+const REASON_REMOVE_BLOCKED: &str = "RemoveBlocked";
+const REASON_REMOVE_FAILED: &str = "RemoveFailed";
 const NO_DRBD_LOCAL: &str = "replicas 1 volume: no DRBD to suspend or resume";
 pub(crate) const LV_LOST: &str = model::keys::LV_LOST;
 
@@ -47,6 +61,9 @@ pub enum StatusWrite {
         generation: Option<i64>,
         capacity: Result<PoolCapacity, String>,
         available: Condition,
+        /// Pools built from devices only.
+        devices: Option<Vec<DeviceStatus>>,
+        released: Option<Condition>,
     },
     Volume {
         name: String,
@@ -60,6 +77,13 @@ pub enum StatusWrite {
         name: String,
         ack: SnapshotAck,
     },
+    /// A Warning Event on a Pool.
+    Event {
+        name: String,
+        uid: Option<String>,
+        reason: String,
+        message: String,
+    },
 }
 
 impl StatusWrite {
@@ -68,7 +92,8 @@ impl StatusWrite {
             Self::Pool { name, .. }
             | Self::Volume { name, .. }
             | Self::VolumeGone { name }
-            | Self::Snapshot { name, .. } => name,
+            | Self::Snapshot { name, .. }
+            | Self::Event { name, .. } => name,
         }
     }
 
@@ -82,8 +107,15 @@ impl StatusWrite {
                 generation,
                 capacity,
                 available,
+                devices,
+                released,
             } => {
-                let mut status = json!({ "conditions": [available] });
+                let mut conditions = vec![available];
+                conditions.extend(released);
+                let mut status = json!({ "conditions": conditions });
+                if let Some(d) = devices {
+                    status["devices"] = json!(d);
+                }
                 if let Some(g) = generation {
                     status["observedGeneration"] = json!(g);
                 }
@@ -117,6 +149,50 @@ impl StatusWrite {
                 "metadata": { "name": name },
                 "status": { "acks": [ack] },
             }),
+            Self::Event { .. } => json!(self.event()),
+        }
+    }
+
+    /// The core Event of an [`Self::Event`], in "default" where kubectl
+    /// describe looks for cluster-scoped objects.
+    fn event(&self) -> k8s_openapi::api::core::v1::Event {
+        use k8s_openapi::api::core::v1::{Event, EventSource, ObjectReference};
+        use kube::api::ObjectMeta;
+        let Self::Event {
+            name,
+            uid,
+            reason,
+            message,
+        } = self
+        else {
+            return Event::default();
+        };
+        let now = Time(k8s_openapi::jiff::Timestamp::now());
+        Event {
+            metadata: ObjectMeta {
+                generate_name: Some(format!("{name}.")),
+                namespace: Some("default".into()),
+                ..ObjectMeta::default()
+            },
+            involved_object: ObjectReference {
+                api_version: Some(format!("{}/{}", model::GROUP, model::VERSION)),
+                kind: Some("Pool".into()),
+                name: Some(name.clone()),
+                uid: uid.clone(),
+                ..ObjectReference::default()
+            },
+            reason: Some(reason.clone()),
+            message: Some(message.clone()),
+            type_: Some("Warning".into()),
+            count: Some(1),
+            first_timestamp: Some(now.clone()),
+            last_timestamp: Some(now),
+            source: Some(EventSource {
+                component: Some(crate::node::AGENT_COMPONENT.into()),
+                host: None,
+            }),
+            reporting_component: Some(crate::node::AGENT_COMPONENT.into()),
+            ..Event::default()
         }
     }
 
@@ -138,6 +214,16 @@ impl StatusWrite {
                 Api::<Snapshot>::all(client.clone())
                     .patch_status(name, &params, &patch)
                     .await?;
+            }
+            Self::Event { .. } => {
+                let api: Api<k8s_openapi::api::core::v1::Event> =
+                    Api::namespaced(client.clone(), "default");
+                let mut ev = self.event();
+                ev.reporting_instance = Some(node.to_owned());
+                if let Some(s) = ev.source.as_mut() {
+                    s.host = Some(node.to_owned());
+                }
+                api.create(&kube::api::PostParams::default(), &ev).await?;
             }
         }
         Ok(())
@@ -254,6 +340,9 @@ pub struct Reconciler {
     dropped_logged: HashSet<String>,
     /// This node's Pools whose vg or thinPool name failed the check this pass.
     invalid_pools: HashSet<String>,
+    /// This node's Pools built from devices that are not ready this pass,
+    /// with why: no LV is created in a VG that is not built, or not ours.
+    unready_pools: HashMap<String, String>,
     /// Why the host's LVM cannot serve Pools, from the startup check.
     lvm_unsupported: Option<String>,
     /// Connections out of Connected, per volume and peer.
@@ -261,6 +350,11 @@ pub struct Reconciler {
     /// Agent Leases by node; None until set, which tests without Leases
     /// read as every peer alive.
     peer_leases: Option<BTreeMap<String, crate::peer::PeerLease>>,
+    disks: Arc<dyn HostDisks>,
+    /// Per Pool, the paths last announced by a DeviceNotUsable Event.
+    device_events: HashMap<String, BTreeMap<String, DeviceState>>,
+    /// Per Pool, the note last announced by a PoolNotGrown Event.
+    pool_notes: HashMap<String, String>,
 }
 
 impl Reconciler {
@@ -285,10 +379,20 @@ impl Reconciler {
             slots_swept: HashMap::new(),
             dropped_logged: HashSet::new(),
             invalid_pools: HashSet::new(),
+            unready_pools: HashMap::new(),
             lvm_unsupported: None,
             peers: crate::peer::Watch::default(),
             peer_leases: None,
+            disks: Arc::new(SysDisks::default()),
+            device_events: HashMap::new(),
+            pool_notes: HashMap::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_disks(mut self, disks: Arc<dyn HostDisks>) -> Self {
+        self.disks = disks;
+        self
     }
 
     /// Every Pool reports Available False with this reason's text.
@@ -335,10 +439,9 @@ impl Reconciler {
             .filter(|p| p.spec.node == self.node)
             .collect();
         pools.sort_by_key(|p| p.name_any());
+        self.unready_pools.clear();
         for pool in &pools {
-            if let Some(w) = self.pool(&mut reads, pool).await {
-                writes.push(w);
-            }
+            writes.extend(self.pool(&mut reads, pool).await);
         }
         // A bad name never reaches an lvm argv, not even through lvs.
         self.invalid_pools = pools
@@ -346,7 +449,11 @@ impl Reconciler {
             .filter(|p| invalid_name(p).is_some())
             .map(|p| p.name_any())
             .collect();
-        pools.retain(|p| invalid_name(p).is_none() && self.lvm_unsupported.is_none());
+        pools.retain(|p| {
+            invalid_name(p).is_none()
+                && self.lvm_unsupported.is_none()
+                && !self.unready_pools.contains_key(&p.name_any())
+        });
 
         let mut vols: Vec<&Volume> = volumes.iter().map(AsRef::as_ref).collect();
         vols.sort_by_key(|v| v.name_any());
@@ -369,16 +476,40 @@ impl Reconciler {
         writes
     }
 
-    async fn pool(&self, reads: &mut Reads, pool: &Pool) -> Option<StatusWrite> {
+    async fn pool(&mut self, reads: &mut Reads, pool: &Pool) -> Vec<StatusWrite> {
         let (vg, thin) = (&pool.spec.vg, &pool.spec.thin_pool);
+        let mut built = None;
         let probed = match (invalid_name(pool), &self.lvm_unsupported) {
             (Some(e), _) => Err((REASON_INVALID_NAME, e)),
             (None, Some(e)) => Err((REASON_LVM_UNSUPPORTED, e.clone())),
+            (None, None) if pool.spec.devices.is_some() => {
+                let out = self.devices_pool(reads, pool).await;
+                let gate = out.gate.clone();
+                if out.unready {
+                    let why = match &gate {
+                        Err((_, why)) => why.clone(),
+                        Ok(()) => "its thin pool is not built".into(),
+                    };
+                    self.unready_pools.insert(pool.name_any(), why);
+                }
+                built = Some(out);
+                match gate {
+                    Ok(()) => self.probe_pool(reads, vg, thin).await,
+                    Err(e) => Err(e),
+                }
+            }
             (None, None) => self.probe_pool(reads, vg, thin).await,
         };
         let generation = pool.metadata.generation;
         let (status, reason, message) = match &probed {
-            Ok(_) => (condition::TRUE, REASON_READY, String::new()),
+            Ok(_) => (
+                condition::TRUE,
+                REASON_READY,
+                built
+                    .as_ref()
+                    .and_then(|o| o.note.clone())
+                    .unwrap_or_default(),
+            ),
             Err((reason, e)) => (condition::FALSE, *reason, e.clone()),
         };
         let capacity = probed.map_err(|(_, e)| e);
@@ -386,6 +517,7 @@ impl Reconciler {
             tracing::warn!(pool = pool.name_any(), error = %e, "pool unavailable");
         }
         let current = pool.status.clone().unwrap_or_default();
+        let now = Time(k8s_openapi::jiff::Timestamp::now());
         let mut conditions = current.conditions.clone();
         condition::set(
             &mut conditions,
@@ -395,22 +527,51 @@ impl Reconciler {
                 reason,
                 message,
                 generation,
-                Time(k8s_openapi::jiff::Timestamp::now()),
+                now.clone(),
             ),
         );
-        let available = condition::get(&conditions, condition::types::AVAILABLE)?.clone();
+        let mut writes = Vec::new();
+        let (devices, released) = match built {
+            Some(out) => {
+                writes.extend(out.events);
+                if let Some((st, why, msg)) = out.released {
+                    condition::set(
+                        &mut conditions,
+                        condition::new(condition::types::RELEASED, st, why, msg, generation, now),
+                    );
+                }
+                (
+                    Some(out.rows.unwrap_or_else(|| current.devices.clone())),
+                    condition::get(&conditions, condition::types::RELEASED)
+                        .cloned()
+                        .filter(|_| pool.metadata.deletion_timestamp.is_some()),
+                )
+            }
+            None => (None, None),
+        };
+        let Some(available) = condition::get(&conditions, condition::types::AVAILABLE).cloned()
+        else {
+            return writes;
+        };
         let cap = capacity.as_ref().ok();
         let unchanged = current.total_bytes == cap.map(|c| c.total_bytes)
             && current.free_bytes == cap.map(|c| c.free_bytes)
             && current.chunk_bytes == cap.map(|c| c.chunk_bytes)
             && current.observed_generation == generation
-            && condition::get(&current.conditions, condition::types::AVAILABLE) == Some(&available);
-        (!unchanged).then(|| StatusWrite::Pool {
-            name: pool.name_any(),
-            generation,
-            capacity,
-            available,
-        })
+            && condition::get(&current.conditions, condition::types::AVAILABLE) == Some(&available)
+            && devices.as_ref().is_none_or(|d| *d == current.devices)
+            && condition::get(&current.conditions, condition::types::RELEASED) == released.as_ref();
+        if !unchanged {
+            writes.push(StatusWrite::Pool {
+                name: pool.name_any(),
+                generation,
+                capacity,
+                available,
+                devices,
+                released,
+            });
+        }
+        writes
     }
 
     /// Capacity of a usable thin pool. Pool zeroing is switched on first:
@@ -459,6 +620,9 @@ impl Reconciler {
         }
         if self.invalid_pools.contains(name) {
             return Err(format!("pool {name} has an invalid vg or thinPool name"));
+        }
+        if let Some(why) = self.unready_pools.get(name) {
+            return Err(format!("pool {name} is not ready: {why}"));
         }
         let pool = pools
             .iter()

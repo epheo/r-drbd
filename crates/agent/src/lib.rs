@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod csi;
+pub mod devices;
 pub mod drbd;
 pub mod events2;
 pub mod exec;

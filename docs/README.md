@@ -7,7 +7,7 @@ You declare thin pools as Pool objects, and claim volumes through a StorageClass
 
 - [Concepts](concepts.md): the objects, the two roles, how a volume is placed.
 - [Install](install.md): host requirements, manifests, first Pool and StorageClass.
-- [Pools](pools.md): declaring thin pools, tiers, capacity, removal.
+- [Pools](pools.md): declaring thin pools or building them from blank disks, tiers, capacity, removal.
 - [Volumes](volumes.md): StorageClass parameters, placement pins, access modes, resize.
 - [Snapshots](snapshots.md): taking snapshots and restoring them.
 - [Operations](operations.md): reading status, node loss, split brain, moving replicas.

@@ -1,5 +1,6 @@
-//! Parsers for the JSON reports of [`crate::cmd::lvs`], [`crate::cmd::lv_tags`]
-//! and [`crate::cmd::vgs`].
+//! Parsers for the JSON reports of [`crate::cmd::lvs`], [`crate::cmd::lv_tags`],
+//! [`crate::cmd::vgs`], and the devices mode reports [`crate::cmd::vgs_all`],
+//! [`crate::cmd::pvs_all`] and [`crate::cmd::thin_pools`].
 
 use std::collections::HashMap;
 
@@ -27,6 +28,36 @@ pub struct Lv {
 pub struct Vg {
     pub name: String,
     pub extent_bytes: u64,
+}
+
+/// One VG of [`crate::cmd::vgs_all`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VgFull {
+    pub name: String,
+    pub extent_bytes: u64,
+    pub size_bytes: u64,
+    pub free_bytes: u64,
+    pub tags: Vec<String>,
+    /// PVs the VG lists but LVM cannot find: the VG is partial.
+    pub missing_pvs: u64,
+}
+
+/// One PV of [`crate::cmd::pvs_all`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pv {
+    pub name: String,
+    /// `None` for an orphan PV.
+    pub vg: Option<String>,
+}
+
+/// One LV of [`crate::cmd::thin_pools`]; sizes are 0 where LVM has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolLv {
+    pub name: String,
+    pub thin_pool: bool,
+    pub size_bytes: u64,
+    pub metadata_bytes: u64,
+    pub chunk_bytes: u64,
 }
 
 /// A percentage as LVM prints it: `digits / 10^scale` percent.
@@ -120,6 +151,43 @@ struct RawLv {
 }
 
 #[derive(Deserialize)]
+struct VgAllSection {
+    vg: Vec<RawVgAll>,
+}
+
+// Field names are LVM's report keys.
+#[allow(clippy::struct_field_names)]
+#[derive(Deserialize)]
+struct RawVgAll {
+    vg_name: String,
+    vg_extent_size: String,
+    vg_size: String,
+    vg_free: String,
+    vg_tags: String,
+    vg_missing_pv_count: String,
+}
+
+#[derive(Deserialize)]
+struct PvSection {
+    pv: Vec<RawPv>,
+}
+
+#[derive(Deserialize)]
+struct RawPv {
+    pv_name: String,
+    vg_name: String,
+}
+
+#[derive(Deserialize)]
+struct RawPoolLv {
+    lv_name: String,
+    segtype: String,
+    lv_size: String,
+    lv_metadata_size: String,
+    chunk_size: String,
+}
+
+#[derive(Deserialize)]
 struct RawTags {
     lv_name: String,
     lv_tags: String,
@@ -208,21 +276,87 @@ pub fn parse_lvs(json: &str) -> Result<Vec<Lv>, ReportError> {
         .collect()
 }
 
+fn split_tags(tags: &str) -> Vec<String> {
+    tags.split(',')
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+pub fn parse_vgs_all(json: &str) -> Result<Vec<VgFull>, ReportError> {
+    const R: &str = "vgs";
+    let d: Doc<VgAllSection> = doc(R, json)?;
+    d.report
+        .into_iter()
+        .flat_map(|s| s.vg)
+        .map(|r| {
+            let c = Ctx {
+                report: R,
+                object: &r.vg_name,
+            };
+            Ok(VgFull {
+                extent_bytes: c.bytes("vg_extent_size", &r.vg_extent_size)?,
+                size_bytes: c.bytes("vg_size", &r.vg_size)?,
+                free_bytes: c.bytes("vg_free", &r.vg_free)?,
+                missing_pvs: r.vg_missing_pv_count.parse().map_err(|_| {
+                    c.err("vg_missing_pv_count", &r.vg_missing_pv_count, "not a count")
+                })?,
+                tags: split_tags(&r.vg_tags),
+                name: r.vg_name,
+            })
+        })
+        .collect()
+}
+
+pub fn parse_pvs(json: &str) -> Result<Vec<Pv>, ReportError> {
+    let d: Doc<PvSection> = doc("pvs", json)?;
+    Ok(d.report
+        .into_iter()
+        .flat_map(|s| s.pv)
+        .map(|r| Pv {
+            name: r.pv_name,
+            vg: Some(r.vg_name).filter(|v| !v.is_empty()),
+        })
+        .collect())
+}
+
+/// Empty sizes (an LV without metadata) read as 0.
+pub fn parse_thin_pools(json: &str) -> Result<Vec<PoolLv>, ReportError> {
+    const R: &str = "lvs";
+    let d: Doc<LvSection<RawPoolLv>> = doc(R, json)?;
+    d.report
+        .into_iter()
+        .flat_map(|s| s.lv)
+        .map(|r| {
+            let c = Ctx {
+                report: R,
+                object: &r.lv_name,
+            };
+            let opt = |field, v: &str| {
+                if v.is_empty() {
+                    Ok(0)
+                } else {
+                    c.bytes(field, v)
+                }
+            };
+            Ok(PoolLv {
+                thin_pool: r.segtype == "thin-pool",
+                size_bytes: c.bytes("lv_size", &r.lv_size)?,
+                metadata_bytes: opt("lv_metadata_size", &r.lv_metadata_size)?,
+                chunk_bytes: opt("chunk_size", &r.chunk_size)?,
+                name: r.lv_name,
+            })
+        })
+        .collect()
+}
+
 /// Tags per LV name; an LV without tags maps to an empty list.
 pub fn parse_tags(json: &str) -> Result<HashMap<String, Vec<String>>, ReportError> {
     let d: Doc<LvSection<RawTags>> = doc("lvs", json)?;
     Ok(d.report
         .into_iter()
         .flat_map(|s| s.lv)
-        .map(|r| {
-            let tags = r
-                .lv_tags
-                .split(',')
-                .filter(|t| !t.is_empty())
-                .map(str::to_owned)
-                .collect();
-            (r.lv_name, tags)
-        })
+        .map(|r| (r.lv_name, split_tags(&r.lv_tags)))
         .collect())
 }
 
