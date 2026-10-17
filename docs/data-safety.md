@@ -31,6 +31,17 @@ These are the guarantees.
 - Thin pool zeroing is turned on, so a new LV never exposes blocks of a deleted one.
 - Values from the API (VG and thin pool names, Volume and Snapshot names) are validated and can never reach an LVM or DRBD command as an option.
 
+## Disks
+
+- A disk is written only when a Pool lists it under `devices`, and only after the same pass found it blank: no signature, no partition, not held, not a multipath path, and an exclusive open succeeded.
+- One wrong path stops the whole Pool before anything is created.
+- LVM commands run without `--yes` or `--force`, so LVM's own refusal of a used disk stays in force.
+- A volume group without the Pool's tag is never adopted, touched or removed.
+- Nothing is ever wiped; a disk with old data stays as it is until you wipe it yourself.
+- NodeDisks only reads; a disk in use is never opened by the inventory.
+- Every read of a disk and every wait on udev has a time bound.
+- See [Disks](disks.md) for what runs and every corner case.
+
 ## Replication
 
 - Writes are synchronous (DRBD protocol C): acknowledged only once every connected replica has them.
