@@ -54,18 +54,21 @@ pub const DEMOTE_BOUND: Duration = Duration::from_secs(12);
 const SETTLE: Duration = Duration::from_secs(2);
 /// The second round, for what is Primary again after the settle.
 pub const AGAIN_MODE: ExecMode = ExecMode::Timeout {
-    wait: Duration::from_secs(2),
+    wait: Duration::from_millis(1750),
     term: Duration::from_secs(1),
     kill: Duration::from_secs(1),
 };
-pub const AGAIN_BOUND: Duration = Duration::from_secs(4);
+pub const AGAIN_BOUND: Duration = Duration::from_millis(3750);
+/// For the second round's roles to show before they are reported.
+const AGAIN_SETTLE: Duration = Duration::from_millis(200);
 /// The guard's share of the shutdown, before the drain.
 pub const GUARD_MAX: Duration = DETECT_BOUND
     .saturating_add(INFLIGHT_WAIT)
     .saturating_add(FLUSH_BOUND)
     .saturating_add(DEMOTE_BOUND)
     .saturating_add(SETTLE)
-    .saturating_add(AGAIN_BOUND);
+    .saturating_add(AGAIN_BOUND)
+    .saturating_add(AGAIN_SETTLE);
 /// drbdsetup's exit code for a resource that is not up.
 const NOT_UP: i32 = 10;
 
@@ -127,10 +130,14 @@ pub fn parse_system_state(stdout: &str) -> Option<bool> {
 /// it, the probe just spawned included, until the scope holds no new ones;
 /// a moment later a new child runs.
 const KILLED_RETRY: Duration = Duration::from_millis(300);
+/// The scope kill comes right after the SIGTERM (124 ms seen); a later kill
+/// is something else, and a retry would eat the pod probe's share.
+const KILLED_EARLY: Duration = Duration::from_millis(500);
 
 async fn local(exec: &dyn Exec, argv: &[String], parse: fn(&str) -> Option<bool>) -> Answer {
+    let t0 = tokio::time::Instant::now();
     let mut out = run_any(exec, argv, PROBE_MODE).await;
-    if matches!(&out, Ok(o) if o.exit_code.is_none()) {
+    if matches!(&out, Ok(o) if o.exit_code.is_none()) && t0.elapsed() < KILLED_EARLY {
         tracing::info!(argv = ?argv, "probe killed by a signal, trying again");
         tokio::time::sleep(KILLED_RETRY).await;
         out = run_any(exec, argv, PROBE_MODE).await;
@@ -528,7 +535,11 @@ impl Guard {
         self.force_all(force, &plan, DEMOTE_MODE, DEMOTE_BOUND)
             .await;
         if !self.tracker().is_available() {
-            tracing::warn!(resources = ?plan, "roles after the forced demote unknown: no DRBD event stream");
+            // No roles to read: an open that outlived the in-flight wait may
+            // promote after the first round, so every owned name goes again.
+            tracing::warn!(resources = ?plan, "roles after the forced demote unknown: no DRBD event stream, forcing once more");
+            tokio::time::sleep(SETTLE).await;
+            self.force_all(force, &plan, AGAIN_MODE, AGAIN_BOUND).await;
             return;
         }
         let deadline = tokio::time::Instant::now() + SETTLE;
@@ -546,7 +557,7 @@ impl Guard {
         }
         tracing::warn!(resources = ?again, "still or again Primary, forcing once more");
         self.force_all(force, &again, AGAIN_MODE, AGAIN_BOUND).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(AGAIN_SETTLE).await;
         for r in self.primaries(&again.iter().cloned().collect()) {
             tracing::warn!(resource = r, "still Primary after the forced demote");
         }

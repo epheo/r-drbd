@@ -308,6 +308,18 @@ async fn local_yes_skips_the_api() {
 }
 
 #[tokio::test]
+async fn stopping_wins_over_logind_false() {
+    // With no delay lock logind is done preparing once systemd stops units.
+    let pods = Pods::new(vec![Ok(disruption(KUBELET_SHUTDOWN_MESSAGE))]);
+    let x = local_exec(ok("b false\n"), code(1, "stopping\n", ""));
+    assert_eq!(
+        detect(x.as_ref(), &pods).await,
+        Verdict::NodeDown("systemd stopping")
+    );
+    assert_eq!(pods.calls(), 0);
+}
+
+#[tokio::test]
 async fn local_no_is_an_update_without_the_api() {
     let pods = Pods::new(vec![Ok(disruption(KUBELET_SHUTDOWN_MESSAGE))]);
     let x = local_exec(ok("b false\n"), code(0, "running\n", ""));
@@ -353,21 +365,42 @@ async fn api_only_when_both_local_probes_fail() {
     );
 }
 
+fn killed() -> crate::Output {
+    crate::Output {
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        duration: Duration::ZERO,
+    }
+}
+
 #[tokio::test(start_paused = true)]
-async fn probe_killed_by_a_signal_runs_again() {
-    let killed = || {
-        Ok(crate::Output {
-            exit_code: None,
-            stdout: String::new(),
-            stderr: String::new(),
-            duration: Duration::ZERO,
-        })
-    };
+async fn probe_killed_early_runs_again() {
     let x = ScriptedExec::new();
-    x.expect(system_state_argv(), killed())
+    x.expect(system_state_argv(), Ok(killed()))
         .expect(system_state_argv(), code(1, "stopping\n", ""));
     assert_eq!(probe_system_state(&x).await, Answer::Yes);
     x.assert_done();
+}
+
+#[tokio::test(start_paused = true)]
+async fn probe_killed_late_is_not_retried() {
+    /// Killed 600 ms into the run: not the scope kill at the SIGTERM.
+    struct LateKill(AtomicU32);
+    #[async_trait::async_trait]
+    impl Exec for LateKill {
+        async fn run(&self, _: &[String], _: ExecMode) -> Result<crate::Output, crate::ExecError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            Ok(killed())
+        }
+    }
+    let x = LateKill(AtomicU32::new(0));
+    assert!(matches!(
+        probe_system_state(&x).await,
+        Answer::Unavailable(_)
+    ));
+    assert_eq!(x.0.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -447,11 +480,12 @@ impl Exec for GuardHost {
         let first = self.sticky.lock().unwrap().remove(&res);
         if !first {
             self.barrier.wait().await;
-            self.tracker
-                .lock()
-                .unwrap()
-                .feed(&format!("change resource name:{res} role:Secondary"))
-                .unwrap();
+            let mut t = self.tracker.lock().unwrap();
+            // An untracked host has no stream to report the role on.
+            if t.is_available() {
+                t.feed(&format!("change resource name:{res} role:Secondary"))
+                    .unwrap();
+            }
         }
         out("")
     }
@@ -591,9 +625,12 @@ async fn guard_flushes_then_forces_in_parallel() {
     // All three demotes must be running at once to pass the barrier.
     let host = GuardHost::new(&t, 3);
     let g = guard(&host, &dir, dir.mounts(MOUNTS), Some("--force=yes"));
-    tokio::time::timeout(Duration::from_secs(20), g.on_signal())
+    // In a serial run the first demote waits on the barrier until its
+    // round's bound and the other two never start: the argv check below
+    // catches that, not this timeout.
+    tokio::time::timeout(Duration::from_secs(40), g.on_signal())
         .await
-        .expect("demotes ran in parallel");
+        .expect("guard ends within its bounds");
     assert!(g.gate.is_closed());
     let seen = host.seen.lock().unwrap().clone();
     let first_sync = seen.iter().position(|a| a[0] == "sync").unwrap();
@@ -686,4 +723,21 @@ async fn guard_without_force_or_shutdown_touches_nothing() {
         x.assert_done();
         assert!(g.gate.is_closed());
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn untracked_forces_every_owned_name_twice() {
+    let dir = ResDir::new("untracked", &["pvc-a.res", "pvc-b.res"]);
+    let t = Arc::new(Mutex::new(Tracker::default()));
+    let host = GuardHost::new(&t, 1);
+    host.sticky
+        .lock()
+        .unwrap()
+        .extend(["pvc-a".to_owned(), "pvc-b".to_owned()]);
+    let g = guard(&host, &dir, dir.mounts(""), Some("--force=yes"));
+    g.on_signal().await;
+    assert_eq!(
+        host.seen("drbdsetup"),
+        ["pvc-a", "pvc-b", "pvc-a", "pvc-b"].map(|r| demote_argv("--force=yes", r))
+    );
 }
