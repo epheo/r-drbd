@@ -312,6 +312,15 @@ pub fn extend_pool_data(vg: &str, thin: &str) -> Vec<String> {
     )
 }
 
+/// Data up to `bytes`, when the metadata covers no more.
+pub fn extend_pool_data_to(vg: &str, thin: &str, bytes: u64) -> Vec<String> {
+    lvm(
+        "lvextend",
+        &["--size", &size(bytes)],
+        format!("{vg}/{thin}"),
+    )
+}
+
 /// An inactive LV: lvremove asks before removing an active one.
 pub fn remove_inactive(vg: &str, lv: &str) -> Vec<String> {
     lvm::<&str>("lvremove", &[], format!("{vg}/{lv}"))

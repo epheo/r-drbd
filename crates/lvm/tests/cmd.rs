@@ -298,6 +298,17 @@ fn devices_mode_changes_never_force() {
             ]),
         ),
         (
+            cmd::extend_pool_data_to("vg1", "thin", 1 << 40),
+            v(&[
+                "lvextend",
+                "--config",
+                C,
+                "--size",
+                "1099511627776b",
+                "vg1/thin",
+            ]),
+        ),
+        (
             cmd::remove_inactive("vg1", "thin"),
             v(&["lvremove", "--config", C, "vg1/thin"]),
         ),

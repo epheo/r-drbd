@@ -156,6 +156,16 @@ impl Lvm {
         self.change(&cmd::extend_pool_data(vg, thin)).await
     }
 
+    pub async fn extend_pool_data_to(
+        &self,
+        vg: &str,
+        thin: &str,
+        bytes: u64,
+    ) -> Result<(), CmdError> {
+        self.change(&cmd::extend_pool_data_to(vg, thin, bytes))
+            .await
+    }
+
     pub async fn remove_inactive(&self, vg: &str, lv: &str) -> Result<(), CmdError> {
         self.change(&cmd::remove_inactive(vg, lv)).await
     }
@@ -329,6 +339,57 @@ pub async fn probe_host(exec: &dyn Exec) -> HostLvm {
             global_filter.as_deref(),
         ),
     }
+}
+
+/// Where LVM keeps its devices files (lvmdevices(8)).
+const DEVICES_DIR: &str = "/etc/lvm/devices";
+
+/// The devices file LVM would use but that does not exist, if so. With
+/// `use_devicesfile = 1` and no file, vgcreate and vgextend create one
+/// that lists only their new PVs, and every other VG of the host drops
+/// out of LVM's view, the root VG included.
+pub async fn devices_file_missing(exec: &dyn Exec) -> Result<Option<String>, CmdError> {
+    let setting = |key: &'static str| async move {
+        let out = run_any(exec, &cmd::host_setting(key), LVM_REPORT_TIMEOUT).await?;
+        Ok::<_, CmdError>(
+            (out.exit_code == Some(0))
+                .then(|| cmd::parse_host_setting(&out.stdout))
+                .flatten(),
+        )
+    };
+    match setting("devices/use_devicesfile").await?.as_deref() {
+        Some("1") => {}
+        Some(_) => return Ok(None),
+        None => {
+            return Err(CmdError::new(
+                "lvmconfig",
+                "devices/use_devicesfile unreadable",
+            ));
+        }
+    }
+    let name = setting("devices/devicesfile")
+        .await?
+        .map(|n| n.trim_matches('"').to_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "system.devices".to_owned());
+    if name.contains('/') {
+        return Err(CmdError::new(
+            "lvmconfig",
+            format!("devices/devicesfile {name:?} is not a file name"),
+        ));
+    }
+    let path = format!("{DEVICES_DIR}/{name}");
+    let out = run_any(exec, &devices_file_argv(&path), LVM_REPORT_TIMEOUT).await?;
+    match out.exit_code {
+        Some(0) => Ok(None),
+        Some(1) => Ok(Some(path)),
+        _ => Err(crate::exec::failure(&devices_file_argv(&path), &out)),
+    }
+}
+
+/// Runs on the host, where the devices file lives.
+pub fn devices_file_argv(path: &str) -> Vec<String> {
+    vec!["test".to_owned(), "-f".to_owned(), path.to_owned()]
 }
 
 /// With a devices file the host scans only listed devices. Without one it
@@ -761,6 +822,39 @@ mod tests {
             (h.version, h.unsupported, h.warning),
             (Some((2, 3, 41)), None, None)
         );
+    }
+
+    #[tokio::test]
+    async fn devices_file_must_exist_when_used() {
+        let expect = |x: &ScriptedExec, use_df: &str, exists: Option<i32>| {
+            x.expect(
+                lvm::cmd::host_setting("devices/use_devicesfile"),
+                ok(&format!("use_devicesfile={use_df}\n")),
+            );
+            if let Some(code) = exists {
+                x.expect(
+                    lvm::cmd::host_setting("devices/devicesfile"),
+                    ok("devicesfile=\"system.devices\"\n"),
+                )
+                .expect(
+                    devices_file_argv("/etc/lvm/devices/system.devices"),
+                    crate::exec::scripted::code(code, "", ""),
+                );
+            }
+        };
+        let x = ScriptedExec::new();
+        expect(&x, "1", Some(1));
+        assert_eq!(
+            devices_file_missing(&x).await.unwrap().as_deref(),
+            Some("/etc/lvm/devices/system.devices")
+        );
+        let x = ScriptedExec::new();
+        expect(&x, "1", Some(0));
+        assert_eq!(devices_file_missing(&x).await.unwrap(), None);
+        let x = ScriptedExec::new();
+        expect(&x, "0", None);
+        assert_eq!(devices_file_missing(&x).await.unwrap(), None);
+        x.assert_done();
     }
 
     #[tokio::test]
