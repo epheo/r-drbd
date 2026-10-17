@@ -12,7 +12,7 @@ use model::{DeviceState, DeviceStatus, Pool, ReclaimPolicy};
 
 use super::{
     REASON_BUILDING, REASON_REMOVE_BLOCKED, REASON_REMOVE_FAILED, REASON_REMOVED,
-    REASON_UNAVAILABLE, Reads, Reconciler, StatusWrite,
+    REASON_UNAVAILABLE, REASON_VG_NOT_OWNED, Reads, Reconciler, StatusWrite,
 };
 use crate::devices::{self, Checked};
 use crate::exec::CmdError;
@@ -56,6 +56,36 @@ struct Look {
 impl Look {
     fn rows(&self) -> Vec<DeviceStatus> {
         self.checked.iter().map(|c| c.row.clone()).collect()
+    }
+
+    /// Listed paths that are PVs without a VG and were `members`.
+    fn orphans(&self, members: &HashSet<&str>) -> Vec<String> {
+        self.checked
+            .iter()
+            .filter(|c| members.contains(c.row.path.as_str()))
+            .filter(|c| {
+                c.node
+                    .as_ref()
+                    .and_then(|n| self.pvs.get(n))
+                    .is_some_and(String::is_empty)
+            })
+            .map(|c| c.row.path.clone())
+            .collect()
+    }
+
+    /// A VG of that name exists without the Pool's tag: not even the
+    /// usual probe may run, it can switch on zeroing.
+    fn foreign(&self, t: &Target<'_>) -> Option<(&'static str, String)> {
+        let vg = self.vg.as_ref()?;
+        (!vg.tags.iter().any(|g| g == t.tag)).then(|| {
+            (
+                REASON_VG_NOT_OWNED,
+                format!(
+                    "volume group {} exists without tag {}: never touched",
+                    t.vg, t.tag
+                ),
+            )
+        })
     }
 }
 
@@ -130,6 +160,7 @@ impl Reconciler {
             match self.look(pool, &paths).await {
                 Ok(l) => Outcome {
                     rows: Some(l.rows()),
+                    gate: l.foreign(&t).map_or(Ok(()), Err),
                     ..Outcome::default()
                 },
                 Err(e) => Outcome {
@@ -208,6 +239,16 @@ impl Reconciler {
         }
     }
 
+    async fn run_release(&self, t: &Target<'_>, step: &Release) -> Result<(), CmdError> {
+        match step {
+            Release::Deactivate => self.lvm.deactivate(t.vg, t.thin).await,
+            Release::RemovePool => self.lvm.remove_inactive(t.vg, t.thin).await,
+            Release::RemoveVg => self.lvm.vgremove(t.vg).await,
+            Release::RemovePvs(d) => self.lvm.pvremove(d).await,
+            Release::Done => Ok(()),
+        }
+    }
+
     /// reclaimPolicy Delete on a deleted Pool. The controller waits on
     /// Released only once no Volume is left; status.volumes is checked
     /// again here so nothing is removed under a late one.
@@ -237,6 +278,9 @@ impl Reconciler {
                 }
             };
             out.rows = Some(look.rows());
+            if let Some(e) = look.foreign(t) {
+                out.gate = Err(e);
+            }
             if !status.volumes.is_empty() {
                 out.released = Some((
                     condition::FALSE,
@@ -263,18 +307,7 @@ impl Reconciler {
             } else {
                 Vec::new()
             };
-            let orphans: Vec<String> = look
-                .checked
-                .iter()
-                .filter(|c| members.contains(c.row.path.as_str()))
-                .filter(|c| {
-                    c.node
-                        .as_ref()
-                        .and_then(|n| look.pvs.get(n))
-                        .is_some_and(String::is_empty)
-                })
-                .map(|c| c.row.path.clone())
-                .collect();
+            let orphans = look.orphans(&members);
             let step = match plan::release(t, look.vg.as_ref(), &lvs, &orphans) {
                 Ok(Release::Done) => {
                     out.released = Some((
@@ -295,13 +328,7 @@ impl Reconciler {
                 }
             };
             tracing::info!(pool = pool.name_any(), step = ?step, "releasing pool");
-            let res = match &step {
-                Release::Deactivate => self.lvm.deactivate(t.vg, t.thin).await,
-                Release::RemovePool => self.lvm.remove_inactive(t.vg, t.thin).await,
-                Release::RemoveVg => self.lvm.vgremove(t.vg).await,
-                Release::RemovePvs(d) => self.lvm.pvremove(d).await,
-                Release::Done => Ok(()),
-            };
+            let res = self.run_release(t, &step).await;
             reads.invalidate(t.vg);
             if let Err(e) = res {
                 out.released = Some((

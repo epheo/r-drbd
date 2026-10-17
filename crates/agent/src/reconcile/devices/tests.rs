@@ -553,3 +553,30 @@ async fn no_lv_in_a_vg_that_is_not_ours() {
         "{err}"
     );
 }
+
+#[tokio::test]
+async fn deleting_a_pool_on_a_foreign_vg_runs_reports_only() {
+    for policy in [ReclaimPolicy::Delete, ReclaimPolicy::Retain] {
+        let x = Arc::new(ScriptedExec::new());
+        x.expect(lvm::cmd::vgs_all(), vgs(&[(4 * GIB, 4 * GIB, "")]))
+            .expect(lvm::cmd::thin_pools(VG), thin_pools(Some((GIB, 68 * MIB))))
+            .expect(lvm::cmd::pvs_all(), pvs(&[("/dev/vdd", VG)]));
+        let p = deleting(pool(&[A]), policy, &[A]);
+        let (w, _) = run(&x, disks(), p).await;
+        let s = status(&w);
+        let (st, reason, _) = available(&s);
+        assert_eq!(
+            (st.as_str(), reason.as_str()),
+            ("False", "VolumeGroupNotOwned")
+        );
+        if policy == ReclaimPolicy::Delete {
+            assert_eq!(released(&s).unwrap().1, "Blocked");
+        }
+        for argv in x.seen.lock().unwrap().iter() {
+            assert!(
+                ["vgs", "lvs", "pvs"].contains(&argv[0].as_str()),
+                "{argv:?}"
+            );
+        }
+    }
+}
