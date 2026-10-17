@@ -1,0 +1,30 @@
+# The DRBD 9 kernel module on every node: built in the cluster for each
+# kernel the nodes run, OpenShift upgrades included, and loaded by KMM.
+apiVersion: kmm.sigs.x-k8s.io/v1beta1
+kind: Module
+metadata:
+  name: drbd
+  namespace: openshift-kmm
+spec:
+  moduleLoader:
+    container:
+      modprobe:
+        # The transport is named so that both modules load: drbd comes in
+        # as its dependency, and the kernel cannot autoload the transport
+        # from an image the host's own modprobe never sees.
+        moduleName: drbd_transport_tcp
+        modulesLoadingOrder:
+          - drbd_transport_tcp
+          - drbd
+      kernelMappings:
+        - regexp: '^.+$'
+          # KMM builds only when the tag is absent, so the DRBD version is
+          # part of it: a new version in the Dockerfile needs a new tag.
+          containerImage: image-registry.openshift-image-registry.svc:5000/openshift-kmm/drbd-kmod:9.3.4-${KERNEL_FULL_VERSION}
+          build:
+            dockerfileConfigMap:
+              name: drbd-kmod-dockerfile
+  # Every node: a diskless tiebreaker and a node that only mounts volumes
+  # need DRBD too.
+  selector:
+    kubernetes.io/os: linux

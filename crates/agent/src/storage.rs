@@ -328,6 +328,13 @@ pub async fn probe_host(exec: &dyn Exec) -> HostLvm {
         _ => None,
     };
     let devices_file = host_setting(exec, "devices/use_devicesfile").await;
+    // Missing, LVM scans as if the setting were off.
+    let file_present = match devices_file.as_deref() {
+        Some("1") => devices_file_absent(exec)
+            .await
+            .is_ok_and(|missing| missing.is_none()),
+        _ => false,
+    };
     let scan_lvs = host_setting(exec, "devices/scan_lvs").await;
     let global_filter = host_setting(exec, "devices/global_filter").await;
     HostLvm {
@@ -335,6 +342,7 @@ pub async fn probe_host(exec: &dyn Exec) -> HostLvm {
         unsupported,
         warning: host_scan_warning(
             devices_file.as_deref(),
+            file_present,
             scan_lvs.as_deref(),
             global_filter.as_deref(),
         ),
@@ -367,6 +375,20 @@ pub async fn devices_file_missing(exec: &dyn Exec) -> Result<Option<String>, Cmd
             ));
         }
     }
+    devices_file_absent(exec).await
+}
+
+/// With `use_devicesfile = 1` known: the devices file's path when it does
+/// not exist.
+pub async fn devices_file_absent(exec: &dyn Exec) -> Result<Option<String>, CmdError> {
+    let setting = |key: &'static str| async move {
+        let out = run_any(exec, &cmd::host_setting(key), LVM_REPORT_TIMEOUT).await?;
+        Ok::<_, CmdError>(
+            (out.exit_code == Some(0))
+                .then(|| cmd::parse_host_setting(&out.stdout))
+                .flatten(),
+        )
+    };
     let name = setting("devices/devicesfile")
         .await?
         .map(|n| n.trim_matches('"').to_owned())
@@ -392,29 +414,36 @@ pub fn devices_file_argv(path: &str) -> Vec<String> {
     vec!["test".to_owned(), "-f".to_owned(), path.to_owned()]
 }
 
-/// With a devices file the host scans only listed devices. Without one it
-/// needs scan_lvs = 0 and a global_filter that rejects DRBD devices.
+/// With a devices file the host scans only listed devices. Without one,
+/// the setting on but the file absent included, it needs scan_lvs = 0 and
+/// a global_filter that rejects DRBD devices.
 pub fn host_scan_warning(
     devices_file: Option<&str>,
+    file_present: bool,
     scan_lvs: Option<&str>,
     global_filter: Option<&str>,
 ) -> Option<String> {
-    const FIX: &str = "use a devices file, or global_filter rejecting /dev/drbd with scan_lvs = 0";
-    if devices_file == Some("1") {
+    const FIX: &str = "use a devices file (an empty one does), or global_filter rejecting /dev/drbd with scan_lvs = 0";
+    if devices_file == Some("1") && file_present {
         return None;
     }
+    let no_file = if devices_file == Some("1") {
+        "use_devicesfile is 1 but the devices file does not exist, so "
+    } else {
+        ""
+    };
     if scan_lvs != Some("0") {
         return Some(format!(
-            "host LVM scans LVs: udev autoactivation could activate a guest VG inside a volume; {FIX}"
+            "{no_file}host LVM scans LVs: udev autoactivation could activate a guest VG inside a volume; {FIX}"
         ));
     }
     match global_filter.and_then(lvm::filter::rejects_drbd) {
         Some(true) => None,
         Some(false) => Some(format!(
-            "host LVM accepts DRBD devices: udev autoactivation could activate a guest VG through /dev/drbdN; {FIX}"
+            "{no_file}host LVM accepts DRBD devices: udev autoactivation could activate a guest VG through /dev/drbdN; {FIX}"
         )),
         None => Some(format!(
-            "host global_filter not verified (pattern syntax beyond this check): make sure it rejects /dev/drbd, or {FIX}"
+            "{no_file}host global_filter not verified (pattern syntax beyond this check): make sure it rejects /dev/drbd, or {FIX}"
         )),
     }
 }
@@ -741,18 +770,37 @@ mod tests {
 
     #[test]
     fn host_scan_rules() {
-        assert_eq!(host_scan_warning(Some("1"), Some("1"), None), None);
+        assert_eq!(host_scan_warning(Some("1"), true, Some("1"), None), None);
+        // The setting on but no file: LVM scans as without it.
+        let w = host_scan_warning(Some("1"), false, Some("0"), None).unwrap();
+        assert!(w.starts_with("use_devicesfile is 1 but the devices file does not exist, so host global_filter not verified"), "{w}");
         assert_eq!(
-            host_scan_warning(Some("0"), Some("0"), Some(r#"["r|^/dev/drbd|", "a|.*|"]"#)),
+            host_scan_warning(Some("1"), false, Some("0"), Some(r#"["r|^/dev/drbd|"]"#)),
             None
         );
-        assert!(host_scan_warning(Some("0"), Some("0"), Some(r#"["a|.*|"]"#)).is_some());
-        assert!(host_scan_warning(None, Some("1"), Some(r#"["r|/dev/drbd|"]"#)).is_some());
-        assert!(host_scan_warning(None, None, None).is_some());
-        let w = host_scan_warning(None, Some("0"), Some(r#"["r|/dev/drbd[0-9]+|"]"#)).unwrap();
+        assert_eq!(
+            host_scan_warning(
+                Some("0"),
+                false,
+                Some("0"),
+                Some(r#"["r|^/dev/drbd|", "a|.*|"]"#)
+            ),
+            None
+        );
+        assert!(host_scan_warning(Some("0"), false, Some("0"), Some(r#"["a|.*|"]"#)).is_some());
+        assert!(host_scan_warning(None, false, Some("1"), Some(r#"["r|/dev/drbd|"]"#)).is_some());
+        assert!(host_scan_warning(None, false, None, None).is_some());
+        let w =
+            host_scan_warning(None, false, Some("0"), Some(r#"["r|/dev/drbd[0-9]+|"]"#)).unwrap();
         assert!(w.starts_with("host global_filter not verified"), "{w}");
         assert!(
-            host_scan_warning(None, Some("0"), Some(r#"["a|.*|", "r|^/dev/drbd|"]"#)).is_some()
+            host_scan_warning(
+                None,
+                false,
+                Some("0"),
+                Some(r#"["a|.*|", "r|^/dev/drbd|"]"#)
+            )
+            .is_some()
         );
     }
 
@@ -793,6 +841,11 @@ mod tests {
                 ok("use_devicesfile=1\n"),
             )
             .expect(
+                lvm::cmd::host_setting("devices/devicesfile"),
+                ok("devicesfile=\"system.devices\"\n"),
+            )
+            .expect(devices_file_argv("/etc/lvm/devices/system.devices"), ok(""))
+            .expect(
                 lvm::cmd::host_setting("devices/scan_lvs"),
                 ok("scan_lvs=0\n"),
             )
@@ -810,6 +863,11 @@ mod tests {
                 ok("use_devicesfile=1\n"),
             )
             .expect(
+                lvm::cmd::host_setting("devices/devicesfile"),
+                ok("devicesfile=\"system.devices\"\n"),
+            )
+            .expect(devices_file_argv("/etc/lvm/devices/system.devices"), ok(""))
+            .expect(
                 lvm::cmd::host_setting("devices/scan_lvs"),
                 ok("scan_lvs=0\n"),
             )
@@ -822,6 +880,38 @@ mod tests {
             (h.version, h.unsupported, h.warning),
             (Some((2, 3, 41)), None, None)
         );
+
+        // The setting on but no file (a stock RHCOS node): LVM scans
+        // everything, and the host accepts DRBD devices.
+        let x = Arc::new(ScriptedExec::new());
+        x.expect(lvm::cmd::version(), ok("  LVM version:     2.03.41(2)\n"))
+            .expect(
+                lvm::cmd::host_setting("devices/use_devicesfile"),
+                ok("use_devicesfile=1\n"),
+            )
+            .expect(
+                lvm::cmd::host_setting("devices/devicesfile"),
+                ok("devicesfile=\"system.devices\"\n"),
+            )
+            .expect(
+                devices_file_argv("/etc/lvm/devices/system.devices"),
+                crate::exec::scripted::code(1, "", ""),
+            )
+            .expect(
+                lvm::cmd::host_setting("devices/scan_lvs"),
+                ok("scan_lvs=0\n"),
+            )
+            .expect(
+                lvm::cmd::host_setting("devices/global_filter"),
+                ok("global_filter=[\"a|.*|\"]\n"),
+            );
+        let h = probe_host(x.as_ref()).await;
+        let w = h.warning.unwrap();
+        assert!(
+            w.starts_with("use_devicesfile is 1 but the devices file does not exist, so host LVM accepts DRBD devices"),
+            "{w}"
+        );
+        x.assert_done();
     }
 
     #[tokio::test]

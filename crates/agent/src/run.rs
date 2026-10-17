@@ -103,7 +103,7 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
     let (client, watch_client) = clients().await?;
     let runner = Arc::new(TokioExec::new(cfg.host_exec_prefix.clone()));
     let exec: Arc<dyn Exec> = runner.clone();
-    let tools = node::probe(exec.as_ref()).await;
+    let (tools, restart) = probe_tools(&exec, &client, &cfg.node).await;
     // Spawned: the first heartbeat never waits on systemctl.
     tokio::spawn(node::startup_checks(exec.clone(), &client, &cfg.node));
 
@@ -112,17 +112,7 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
     let (stores, _watches) = watch::start(&watch_client, &cfg.namespace, &trigger);
     let tracker = Arc::new(Mutex::new(Tracker::default()));
     let features = tools.drbd();
-    let events = features.is_some().then(|| {
-        // No prefix: drbdsetup runs from the image.
-        tokio::spawn(drbd::events2(
-            None,
-            tracker.clone(),
-            drbd::Notify {
-                changes: changes.clone(),
-                pass: trigger.clone(),
-            },
-        ))
-    });
+    let events = features.map(|_| spawn_events2(&tracker, &changes, &trigger));
     if events.is_none() {
         tracing::warn!("DRBD not found: replicated volumes cannot be served on this node");
     }
@@ -177,6 +167,7 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
         // The other arms are only borrowed: while the guard runs, the
         // reconcile and CSI tasks keep running and the drain below waits for them.
         r = signalled(&guard) => r,
+        () = restart.notified() => Ok(()),
     };
     let _ = stop_tx.send(true);
     let pass = async {
@@ -204,6 +195,49 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
         e.abort();
     }
     result
+}
+
+/// `drbdsetup events2` from the image (no host prefix) feeding the tracker.
+fn spawn_events2(
+    tracker: &Arc<Mutex<Tracker>>,
+    changes: &Arc<Trigger>,
+    pass: &Arc<Trigger>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(drbd::events2(
+        None,
+        tracker.clone(),
+        drbd::Notify {
+            changes: changes.clone(),
+            pass: pass.clone(),
+        },
+    ))
+}
+
+/// The tool probe. The DRBD side of the agent is fixed at start, so a
+/// module an operator loads later fires the returned restart; nothing
+/// waits for it, the heartbeat and the CSI socket come up at once.
+async fn probe_tools(
+    exec: &Arc<dyn Exec>,
+    client: &Client,
+    node: &str,
+) -> (node::Tools, Arc<tokio::sync::Notify>) {
+    let tools = node::probe(exec.as_ref()).await;
+    if tools.drbd_kernel.is_some() {
+        node::disable_dead_helper(exec.as_ref(), Path::new(node::HOST_ROOT)).await;
+    }
+    let restart = Arc::new(tokio::sync::Notify::new());
+    if tools.drbd_utils.is_some() && tools.drbd_kernel.is_none() {
+        let (exec, restart) = (exec.clone(), restart.clone());
+        let events = node::KubeNodeEvents {
+            client: client.clone(),
+            node: node.to_owned(),
+        };
+        tokio::spawn(async move {
+            node::watch_for_module(exec.as_ref(), &events, node::MODULE_RECHECK).await;
+            restart.notify_one();
+        });
+    }
+    (tools, restart)
 }
 
 /// The NodeDisks task and what the reconciler shares with it.
@@ -258,16 +292,25 @@ fn spawn_inventory(
     }
 }
 
-/// The host LVM check, logged. Runs once this node has a Pool, until a
-/// version is read: a failed probe blocks nothing and is tried next pass.
-async fn check_lvm(exec: &dyn Exec, rec: &mut Reconciler) -> bool {
+/// The host LVM check, logged. Runs once on every node, a node without a
+/// Pool still attaches volumes its host must not scan, and again every
+/// pass while a node with a Pool gives no version: a failed probe blocks
+/// nothing. A node without lvm2 and without a Pool is left alone until a
+/// Pool appears; without lvm2 there is no udev scan to warn about either.
+async fn check_lvm(exec: &dyn Exec, rec: &mut Reconciler, has_pool: bool) -> bool {
     let host = crate::storage::probe_host(exec).await;
+    if host.version.is_none() {
+        if has_pool {
+            tracing::warn!("LVM version unreadable; checking again next pass");
+        } else {
+            tracing::info!(
+                "LVM version unreadable on a node without a Pool; checked again when one appears"
+            );
+        }
+        return false;
+    }
     if let Some(w) = &host.warning {
         tracing::warn!("{w}");
-    }
-    if host.version.is_none() {
-        tracing::warn!("LVM version unreadable; checking again next pass");
-        return false;
     }
     if let Some(e) = &host.unsupported {
         tracing::error!("{e}; every Pool on this node reports Available False");
@@ -308,13 +351,15 @@ async fn reconcile_loop(
     triggers.ready.send_replace(true);
     let node = rec.node().to_owned();
     tracing::info!(node, "caches ready, reconciling");
-    let mut lvm_checked = false;
+    let (mut lvm_checked, mut lvm_probed) = (false, false);
     loop {
         rec.set_addresses(addresses(&stores));
         rec.set_peer_leases(peer_leases(&stores));
         let pools = stores.pools.state();
-        if !lvm_checked && pools.iter().any(|p| p.spec.node == node) {
-            lvm_checked = check_lvm(exec.as_ref(), &mut rec).await;
+        let has_pool = pools.iter().any(|p| p.spec.node == node);
+        if !lvm_checked && (has_pool || !lvm_probed) {
+            lvm_probed = true;
+            lvm_checked = check_lvm(exec.as_ref(), &mut rec, has_pool).await;
         }
         let volumes = stores.volumes.state();
         let snapshots = stores.snapshots.state();

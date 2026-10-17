@@ -21,9 +21,11 @@ const C: &str = "/dev/disk/by-id/virtio-c";
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
 
-/// The devices file check before vgcreate and vgextend: in use, present.
+/// The devices file check before vgcreate and vgextend: in use, present
+/// or missing.
 trait DevicesFile {
     fn expect_devices_file(&self) -> &Self;
+    fn expect_devices_file_missing(&self) -> &Self;
 }
 
 impl DevicesFile for ScriptedExec {
@@ -39,6 +41,21 @@ impl DevicesFile for ScriptedExec {
         .expect(
             crate::storage::devices_file_argv("/etc/lvm/devices/system.devices"),
             ok(""),
+        )
+    }
+
+    fn expect_devices_file_missing(&self) -> &Self {
+        self.expect(
+            lvm::cmd::host_setting("devices/use_devicesfile"),
+            ok("use_devicesfile=1\n"),
+        )
+        .expect(
+            lvm::cmd::host_setting("devices/devicesfile"),
+            ok("devicesfile=\"system.devices\"\n"),
+        )
+        .expect(
+            crate::storage::devices_file_argv("/etc/lvm/devices/system.devices"),
+            crate::exec::scripted::code(1, "", ""),
         )
     }
 }
@@ -611,23 +628,12 @@ async fn deleting_a_pool_on_a_foreign_vg_runs_reports_only() {
 }
 
 #[tokio::test]
-async fn no_vgcreate_without_the_devices_file_in_use() {
+async fn no_vgcreate_without_the_devices_file_while_the_host_has_pvs() {
     let x = Arc::new(ScriptedExec::new());
     x.expect(lvm::cmd::vgs_all(), vgs(&[]))
-        .expect(lvm::cmd::pvs_all(), pvs(&[]))
+        .expect(lvm::cmd::pvs_all(), pvs(&[("/dev/nvme0n1p3", "rootvg")]))
         .expect(wipefs_argv("/dev/vdd"), ok(WIPEFS_BLANK))
-        .expect(
-            lvm::cmd::host_setting("devices/use_devicesfile"),
-            ok("use_devicesfile=1\n"),
-        )
-        .expect(
-            lvm::cmd::host_setting("devices/devicesfile"),
-            ok("devicesfile=\"system.devices\"\n"),
-        )
-        .expect(
-            crate::storage::devices_file_argv("/etc/lvm/devices/system.devices"),
-            crate::exec::scripted::code(1, "", ""),
-        );
+        .expect_devices_file_missing();
     let (w, _) = run(&x, disks(), pool(&[A])).await;
     let (st, reason, msg) = available(&status(&w));
     assert_eq!((st.as_str(), reason.as_str()), ("False", "Building"));
@@ -635,7 +641,41 @@ async fn no_vgcreate_without_the_devices_file_in_use() {
         msg.contains("/etc/lvm/devices/system.devices does not exist"),
         "{msg}"
     );
-    assert!(msg.contains("vgimportdevices --all"), "{msg}");
+    assert!(msg.contains("1 PV(s) (/dev/nvme0n1p3 of rootvg)"), "{msg}");
+    assert!(msg.contains("vgimportdevices <vg>"), "{msg}");
+    assert!(!msg.contains("--all on"), "{msg}");
+    assert!(!x.seen.lock().unwrap().iter().any(|a| a[0] == "vgcreate"));
+}
+
+/// A host with no PV at all (RHCOS, an image-based OS): the file vgcreate
+/// makes then lists exactly the host's PVs, so nothing is hidden.
+#[tokio::test]
+async fn no_pv_on_the_host_builds_without_the_devices_file() {
+    let x = Arc::new(ScriptedExec::new());
+    let free = 4 * GIB - EXTENT;
+    x.expect(lvm::cmd::vgs_all(), vgs(&[]))
+        .expect(lvm::cmd::pvs_all(), pvs(&[]))
+        .expect(wipefs_argv("/dev/vdd"), ok(WIPEFS_BLANK))
+        .expect_devices_file_missing()
+        .expect(lvm::cmd::vgcreate(VG, TAG, &[A.into()]), ok(""));
+    x.expect(lvm::cmd::vgs_all(), vgs(&[(free, free, TAG)]))
+        .expect(lvm::cmd::thin_pools(VG), thin_pools(None))
+        .expect(lvm::cmd::pvs_all(), pvs(&[("/dev/vdd", VG)]))
+        .expect(
+            lvm::cmd::create_thin_pool(VG, THIN, 64 << 10, 68 * MIB),
+            ok(""),
+        );
+    x.expect(lvm::cmd::vgs_all(), vgs(&[(free, 0, TAG)]))
+        .expect(
+            lvm::cmd::thin_pools(VG),
+            thin_pools(Some((free - 136 * MIB, 68 * MIB))),
+        )
+        .expect(lvm::cmd::pvs_all(), pvs(&[("/dev/vdd", VG)]));
+    probe(&x);
+    let (w, _) = run(&x, disks(), pool(&[A])).await;
+    let s = status(&w);
+    assert_eq!(available(&s).0, "True", "{s}");
+    assert_eq!(s["devices"][0]["state"], "Member");
 }
 
 /// A Pool deleted under Delete whose VG is gone and whose disk A still

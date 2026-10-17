@@ -1,0 +1,62 @@
+# RHCOS runs LVM with use_devicesfile = 1 and no devices file, so its LVM
+# scans every block device, DRBD devices included: a guest's LVM inside a
+# volume would be activated on the host. On its first boot this unit
+# imports the node's own PVs into a devices file, or creates an empty one,
+# before the container runtime can bring any DRBD device up. LVM maintains
+# the file from then on (a Pool's build adds its disks), so it is a unit,
+# not a managed file: a managed file edited by LVM would read as drift.
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 99-worker-r-drbd-lvm-devices-file
+  labels:
+    machineconfiguration.openshift.io/role: worker
+spec:
+  config:
+    ignition:
+      version: 3.2.0
+    systemd:
+      units:
+        - name: r-drbd-lvm-devices-file.service
+          enabled: true
+          contents: |
+            [Unit]
+            Description=LVM devices file, so the host never scans DRBD devices
+            ConditionPathExists=!/etc/lvm/devices/system.devices
+            After=local-fs.target
+            Before=crio.service kubelet.service
+
+            [Service]
+            Type=oneshot
+            ExecStart=/bin/sh -c 'vgimportdevices --all; [ -e /etc/lvm/devices/system.devices ] || install -D -m 600 /dev/null /etc/lvm/devices/system.devices'
+
+            [Install]
+            WantedBy=multi-user.target
+---
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 99-master-r-drbd-lvm-devices-file
+  labels:
+    machineconfiguration.openshift.io/role: master
+spec:
+  config:
+    ignition:
+      version: 3.2.0
+    systemd:
+      units:
+        - name: r-drbd-lvm-devices-file.service
+          enabled: true
+          contents: |
+            [Unit]
+            Description=LVM devices file, so the host never scans DRBD devices
+            ConditionPathExists=!/etc/lvm/devices/system.devices
+            After=local-fs.target
+            Before=crio.service kubelet.service
+
+            [Service]
+            Type=oneshot
+            ExecStart=/bin/sh -c 'vgimportdevices --all; [ -e /etc/lvm/devices/system.devices ] || install -D -m 600 /dev/null /etc/lvm/devices/system.devices'
+
+            [Install]
+            WantedBy=multi-user.target

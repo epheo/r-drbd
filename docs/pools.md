@@ -107,8 +107,10 @@ To reuse a disk with old data, wipe it yourself first (`wipefs -a`), deliberatel
    One bad path stops the whole Pool, Available False with the reason of the worst row; nothing is created.
 2. `vgcreate` with the tag `r-drbd.pool.<pool name>`.
    It runs without `--yes` or `--force`, so LVM's own refusal of a disk with a signature is a second guard.
-   With `use_devicesfile = 1` the devices file must already exist: otherwise vgcreate would create it with only the new disks, and every other VG of the host, the root VG included, would drop out of LVM's view.
-   The agent then refuses (reason `Building`); run `vgimportdevices --all` on the node first.
+   With `use_devicesfile = 1` and no devices file, vgcreate would create one with only the new disks, and every other PV of the host, the root VG included, would drop out of LVM's view.
+   So on a host that has PVs the agent refuses (reason `Building`, naming them); add them to a devices file first, `vgimportdevices <vg>` per VG or `lvmdevices --adddev` for a PV without one.
+   Not `--all`: without the file, LVM also sees PVs inside volumes attached through DRBD, and the import would hand them to the host.
+   A host without any PV needs nothing: the file vgcreate makes then lists exactly the host's PVs.
 3. The thin pool takes all the space, with metadata sized as below and zeroing on.
 4. From there the Pool works like any other.
 

@@ -1,0 +1,26 @@
+# Graceful node shutdown is off on OpenShift until a KubeletConfig turns it
+# on. One object per pool; each node of the pool drains and reboots once.
+apiVersion: machineconfiguration.openshift.io/v1
+kind: KubeletConfig
+metadata:
+  name: r-drbd-graceful-shutdown-worker
+spec:
+  machineConfigPoolSelector:
+    matchLabels:
+      pools.operator.machineconfiguration.openshift.io/worker: ""
+  kubeletConfig:
+    shutdownGracePeriod: 90s
+    shutdownGracePeriodCriticalPods: 30s
+---
+# Control plane nodes store data too on compact and single node clusters.
+apiVersion: machineconfiguration.openshift.io/v1
+kind: KubeletConfig
+metadata:
+  name: r-drbd-graceful-shutdown-master
+spec:
+  machineConfigPoolSelector:
+    matchLabels:
+      pools.operator.machineconfiguration.openshift.io/master: ""
+  kubeletConfig:
+    shutdownGracePeriod: 90s
+    shutdownGracePeriodCriticalPods: 30s

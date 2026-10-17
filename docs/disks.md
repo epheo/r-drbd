@@ -90,7 +90,8 @@ Each row says what the agent does and what you see.
 | A Pool recreated under a new name over a retained VG | The tag names the old Pool: `VolumeGroupNotOwned` | r-drbd adopts the VG once its tag names the new Pool (`vgchange --deltag`, `--addtag`); that is your call |
 | The agent restarts between two steps | The next pass resumes from what is on the disks | |
 | A crash inside `vgcreate` itself | LVM labels without a VG; the disks read `NotEmpty` (`LVM2_member`) | `pvremove` them; the build goes on |
-| `use_devicesfile = 1` and the devices file does not exist | Refused before `vgcreate` or `vgextend`, reason `Building`: that command would create the file with only the new disks and hide every other VG of the host | `vgimportdevices --all` on the node |
+| `use_devicesfile = 1`, no devices file, and the host has PVs | Refused before `vgcreate` or `vgextend`, reason `Building`, naming the PVs: that command would create the file with only the new disks and hide them | `vgimportdevices <vg>` per VG on the node, never `--all` (it would also import PVs found on DRBD devices) |
+| `use_devicesfile = 1`, no devices file, and the host has no PV | Built: the file `vgcreate` makes lists the new disks, which are then the host's only PVs | Nothing |
 | The host's LVM filter excludes the listed disks | `vgcreate` fails; reason `Building` with the LVM error | Fix the filter or the devices file |
 | An LVM command fails before the thin pool exists | Reason `Building`, with the step and the error; retried every pass | Read the message |
 | A build takes more than 8 steps in one pass | "still building after 8 steps"; the next pass continues | |
