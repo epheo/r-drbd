@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lvm::cmd;
-use lvm::report::{self, Lv, Vg};
+use lvm::report::{self, Lv, PoolLv, Pv, Vg, VgFull};
+
+pub mod plan;
 
 use crate::exec::{CmdError, LVM_CHANGE_TIMEOUT, LVM_REPORT_TIMEOUT, run_any};
 use crate::{Exec, Output};
@@ -101,6 +103,69 @@ impl Lvm {
             .into_iter()
             .find(|r| r.name == vg)
             .ok_or_else(|| CmdError::new("vgs", format!("volume group {vg} not in the report")))
+    }
+
+    /// Every VG of the host.
+    pub async fn vgs_all(&self) -> Result<Vec<VgFull>, CmdError> {
+        let out = self.report(&cmd::vgs_all()).await?;
+        report::parse_vgs_all(&out).map_err(|e| CmdError::new("vgs", e.to_string()))
+    }
+
+    /// Every PV the host's LVM sees.
+    pub async fn pvs_all(&self) -> Result<Vec<Pv>, CmdError> {
+        let out = self.report(&cmd::pvs_all()).await?;
+        report::parse_pvs(&out).map_err(|e| CmdError::new("pvs", e.to_string()))
+    }
+
+    /// LVs of `vg` with thin pool sizes.
+    pub async fn thin_pools(&self, vg: &str) -> Result<Vec<PoolLv>, CmdError> {
+        let out = self.report(&cmd::thin_pools(vg)).await?;
+        report::parse_thin_pools(&out).map_err(|e| CmdError::new("lvs", e.to_string()))
+    }
+
+    pub async fn vgcreate(&self, vg: &str, tag: &str, devices: &[String]) -> Result<(), CmdError> {
+        self.change(&cmd::vgcreate(vg, tag, devices)).await
+    }
+
+    pub async fn vgextend(&self, vg: &str, devices: &[String]) -> Result<(), CmdError> {
+        self.change(&cmd::vgextend(vg, devices)).await
+    }
+
+    pub async fn create_thin_pool(
+        &self,
+        vg: &str,
+        thin: &str,
+        chunk_bytes: u64,
+        meta_bytes: u64,
+    ) -> Result<(), CmdError> {
+        self.change(&cmd::create_thin_pool(vg, thin, chunk_bytes, meta_bytes))
+            .await
+    }
+
+    pub async fn extend_pool_metadata(
+        &self,
+        vg: &str,
+        thin: &str,
+        meta_bytes: u64,
+    ) -> Result<(), CmdError> {
+        self.change(&cmd::extend_pool_metadata(vg, thin, meta_bytes))
+            .await
+    }
+
+    pub async fn extend_pool_data(&self, vg: &str, thin: &str) -> Result<(), CmdError> {
+        self.change(&cmd::extend_pool_data(vg, thin)).await
+    }
+
+    pub async fn remove_inactive(&self, vg: &str, lv: &str) -> Result<(), CmdError> {
+        self.change(&cmd::remove_inactive(vg, lv)).await
+    }
+
+    pub async fn vgremove(&self, vg: &str) -> Result<(), CmdError> {
+        self.change(&cmd::vgremove(vg)).await
+    }
+
+    pub async fn pvremove(&self, devices: &[String]) -> Result<(), CmdError> {
+        self.change(&cmd::pvremove(devices)).await
     }
 
     /// Thin pool probe and capacity.
