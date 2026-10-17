@@ -171,7 +171,9 @@ async fn blank_disks_build_vg_then_thin_pool() {
             pvs(&[("/dev/vdd", VG), ("/dev/vde", VG)]),
         );
     probe(&x);
-    let (w, _) = run(&x, disks(), pool(&[A, B])).await;
+    let (w, mut r) = run(&x, disks(), pool(&[A, B])).await;
+    assert!(r.take_disks_changed(), "NodeDisks due after a build");
+    assert!(!r.take_disks_changed());
     let s = status(&w);
     assert_eq!(available(&s).0, "True");
     assert_eq!(s["chunkBytes"], 65_536);
@@ -503,6 +505,7 @@ async fn ready_pool_writes_nothing_when_unchanged() {
     ready(&x);
     let mut p = pool(&[A]);
     let (w, mut r) = run(&x, disks(), p.clone()).await;
+    assert!(r.take_disks_changed(), "rows not written yet");
     let StatusWrite::Pool {
         capacity,
         available,
@@ -526,6 +529,7 @@ async fn ready_pool_writes_nothing_when_unchanged() {
     let w = r.pass(&[Arc::new(p)], &[], &[]).await;
     x.assert_done();
     assert!(w.is_empty(), "{w:?}");
+    assert!(!r.take_disks_changed(), "same rows, no step");
 }
 
 #[tokio::test]
@@ -799,4 +803,37 @@ async fn unreadable_host_keeps_a_built_pool_on_the_usual_probe() {
     let (w, r) = run(&x, disks(), pool(&[A])).await;
     assert_eq!(available(&status(&w)).0, "False");
     assert!(r.unready_pools.contains_key(POOL));
+}
+
+#[tokio::test]
+async fn inventory_names_the_pool_of_a_tagged_vg() {
+    let d = FakeDisks::default();
+    d.set("/dev/vdd", disk("vdd"))
+        .set(A, disk("vdd"))
+        .set("/dev/vde", disk("vde"));
+    let x = Arc::new(ScriptedExec::new());
+    x.expect(lvm::cmd::pvs_all(), pvs(&[("/dev/vdd", VG)]))
+        .expect(lvm::cmd::vgs_all(), vgs(&[(4 * GIB, 0, TAG)]))
+        .expect(wipefs_argv("/dev/vde"), ok(WIPEFS_BLANK));
+    let r = Reconciler::new(NODE, x.clone()).with_disks(Arc::new(d));
+    let s = r.disk_inventory().await;
+    x.assert_done();
+    assert_eq!(s.blank, 1);
+    assert_eq!(s.disks[0].path, A);
+    assert_eq!(s.disks[0].state, DeviceState::Member);
+    assert_eq!(s.disks[0].pool.as_deref(), Some(POOL));
+    assert_eq!(s.disks[1].state, DeviceState::Blank);
+}
+
+#[tokio::test]
+async fn inventory_without_lvm_reports_still_lists_disks() {
+    let d = FakeDisks::default();
+    d.set("/dev/vde", disk("vde"));
+    let x = Arc::new(ScriptedExec::new());
+    x.expect(lvm::cmd::pvs_all(), fail("lvm not found"))
+        .expect(wipefs_argv("/dev/vde"), ok(WIPEFS_BLANK));
+    let r = Reconciler::new(NODE, x.clone()).with_disks(Arc::new(d));
+    let s = r.disk_inventory().await;
+    x.assert_done();
+    assert_eq!(s.blank, 1);
 }

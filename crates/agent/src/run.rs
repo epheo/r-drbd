@@ -247,6 +247,7 @@ async fn reconcile_loop(
     let node = rec.node().to_owned();
     tracing::info!(node, "caches ready, reconciling");
     let mut lvm_checked = false;
+    let mut disks_due = tokio::time::Instant::now();
     loop {
         rec.set_addresses(addresses(&stores));
         rec.set_peer_leases(peer_leases(&stores));
@@ -259,6 +260,20 @@ async fn reconcile_loop(
         let writes = rec.pass(&pools, &volumes, &snapshots).await;
         for pool in apply(&client, &node, writes).await {
             rec.events_unsent(&pool);
+        }
+        // In the loop, not beside it: its exclusive open never meets a
+        // vgcreate of this agent on the same disk.
+        if rec.take_disks_changed() || tokio::time::Instant::now() >= disks_due {
+            disks_due = tokio::time::Instant::now() + crate::inventory::EVERY;
+            let status = rec.disk_inventory().await;
+            match crate::inventory::write(&client, &node, &status).await {
+                Ok(true) => tracing::info!(blank = status.blank, "NodeDisks updated"),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "NodeDisks write failed, retried next pass");
+                    disks_due = tokio::time::Instant::now();
+                }
+            }
         }
         // Fixed per pass so a stream of refreshes cannot push the resync out.
         let resync = tokio::time::Instant::now() + watch::RESYNC;

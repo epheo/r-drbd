@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use kube::ResourceExt;
 use lvm::report::{PoolLv, VgFull};
 use model::condition;
-use model::{DeviceState, DeviceStatus, Pool, ReclaimPolicy};
+use model::{DeviceState, DeviceStatus, NodeDisksStatus, Pool, ReclaimPolicy};
 
 use super::{
     REASON_BUILDING, REASON_DEVICE_MISSING, REASON_REMOVE_BLOCKED, REASON_REMOVE_FAILED,
@@ -16,6 +16,7 @@ use super::{
 };
 use crate::devices::{self, Checked};
 use crate::exec::CmdError;
+use crate::inventory;
 use crate::storage;
 use crate::storage::plan::{self, Blocked, Release, Seen, Step, Target};
 
@@ -125,12 +126,6 @@ fn look_failed(pool: &Pool, error: String) -> Outcome {
     }
 }
 
-/// A PV name as the agent's /dev resolves it, so it compares with a
-/// resolved by-id link.
-fn resolved(name: &str) -> PathBuf {
-    std::fs::canonicalize(name).unwrap_or_else(|_| PathBuf::from(name))
-}
-
 impl Reconciler {
     async fn look(&self, pool: &Pool, paths: &[String]) -> Result<Look, String> {
         let (vg_name, thin) = (&pool.spec.vg, &pool.spec.thin_pool);
@@ -157,7 +152,7 @@ impl Reconciler {
             .await
             .map_err(|e| e.to_string())?
             .into_iter()
-            .map(|p| (resolved(&p.name), p.vg.unwrap_or_default()))
+            .map(|p| (devices::resolved(&p.name), p.vg.unwrap_or_default()))
             .collect();
         let checked =
             devices::check(self.lvm.exec(), self.disks.as_ref(), paths, &pvs, vg_name).await;
@@ -204,7 +199,31 @@ impl Reconciler {
                 Err(e) => look_failed(pool, e),
             }
         };
+        let before = pool.status.as_ref().map(|s| &s.devices);
+        if out.rows.is_some() && out.rows.as_ref() != before {
+            self.disks_changed = true;
+        }
         self.device_events(pool, out)
+    }
+
+    /// The node's disks for its NodeDisks. Without LVM reports a PV shows
+    /// as NotEmpty by its signature, or Busy while active.
+    pub async fn disk_inventory(&self) -> NodeDisksStatus {
+        let reports = async {
+            let pvs = self.lvm.pvs_all().await?;
+            let vgs = self.lvm.vgs_all().await?;
+            Ok::<_, CmdError>(inventory::Lvm::from_reports(&pvs, &vgs))
+        };
+        let lvm = reports.await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "disk inventory without LVM reports");
+            inventory::Lvm::default()
+        });
+        inventory::status(inventory::scan(self.lvm.exec(), self.disks.as_ref(), &lvm).await)
+    }
+
+    /// A Pool's disks changed since the last call: NodeDisks is due.
+    pub fn take_disks_changed(&mut self) -> bool {
+        std::mem::take(&mut self.disks_changed)
     }
 
     async fn build(
@@ -256,6 +275,7 @@ impl Reconciler {
             };
             tracing::info!(pool = pool.name_any(), step = step.name(), "building pool");
             let res = self.run_step(t, &step).await;
+            self.disks_changed = true;
             reads.invalidate(t.vg);
             let Err(e) = res else { continue };
             let message = format!("{}: {e}", step.name());
@@ -409,6 +429,7 @@ impl Reconciler {
             };
             tracing::info!(pool = pool.name_any(), step = ?step, "releasing pool");
             let res = self.run_release(t, &step).await;
+            self.disks_changed = true;
             reads.invalidate(t.vg);
             if let Err(e) = res {
                 out.released = Some((

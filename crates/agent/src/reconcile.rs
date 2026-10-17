@@ -355,6 +355,8 @@ pub struct Reconciler {
     device_events: HashMap<String, BTreeMap<String, DeviceState>>,
     /// Per Pool, the note last announced by a PoolNotGrown Event.
     pool_notes: HashMap<String, String>,
+    /// A Pool step ran or a Pool's device rows changed.
+    disks_changed: bool,
 }
 
 impl Reconciler {
@@ -386,6 +388,7 @@ impl Reconciler {
             disks: Arc::new(SysDisks::default()),
             device_events: HashMap::new(),
             pool_notes: HashMap::new(),
+            disks_changed: false,
         }
     }
 

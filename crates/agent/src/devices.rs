@@ -1,4 +1,5 @@
-//! Checks on the disks a Pool lists, before the agent writes to any of them.
+//! Checks on the disks a Pool lists, before the agent writes to any of them,
+//! and on every whole disk of the node for its NodeDisks.
 //!
 //! Each listed path gets one [`DeviceState`]. When several apply, the first
 //! of Missing, NotADisk, Member, Busy, NotEmpty, Blank wins.
@@ -71,6 +72,15 @@ pub trait HostDisks: Send + Sync + std::fmt::Debug {
     /// Everything but the exclusive open, left `Ok`.
     fn facts(&self, path: &str) -> Facts;
     fn exclusive(&self, node: &Path) -> Result<(), String>;
+    /// Kernel names of the whole disks, sorted: no partition, none of [`NOT_DISKS`].
+    fn whole_disks(&self) -> Vec<String>;
+    /// The by-id links, sorted, by the kernel name they resolve to.
+    fn by_id(&self) -> BTreeMap<String, Vec<String>>;
+}
+
+/// Not a kernel name of a whole disk, whatever sysfs says.
+pub fn not_a_disk_name(name: &str) -> bool {
+    NOT_DISKS.iter().any(|(p, _)| name.starts_with(p))
 }
 
 /// The real host: /dev and /sys are the host's in the agent pod, and with
@@ -79,6 +89,7 @@ pub trait HostDisks: Send + Sync + std::fmt::Debug {
 pub struct SysDisks {
     pub sys: PathBuf,
     pub mountinfo: PathBuf,
+    pub by_id: PathBuf,
 }
 
 impl Default for SysDisks {
@@ -86,6 +97,7 @@ impl Default for SysDisks {
         Self {
             sys: "/sys".into(),
             mountinfo: "/proc/1/mountinfo".into(),
+            by_id: "/dev/disk/by-id".into(),
         }
     }
 }
@@ -118,6 +130,37 @@ impl HostDisks for SysDisks {
     fn exclusive(&self, node: &Path) -> Result<(), String> {
         open_exclusive(node)
     }
+
+    fn whole_disks(&self) -> Vec<String> {
+        let base = self.sys.join("class/block");
+        dir_names(&base)
+            .into_iter()
+            .filter(|n| !not_a_disk_name(n) && !base.join(n).join("partition").exists())
+            .collect()
+    }
+
+    fn by_id(&self) -> BTreeMap<String, Vec<String>> {
+        let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for link in dir_names(&self.by_id) {
+            let path = self.by_id.join(&link);
+            let Some(name) = std::fs::canonicalize(&path)
+                .ok()
+                .and_then(|t| t.file_name().and_then(|n| n.to_str()).map(str::to_owned))
+            else {
+                continue;
+            };
+            out.entry(name)
+                .or_default()
+                .push(path.display().to_string());
+        }
+        out
+    }
+}
+
+/// A PV name as the agent's /dev resolves it, so it compares with a
+/// resolved by-id link.
+pub fn resolved(name: &str) -> PathBuf {
+    std::fs::canonicalize(name).unwrap_or_else(|_| PathBuf::from(name))
 }
 
 /// The kernel name of a block device node.
@@ -445,7 +488,7 @@ pub async fn check(
 pub(crate) mod fake {
     //! Scripted host disks.
 
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
 
     use super::{Facts, HostDisks, Sys};
@@ -519,6 +562,44 @@ pub(crate) mod fake {
                 .values()
                 .find(|f| f.dev.as_deref().ok() == Some(node))
                 .map_or(Ok(()), |f| f.exclusive.clone())
+        }
+
+        /// The scripted paths directly under /dev.
+        fn whole_disks(&self) -> Vec<String> {
+            let mut v: Vec<String> = self
+                .facts
+                .lock()
+                .unwrap()
+                .keys()
+                .filter_map(|p| p.strip_prefix("/dev/"))
+                .filter(|n| !n.contains('/'))
+                .map(str::to_owned)
+                .collect();
+            v.sort();
+            v
+        }
+
+        /// The scripted by-id paths, by the node their facts resolve to.
+        fn by_id(&self) -> BTreeMap<String, Vec<String>> {
+            let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for (path, f) in self.facts.lock().unwrap().iter() {
+                if !path.starts_with("/dev/disk/by-id/") {
+                    continue;
+                }
+                if let Some(name) = f
+                    .dev
+                    .as_ref()
+                    .ok()
+                    .and_then(|n| n.file_name())
+                    .and_then(|n| n.to_str())
+                {
+                    out.entry(name.to_owned()).or_default().push(path.clone());
+                }
+            }
+            for v in out.values_mut() {
+                v.sort();
+            }
+            out
         }
     }
 }
@@ -626,6 +707,50 @@ mod tests {
         assert_eq!(s.serial.as_deref(), Some("S7KH123"));
         assert!(s.read_only);
         assert!(read_sys(&t, "sdz").is_err());
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[test]
+    fn whole_disks_and_their_links() {
+        let t = std::env::temp_dir().join(format!("r-drbd-disks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let block = t.join("sys/class/block");
+        for n in ["vda", "nvme0n1", "loop0", "dm-0", "sr0", "zram0"] {
+            std::fs::create_dir_all(block.join(n)).unwrap();
+        }
+        // In real sysfs a partition is also listed at the top level.
+        std::fs::create_dir_all(block.join("vda1")).unwrap();
+        std::fs::write(block.join("vda1/partition"), "1\n").unwrap();
+        let dev = t.join("dev");
+        let by_id = dev.join("disk/by-id");
+        std::fs::create_dir_all(&by_id).unwrap();
+        for n in ["vda", "vda1", "nvme0n1"] {
+            std::fs::write(dev.join(n), "").unwrap();
+        }
+        for (link, target) in [
+            ("virtio-a", "../../vda"),
+            ("virtio-a-part1", "../../vda1"),
+            ("wwn-0x1", "../../nvme0n1"),
+            ("nvme-SSD_1", "../../nvme0n1"),
+            ("dangling", "../../nope"),
+        ] {
+            std::os::unix::fs::symlink(target, by_id.join(link)).unwrap();
+        }
+        let d = SysDisks {
+            sys: t.join("sys"),
+            mountinfo: t.join("mountinfo"),
+            by_id: by_id.clone(),
+        };
+        assert_eq!(d.whole_disks(), ["nvme0n1", "vda"]);
+        let l = |n: &str| by_id.join(n).display().to_string();
+        assert_eq!(
+            d.by_id(),
+            BTreeMap::from([
+                ("nvme0n1".to_owned(), vec![l("nvme-SSD_1"), l("wwn-0x1")]),
+                ("vda".to_owned(), vec![l("virtio-a")]),
+                ("vda1".to_owned(), vec![l("virtio-a-part1")]),
+            ])
+        );
         let _ = std::fs::remove_dir_all(&t);
     }
 

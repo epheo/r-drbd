@@ -35,6 +35,7 @@ name = "controller-dev"
 required-features = ["dev-bin"]
 
 [dev-dependencies]
+agent = { path = "../agent" }
 # test-util: paused clock for the Lease deadline test.
 tokio = { version = "1.53.3", features = ["test-util"] }
 tempfile = "3.27.0"
