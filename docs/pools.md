@@ -84,7 +84,7 @@ Before any change, on every pass, each listed path gets one state in `status.dev
 | `Member` | A PV of this Pool's VG |
 | `Blank` | Whole disk, no signature, no partition, not held, exclusive open succeeds |
 | `NotEmpty` | A signature or a partition table; the message names it, with its offset |
-| `Busy` | Mounted, held by another device (dm, md), a multipath path or not yet settled by udev, or the exclusive open failed or did not return within 10 s |
+| `Busy` | Mounted, held by another device (dm, md), a multipath path or not yet settled by udev (up to a minute), or the exclusive open failed, did not return within 10 s, or an earlier one has not returned yet |
 | `NotADisk` | A partition, dm, md, loop, drbd, zram, RAM, nbd, RBD, ZFS volume, null block, floppy or optical device, an eMMC boot area, read-only, or size 0 (no medium) |
 | `Missing` | The path does not resolve |
 

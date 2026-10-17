@@ -287,6 +287,9 @@ impl Scanner {
             if self.stopping() {
                 break;
             }
+            if dirty.disks.contains(name) {
+                self.disks.udev_restart(name);
+            }
             let (d, t) = (self.disks.clone(), table.clone());
             let path = format!("/dev/{name}");
             let Ok(mut f) = tokio::task::spawn_blocking(move || d.facts(&path, &t)).await else {
@@ -294,7 +297,7 @@ impl Scanner {
             };
             f.exclusive = Ok(());
             let same = self.cache.get(name).is_some_and(|e| e.facts == f);
-            if dirty.all || dirty.disks.contains(name) || !same {
+            if dirty.all || dirty.disks.contains(name) || dirty.again.contains(name) || !same {
                 self.cache.insert(
                     name.clone(),
                     Entry {

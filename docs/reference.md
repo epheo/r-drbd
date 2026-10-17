@@ -119,7 +119,7 @@ It claims nothing: a Pool uses only the disks it lists.
 
 Other differences from a Pool's checks:
 - `wipefs` and the exclusive open run only on a disk every other check finds blank, so a disk in use is never read or opened;
-- a disk the kernel announced but udev has not processed yet is `Busy`, "udev not settled", and read again a few seconds later.
+- a disk the kernel announced but udev has not processed yet is `Busy`, "udev not settled", and read again a few seconds later; after a minute without a udev entry the other checks decide.
 
 When the agent reads:
 - every disk at start and hourly (every 5 minutes under `watch: poll`);

@@ -6,10 +6,10 @@
 //! Facts come from the by-id link, sysfs, the host mount table and an
 //! exclusive open from this process; signatures from the host's wipefs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use model::{DeviceState, DeviceStatus};
 
@@ -112,6 +112,10 @@ pub const OPEN_WAIT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 pub const OPEN_WAIT: Duration = Duration::from_millis(200);
 const OPEN_HUNG: &str = "exclusive open did not return";
+const OPEN_PENDING: &str = "an earlier open has not returned";
+/// Without a udev entry this long, udev is not coming (no udevd, or
+/// rules that skip the device): the other checks decide.
+pub const UDEV_WAIT: Duration = Duration::from_secs(60);
 
 fn open_hung() -> String {
     format!("{OPEN_HUNG} within {OPEN_WAIT:?}")
@@ -119,10 +123,22 @@ fn open_hung() -> String {
 
 /// The row message of a failed exclusive open.
 pub fn open_message(e: &str) -> String {
-    if e.starts_with(OPEN_HUNG) {
+    if e.starts_with(OPEN_HUNG) || e == OPEN_PENDING {
         e.to_owned()
     } else {
         format!("exclusive open failed: {e}")
+    }
+}
+
+/// Frees the node when the thread returns, however it returns.
+struct InFlight {
+    disks: Arc<dyn HostDisks>,
+    node: PathBuf,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.disks.opens().lock().unwrap().remove(&self.node);
     }
 }
 
@@ -130,6 +146,10 @@ pub fn open_message(e: &str) -> String {
 pub trait HostDisks: Send + Sync + std::fmt::Debug {
     /// The host mount table, read once per pass; empty when unreadable.
     fn mounts(&self) -> Arc<str>;
+    /// A kernel uevent on `name`: the wait for its udev entry starts over.
+    fn udev_restart(&self, name: &str);
+    /// Device nodes with an exclusive open still running on a thread.
+    fn opens(&self) -> &Mutex<HashSet<PathBuf>>;
     /// Everything but the exclusive open, left `Ok`.
     fn facts(&self, path: &str, mounts: &str) -> Facts;
     fn exclusive(&self, node: &Path) -> Result<(), String>;
@@ -160,13 +180,23 @@ pub fn not_a_disk_name(name: &str) -> bool {
 }
 
 /// The exclusive open on a blocking thread, bounded by [`OPEN_WAIT`]: past
-/// it the disk reads Busy and the thread finishes on its own.
+/// it the disk reads Busy and the thread finishes on its own. While it
+/// has not, a new open of the node is refused without a thread.
 pub async fn open_exclusive_blocking(
     disks: &Arc<dyn HostDisks>,
     node: &Path,
 ) -> Result<(), String> {
+    if !disks.opens().lock().unwrap().insert(node.to_owned()) {
+        return Err(OPEN_PENDING.to_owned());
+    }
     let (d, n) = (disks.clone(), node.to_owned());
-    let join = tokio::task::spawn_blocking(move || d.exclusive(&n));
+    let join = tokio::task::spawn_blocking(move || {
+        let _done = InFlight {
+            disks: d.clone(),
+            node: n.clone(),
+        };
+        d.exclusive(&n)
+    });
     match tokio::time::timeout(OPEN_WAIT, join).await {
         Ok(r) => r.unwrap_or_else(|e| Err(e.to_string())),
         Err(_) => Err(open_hung()),
@@ -175,13 +205,16 @@ pub async fn open_exclusive_blocking(
 
 /// The real host: /dev and /sys are the host's in the agent pod, and with
 /// hostPID init's mount table is the host's.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SysDisks {
     pub sys: PathBuf,
     pub mountinfo: PathBuf,
     pub by_id: PathBuf,
     /// The host's udev database, through init's root: not mounted in the pod.
     pub udev: PathBuf,
+    /// Disks without a udev entry, by kernel name, since when.
+    pub unsettled: Mutex<HashMap<String, Instant>>,
+    pub opens: Mutex<HashSet<PathBuf>>,
 }
 
 impl Default for SysDisks {
@@ -191,18 +224,27 @@ impl Default for SysDisks {
             mountinfo: "/proc/1/mountinfo".into(),
             by_id: "/dev/disk/by-id".into(),
             udev: "/proc/1/root/run/udev/data".into(),
+            unsettled: Mutex::default(),
+            opens: Mutex::default(),
         }
     }
 }
 
 impl SysDisks {
-    fn udev(&self, sys: &Sys) -> Udev {
+    fn udev(&self, name: &str, sys: &Sys) -> Udev {
         if !self.udev_readable() {
             return Udev::Unknown;
         }
-        match std::fs::read_to_string(self.udev.join(format!("b{}", sys.dev))) {
-            Ok(e) => Udev::Settled(parse_udev(&e)),
-            Err(_) => Udev::Unsettled,
+        let mut waits = self.unsettled.lock().unwrap();
+        if let Ok(e) = std::fs::read_to_string(self.udev.join(format!("b{}", sys.dev))) {
+            waits.remove(name);
+            return Udev::Settled(parse_udev(&e));
+        }
+        let since = *waits.entry(name.to_owned()).or_insert_with(Instant::now);
+        if since.elapsed() >= UDEV_WAIT {
+            Udev::Unknown
+        } else {
+            Udev::Unsettled
         }
     }
 }
@@ -213,6 +255,14 @@ impl HostDisks for SysDisks {
         std::fs::read_to_string(&self.mountinfo)
             .unwrap_or_default()
             .into()
+    }
+
+    fn udev_restart(&self, name: &str) {
+        self.unsettled.lock().unwrap().remove(name);
+    }
+
+    fn opens(&self) -> &Mutex<HashSet<PathBuf>> {
+        &self.opens
     }
 
     fn facts(&self, path: &str, mounts: &str) -> Facts {
@@ -226,12 +276,19 @@ impl HostDisks for SysDisks {
                 udev: Udev::Unknown,
             };
         };
-        let sys = block_name(node).and_then(|name| read_sys(&self.sys, &name));
+        let name = block_name(node);
+        let sys = name
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|n| read_sys(&self.sys, n));
         let mounts = sys
             .as_ref()
             .map(|s| mounts_of(mounts, s))
             .unwrap_or_default();
-        let udev = sys.as_ref().map(|s| self.udev(s)).unwrap_or_default();
+        let udev = match (&name, &sys) {
+            (Ok(n), Ok(s)) => self.udev(n, s),
+            _ => Udev::Unknown,
+        };
         Facts {
             dev,
             sys,
@@ -656,6 +713,9 @@ pub(crate) mod fake {
         pub(crate) opened: Mutex<Vec<std::path::PathBuf>>,
         /// Nodes whose exclusive open never returns in time.
         pub(crate) hung: Mutex<HashSet<std::path::PathBuf>>,
+        /// Kernel names whose udev wait was restarted, in order.
+        pub(crate) restarted: Mutex<Vec<String>>,
+        pub(crate) opens: Mutex<HashSet<std::path::PathBuf>>,
     }
 
     /// A blank whole disk `name` of 4 GiB behind `path`.
@@ -684,6 +744,14 @@ pub(crate) mod fake {
     impl HostDisks for FakeDisks {
         fn mounts(&self) -> Arc<str> {
             "".into()
+        }
+
+        fn udev_restart(&self, name: &str) {
+            self.restarted.lock().unwrap().push(name.to_owned());
+        }
+
+        fn opens(&self) -> &Mutex<HashSet<std::path::PathBuf>> {
+            &self.opens
         }
 
         fn facts(&self, path: &str, _mounts: &str) -> Facts {
@@ -909,6 +977,7 @@ mod tests {
             mountinfo: t.join("mountinfo"),
             by_id: by_id.clone(),
             udev: t.join("udev"),
+            ..SysDisks::default()
         };
         assert_eq!(d.whole_disks(), ["nvme0n1", "vda"]);
         let l = |n: &str| by_id.join(n).display().to_string();
@@ -1134,30 +1203,46 @@ mod tests {
             mountinfo: t.join("mountinfo"),
             by_id: t.join("by-id"),
             udev: db.clone(),
+            ..SysDisks::default()
         };
         assert_eq!(
-            d.udev(&sys("8:16")),
+            d.udev("sdb", &sys("8:16")),
             Udev::Settled(UdevFlags {
                 multipath_path: true,
                 not_ready: false
             })
         );
-        assert_eq!(d.udev(&sys("8:32")), Udev::Unsettled);
+        // No entry: unsettled, until the wait runs out; a uevent restarts it.
+        assert_eq!(d.udev("sdc", &sys("8:32")), Udev::Unsettled);
+        let long_ago = Instant::now()
+            .checked_sub(UDEV_WAIT + Duration::from_secs(1))
+            .expect("uptime past the wait");
+        d.unsettled.lock().unwrap().insert("sdc".into(), long_ago);
+        assert_eq!(d.udev("sdc", &sys("8:32")), Udev::Unknown);
+        d.udev_restart("sdc");
+        assert_eq!(d.udev("sdc", &sys("8:32")), Udev::Unsettled);
+        // The entry arrives: settled, and the wait is forgotten.
+        std::fs::write(db.join("b8:32"), "E:ID_PATH=x\n").unwrap();
+        assert_eq!(
+            d.udev("sdc", &sys("8:32")),
+            Udev::Settled(UdevFlags::default())
+        );
+        assert!(d.unsettled.lock().unwrap().is_empty());
         let none = SysDisks {
             udev: t.join("nowhere"),
-            ..d
+            ..SysDisks::default()
         };
-        assert_eq!(none.udev(&sys("8:16")), Udev::Unknown);
+        assert_eq!(none.udev("sdb", &sys("8:16")), Udev::Unknown);
         let _ = std::fs::remove_dir_all(&t);
     }
 
     /// A hung open ends the wait, not the pass; the disk reads Busy and
-    /// is not read.
+    /// is not read. While the thread runs, no second thread is started.
     #[tokio::test]
-    async fn a_hung_open_reads_busy() {
+    async fn a_hung_open_reads_busy_once_per_thread() {
         let disks = Arc::new(FakeDisks::default());
-        disks.set("/dev/disk/by-id/a", disk("vdd"));
-        disks.hung.lock().unwrap().insert("/dev/vdd".into());
+        disks.set("/dev/disk/by-id/a", disk("sdhang"));
+        disks.hung.lock().unwrap().insert("/dev/sdhang".into());
         let x = ScriptedExec::new();
         let dyn_disks: Arc<dyn HostDisks> = disks.clone();
         let paths = ["/dev/disk/by-id/a".to_owned()];
@@ -1168,6 +1253,22 @@ mod tests {
             rows[0].row.message.as_deref(),
             Some("exclusive open did not return within 200ms")
         );
+        // The next pass: the earlier thread still runs.
+        let rows = check(&x, &dyn_disks, &paths, &BTreeMap::new(), "vg1").await;
+        assert_eq!(rows[0].row.state, DeviceState::Busy);
+        assert_eq!(
+            rows[0].row.message.as_deref(),
+            Some("an earlier open has not returned")
+        );
+        assert_eq!(disks.opened.lock().unwrap().len(), 1);
+        // The thread returned: opens run again.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        disks.hung.lock().unwrap().clear();
+        x.expect(wipefs_argv("/dev/sdhang"), ok(WIPEFS_BLANK));
+        let rows = check(&x, &dyn_disks, &paths, &BTreeMap::new(), "vg1").await;
+        x.assert_done();
+        assert_eq!(rows[0].row.state, DeviceState::Blank);
+        assert_eq!(disks.opened.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

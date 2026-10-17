@@ -70,6 +70,55 @@ fn uevent_socket() -> std::io::Result<OwnedFd> {
     Ok(fd)
 }
 
+/// What one receive means for the watch.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    /// Read on.
+    Next,
+    /// The queue is empty.
+    Drained,
+    /// The receiver is gone or the socket failed: the thread ends.
+    End,
+}
+
+/// One message; only the kernel, as pid 0, speaks on group 1. udevd and
+/// libudev users send under their own pid, an unaddressed message is
+/// nobody's.
+fn on_message(from: Option<u32>, msg: &[u8], tx: &UnboundedSender<Wake>) -> Step {
+    if from != Some(0) {
+        return Step::Next;
+    }
+    match parse_uevent(msg).map(|w| tx.send(w)) {
+        Some(Err(_)) => Step::End,
+        _ => Step::Next,
+    }
+}
+
+/// A receive error. ENOBUFS is the kernel saying it dropped events (a
+/// hotplug or rescan burst); it also shows as POLLERR until read.
+fn on_recv_error(e: Errno, tx: &UnboundedSender<Wake>) -> Step {
+    match e {
+        Errno::AGAIN => Step::Drained,
+        Errno::INTR => Step::Next,
+        Errno::NOBUFS => {
+            if tx.send(Wake::All).is_err() {
+                Step::End
+            } else {
+                Step::Next
+            }
+        }
+        e => {
+            lost(tx, &format!("recvfrom: {e}"));
+            Step::End
+        }
+    }
+}
+
+/// Socket states no read clears.
+fn socket_gone(revents: PollFlags) -> bool {
+    revents.intersects(PollFlags::HUP | PollFlags::NVAL)
+}
+
 /// The thread's end that is not a shutdown: the loop polls from now on.
 fn lost(tx: &UnboundedSender<Wake>, why: &str) {
     tracing::warn!(error = why, "uevent watch ended");
@@ -79,34 +128,19 @@ fn lost(tx: &UnboundedSender<Wake>, why: &str) {
 /// Reads every queued uevent; false when the thread must end.
 fn drain(sock: &OwnedFd, buf: &mut [u8], tx: &UnboundedSender<Wake>) -> bool {
     loop {
-        match recvfrom(sock, &mut *buf, RecvFlags::empty()) {
+        let step = match recvfrom(sock, &mut *buf, RecvFlags::empty()) {
             Ok((n, _, from)) => {
-                // Only the kernel sends as pid 0; udevd and libudev users
-                // send under their own pid.
                 let pid = from
                     .and_then(|a| SocketAddrNetlink::try_from(a).ok())
-                    .map_or(0, |a| a.pid());
-                if pid != 0 {
-                    continue;
-                }
-                if let Some(w) = parse_uevent(&buf[..n])
-                    && tx.send(w).is_err()
-                {
-                    return false;
-                }
+                    .map(|a| a.pid());
+                on_message(pid, &buf[..n], tx)
             }
-            Err(Errno::AGAIN) => return true,
-            Err(Errno::INTR) => {}
-            // The kernel dropped events: read everything again.
-            Err(Errno::NOBUFS) => {
-                if tx.send(Wake::All).is_err() {
-                    return false;
-                }
-            }
-            Err(e) => {
-                lost(tx, &format!("recvfrom: {e}"));
-                return false;
-            }
+            Err(e) => on_recv_error(e, tx),
+        };
+        match step {
+            Step::Next => {}
+            Step::Drained => return true,
+            Step::End => return false,
         }
     }
 }
@@ -136,11 +170,13 @@ fn watch(sock: &OwnedFd, table: &std::fs::File, stop: &OwnedFd, tx: &UnboundedSe
         if t.intersects(PollFlags::PRI | PollFlags::ERR) && tx.send(Wake::Refresh).is_err() {
             return;
         }
-        if s.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) {
-            lost(tx, "socket error");
+        if socket_gone(s) {
+            lost(tx, "socket closed");
             return;
         }
-        if s.intersects(PollFlags::IN) && !drain(sock, &mut buf, tx) {
+        // ERR is a pending socket error, ENOBUFS after a burst: the read
+        // reports and clears it.
+        if s.intersects(PollFlags::IN | PollFlags::ERR) && !drain(sock, &mut buf, tx) {
             return;
         }
     }
@@ -207,6 +243,35 @@ mod tests {
         assert_eq!(parse_uevent(net), None);
         // udev's own messages start with "libudev", never on group 1.
         assert_eq!(parse_uevent(b"libudev\0\xfe\xed"), None);
+    }
+
+    #[test]
+    fn only_the_kernel_is_heard() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(on_message(Some(0), MKFS_CHANGE, &tx), Step::Next);
+        assert_eq!(rx.try_recv().ok(), Some(Wake::Disk("vdf".into())));
+        assert_eq!(on_message(Some(4242), MKFS_CHANGE, &tx), Step::Next);
+        assert_eq!(on_message(None, MKFS_CHANGE, &tx), Step::Next);
+        assert!(rx.try_recv().is_err(), "other senders are dropped");
+        drop(rx);
+        assert_eq!(on_message(Some(0), MKFS_CHANGE, &tx), Step::End);
+    }
+
+    /// A burst overflows the socket: the kernel sets ENOBUFS, poll shows
+    /// POLLERR, and the read turns it into one full pass, not an end.
+    #[test]
+    fn an_overflow_is_a_full_pass_not_a_lost_watch() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(!socket_gone(PollFlags::ERR | PollFlags::IN));
+        assert!(socket_gone(PollFlags::HUP));
+        assert!(socket_gone(PollFlags::NVAL));
+        assert_eq!(on_recv_error(Errno::NOBUFS, &tx), Step::Next);
+        assert_eq!(rx.try_recv().ok(), Some(Wake::All));
+        assert_eq!(on_recv_error(Errno::AGAIN, &tx), Step::Drained);
+        assert_eq!(on_recv_error(Errno::INTR, &tx), Step::Next);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(on_recv_error(Errno::BADF, &tx), Step::End);
+        assert_eq!(rx.try_recv().ok(), Some(Wake::WatchLost));
     }
 
     /// The thread ends on drop; where the socket cannot open, start

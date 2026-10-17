@@ -391,15 +391,59 @@ async fn busy_disks_are_never_read() {
     assert!(d.opened.lock().unwrap().is_empty());
     assert_eq!(p.unsettled, BTreeSet::from(["sdc".to_owned()]));
 
-    // udevd done: the entry appeared, the facts changed, the disk is read.
-    d.set("/dev/sdc", disk("sdc"));
+    // The loop's recheck does not restart the udev wait; a uevent does.
+    let mut dirty = Dirty::default();
+    dirty.again.insert("sdc".into());
+    s.pass(dirty).await;
+    assert!(d.restarted.lock().unwrap().is_empty());
+    let mut dirty = Dirty::default();
+    dirty.disks.insert("sdb".into());
+    s.pass(dirty).await;
+    assert_eq!(*d.restarted.lock().unwrap(), ["sdb"]);
+
+    // The wait ran out: the other checks decide, no more rechecks.
+    let mut given_up = disk("sdc");
+    given_up.udev = Udev::Unknown;
+    d.set("/dev/sdc", given_up);
     x.expect(wipefs_argv("/dev/sdc"), ok(WIPEFS_BLANK));
     let mut dirty = Dirty::default();
-    dirty.disks.insert("sdc".into());
+    dirty.again.insert("sdc".into());
     let p = s.pass(dirty).await;
     x.assert_done();
     assert_eq!(p.status.disks[1].state, DeviceState::Blank);
     assert!(p.unsettled.is_empty());
+
+    // udevd done after all: the entry appeared, the facts changed, the disk is read.
+    d.set("/dev/sdc", disk("sdc"));
+    x.expect(wipefs_argv("/dev/sdc"), ok(WIPEFS_BLANK));
+    let p = s.pass(Dirty::default()).await;
+    x.assert_done();
+    assert_eq!(p.status.disks[1].state, DeviceState::Blank);
+}
+
+#[tokio::test]
+async fn wakes_before_the_caches_are_ready_fold_into_the_first_pass() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    for w in [Wake::Disk("sda".into()), Wake::All, Wake::Refresh] {
+        tx.send(w).unwrap();
+    }
+    assert!(!drain_until_ready(std::future::ready(()), &mut rx).await);
+    assert!(rx.try_recv().is_err(), "queued wakes folded away");
+
+    // A watch lost meanwhile is kept; wakes after the caches are ready too.
+    tx.send(Wake::WatchLost).unwrap();
+    tx.send(Wake::Lvm).unwrap();
+    let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
+    let wait = async move {
+        let _ = ready_rx.wait_for(|r| *r).await;
+    };
+    let drain = tokio::spawn(async move { (drain_until_ready(wait, &mut rx).await, rx) });
+    tokio::task::yield_now().await;
+    ready_tx.send(true).unwrap();
+    let (lost, mut rx) = drain.await.unwrap();
+    assert!(lost);
+    tx.send(Wake::Refresh).unwrap();
+    assert_eq!(rx.try_recv().ok(), Some(Wake::Refresh));
 }
 
 #[tokio::test]

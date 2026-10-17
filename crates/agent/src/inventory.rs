@@ -101,8 +101,10 @@ pub struct Dirty {
     /// Read every disk and the LVM reports.
     pub all: bool,
     pub lvm: bool,
-    /// Kernel names to read again.
+    /// Kernel names a uevent named: read again, udev wait restarted.
     pub disks: BTreeSet<String>,
+    /// Kernel names the loop brings back: unchecked or unsettled last time.
+    pub again: BTreeSet<String>,
 }
 
 impl Dirty {
@@ -320,11 +322,11 @@ pub async fn run_loop(
                 return;
             }
             if !p.unchecked.is_empty() {
-                dirty.disks.extend(p.unchecked);
+                dirty.again.extend(p.unchecked);
                 scan_at = Some(Instant::now() + RETRY_FIRST);
             }
             if !p.unsettled.is_empty() {
-                dirty.disks.extend(p.unsettled);
+                dirty.again.extend(p.unsettled);
                 let soon = Instant::now() + RECHECK;
                 scan_at = Some(scan_at.map_or(soon, |t| t.min(soon)));
             }
@@ -395,18 +397,42 @@ pub async fn run_loop(
     }
 }
 
+/// Drops the wakes queued while the caches load: the first pass reads
+/// everything anyway. Returns whether the watch was lost meanwhile.
+pub async fn drain_until_ready(
+    ready: impl std::future::Future<Output = ()> + Send,
+    wakes: &mut UnboundedReceiver<Wake>,
+) -> bool {
+    let mut ready = std::pin::pin!(ready);
+    let mut lost = false;
+    loop {
+        tokio::select! {
+            biased;
+            w = wakes.recv(), if !wakes.is_empty() => match w {
+                Some(Wake::WatchLost) => lost = true,
+                Some(_) => {}
+                None => return lost,
+            },
+            () = &mut ready => return lost,
+        }
+    }
+}
+
 /// The agent's inventory task; the first pass waits for the Pool cache.
 pub async fn run(
     client: Client,
-    scanner: Scanner,
+    mut scanner: Scanner,
     watcher: Option<Watcher>,
     ready: impl std::future::Future<Output = ()> + Send,
-    wakes: UnboundedReceiver<Wake>,
+    mut wakes: UnboundedReceiver<Wake>,
     stop: tokio::sync::watch::Receiver<bool>,
 ) {
     // Held until this task ends: dropping it stops the watcher thread.
     let _watcher = watcher;
-    ready.await;
+    if drain_until_ready(ready, &mut wakes).await {
+        tracing::warn!("uevent watch ended: NodeDisks checks every disk every 5 minutes");
+        scanner.set_watch(DiskWatch::Poll);
+    }
     let udev = scanner.udev_readable();
     tracing::info!(watch = ?scanner.watch(), udev, "NodeDisks inventory started");
     if !udev {
