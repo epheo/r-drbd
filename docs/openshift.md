@@ -7,8 +7,8 @@ Graceful node shutdown is off until a KubeletConfig turns it on.
 
 This page walks through an install on OpenShift 4.14 or newer with KMM 2.x.
 The pieces live in `deploy/openshift`.
-r-drbd's own test suite has not run on an OpenShift cluster yet.
-The module build was tested against a CentOS Stream 9 kernel outside KMM, not yet with the Driver Toolkit.
+Verified on OpenShift 4.22 with KMM 2.7, on a single node: the Driver Toolkit build, the load, the install with the agent started before the module, local volumes with snapshots and expansion, the preflight validation, and the uninstall.
+Replicated volumes between OpenShift nodes have not been tried yet.
 
 ## Before you start
 
@@ -76,7 +76,14 @@ After r-drbd is installed, each node also reports the module version:
 
 ### Variants
 
-No internal registry (`managementState: Removed`, common on bare metal): point `containerImage` at a registry you can push to, and add to the Module an `imageRepoSecret` naming a `kubernetes.io/dockerconfigjson` Secret in `openshift-kmm` that can push and pull there.
+No internal registry (`managementState: Removed`, the default on bare metal and on a single node): the simplest is to turn it on without persistent storage.
+
+    oc patch configs.imageregistry.operator.openshift.io cluster --type merge \
+      -p '{"spec":{"managementState":"Managed","replicas":1,"rolloutStrategy":"Recreate","storage":{"emptyDir":{}}}}'
+
+A registry restart loses the image; KMM builds it again on its next pass, and a node that reboots meanwhile waits those minutes for its module.
+Turning the registry on or off changes the API server's image configuration and rolls out a new revision: on a single node, about a minute without the API.
+Or point `containerImage` at a registry you can push to, and add to the Module an `imageRepoSecret` naming a `kubernetes.io/dockerconfigjson` Secret in `openshift-kmm` that can push and pull there.
 
 Build outside the cluster, for an air gap or to keep the artefact under review:
 
@@ -247,6 +254,6 @@ The node settings can stay; deleting them reboots the pools again, and the devic
 | A Pool stays `Building` naming PVs and `vgimportdevices` | PVs on the node but no devices file | `vgimportdevices <vg>` per VG, never `--all` |
 | The agent logs `use_devicesfile is 1 but the devices file does not exist` at start | The node skipped step 2: its LVM scans DRBD devices | Apply `deploy/openshift/node`, or create the file by hand as the unit does |
 | A node got PVs after step 2 outside LVM's own commands (a cloned disk) | They are not in the devices file; the host's LVM ignores them | `lvmdevices --adddev <device>` |
-| A single node cluster | Replicated classes never bind: no peer | Use `r-drbd-local` |
+| A single node cluster | Replicated classes never bind: the claim's Events say `1 more replica(s) ... needed; rejected: none (no pools)` | Use `r-drbd-local`; a single replica is a plain LV, no DRBD device |
 | Compact cluster, data on control plane nodes | Works; the agent tolerates every taint | Apply the master KubeletConfig too |
 | Kernel log lines `helper command: /sbin/drbdadm ... exit code` | The agent could not set `usermode_helper` (no write access to sysfs) | Harmless; check the agent log for the reason |

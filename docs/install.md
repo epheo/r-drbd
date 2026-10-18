@@ -168,5 +168,8 @@ Then:
 1. Delete every PVC and VolumeSnapshot backed by r-drbd, and wait for the Volumes and Snapshots to go.
 2. Delete the Pools.
 3. `kubectl delete -k deploy/base`, then delete the CRDs.
+4. The version annotations stay on the Nodes:
+
+       kubectl annotate node --all r-drbd.io/drbd-kernel- r-drbd.io/drbd-utils- r-drbd.io/lvm-
 
 Deleting the agent first leaves Volumes stuck on their finalizers: the agent is what removes the LVs.
