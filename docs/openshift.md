@@ -7,7 +7,7 @@ Graceful node shutdown is off until a KubeletConfig turns it on.
 
 This page walks through an install on OpenShift 4.14 or newer with KMM 2.x.
 The pieces live in `deploy/openshift`.
-Verified on OpenShift 4.22 with KMM 2.7, on a single node: the Driver Toolkit build, the load, the install with the agent started before the module, local volumes with snapshots and expansion, the preflight validation, and the uninstall.
+Verified on OpenShift 4.22 with KMM 2.7, on a single node: the Driver Toolkit build, the load, the install with the agent started before the module, local volumes with snapshots and expansion, the preflight validation, the uninstall, and the node settings in one reboot.
 Replicated volumes between OpenShift nodes have not been tried yet.
 
 ## Before you start
