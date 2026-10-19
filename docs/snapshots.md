@@ -75,6 +75,7 @@ Rules:
   The first node restores the snapshot; DRBD copies it in full to the other replicas, which start empty.
 - The requested size may be larger than the snapshot; it may not be smaller.
 - Pins that point away from the snapshot's nodes or Pools fail the restore with reason `RestoreNodeConflict`.
+- The claim must still fit the scheduler's capacity check (see [Scheduling](volumes.md#scheduling)), although placement never charges a restore against capacity.
 
 The restored volume keeps the source's file system; it is never formatted again.
 
