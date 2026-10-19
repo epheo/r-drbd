@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod alloc;
+pub mod capacity;
 pub mod csi;
 pub mod evict;
 pub mod leader;

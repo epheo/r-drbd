@@ -10,7 +10,7 @@ use model::keys::FINALIZER_POOL;
 use model::{Pool, ReclaimPolicy, Role, Volume};
 use serde_json::json;
 
-use crate::store::{Stores, node_ready};
+use crate::store::Stores;
 use crate::{Ctx, Memory, apply_status, has_finalizer, set_finalizer};
 
 /// (node, pool) to the (name, sizeBytes) of every Volume with a diskful
@@ -65,7 +65,7 @@ pub(crate) fn view(p: &Pool, usage: &Usage, ready_nodes: &[String]) -> placer::P
 const PLACEABLE_STEP: u64 = 1 << 20;
 
 /// What status.placeableBytes shows: 0 for a pool placement skips.
-fn placeable(view: &placer::PoolView) -> u64 {
+pub(crate) fn placeable(view: &placer::PoolView) -> u64 {
     if !(view.node_ready && view.available) {
         return 0;
     }
@@ -124,15 +124,7 @@ pub(crate) async fn reconcile_all(ctx: &Ctx<'_>, memory: &Memory) {
         .iter()
         .filter_map(|v| v.spec.pool.as_deref())
         .collect();
-    let mut ready_nodes: Vec<String> = ctx
-        .stores
-        .nodes
-        .state()
-        .iter()
-        .filter(|n| node_ready(n))
-        .map(|n| n.name_any())
-        .collect();
-    ready_nodes.sort();
+    let ready_nodes = ctx.stores.ready_nodes();
     let snapshots = ctx.stores.snapshots.state();
     // A snapshot LV outlives its Volume; the pool must too.
     let snapshot_held: HashSet<(&str, &str)> = snapshots

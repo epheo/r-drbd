@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 
 use crate::alloc::{self, Entropy, Used};
 use crate::pool::Usage;
-use crate::store::{Stores, node_ready};
+use crate::store::Stores;
 use crate::{Ctx, Memory, apply_status, has_finalizer, set_finalizer, valid_volume_name};
 
 pub mod reason {
@@ -892,14 +892,7 @@ struct Placing {
 impl Placing {
     fn new(stores: &Stores, usage: &Usage, memory: &Memory, volumes: &[Arc<Volume>]) -> Self {
         let pools = Stores::sorted(&stores.pools);
-        let mut ready_nodes: Vec<String> = stores
-            .nodes
-            .state()
-            .iter()
-            .filter(|n| node_ready(n))
-            .map(|n| n.name_any())
-            .collect();
-        ready_nodes.sort();
+        let ready_nodes = stores.ready_nodes();
         Self {
             views: pool_views(&pools, usage, &ready_nodes),
             used: Used::from_assignments(volumes.iter().filter_map(|v| memory.assignment(v))),
