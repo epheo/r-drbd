@@ -340,6 +340,39 @@ async fn a_new_label_rereads_lvm() {
     );
 }
 
+/// pvcreate, vgcreate and lvcreate within one debounce: the first pass
+/// after them finds the disk held, so wipefs never sees the label.
+#[tokio::test]
+async fn a_disk_held_before_its_label_is_read_rereads_lvm() {
+    let d = Arc::new(FakeDisks::default());
+    d.set("/dev/vdb", disk("vdb"));
+    let x = Arc::new(ScriptedExec::new());
+    x.expect(wipefs_argv("/dev/vdb"), ok(WIPEFS_BLANK))
+        .expect(lvm::cmd::pvs_all(), pvs_out(&[]))
+        .expect(lvm::cmd::vgs_all(), vgs_out(&[]));
+    let mut s = scanner(&x, &d, vec![]);
+    assert_eq!(
+        summary(&s.pass(Dirty::everything()).await.status),
+        ["vdb /dev/vdb Blank - -"]
+    );
+    let mut held = disk("vdb");
+    held.sys.as_mut().unwrap().holders = vec!["dm-0".into(), "dm-1".into()];
+    d.set("/dev/vdb", held);
+    x.expect(lvm::cmd::pvs_all(), pvs_out(&[("/dev/vdb", "vm")]))
+        .expect(lvm::cmd::vgs_all(), vgs_out(&[("vm", "")]));
+    let mut dirty = Dirty::default();
+    dirty.add(Wake::Disk("vdb".into()));
+    let p = s.pass(dirty).await;
+    x.assert_done();
+    assert_eq!(summary(&p.status), ["vdb /dev/vdb NotEmpty - PV of VG vm"]);
+
+    // Known now: later events on the held disk run nothing.
+    let mut dirty = Dirty::default();
+    dirty.add(Wake::Disk("vdb".into()));
+    assert_eq!(s.pass(dirty).await.status, p.status);
+    x.assert_done();
+}
+
 #[tokio::test]
 async fn without_lvm_reports_a_pv_reads_by_its_signature_and_is_never_opened() {
     let d = Arc::new(FakeDisks::default());

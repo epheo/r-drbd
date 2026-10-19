@@ -138,6 +138,7 @@ Each row says what the agent does and what you see.
 |---|---|---|
 | A disk plugged, unplugged, partitioned, formatted, wiped or labelled, then closed | Shown within seconds (the kernel reports it) | |
 | A mount or an unmount | Shown within seconds (the mount table reports it) | |
+| A disk made a PV and held by its LVs before the inventory read the label | `NotEmpty` naming the VG within seconds: LVM's reports are read again once the disk is held | |
 | A writer that never closes the disk (a VM, a raw database, a long `dd`) | Shown at the hourly check | |
 | A holder leaving no trace in sysfs (an iSCSI target, an exclusive open) | `Busy` only when opened; kept until the disk's next event or the hourly check | |
 | A disk without any by-id link | `path` is `/dev/<name>`; a Pool cannot list it | Give the disk a serial or WWN |

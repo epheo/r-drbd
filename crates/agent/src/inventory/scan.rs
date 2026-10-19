@@ -159,6 +159,12 @@ fn needs_signatures(f: &Facts) -> bool {
     devices::classify_early(f, None, "").is_none()
 }
 
+/// Whole-disk holders only: a PV on a partition never names the disk's row.
+fn held_unknown_pv(f: &Facts, lvm: &Lvm) -> bool {
+    let held = f.sys.as_ref().is_ok_and(|s| !s.holders.is_empty());
+    held && f.dev.as_ref().is_ok_and(|n| !lvm.pvs.contains_key(n))
+}
+
 fn has_lvm_signature(e: &Entry) -> bool {
     matches!(&e.sigs, Some(Ok(s)) if s.iter().any(|g| g.kind == LVM_SIGNATURE))
 }
@@ -323,6 +329,9 @@ impl Scanner {
                 continue;
             };
             if !needs_signatures(&e.facts) {
+                // LVs activated before wipefs saw the label hold the disk,
+                // and wipefs stays off a held disk: only LVM can name its VG.
+                stale |= held_unknown_pv(&e.facts, &self.lvm);
                 continue;
             }
             if Instant::now() >= deadline || self.stopping() {
