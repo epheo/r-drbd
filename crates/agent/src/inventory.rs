@@ -87,7 +87,8 @@ pub enum Wake {
     Disk(String),
     /// Mount table or another block device changed: cheap facts again.
     Refresh,
-    /// A Pool device change: LVM reports again.
+    /// A Pool device change, or a Pool of this node added, removed or
+    /// re-pointed: LVM reports again.
     Lvm,
     /// Lost events: read every disk again.
     All,

@@ -340,6 +340,46 @@ async fn a_new_label_rereads_lvm() {
     );
 }
 
+/// A Pool deleted with its VG kept changes no disk: only the Pool list
+/// says the row is no longer Member.
+#[tokio::test]
+async fn a_pool_gone_from_its_vg_rereads_lvm() {
+    let d = Arc::new(FakeDisks::default());
+    let mut held = disk("vdb");
+    held.sys.as_mut().unwrap().holders = vec!["dm-0".into()];
+    d.set("/dev/vdb", held);
+    let x = Arc::new(ScriptedExec::new());
+    let reports = |x: &ScriptedExec| {
+        x.expect(lvm::cmd::pvs_all(), pvs_out(&[("/dev/vdb", "vm")]))
+            .expect(lvm::cmd::vgs_all(), vgs_out(&[("vm", "")]));
+    };
+    reports(&x);
+    let pools = Arc::new(StdMutex::new(vec![pool("p1", "vm", false)]));
+    let (_never, stop) = tokio::sync::watch::channel(false);
+    let disks: Arc<dyn HostDisks> = d.clone();
+    let list = pools.clone();
+    let mut s = Scanner::new(
+        NODE.into(),
+        x.clone(),
+        disks,
+        Arc::default(),
+        Box::new(move || list.lock().unwrap().clone()),
+        DiskWatch::Uevent,
+        stop,
+    );
+    assert_eq!(
+        summary(&s.pass(Dirty::everything()).await.status),
+        ["vdb /dev/vdb Member p1 -"]
+    );
+    pools.lock().unwrap().clear();
+    reports(&x);
+    let mut dirty = Dirty::default();
+    dirty.add(Wake::Lvm);
+    let p = s.pass(dirty).await;
+    x.assert_done();
+    assert_eq!(summary(&p.status), ["vdb /dev/vdb NotEmpty - PV of VG vm"]);
+}
+
 /// pvcreate, vgcreate and lvcreate within one debounce: the first pass
 /// after them finds the disk held, so wipefs never sees the label.
 #[tokio::test]

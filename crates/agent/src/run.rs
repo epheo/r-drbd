@@ -323,12 +323,42 @@ async fn stopped(rx: &mut tokio::sync::watch::Receiver<bool>) {
     let _ = rx.wait_for(|s| *s).await;
 }
 
+/// What of this node's Pools the NodeDisks rows depend on: which VG
+/// each owns, and whether by its tag or by its `vg`.
+#[derive(Debug, Default)]
+struct PoolSet(Option<BTreeMap<String, PoolKey>>);
+
+/// `vg`, `thinPool`, `devices`.
+type PoolKey = (String, String, Option<Vec<String>>);
+
+impl PoolSet {
+    /// True when the set differs from the last one seen, and for the
+    /// first: the inventory's first pass may have read the Pools earlier.
+    fn update(&mut self, pools: &[Arc<model::Pool>], node: &str) -> bool {
+        let now = pools
+            .iter()
+            .filter(|p| p.spec.node == node)
+            .map(|p| {
+                let s = &p.spec;
+                (
+                    p.name_any(),
+                    (s.vg.clone(), s.thin_pool.clone(), s.devices.clone()),
+                )
+            })
+            .collect();
+        let changed = self.0.as_ref() != Some(&now);
+        self.0 = Some(now);
+        changed
+    }
+}
+
 struct Triggers {
     /// Watch changes, the resync timer, events2 becoming available or lost.
     pass: Arc<Trigger>,
     /// events2 lines: a status refresh of the touched volumes only.
     changes: Arc<Trigger>,
-    /// The NodeDisks inventory, after a Pool device change.
+    /// The NodeDisks inventory, after a Pool device change or a change
+    /// of this node's Pools.
     disks: tokio::sync::mpsc::UnboundedSender<crate::inventory::Wake>,
     /// The caches are ready, for the inventory: kube's `wait_until_ready`
     /// wakes only the last of several waiters.
@@ -352,6 +382,7 @@ async fn reconcile_loop(
     let node = rec.node().to_owned();
     tracing::info!(node, "caches ready, reconciling");
     let (mut lvm_checked, mut lvm_probed) = (false, false);
+    let mut pool_set = PoolSet::default();
     loop {
         rec.set_addresses(addresses(&stores));
         rec.set_peer_leases(peer_leases(&stores));
@@ -367,7 +398,8 @@ async fn reconcile_loop(
         for pool in apply(&client, &node, writes).await {
             rec.events_unsent(&pool);
         }
-        if rec.take_disks_changed() {
+        let pool_set_changed = pool_set.update(&pools, &node);
+        if rec.take_disks_changed() || pool_set_changed {
             let _ = triggers.disks.send(crate::inventory::Wake::Lvm);
         }
         // Fixed per pass so a stream of refreshes cannot push the resync out.
@@ -524,6 +556,82 @@ mod tests {
             pod: None,
         });
         assert_send(&fut);
+    }
+
+    fn pool(name: &str, node: &str, vg: &str) -> Arc<model::Pool> {
+        Arc::new(model::Pool::new(
+            name,
+            model::PoolSpec {
+                node: node.into(),
+                tier: "t".into(),
+                vg: vg.into(),
+                thin_pool: "thin".into(),
+                overcommit_percent: model::DEFAULT_OVERCOMMIT_PERCENT,
+                reserve_percent: model::DEFAULT_RESERVE_PERCENT,
+                devices: None,
+                chunk_size: None,
+                reclaim_policy: None,
+            },
+        ))
+    }
+
+    fn with(p: &Arc<model::Pool>, f: impl FnOnce(&mut model::Pool)) -> Arc<model::Pool> {
+        let mut p = (**p).clone();
+        f(&mut p);
+        Arc::new(p)
+    }
+
+    #[test]
+    fn pool_set_wakes_on_this_nodes_pools_only() {
+        let a = pool("a", "n1", "vg1");
+        let mut set = PoolSet::default();
+        assert!(set.update(std::slice::from_ref(&a), "n1"), "first set");
+        assert!(!set.update(std::slice::from_ref(&a), "n1"), "same set");
+
+        let b = pool("b", "n1", "vg2");
+        assert!(set.update(&[a.clone(), b.clone()], "n1"), "added");
+        assert!(set.update(std::slice::from_ref(&a), "n1"), "removed");
+
+        let vg = with(&a, |p| p.spec.vg = "vg9".into());
+        assert!(set.update(&[vg], "n1"), "vg");
+        assert!(set.update(std::slice::from_ref(&a), "n1"));
+        let thin = with(&a, |p| p.spec.thin_pool = "t2".into());
+        assert!(set.update(&[thin], "n1"), "thinPool");
+        assert!(set.update(std::slice::from_ref(&a), "n1"));
+        let devs = with(&a, |p| {
+            p.spec.devices = Some(vec!["/dev/disk/by-id/x".into()]);
+        });
+        assert!(set.update(std::slice::from_ref(&devs), "n1"), "devices");
+        let more = with(&devs, |p| {
+            p.spec
+                .devices
+                .as_mut()
+                .unwrap()
+                .push("/dev/disk/by-id/y".into());
+        });
+        assert!(set.update(&[more], "n1"), "a device appended");
+        assert!(set.update(std::slice::from_ref(&a), "n1"));
+
+        let other = pool("c", "n2", "vg1");
+        assert!(
+            !set.update(&[a.clone(), other.clone()], "n1"),
+            "other node added"
+        );
+        let moved = with(&other, |p| p.spec.vg = "vg3".into());
+        assert!(!set.update(&[a.clone(), moved], "n1"), "other node changed");
+        assert!(
+            !set.update(std::slice::from_ref(&a), "n1"),
+            "other node removed"
+        );
+
+        let status = with(&a, |p| {
+            p.status = Some(model::PoolStatus {
+                free_bytes: Some(1 << 30),
+                ..model::PoolStatus::default()
+            });
+            p.metadata.resource_version = Some("7".into());
+        });
+        assert!(!set.update(&[status], "n1"), "status only");
     }
 
     #[test]

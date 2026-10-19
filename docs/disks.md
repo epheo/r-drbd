@@ -143,6 +143,7 @@ Each row says what the agent does and what you see.
 | A holder leaving no trace in sysfs (an iSCSI target, an exclusive open) | `Busy` only when opened; kept until the disk's next event or the hourly check | |
 | A disk without any by-id link | `path` is `/dev/<name>`; a Pool cannot list it | Give the disk a serial or WWN |
 | A disk of a Pool without `devices` | `Member`, naming the Pool whose `vg` holds it; several such Pools: the first by name, the others in the message | |
+| A Pool without `devices` created on an existing VG, deleted from it (the VG stays), or pointed at another VG | Its disks read `Member` naming the Pool, or `NotEmpty` naming the VG, within seconds | |
 | A disk of a VG tagged for a Pool not on this node, or for two Pools | `NotEmpty`, saying so | |
 | A disk of any other VG (the root VG) | `NotEmpty`, naming the VG | |
 | Hidden NVMe multipath paths, floppies, eMMC boot areas, zvols, RBD, null block | Left out, or `NotADisk` | |
