@@ -14,6 +14,7 @@ You declare thin pools as Pool objects, and claim volumes through a StorageClass
 - [Snapshots](snapshots.md): taking snapshots and restoring them.
 - [Operations](operations.md): reading status, node loss, split brain, moving replicas.
 - [Data safety](data-safety.md): what r-drbd never does to your data.
+- [Performance](performance.md): memory, provisioning latency and data path, measured on a small test bed.
 
 ## Reference
 
