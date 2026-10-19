@@ -147,6 +147,38 @@ subjects:
     name: r-drbd-agent
     namespace: r-drbd-system
 ---
+# csi-provisioner publishes capacity in its own namespace and walks from its
+# pod up to the Deployment that owns those objects.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: r-drbd-controller
+  namespace: r-drbd-system
+rules:
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csistoragecapacities"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: r-drbd-controller
+  namespace: r-drbd-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: r-drbd-controller
+subjects:
+  - kind: ServiceAccount
+    name: r-drbd-controller
+    namespace: r-drbd-system
+---
 # The agent reads its own pod at shutdown on hosts without systemd.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

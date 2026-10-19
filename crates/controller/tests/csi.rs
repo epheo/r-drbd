@@ -13,7 +13,7 @@ use csi::v1::volume_capability::{AccessMode, AccessType, BlockVolume, MountVolum
 use csi::v1::volume_content_source::{SnapshotSource, Type as SourceType};
 use csi::v1::{
     CapacityRange, ControllerExpandVolumeRequest, ControllerPublishVolumeRequest,
-    CreateSnapshotRequest, CreateVolumeRequest, Topology, TopologyRequirement,
+    CreateSnapshotRequest, CreateVolumeRequest, GetCapacityRequest, Topology, TopologyRequirement,
     ValidateVolumeCapabilitiesRequest, VolumeCapability, VolumeContentSource,
 };
 use k8s_openapi::api::core::v1::PersistentVolumeClaim;
@@ -80,6 +80,62 @@ async fn controller_calls() {
     let _watchers = tokio::spawn(watchers);
     stores.wait_ready().await.unwrap();
     let svc = controller::csi::Csi::new(client.clone(), stores, cfg);
+
+    // Capacity from placeableBytes, once the pool pass has published it.
+    // Rooms: p1 90 GiB, p2a 45, p2b 36 (free less the 5 percent reserve).
+    let capacity = |params: &[(&str, &str)], node: Option<&str>| GetCapacityRequest {
+        parameters: params
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect(),
+        accessible_topology: node.map(topology),
+        ..GetCapacityRequest::default()
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let local = [("tier", "fast")];
+    let replicated = [("tier", "fast"), ("replicas", "2")];
+    let expected = [
+        (&local[..], Some("n1"), 90),
+        (&local[..], Some("n2"), 45),
+        (&local[..], Some("n3"), 0),
+        (&local[..], None, 90),
+        (&replicated[..], Some("n1"), 45),
+        (&replicated[..], Some("n2"), 45),
+        // Any node attaches a replicated volume, n3 without a Pool too.
+        (&replicated[..], Some("n3"), 45),
+        (&replicated[..], None, 45),
+        // No Pool has the tier: 0, never a stale number.
+        (&[("tier", "slow")][..], Some("n1"), 0),
+        (&[("tier", "fast"), ("replicas", "3")][..], None, 0),
+    ];
+    for (params, node, gib) in expected {
+        let want = i64::try_from(gib * GIB).unwrap();
+        loop {
+            let got = svc
+                .get_capacity(Request::new(capacity(params, node)))
+                .await
+                .unwrap()
+                .into_inner();
+            if got.available_capacity == want {
+                assert_eq!(got.maximum_volume_size, Some(want));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{params:?} on {node:?}: {} bytes, want {want}",
+                got.available_capacity
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    let err = svc
+        .get_capacity(Request::new(capacity(
+            &[("tier", "fast"), ("replicas", "4")],
+            Some("n1"),
+        )))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
 
     // PVC annotations pin the pool (and so the node) over free space.
     let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), "default");

@@ -68,15 +68,7 @@ pub fn parse_params<S: std::hash::BuildHasher>(
         .filter(|t| !t.is_empty())
         .ok_or_else(|| format!("parameter {PARAM_TIER} is required"))?
         .clone();
-    let replicas = match p.get(PARAM_REPLICAS) {
-        None => 1,
-        Some(r) => r
-            .trim()
-            .parse::<u32>()
-            .ok()
-            .filter(|n| (1..=3).contains(n))
-            .ok_or_else(|| format!("parameter {PARAM_REPLICAS} must be 1, 2 or 3, got {r:?}"))?,
-    };
+    let replicas = parse_replicas(p)?;
     let pvc = match (p.get(PARAM_PVC_NAMESPACE), p.get(PARAM_PVC_NAME)) {
         (Some(ns), Some(n)) if !ns.is_empty() && !n.is_empty() => Some((ns.clone(), n.clone())),
         _ => None,
@@ -86,6 +78,20 @@ pub fn parse_params<S: std::hash::BuildHasher>(
         replicas,
         pvc,
     })
+}
+
+pub fn parse_replicas<S: std::hash::BuildHasher>(
+    p: &HashMap<String, String, S>,
+) -> Result<u32, String> {
+    match p.get(PARAM_REPLICAS) {
+        None => Ok(1),
+        Some(r) => r
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|n| (1..=3).contains(n))
+            .ok_or_else(|| format!("parameter {PARAM_REPLICAS} must be 1, 2 or 3, got {r:?}")),
+    }
 }
 
 /// The Volume access mode a capability needs. MULTI_NODE_* is raw block
@@ -1063,9 +1069,26 @@ impl Controller for Csi {
 
     async fn get_capacity(
         &self,
-        _: Request<GetCapacityRequest>,
+        req: Request<GetCapacityRequest>,
     ) -> Result<Response<GetCapacityResponse>, Status> {
-        Err(Status::unimplemented("GetCapacity"))
+        let req = req.into_inner();
+        for c in &req.volume_capabilities {
+            check_capability(c).map_err(Status::invalid_argument)?;
+        }
+        let segment = req
+            .accessible_topology
+            .as_ref()
+            .and_then(|t| t.segments.get(TOPOLOGY_KEY))
+            .map(String::as_str);
+        let ready_nodes = self.stores.ready_nodes();
+        let pools = Stores::sorted(&self.stores.pools);
+        let bytes = crate::capacity::answer(&pools, &ready_nodes, &req.parameters, segment)
+            .map_err(Status::invalid_argument)?;
+        Ok(Response::new(GetCapacityResponse {
+            available_capacity: to_i64(bytes),
+            maximum_volume_size: Some(to_i64(bytes)),
+            minimum_volume_size: None,
+        }))
     }
 
     async fn controller_get_capabilities(
@@ -1083,6 +1106,7 @@ impl Controller for Csi {
                 cap(rpc::Type::PublishUnpublishVolume),
                 cap(rpc::Type::ExpandVolume),
                 cap(rpc::Type::CreateDeleteSnapshot),
+                cap(rpc::Type::GetCapacity),
             ],
         }))
     }

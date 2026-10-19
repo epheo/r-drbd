@@ -106,6 +106,19 @@ impl Stores {
             .map(|d| d + Duration::from_millis(100))
     }
 
+    /// Names of the Ready nodes, sorted for binary search.
+    pub fn ready_nodes(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .nodes
+            .state()
+            .iter()
+            .filter(|n| node_ready(n))
+            .map(|n| n.name_any())
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Objects sorted by name, so passes and allocation are deterministic.
     pub fn sorted<K>(store: &Store<K>) -> Vec<Arc<K>>
     where
