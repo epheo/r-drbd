@@ -104,7 +104,7 @@ async fn controller_calls() {
         // Any node attaches a replicated volume, n3 without a Pool too.
         (&replicated[..], Some("n3"), 45),
         (&replicated[..], None, 45),
-        // No Pool has the tier: 0, so the provisioner drops the object.
+        // No Pool has the tier: 0, never a stale number.
         (&[("tier", "slow")][..], Some("n1"), 0),
         (&[("tier", "fast"), ("replicas", "3")][..], None, 0),
     ];

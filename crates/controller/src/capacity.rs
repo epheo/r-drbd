@@ -14,8 +14,8 @@ use crate::pool::Usage;
 /// sends) every tier counts.
 // A tier no Pool declares answers 0, not an error: the provisioner keeps an
 // object on error, and a stale one would send the scheduler to a node the
-// placer refuses. The scheduler reads a missing object as no capacity, so 0
-// (the provisioner deletes the object) and no object behave the same.
+// placer refuses. csi-provisioner v6.3.0 keeps an object saying 0; the
+// scheduler reads that and a missing object alike, as no capacity.
 pub fn answer<S: std::hash::BuildHasher>(
     pools: &[Arc<Pool>],
     ready_nodes: &[String],
