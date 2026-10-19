@@ -101,7 +101,11 @@ async fn controller_calls() {
         (&local[..], None, 90),
         (&replicated[..], Some("n1"), 45),
         (&replicated[..], Some("n2"), 45),
-        (&replicated[..], Some("n3"), 0),
+        // Any node attaches a replicated volume, n3 without a Pool too.
+        (&replicated[..], Some("n3"), 45),
+        (&replicated[..], None, 45),
+        // No Pool has the tier: 0, so the provisioner drops the object.
+        (&[("tier", "slow")][..], Some("n1"), 0),
         (&[("tier", "fast"), ("replicas", "3")][..], None, 0),
     ];
     for (params, node, gib) in expected {
@@ -125,7 +129,10 @@ async fn controller_calls() {
         }
     }
     let err = svc
-        .get_capacity(Request::new(capacity(&[("tier", "slow")], Some("n1"))))
+        .get_capacity(Request::new(capacity(
+            &[("tier", "fast"), ("replicas", "4")],
+            Some("n1"),
+        )))
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::InvalidArgument, "{err}");

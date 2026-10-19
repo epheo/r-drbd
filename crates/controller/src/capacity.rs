@@ -11,7 +11,11 @@ use crate::pool::Usage;
 
 /// GetCapacity for the class `parameters` on the node of `segment`, or the
 /// whole cluster when None. Without a tier (a bare request, as csi-sanity
-/// sends) every tier counts; a tier no Pool declares is an error.
+/// sends) every tier counts.
+// A tier no Pool declares answers 0, not an error: the provisioner keeps an
+// object on error, and a stale one would send the scheduler to a node the
+// placer refuses. The scheduler reads a missing object as no capacity, so 0
+// (the provisioner deletes the object) and no object behave the same.
 pub fn answer<S: std::hash::BuildHasher>(
     pools: &[Arc<Pool>],
     ready_nodes: &[String],
@@ -23,17 +27,12 @@ pub fn answer<S: std::hash::BuildHasher>(
         .get(PARAM_TIER)
         .map(String::as_str)
         .filter(|t| !t.is_empty());
-    if let Some(t) = tier
-        && !pools.iter().any(|p| p.spec.tier == t)
-    {
-        return Err(format!("no Pool has tier {t}"));
-    }
     Ok(largest(pools, ready_nodes, tier, replicas, segment))
 }
 
 /// Largest volume of `replicas` diskful replicas of `tier` (every tier
-/// when None) that placement accepts now, with one replica on `node`, or
-/// anywhere when None. 0 when none fits.
+/// when None) that placement accepts now for a pod on `node`, or anywhere
+/// when None. 0 when none fits.
 pub fn largest(
     pools: &[Arc<Pool>],
     ready_nodes: &[String],
@@ -41,6 +40,10 @@ pub fn largest(
     replicas: u32,
     node: Option<&str>,
 ) -> u64 {
+    // Only a local volume lives on the pod's node. A replicated one is
+    // placed by free space anywhere and any node attaches it diskless, so
+    // every node sees the cluster-wide answer.
+    let node = node.filter(|_| replicas == 1);
     let views: Vec<PoolView> = pools.iter().map(|p| view(p, ready_nodes)).collect();
     let mut tiers: Vec<&str> = match tier {
         Some(t) => vec![t],
@@ -91,23 +94,16 @@ fn largest_in(views: &[PoolView], tier: &str, replicas: u32, node: Option<&str>)
 }
 
 fn placed(views: &[PoolView], tier: &str, replicas: u32, node: Option<&str>, size: u64) -> bool {
-    let request = |replicas, node: Option<&str>, existing: Vec<String>| Request {
+    let request = Request {
         size_bytes: size,
         replicas,
         tier: tier.to_owned(),
         pool: None,
         node: node.map(str::to_owned),
-        existing,
+        existing: Vec::new(),
         holds_data: false,
     };
-    let fits = |r: &Request| matches!(placer::place(r, views), Outcome::Placed { .. });
-    match node {
-        None => fits(&request(replicas, None, Vec::new())),
-        Some(n) => {
-            fits(&request(1, Some(n), Vec::new()))
-                && (replicas <= 1 || fits(&request(replicas, None, vec![n.to_owned()])))
-        }
-    }
+    matches!(placer::place(&request, views), Outcome::Placed { .. })
 }
 
 #[cfg(test)]
@@ -258,11 +254,11 @@ mod tests {
             &[],
         );
         let fast = Some("fast");
-        assert_eq!(largest(&pools, &r, fast, 2, Some("n1")), 50 * G);
-        assert_eq!(largest(&pools, &r, fast, 2, Some("n2")), 50 * G);
-        assert_eq!(largest(&pools, &r, fast, 2, None), 50 * G);
-        // n3 holds no Pool; three replicas need a third node.
-        assert_eq!(largest(&pools, &r, fast, 2, Some("n3")), 0);
+        // Every node, n3 without a Pool too: it attaches diskless.
+        for node in [Some("n1"), Some("n2"), Some("n3"), None] {
+            assert_eq!(largest(&pools, &r, fast, 2, node), 50 * G, "{node:?}");
+        }
+        // Three replicas need a third node with a Pool.
         assert_eq!(largest(&pools, &r, fast, 3, Some("n1")), 0);
         assert_eq!(largest(&pools, &r, fast, 3, None), 0);
     }
@@ -280,13 +276,12 @@ mod tests {
             &[],
         );
         let fast = Some("fast");
-        assert_eq!(largest(&pools, &r, fast, 2, Some("n1")), 80 * G);
-        assert_eq!(largest(&pools, &r, fast, 2, Some("n2")), 50 * G);
-        assert_eq!(largest(&pools, &r, fast, 2, Some("n3")), 80 * G);
-        assert_eq!(largest(&pools, &r, fast, 2, Some("n4")), 0);
-        assert_eq!(largest(&pools, &r, fast, 2, None), 80 * G);
-        assert_eq!(largest(&pools, &r, fast, 3, Some("n1")), 50 * G);
-        assert_eq!(largest(&pools, &r, fast, 3, None), 50 * G);
+        // The second best node bounds two replicas, the third best three,
+        // whichever node the pod is on.
+        for node in [Some("n1"), Some("n2"), Some("n3"), Some("n4"), None] {
+            assert_eq!(largest(&pools, &r, fast, 2, node), 80 * G, "{node:?}");
+            assert_eq!(largest(&pools, &r, fast, 3, node), 50 * G, "{node:?}");
+        }
     }
 
     #[test]
@@ -325,6 +320,7 @@ mod tests {
         assert_eq!(largest(&pools, &r, fast, 1, Some("n2")), 15 * G);
         assert_eq!(largest(&pools, &r, fast, 1, Some("n3")), 0);
         assert_eq!(largest(&pools, &r, fast, 2, Some("n1")), 15 * G);
+        assert_eq!(largest(&pools, &r, fast, 2, Some("n3")), 15 * G);
         assert_eq!(largest(&pools, &r, fast, 3, None), 0);
     }
 
@@ -336,8 +332,8 @@ mod tests {
         assert_eq!(ask(&[("tier", "fast")]), Ok(95 * G));
         assert_eq!(ask(&[("tier", "fast"), ("replicas", "2")]), Ok(0));
         assert_eq!(ask(&[]), Ok(95 * G));
-        let unknown = ask(&[("tier", "slow")]).unwrap_err();
-        assert!(unknown.contains("tier slow"), "{unknown}");
+        assert_eq!(ask(&[("tier", "slow")]), Ok(0));
+        assert_eq!(ask(&[("tier", "slow"), ("replicas", "2")]), Ok(0));
         assert!(ask(&[("tier", "fast"), ("replicas", "two")]).is_err());
         assert!(ask(&[("tier", "fast"), ("replicas", "4")]).is_err());
     }

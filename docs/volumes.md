@@ -71,7 +71,8 @@ Refused:
 Under `WaitForFirstConsumer` the scheduler sees each node's capacity per StorageClass, refreshed every minute.
 For `replicas: 1`, a node's capacity is the largest `placeableBytes` among its Pools of the tier.
 A node without such a Pool has none, so it is never chosen for a local claim.
-For `replicas` 2 or 3, it is the largest volume with one replica on that node and the others on other nodes; the first pod of a new replicated claim also lands on a node with a Pool of the tier.
+For `replicas` 2 or 3, every node sees the same number, the largest volume placement can spread over that many nodes, since any node can attach it.
+Only local claims are kept off nodes without a Pool.
 A claim no Pool can hold stays Pending; the pod's events carry the scheduler's message, `node(s) did not have enough free storage`.
 If capacity changes between two refreshes, CreateVolume refuses the node and the scheduler picks again.
 
