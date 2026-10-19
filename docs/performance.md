@@ -119,7 +119,7 @@ Other operations, replicated class, median of 3:
 | Resize 1Gi to 2Gi to the file system grown in the pod | 47.34 | 47.34, 53.07, 38.77 |
 | Claim deleted to Volume gone | 7.55 | 15.80, 3.85, 7.55 |
 
-- The restore claims ask for 2Gi: a known issue, being fixed, makes a snapshot of a 1Gi Volume report 1077698560 bytes (the DRBD device size: the LV rounded up to a 4 MiB extent, minus metadata for 6 peer slots), so a 1Gi restore claim is refused.
+- The restore claims ask for 2Gi: when this was measured a snapshot of a 1Gi Volume reported the DRBD device size, a little above 1Gi, and a 1Gi restore claim was refused; snapshots now report the requested size and a same-size restore binds.
 - No provisioning latency of the Java-based stack was measured, so there is no direct comparison.
 - Every measured time is far below the acceptance bounds under Targets.
 
