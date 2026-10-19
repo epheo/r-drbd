@@ -559,6 +559,14 @@ pub fn resume_members(listed: &[String], acks: &[SnapshotAck]) -> Vec<String> {
         .collect()
 }
 
+/// What restores can rely on: the requested size, or less while a replica
+/// has not grown to it yet. The DRBD device is larger than the request (the LV
+/// rounds up to an extent), so reporting it would refuse a same-size restore.
+pub fn restore_size(v: &Volume) -> u64 {
+    let usable = v.status.as_ref().and_then(|st| st.usable_bytes);
+    usable.map_or(v.spec.size_bytes, |u| u.min(v.spec.size_bytes))
+}
+
 /// Writes the outcome of one step; returns when to look again.
 async fn apply_step(
     ctx: &Ctx<'_>,
@@ -588,9 +596,7 @@ async fn apply_step(
             let mut wanted = current;
             wanted.phase_since = Some(crate::now());
             if phase == SnapshotPhase::Taking {
-                // What restores can rely on: every replica has grown to it.
-                let usable = v.status.as_ref().and_then(|st| st.usable_bytes);
-                wanted.size_bytes = Some(usable.unwrap_or(v.spec.size_bytes));
+                wanted.size_bytes = Some(restore_size(v));
                 // A restore starts with the source's filesystem marker.
                 wanted.file_system = v.status.as_ref().and_then(|st| st.file_system.clone());
             }
@@ -685,6 +691,43 @@ mod tests {
             take_timeout: Duration::from_secs(120),
             suspend_timeout: Duration::from_secs(30),
         }
+    }
+
+    fn volume(size: u64, usable: Option<u64>) -> Volume {
+        let mut v = Volume::new(
+            "pvc-1",
+            model::VolumeSpec {
+                size_bytes: size,
+                replicas: 2,
+                tier: "test".into(),
+                pool: None,
+                node: None,
+                access_mode: model::AccessMode::default(),
+                attachments: vec![],
+                evict: vec![],
+                source: None,
+                resolve: None,
+                assignment: None,
+            },
+        );
+        v.status = Some(VolumeStatus {
+            usable_bytes: usable,
+            ..VolumeStatus::default()
+        });
+        v
+    }
+
+    #[test]
+    fn restore_size_is_the_request_not_the_drbd_device() {
+        const GI: u64 = 1 << 30;
+        // The DRBD device of a 1Gi replicated volume.
+        assert_eq!(restore_size(&volume(GI, Some(1_077_698_560))), GI);
+        assert_eq!(restore_size(&volume(GI, None)), GI);
+        // Mid-resize: a replica still at the old size bounds what a restore gets.
+        assert_eq!(
+            restore_size(&volume(2 * GI, Some(1_077_698_560))),
+            1_077_698_560
+        );
     }
 
     #[test]
