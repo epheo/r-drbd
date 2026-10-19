@@ -177,10 +177,12 @@ Volume Events: `Evicted`, `EvictionBlocked`, `SplitBrainResolved`, `PeerUnreacha
 
 Name `r-drbd.io`.
 
-Controller capabilities: create and delete volume, publish and unpublish, expand, create and delete snapshot.
+Controller capabilities: create and delete volume, publish and unpublish, expand, create and delete snapshot, capacity.
 Node capabilities: stage and unstage, expand, volume stats.
 
-Not supported: clone from a PVC, ListVolumes, ListSnapshots, GetCapacity.
+Not supported: clone from a PVC, ListVolumes, ListSnapshots.
+
+GetCapacity answers per node and class from the Pools' `placeableBytes`, without an LVM call; see [Volumes](volumes.md#scheduling).
 
 StorageClass parameters: `tier` (required), `replicas` (1, 2 or 3, default 1).
 PVC annotations: `r-drbd.io/node`, `r-drbd.io/pool`.
@@ -215,6 +217,7 @@ Other environment:
 |---|---|
 | Lease `r-drbd-controller` | Controller leader election |
 | Lease `r-drbd-agent-<node>` | Agent heartbeat, renewed every 10 s, stale after 40 s |
+| CSIStorageCapacity, in the controller's namespace | Capacity per node and StorageClass for the scheduler; owned by the controller Deployment |
 | Node annotations `r-drbd.io/drbd-kernel`, `r-drbd.io/drbd-utils`, `r-drbd.io/lvm` | Tool versions seen by the agent |
 
 ## Host
