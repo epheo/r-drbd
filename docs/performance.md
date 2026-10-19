@@ -1,23 +1,23 @@
 # Performance
 
 Memory, CPU, provisioning latency and data path of r-drbd, measured on one small test bed.
-The numbers are from one run; they show the order of magnitude, not a guarantee.
+The numbers are from one measurement session, on one day; they show the order of magnitude, not a guarantee.
 
 ## Targets
 
 - Controller: under 50 MiB RSS idle, its CSI controller plugin included (it runs in the same process).
 - Agent: under 30 MiB RSS, its CSI node plugin included.
-- Provisioning: no slower than the stack r-drbd replaces.
+- Provisioning: within the acceptance bounds this project holds itself to: a replicated claim Bound within 600 s, its pod Running within 300 s more, both replicas UpToDate within 300 s, a local claim Bound within 300 s.
 - Data path: DRBD's own; r-drbd adds nothing on it.
 
-Result: both memory targets are met with a wide margin (controller peak 7.9 MiB, agent peak 11.4 MiB).
+Result: both memory targets are met (controller peak 7.9 MiB, agent peak 11.4 MiB).
 
 ## Bed
 
 - Three virtual machines on one physical host, joined into one MicroShift cluster.
-- Data node A: 4 vCPU, 5 GiB, control plane, data and the r-drbd controller.
-- Data node B: 2 vCPU, 3.5 GiB, data.
-- Node C: 2 vCPU, 4 GiB, diskless tiebreaker, no Pool.
+- Data node A: 4 vCPU, 5 GiB allocated, control plane, data and the r-drbd controller.
+- Data node B: 2 vCPU, 3.5 GiB allocated, data.
+- Node C: 2 vCPU, 4 GiB allocated, diskless tiebreaker, no Pool.
 - Each data node: one 20 GiB virtio disk, itself a thin LV on an NVMe thin pool of the host.
 - Inside each data node: one VG on that disk, one thin pool (64 KiB chunks, zeroing on), one Pool.
 - One virtual L2 between the machines; ping round trip with 4 KiB payload 0.196 ms on average.
@@ -29,11 +29,12 @@ Result: both memory targets are met with a wide margin (controller peak 7.9 MiB,
 - Memory: for every r-drbd pod, from the node's `/proc`: VmRSS and RssAnon of every process in the r-drbd container, and `memory.current` of the container cgroup.
 - The target is checked against VmRSS of the `r-drbd` process.
 - Helper processes (`drbdsetup events2`, and in the burst `drbdadm`, `lvs`, `mkfs.xfs`) are reported apart as "helpers".
-- CSI sidecars (provisioner, attacher, resizer, snapshotter, registrar) are upstream images, not counted in the target; the controller pod total with them is given once.
+- CSI sidecars are upstream images, not counted in the target: four in the controller pod (provisioner, attacher, resizer, snapshotter), the node driver registrar in each agent pod; the pod totals with them are given once.
 - Points: idle 10 min after start with no Volume; 20 Volumes (10 local, 10 with 2 replicas), each with a running pod, 5 min after the last pod started; peak during the burst that created them (20 claims and 20 pods at once, sampled every 2 s until all Running); 5 min after deleting everything.
 - Provisioning: claim and pod created together, polled every 0.2 s; time to claim Bound and to pod Running.
 - StorageClasses use `volumeBindingMode: WaitForFirstConsumer`, so Bound includes pod scheduling.
 - Pods are pinned to a data node with a nodeSelector: local claims on node B, replicated claims on node A (the Primary).
+- Why: an unpinned local claim can be scheduled to the node without a Pool and stays Pending (a known issue, being fixed separately).
 - 10 sequential runs per class, each claim deleted before the next; p50 and p95 are nearest-rank.
 - Snapshot, restore, resize and delete: 3 runs on the replicated class, median reported.
 - Data path: fio 3.27 from one container image, 30 s runs, two runs each, the second reported.
@@ -41,7 +42,7 @@ Result: both memory targets are met with a wide margin (controller peak 7.9 MiB,
 - 1 MiB sequential write: `--rw=write --bs=1M --iodepth=8 --direct=1 --ioengine=libaio`.
 - All runs on the first 1 GiB of the device; the sequential runs go first, so the random runs hit allocated thin chunks.
 - Local and replicated: fio in a pod on node A on a `volumeMode: Block` claim of 2 GiB.
-- Floor: a 2 GiB thin LV in the same thin pool on node A, written by the same fio image run with podman on the host.
+- Floor: a 2 GiB thin LV in the same thin pool on node A, written by the same fio image run with podman on node A itself, outside Kubernetes.
 
 ## Memory (MiB)
 
@@ -82,6 +83,7 @@ Peak over the 9 samples of the burst (each column its own maximum):
 | Agent, node C | 9.5 | 2.0 | 0.3 | 4.7 |
 
 - Even the whole agent container stays under 30 MiB at its peak (23.0 MiB).
+- The agent pod with its registrar reached 30.9 MiB on node A with 20 Volumes; the target is on the process, which stays met.
 - The controller pod with its four CSI sidecars: 121.5 MiB idle, 162.2 MiB with 20 Volumes.
 - `memory.current` can be below VmRSS: file pages of the binary first read by another cgroup count in RSS but are not charged to the container.
 
@@ -94,7 +96,8 @@ CPU time of each container over its first 10 min, idle:
 | Agent, node B | 0.52 |
 | Agent, node C | 0.10 |
 
-For comparison, a Java-based DRBD control plane measured earlier on one node with 2 pools and 2 resources used 756 MiB for its controller plus 35 MiB for its wrapper, and 345 MiB for its node agent.
+For comparison, process RSS of a Java-based DRBD control plane, idle: 756 MiB for its controller plus 35 MiB for its wrapper, 345 MiB for its node agent.
+Those figures come from another bed (one node, 2 pools, 2 resources) and another method; compare the order of magnitude only.
 
 ## Provisioning latency (s)
 
@@ -116,10 +119,9 @@ Other operations, replicated class, median of 3:
 | Resize 1Gi to 2Gi to the file system grown in the pod | 47.34 | 47.34, 53.07, 38.77 |
 | Claim deleted to Volume gone | 7.55 | 15.80, 3.85, 7.55 |
 
-- The restore claims ask for 2Gi: a snapshot of a 1Gi Volume reports a restore size of 1077698560 bytes (the LV with DRBD metadata), and a smaller claim is refused.
+- The restore claims ask for 2Gi: a known issue, being fixed, makes a snapshot of a 1Gi Volume report 1077698560 bytes (the DRBD device size: the LV rounded up to a 4 MiB extent, minus metadata for 6 peer slots), so a 1Gi restore claim is refused.
 - No provisioning latency of the Java-based stack was measured, so there is no direct comparison.
-- The bound the product must stay under is a downstream end-to-end test: a replicated claim Bound within 600 s, its pod Running within 300 s more, both replicas UpToDate within 300 s, a local claim Bound within 300 s.
-- Every measured time is far below those bounds.
+- Every measured time is far below the acceptance bounds under Targets.
 
 ## Data path
 
@@ -139,8 +141,8 @@ Second run of each:
 
 ## Caveats
 
-- Nested virtualization: the disks are virtio on a thin pool of the host, the network a virtual bridge; real disks and NICs give other numbers.
+- Virtual machines with a stacked thin pool (guest thin pool on a host thin LV): the disks are virtio, the network a virtual bridge; real disks and NICs give other numbers.
 - Shared host: the physical host runs other workloads, and the cluster ran an unrelated set of pods on every node; neither was stopped.
 - Thin LVs with zeroing everywhere, the floor included; a first write to a chunk costs more than the steady state shown.
-- One run per point; no averaging across runs or days.
+- One measurement session, on one day; no averaging across sessions or days.
 - Memory is RSS, not a limit: set requests and limits from your own peaks with headroom.
