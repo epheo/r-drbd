@@ -34,7 +34,7 @@ Result: both memory targets are met (controller peak 7.9 MiB, agent peak 11.4 Mi
 - Provisioning: claim and pod created together, polled every 0.2 s; time to claim Bound and to pod Running.
 - StorageClasses use `volumeBindingMode: WaitForFirstConsumer`, so Bound includes pod scheduling.
 - Pods are pinned to a data node with a nodeSelector: local claims on node B, replicated claims on node A (the Primary).
-- Why: an unpinned local claim can be scheduled to the node without a Pool and stays Pending (a known issue, being fixed separately).
+- Why: when this was measured the scheduler could place an unpinned local claim on the node without a Pool, where it stayed Pending; the scheduler now sees per-node capacity and does not pick that node (see volumes.md, Scheduling).
 - 10 sequential runs per class, each claim deleted before the next; p50 and p95 are nearest-rank.
 - Snapshot, restore, resize and delete: 3 runs on the replicated class, median reported.
 - Data path: fio 3.27 from one container image, 30 s runs, two runs each, the second reported.
