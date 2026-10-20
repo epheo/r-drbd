@@ -266,7 +266,11 @@ async fn drive_leases(
         let now = Instant::now();
         let wake = match event {
             Ok(watcher::Event::Init) => {
-                relist = Some((std::mem::take(&mut seen), Vec::new()));
+                // A failed list page starts a second Init: keep the
+                // observations the first one took.
+                let (_, listed) =
+                    relist.get_or_insert_with(|| (std::mem::take(&mut seen), Vec::new()));
+                listed.clear();
                 false
             }
             Ok(watcher::Event::InitApply(l)) => {
