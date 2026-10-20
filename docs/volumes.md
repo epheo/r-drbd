@@ -87,6 +87,7 @@ Increase the PVC request:
 
 Each agent grows its LV, then DRBD grows once all replicas are larger, then XFS grows on the node using it.
 Expansion works online.
+It is refused while a snapshot of the volume is suspending or taking; the resizer retries.
 Shrinking is refused.
 
 `status.usableBytes` keeps the old size until every diskful replica on a reachable node reports the new one.

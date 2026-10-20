@@ -55,7 +55,7 @@ Each node keeps its own deadlines, on its own clock:
 So IO stays frozen about 4 minutes at most, and no node resumes before every copy of a Ready snapshot is taken.
 A node that is no longer suspended when it should be (a reboot, a resume on its deadline) fails the snapshot.
 A replica attached during the round never suspended, so it fails the snapshot too.
-While a round runs, no replica grows.
+While a round runs, volume expansion is refused (the call is retried) and no replica grows.
 
 A failed take is a failure: the Snapshot never turns Ready without a backing LV on every node.
 A snapshot of a volume that is being deleted, or that stays missing for 30 s, fails.

@@ -1217,6 +1217,12 @@ impl Controller for Csi {
                 done = true;
                 break;
             }
+            // A grow moves DRBD metadata; under a take the copies would differ.
+            if let Some(snap) = crate::volume::snapshot_in_progress(&self.stores, &name) {
+                return Err(Status::aborted(format!(
+                    "volume {name}: snapshot {snap} is in its round; retry"
+                )));
+            }
             // Assignments only the reconciler has in memory are missed; a
             // newer one lands in the store within a pass.
             let volumes = Stores::sorted(&self.stores.volumes);

@@ -855,3 +855,83 @@ async fn attachment_failure_is_per_node() {
         .count();
     assert_eq!(failures, 1);
 }
+
+/// A grow moves DRBD metadata: never while a snapshot round takes copies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expand_refused_mid_round() {
+    use model::SnapshotPhase;
+    let assets = require_envtest!();
+    support::init_tracing();
+    let env = Env::start(&assets).await;
+    let client = env.client().await;
+    node(&client, "n1", true).await;
+    pool(&client, "p1", "n1", "fast", 100 * GIB).await;
+    let cfg = support::config(&env, "ctl");
+    let _ctl = support::spawn(env.clients().await, cfg.clone());
+    let mut spec = support::volume_spec(GIB, 1, "fast");
+    spec.node = Some("n1".into());
+    support::create_volume(&client, "pvc-x", spec).await;
+    support::volume_where(&client, "pvc-x", |v| v.spec.assignment.is_some()).await;
+    let a1 = FakeAgent::new(&client, "n1");
+    a1.ready("pvc-x").await;
+    support::volume_where(&client, "pvc-x", |v| {
+        support::phase_of(v) == model::VolumePhase::Ready
+    })
+    .await;
+    let (stores, watchers) = controller::store::start(
+        client.clone(),
+        support::NAMESPACE,
+        controller::store::LEASE_STALE,
+    );
+    let _watchers = tokio::spawn(watchers);
+    stores.wait_ready().await.unwrap();
+    let svc = controller::csi::Csi::new(client.clone(), stores.clone(), cfg);
+    let expand = || ControllerExpandVolumeRequest {
+        volume_id: "pvc-x".into(),
+        capacity_range: Some(CapacityRange {
+            required_bytes: i64::try_from(2 * GIB).unwrap(),
+            limit_bytes: 0,
+        }),
+        volume_capability: Some(block(Mode::SingleNodeWriter)),
+        ..ControllerExpandVolumeRequest::default()
+    };
+
+    support::create_snapshot(&client, "s1", "pvc-x").await;
+    support::snapshot_where(&client, "s1", |s| {
+        support::snap_phase(s) == SnapshotPhase::Taking
+    })
+    .await;
+    support::eventually(Duration::from_secs(10), || async {
+        stores
+            .snapshot("s1")
+            .filter(|s| controller::volume::round_running(s))
+    })
+    .await;
+    let err = svc
+        .controller_expand_volume(Request::new(expand()))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Aborted, "{err}");
+    assert!(err.message().contains("snapshot s1"), "{err}");
+    assert_eq!(
+        get_volume(&client, "pvc-x").await.unwrap().spec.size_bytes,
+        GIB
+    );
+
+    a1.ack("s1", SnapshotPhase::Taking, true, Some("p1")).await;
+    support::snapshot_where(&client, "s1", |s| {
+        support::snap_phase(s) == SnapshotPhase::Ready
+    })
+    .await;
+    let _auto = a1.spawn_auto();
+    support::eventually(Duration::from_secs(20), || async {
+        svc.controller_expand_volume(Request::new(expand()))
+            .await
+            .ok()
+    })
+    .await;
+    assert_eq!(
+        get_volume(&client, "pvc-x").await.unwrap().spec.size_bytes,
+        2 * GIB
+    );
+}
