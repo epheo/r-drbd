@@ -227,6 +227,11 @@ pub(crate) struct Memory {
     /// a recreated Volume of the same name apart. Once the store moves past
     /// that resourceVersion it holds the write (or a later state).
     pub(crate) assigned: HashMap<String, (Option<String>, Assignment)>,
+    /// Assignment writes of unknown outcome, keyed as `assigned`. They hold
+    /// their minor and ports but do not make the Volume assigned: once the
+    /// store moves past that resourceVersion, the write is in it or never
+    /// lands.
+    pub(crate) pending: HashMap<String, (Option<String>, Assignment)>,
     /// Split-brain pairs latched per Volume uid (volume::drbd_conditions).
     pub(crate) split: HashMap<String, BTreeSet<volume::Pair>>,
     /// Volume uids whose spec.resolve has seen SplitBrain True; only those
@@ -262,6 +267,24 @@ impl Memory {
             .filter(|(rv, _)| *rv == v.metadata.resource_version)
             .map(|(_, a)| a);
         pending.or(v.spec.assignment.as_ref())
+    }
+
+    /// Minors and ports held by stored, written and pending assignments.
+    pub(crate) fn used(&self, volumes: &[std::sync::Arc<model::Volume>]) -> alloc::Used {
+        let mut used =
+            alloc::Used::from_assignments(volumes.iter().filter_map(|v| self.assignment(v)));
+        for v in volumes {
+            let pending = v
+                .metadata
+                .uid
+                .as_deref()
+                .and_then(|uid| self.pending.get(uid))
+                .filter(|(rv, _)| *rv == v.metadata.resource_version);
+            if let Some((_, a)) = pending {
+                used.add(a);
+            }
+        }
+        used
     }
 
     /// Latched split pairs; after a restart, the ones the SplitBrain
@@ -325,6 +348,13 @@ impl Memory {
                 .insert(uid, (v.metadata.resource_version.clone(), a));
         }
     }
+
+    pub(crate) fn reserve(&mut self, v: &model::Volume, a: Assignment) {
+        if let Some(uid) = v.metadata.uid.clone() {
+            self.pending
+                .insert(uid, (v.metadata.resource_version.clone(), a));
+        }
+    }
 }
 
 pub(crate) struct Ctx<'a> {
@@ -370,9 +400,9 @@ async fn pass(ctx: &Ctx<'_>, memory: &mut Memory) -> Option<Duration> {
         .iter()
         .filter_map(|v| Some((v.metadata.uid.clone()?, v.metadata.resource_version.clone())))
         .collect();
-    memory
-        .assigned
-        .retain(|uid, (rv, _)| seen.get(uid).is_some_and(|cur| cur == rv));
+    let current = |uid: &String, rv: &Option<String>| seen.get(uid).is_some_and(|cur| cur == rv);
+    memory.assigned.retain(|uid, (rv, _)| current(uid, rv));
+    memory.pending.retain(|uid, (rv, _)| current(uid, rv));
     memory.split.retain(|uid, _| seen.contains_key(uid));
     memory.resolving.retain(|uid| seen.contains_key(uid));
     memory.initialized.retain(|uid, _| seen.contains_key(uid));
@@ -523,7 +553,77 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{CONNECT_TIMEOUT, READ_TIMEOUT, request_config, valid_name, valid_volume_name};
+    use std::sync::Arc;
+
+    use super::{
+        CONNECT_TIMEOUT, Memory, READ_TIMEOUT, request_config, valid_name, valid_volume_name,
+    };
+    use crate::volume::Outcome;
+    use model::keys::{MINOR_RANGE, PORT_RANGE};
+
+    fn volume(uid: &str, rv: &str, assignment: Option<serde_json::Value>) -> Arc<model::Volume> {
+        let mut spec = serde_json::json!({ "sizeBytes": 1 << 30, "replicas": 2, "tier": "t" });
+        if let Some(a) = assignment {
+            spec["assignment"] = a;
+        }
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "r-drbd.io/v1alpha1",
+                "kind": "Volume",
+                "metadata": { "name": uid, "uid": uid, "resourceVersion": rv },
+                "spec": spec,
+            }))
+            .expect("volume"),
+        )
+    }
+
+    fn assignment(minor: u32, node: &str, port: u16) -> serde_json::Value {
+        serde_json::json!({
+            "minor": minor,
+            "replicas": [{ "node": node, "nodeId": 0, "port": port, "role": "diskful", "pool": "p" }],
+        })
+    }
+
+    #[test]
+    fn write_outcomes() {
+        let api = |code| -> Result<(), kube::Error> {
+            Err(kube::Error::Api(Box::new(kube::core::Status {
+                code,
+                ..kube::core::Status::default()
+            })))
+        };
+        assert_eq!(Outcome::of(&Ok::<_, kube::Error>(())), Outcome::Applied);
+        for code in [400, 403, 404, 409, 422] {
+            assert_eq!(Outcome::of(&api(code)), Outcome::Rejected, "{code}");
+        }
+        // A 5xx or a lost answer may still commit.
+        for code in [0, 500, 503, 504] {
+            assert_eq!(Outcome::of(&api(code)), Outcome::Unknown, "{code}");
+        }
+        let transport = Err::<(), _>(kube::Error::LinesCodecMaxLineLengthExceeded);
+        assert_eq!(Outcome::of(&transport), Outcome::Unknown);
+    }
+
+    #[test]
+    fn an_unknown_write_holds_its_minor_and_port_until_the_volume_moves() {
+        let (minor, port) = (*MINOR_RANGE.start(), *PORT_RANGE.start());
+        let mut memory = Memory::default();
+        let unsure = volume("a", "1", None);
+        let a = serde_json::from_value(assignment(minor, "n1", port)).expect("assignment");
+        memory.reserve(&unsure, a);
+        let used = memory.used(std::slice::from_ref(&unsure));
+        assert_eq!(used.lowest_free_minor(), Some(minor + 1));
+        assert_eq!(used.lowest_free_port("n1"), Some(port + 1));
+        assert_eq!(used.lowest_free_port("n2"), Some(port));
+        // Pending only reserves: the Volume itself is still unassigned.
+        assert!(memory.assignment(&unsure).is_none());
+        // Moved without the write: nothing held.
+        let moved = volume("a", "2", None);
+        assert_eq!(memory.used(&[moved]).lowest_free_minor(), Some(minor));
+        // Moved with it: held by the stored assignment.
+        let landed = volume("a", "2", Some(assignment(minor, "n1", port)));
+        assert_eq!(memory.used(&[landed]).lowest_free_minor(), Some(minor + 1));
+    }
 
     #[test]
     fn only_requests_time_out() {

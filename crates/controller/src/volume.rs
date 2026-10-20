@@ -966,7 +966,7 @@ impl Placing {
         let ready_nodes = stores.ready_nodes();
         Self {
             views: pool_views(&pools, usage, &ready_nodes),
-            used: Used::from_assignments(volumes.iter().filter_map(|v| memory.assignment(v))),
+            used: memory.used(volumes),
             ready_nodes,
         }
     }
@@ -1237,12 +1237,14 @@ async fn reconcile(
         return;
     }
     match place(ctx, placing, v) {
-        Placement::Assign(a) => {
-            if write_assignment(api, v, &a).await {
+        Placement::Assign(a) => match write_assignment(api, v, &a).await {
+            Outcome::Applied => {
                 placing.record(&a, v.spec.size_bytes);
                 memory.remember(v, a);
             }
-        }
+            Outcome::Unknown => reserve_unknown(memory, placing, v, a),
+            Outcome::Rejected => {}
+        },
         Placement::Wait(c) => {
             write(
                 memory,
@@ -1283,12 +1285,17 @@ async fn converge(
     let Some(next) = next else {
         return (a, failed);
     };
-    if write_assignment(api, v, &next).await {
-        placing.used.add(&next);
-        memory.remember(v, next.clone());
-        (next, failed)
-    } else {
-        (a, failed)
+    match write_assignment(api, v, &next).await {
+        Outcome::Applied => {
+            placing.used.add(&next);
+            memory.remember(v, next.clone());
+            (next, failed)
+        }
+        Outcome::Unknown => {
+            reserve_unknown(memory, placing, v, next);
+            (a, failed)
+        }
+        Outcome::Rejected => (a, failed),
     }
 }
 
@@ -1471,8 +1478,8 @@ async fn evict_step(
             next,
             diskful,
             event,
-        } => {
-            if write_assignment(api, v, &next).await {
+        } => match write_assignment(api, v, &next).await {
+            Outcome::Applied => {
                 placing.used.add(&next);
                 if let Some((n, p)) = &diskful {
                     placing.reserve(n, p, v.spec.size_bytes);
@@ -1481,7 +1488,9 @@ async fn evict_step(
                 info!(volume = name, node, event, "evicted");
                 crate::event(ctx.client, v, reason::EVICTED, &event).await;
             }
-        }
+            Outcome::Unknown => reserve_unknown(memory, placing, v, next),
+            Outcome::Rejected => {}
+        },
     }
 }
 
@@ -1744,10 +1753,31 @@ async fn delete(memory: &mut Memory, api: &Api<Volume>, v: &Volume, health: &Hea
     write(memory, api, v, wanted).await;
 }
 
+/// What became of an assignment write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Applied,
+    /// The apiserver refused it: it never lands.
+    Rejected,
+    /// No answer, or a server error: it may still land, until the stored
+    /// resourceVersion moves.
+    Unknown,
+}
+
+impl Outcome {
+    pub fn of<T>(r: &Result<T, kube::Error>) -> Self {
+        match r {
+            Ok(_) => Self::Applied,
+            Err(kube::Error::Api(s)) if (400..500).contains(&s.code) => Self::Rejected,
+            Err(_) => Self::Unknown,
+        }
+    }
+}
+
 /// Writes spec.assignment with server-side apply, guarded by the
-/// resourceVersion `v` was read at. False when the object moved
-/// or is gone: the next pass places it again from fresh state.
-pub async fn write_assignment(api: &Api<Volume>, v: &Volume, a: &Assignment) -> bool {
+/// resourceVersion `v` was read at, so at most one write per
+/// resourceVersion lands.
+pub async fn write_assignment(api: &Api<Volume>, v: &Volume, a: &Assignment) -> Outcome {
     let name = v.name_any();
     let patch = json!({
         "apiVersion": "r-drbd.io/v1alpha1",
@@ -1756,20 +1786,30 @@ pub async fn write_assignment(api: &Api<Volume>, v: &Volume, a: &Assignment) -> 
         "spec": { "assignment": a },
     });
     let pp = PatchParams::apply(CONTROLLER_FIELD_MANAGER).force();
-    match api.patch(&name, &pp, &Patch::Apply(&patch)).await {
-        Ok(_) => {
+    let r = api.patch(&name, &pp, &Patch::Apply(&patch)).await;
+    let outcome = Outcome::of(&r);
+    match (outcome, r) {
+        (_, Ok(_)) => {
             info!(volume = name, nodes = ?a.replicas.iter().map(|r| r.node.as_str()).collect::<Vec<_>>(), minor = ?a.minor, "assigned");
-            true
         }
-        Err(kube::Error::Api(s)) if s.is_conflict() || s.is_not_found() => {
+        (_, Err(kube::Error::Api(s))) if s.is_conflict() || s.is_not_found() => {
             debug!(volume = name, "assignment raced; retrying next pass");
-            false
         }
-        Err(e) => {
-            warn!(volume = name, error = %e, "writing the assignment failed");
-            false
+        (Outcome::Rejected, Err(e)) => {
+            warn!(volume = name, error = %e, "the assignment was rejected");
+        }
+        (_, Err(e)) => {
+            warn!(volume = name, error = %e, "assignment write outcome unknown; its minor and ports stay reserved");
         }
     }
+    outcome
+}
+
+/// An Unknown write keeps its minor and ports from every later allocation
+/// until the store shows whether it landed.
+fn reserve_unknown(memory: &mut Memory, placing: &mut Placing, v: &Volume, a: Assignment) {
+    placing.used.add(&a);
+    memory.reserve(v, a);
 }
 
 enum Placement {
