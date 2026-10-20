@@ -3,3 +3,5 @@
 channel = "1.99.0"
 profile = "minimal"
 components = ["rustfmt", "clippy"]
+# Static builds for test hosts and scratch images.
+targets = ["x86_64-unknown-linux-musl"]
