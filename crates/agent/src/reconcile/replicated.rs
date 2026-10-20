@@ -762,10 +762,12 @@ impl Reconciler {
                 // replica's DRBD disk can show up Inconsistent beside it.
                 return Ok(false);
             }
-            let chunk = pools
-                .iter()
-                .find(|p| p.name_any() == place.pool)
-                .and_then(|p| p.status.as_ref()?.chunk_bytes);
+            let chunk = reads.chunk_bytes(&place).or_else(|| {
+                pools
+                    .iter()
+                    .find(|p| p.name_any() == place.pool)
+                    .and_then(|p| p.status.as_ref()?.chunk_bytes)
+            });
             Some((b, chunk, place))
         } else {
             None

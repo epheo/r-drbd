@@ -299,6 +299,27 @@ async fn pool_unchanged_writes_nothing() {
     x.assert_done();
 }
 
+/// A failed probe keeps the chunk the Pool was created with.
+#[tokio::test]
+async fn failed_probe_keeps_chunk_bytes() {
+    let x = Arc::new(ScriptedExec::new());
+    x.expect(lvm::cmd::lvs(VG), report_fail("Volume group not found"));
+    let mut p = (*pool()).clone();
+    p.status = Some(PoolStatus {
+        total_bytes: Some(POOL_BYTES),
+        chunk_bytes: Some(65536),
+        ..PoolStatus::default()
+    });
+    let w = Reconciler::new(NODE, x.clone())
+        .pass(&[Arc::new(p)], &[], &[])
+        .await;
+    x.assert_done();
+    let body = w[0].body();
+    assert_eq!(body["status"]["conditions"][0]["status"], "False");
+    assert!(body["status"].get("totalBytes").is_none());
+    assert_eq!(body["status"]["chunkBytes"], 65536);
+}
+
 #[tokio::test]
 async fn create() {
     let x = Arc::new(ScriptedExec::new());

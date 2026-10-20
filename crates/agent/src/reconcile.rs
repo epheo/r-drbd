@@ -62,6 +62,10 @@ pub enum StatusWrite {
         name: String,
         generation: Option<i64>,
         capacity: Result<PoolCapacity, String>,
+        /// From the probe, else the last one written: the chunk is fixed at
+        /// creation, and a value that vanished while the probe fails would
+        /// re-render every replicated volume of the Pool.
+        chunk_bytes: Option<u64>,
         available: Condition,
         /// Pools built from devices only.
         devices: Option<Vec<DeviceStatus>>,
@@ -108,6 +112,7 @@ impl StatusWrite {
                 name,
                 generation,
                 capacity,
+                chunk_bytes,
                 available,
                 devices,
                 released,
@@ -124,7 +129,9 @@ impl StatusWrite {
                 if let Ok(c) = capacity {
                     status["totalBytes"] = json!(c.total_bytes);
                     status["freeBytes"] = json!(c.free_bytes);
-                    status["chunkBytes"] = json!(c.chunk_bytes);
+                }
+                if let Some(c) = chunk_bytes {
+                    status["chunkBytes"] = json!(c);
                 }
                 json!({
                     "apiVersion": api_version,
@@ -284,6 +291,15 @@ impl Reads {
             Ok(m) => Ok(m.get(lv).cloned().unwrap_or_default()),
             Err(e) => Err(e.clone()),
         }
+    }
+
+    /// The thin pool's chunk from this pass's lvs, when already read.
+    fn chunk_bytes(&self, place: &Place) -> Option<u64> {
+        let rows = self.lvs.get(&place.vg)?.as_ref().ok()?;
+        rows.iter()
+            .find(|r| r.name == place.thin && r.thin_pool)
+            .map(|r| r.chunk_bytes)
+            .filter(|&c| c > 0)
     }
 
     fn invalidate(&mut self, vg: &str) {
@@ -580,9 +596,10 @@ impl Reconciler {
             return writes;
         };
         let cap = capacity.as_ref().ok();
+        let chunk_bytes = cap.map(|c| c.chunk_bytes).or(current.chunk_bytes);
         let unchanged = current.total_bytes == cap.map(|c| c.total_bytes)
             && current.free_bytes == cap.map(|c| c.free_bytes)
-            && current.chunk_bytes == cap.map(|c| c.chunk_bytes)
+            && current.chunk_bytes == chunk_bytes
             && current.observed_generation == generation
             && condition::get(&current.conditions, condition::types::AVAILABLE) == Some(&available)
             && devices.as_ref().is_none_or(|d| *d == current.devices)
@@ -592,6 +609,7 @@ impl Reconciler {
                 name: pool.name_any(),
                 generation,
                 capacity,
+                chunk_bytes,
                 available,
                 devices,
                 released,
