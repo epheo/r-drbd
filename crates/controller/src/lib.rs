@@ -89,7 +89,7 @@ pub enum Error {
     #[error("CSI server: {0}")]
     Transport(#[from] tonic::transport::Error),
     #[error("kube config: {0}")]
-    KubeConfig(String),
+    KubeConfig(#[source] kube::config::InferConfigError),
     #[error("lost the leader Lease {0}")]
     LostLease(String),
     #[error("watch of {0} ended")]
@@ -167,7 +167,7 @@ fn request_config(mut config: kube::Config) -> kube::Config {
 pub async fn run(cfg: Config) -> Result<(), Error> {
     let config = kube::Config::infer()
         .await
-        .map_err(|e| Error::KubeConfig(e.to_string()))?;
+        .map_err(Error::KubeConfig)?;
     Box::pin(run_with_clients(cfg, Clients::new(config)?)).await
 }
 
