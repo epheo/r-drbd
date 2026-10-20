@@ -700,21 +700,114 @@ async fn restore_waits_for_its_peers_before_any_uuid_step() {
     assert!(!seen(&x, "new-current-uuid"));
 }
 
+/// n2's entry: restored, its LV at `kib`.
+fn restored_peer(kib: u64) -> ReplicaStatus {
+    ReplicaStatus {
+        allocated_bytes: Some(kib * 1024),
+        ..peer_entry("n2", true)
+    }
+}
+
 #[tokio::test]
-async fn larger_restore_syncs_from_the_initial_node() {
-    // Every peer restored and connected, but the LVs grew past the old
-    // metadata, which differs per node: never a clear-bitmap.
-    let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+async fn larger_restore_starts_at_the_snapshot_size_then_grows() {
+    let resize_synced: Vec<String> = ["drbdadm", "resize", "pvc-1/0"].map(str::to_owned).to_vec();
+    let mut r = Rig::new(&[], FakeHost::default());
+    let x = r.x.clone();
+    let vol = |peer_kib| with_entries(restored(volume(2 * GIB)), vec![restored_peer(peer_kib)]);
+    // At the snapshot's size: no size on the lvcreate, no lvextend.
+    reads(&x, &[source_lv()]);
+    expect_restore(&x);
+    r.expect_check();
+    expect_lv_tags(&x, &[("pvc-1", &[NEW, FROM])]);
+    expect_md(&x, &[NEW]);
+    up_plan(&x);
+    let w = r.pass(&[vol(LV_KIB)], &[source_snapshot()]).await;
+    let e = entry_of(&w);
+    assert_eq!(e.allocated_bytes, Some(LV_KIB * 1024));
+    assert_eq!(
+        e.observed_generation, None,
+        "not applied at the snapshot size"
+    );
+    assert!(!seen(&x, "lvextend"));
+
+    // Up, Inconsistent beside a restored n2: the bitmap is cleared at the
+    // snapshot size; the resize waits for n2's LV.
+    r.feed(
+        &up("Inconsistent", "Inconsistent")
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    *r.host.sectors.lock().unwrap() = NET_SECTORS;
+    reads_again(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    x.expect(argv::start_without_sync("pvc-1"), ok(""));
+    let w = r.pass(&[vol(LV_KIB)], &[source_snapshot()]).await;
+    assert_eq!(entry_of(&w).observed_generation, None);
+
+    // UpToDate: the LV grows to the gross size.
+    r.feed(&[
+        "change device name:pvc-1 volume:0 disk:UpToDate",
+        "change peer-device name:pvc-1 conn-name:n2 volume:0 peer-disk:UpToDate",
+    ]);
+    reads_again(&x, &[source_lv(), lv(LV_KIB)]);
+    x.expect(lvm::cmd::extend(VG, "pvc-1", LV2_KIB * 1024), ok(""));
+    expect_lvs(&x, &[source_lv(), lv(LV2_KIB)]);
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    let w = r.pass(&[vol(LV_KIB)], &[source_snapshot()]).await;
+    assert_eq!(entry_of(&w).observed_generation, None, "resize waits");
+
+    // n2 grew too: the lowest node id resizes, and the new area syncs.
+    reads_again(&x, &[source_lv(), lv(LV2_KIB)]);
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    x.expect(resize_synced, ok(""));
+    dry(&x, "");
+    let w = r.pass(&[vol(LV2_KIB)], &[source_snapshot()]).await;
+    assert_eq!(entry_of(&w).observed_generation, Some(3));
+    assert!(!seen(&x, "--assume-clean") && !seen(&x, "--force-resync"));
+}
+
+#[tokio::test]
+async fn expand_after_initialization_keeps_assume_clean() {
+    let mut r = Rig::new(&healthy(), up_host());
     let x = r.x.clone();
     reads(&x, &[source_lv(), lv(LV2_KIB)]);
     r.expect_check();
     r.expect_sweep();
-    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    x.expect(
+        ["drbdadm", "resize", "--assume-clean", "pvc-1/0"]
+            .map(str::to_owned)
+            .to_vec(),
+        ok(""),
+    );
     dry(&x, "");
-    x.expect(argv::start_as_source("pvc-1"), ok(""));
-    let vol = with_entries(restored(volume(2 * GIB)), vec![peer_entry("n2", true)]);
+    let vol = initialized(with_entries(
+        restored(volume(2 * GIB)),
+        vec![restored_peer(LV2_KIB)],
+    ));
     r.pass(&[vol], &[source_snapshot()]).await;
-    assert!(!seen(&x, "--clear-bitmap"));
+}
+
+#[tokio::test]
+async fn restore_never_clears_the_bitmap_when_its_lv_is_not_at_the_snapshot_size() {
+    // Every peer restored and connected, but this LV is larger than its
+    // snapshot LV, or the snapshot LV is not in the report.
+    for rows in [vec![source_lv(), lv(LV2_KIB)], vec![lv(LV_KIB)]] {
+        let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+        let x = r.x.clone();
+        reads(&x, &rows);
+        r.expect_check();
+        r.expect_sweep();
+        expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+        dry(&x, "");
+        x.expect(argv::start_as_source("pvc-1"), ok(""));
+        let vol = with_entries(restored(volume(GIB)), vec![peer_entry("n2", true)]);
+        r.pass(&[vol], &[source_snapshot()]).await;
+        assert!(!seen(&x, "--clear-bitmap"));
+    }
 }
 
 /// n2 (not the initial node) with its restored LV up; returns its entry.

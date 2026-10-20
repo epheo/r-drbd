@@ -161,20 +161,6 @@ fn timeout_blocker(s: &Step<'_>, r: &Resource, lost: bool) -> Option<&'static st
     None
 }
 
-/// A restore larger than its snapshot: each LV grew past its old DRBD
-/// metadata, which differs per node and now lies inside the data area, so
-/// the copies are not identical. Without a size on record, assumed grown.
-fn restore_grown(vol: &Volume, snapshots: &[Arc<Snapshot>]) -> bool {
-    let Some(src) = &vol.spec.source else {
-        return false;
-    };
-    snapshots
-        .iter()
-        .find(|x| x.name_any() == src.snapshot)
-        .and_then(|x| x.status.as_ref()?.size_bytes)
-        != Some(vol.spec.size_bytes)
-}
-
 /// Diskful peers the first data still waits for: not connected, not
 /// Inconsistent, or, for a restore from `source`, not reporting that
 /// snapshot in restoredFrom.
@@ -822,8 +808,14 @@ impl Reconciler {
 
         if diskful {
             let lost = *rebuilt || s.prev_lost() || self.rebuilt_seen.contains(&name);
-            let grown = restore_grown(s.vol, snapshots);
-            self.first_data(s, &name, lost, restored.is_some(), grown)
+            let at_snapshot_size = match &backing {
+                Some((b, _, place)) if restored.is_some() => {
+                    self.at_snapshot_size(reads, snapshots, s, place, &b.row)
+                        .await
+                }
+                _ => false,
+            };
+            self.first_data(s, &name, lost, restored.is_some(), at_snapshot_size)
                 .await?;
         }
         Ok(complete)
@@ -878,10 +870,7 @@ impl Reconciler {
     }
 
     /// Create, restore, activate or grow the backing LV to the DRBD gross
-    /// size rounded to the extent. Growth moves the end of the device where
-    /// internal metadata lives, so an existing LV grows only under an
-    /// attached disk (DRBD relocates its metadata online) or right after
-    /// this pass created it (a restore of a smaller snapshot).
+    /// size rounded to the extent, when [`Step::may_grow`] allows.
     /// A lost LV is rebuilt empty once the volume is initialized: its peers
     /// hold the data, and a restore would bring back older data. Before
     /// that, every diskful replica of a restore restores from its own copy
@@ -896,12 +885,6 @@ impl Reconciler {
         place: &Place,
     ) -> Result<Backing, String> {
         let (vol, prev) = (s.vol, s.prev);
-        let attached = s.res.and_then(|r| r.devices.get(&VOLUME)).is_some_and(|d| {
-            matches!(
-                d.disk.as_deref(),
-                Some("UpToDate" | "Consistent" | "Outdated" | "Inconsistent")
-            )
-        });
         let lv = lvm::names::volume_lv(&vol.name_any());
         let vg = place.vg.as_str();
         let rows = reads.lvs(&self.lvm, vg).await?;
@@ -944,7 +927,8 @@ impl Reconciler {
         if created {
             reads.created.insert(format!("{vg}/{lv}"));
         }
-        let may_grow = attached || created;
+        let restoring = vol.spec.source.is_some() && !s.initialized();
+        let may_grow = s.may_grow(created);
         let r = row.ok_or_else(|| format!("LV {vg}/{lv} missing after create"))?;
         let mut changed = false;
         if !r.active {
@@ -956,7 +940,11 @@ impl Reconciler {
         }
         let mut grown = true;
         if r.size_bytes < desired && !may_grow {
-            tracing::info!(lv, "backing LV grows once the DRBD disk is attached");
+            if restoring {
+                tracing::info!(lv, "restored LV grows once its disk holds data");
+            } else {
+                tracing::info!(lv, "backing LV grows once the DRBD disk is attached");
+            }
             grown = false;
         } else if r.size_bytes < desired {
             tracing::info!(
@@ -1016,6 +1004,38 @@ impl Reconciler {
         let tag = storage::from_tag(uid);
         let tags = reads.tags(&self.lvm, &place.vg, lv).await?;
         Ok(tags.contains(&tag).then(|| src.snapshot.clone()))
+    }
+
+    /// This replica's LV has the size of its source snapshot LV in the same
+    /// lvs report: its metadata sits where the source's did, so its data
+    /// area holds nothing but the snapshot's. False when either row is
+    /// missing.
+    async fn at_snapshot_size(
+        &self,
+        reads: &mut Reads,
+        snapshots: &[Arc<Snapshot>],
+        s: &Step<'_>,
+        place: &Place,
+        row: &LvRow,
+    ) -> bool {
+        let Some(src) = &s.vol.spec.source else {
+            return false;
+        };
+        let Some(snap) = snapshots.iter().find(|x| x.name_any() == src.snapshot) else {
+            return false;
+        };
+        let source = lvm::names::snapshot_lv(&snap.spec.volume, &src.snapshot);
+        let Ok(rows) = reads.lvs(&self.lvm, &place.vg).await else {
+            return false;
+        };
+        let size = |name: &str| {
+            find_in_pool(&rows, name, &place.thin)
+                .ok()
+                .flatten()
+                .map(|r| r.size_bytes)
+        };
+        let (mine, theirs) = (size(&row.name), size(&source));
+        mine.is_some() && mine == theirs
     }
 
     /// Ownership comes from the LV's tags only:
@@ -1112,10 +1132,10 @@ impl Reconciler {
     /// A restore counts a peer as ready only when its entry also reports
     /// the source snapshot in restoredFrom: clearing the bitmap beside an
     /// empty disk would declare it in sync. Without that on every peer it
-    /// starts after `init_wait` as the sync source; a `grown` restore
-    /// always does, its copies differ where the old metadata was. A node
-    /// that cannot prove its own copy (`restored` false) never starts a
-    /// restore.
+    /// starts after `init_wait` as the sync source. So it does when this
+    /// node's LV is not `at_snapshot_size`: metadata of another size leaves
+    /// old metadata in the data area. A node that cannot prove its own copy
+    /// (`restored` false) never starts a restore.
     ///
     /// `lost`: this replica was rebuilt. A rebuilt replica may still take
     /// the all-connected path (nobody holds data then), never the timeout
@@ -1127,7 +1147,7 @@ impl Reconciler {
         name: &str,
         lost: bool,
         restored: bool,
-        grown: bool,
+        at_snapshot_size: bool,
     ) -> Result<(), String> {
         if s.initialized() || !s.initial_node() {
             self.init_started.remove(name);
@@ -1165,7 +1185,7 @@ impl Reconciler {
                 "this node's copy is not proven to come from snapshot {snap}: the restore does not start"
             ));
         }
-        let waiting = unready_peers(s, r, &self.node, source.filter(|_| !grown));
+        let waiting = unready_peers(s, r, &self.node, source.filter(|_| at_snapshot_size));
         let since = *self
             .init_started
             .entry(name.to_owned())
@@ -1190,11 +1210,11 @@ impl Reconciler {
             );
             return Ok(());
         }
-        if source.is_some() && (grown || !waiting.is_empty()) {
+        if source.is_some() && (!at_snapshot_size || !waiting.is_empty()) {
             tracing::warn!(
                 volume = name,
                 ?waiting,
-                grown,
+                at_snapshot_size,
                 "restored copies not all identical: this one is the source, the others full-sync"
             );
             self.drbd_cmd(&argv::start_as_source(name), DRBD_TIMEOUT)
@@ -1369,8 +1389,16 @@ impl Reconciler {
             return Ok(Resize::Waiting);
         }
         let name = s.vol.name_any();
-        tracing::info!(volume = name, from = current, "growing DRBD device");
-        self.drbd_cmd(&argv::resize(&name), DRBD_TIMEOUT).await?;
+        // A restore grows from its snapshot's size: the new area holds each
+        // node's old metadata, which differs, so it syncs.
+        let synced = s.vol.spec.source.is_some() && !s.initialized();
+        tracing::info!(volume = name, from = current, synced, "growing DRBD device");
+        let argv = if synced {
+            argv::resize_synced(&name)
+        } else {
+            argv::resize(&name)
+        };
+        self.drbd_cmd(&argv, DRBD_TIMEOUT).await?;
         Ok(Resize::Done)
     }
 
@@ -1639,6 +1667,23 @@ impl Step<'_> {
             .status
             .as_ref()
             .is_some_and(|st| st.initialized_at.is_some())
+    }
+
+    /// Growth moves the end of the device where internal metadata lives, so
+    /// an existing LV grows only under an attached disk (DRBD relocates its
+    /// metadata online) or right after this pass created it. A restore keeps
+    /// its snapshot's size until its disk holds data: fresh metadata then
+    /// lands where the source's was, the copies stay identical, and the
+    /// grown part syncs through the resize.
+    fn may_grow(&self, created: bool) -> bool {
+        let disk = self
+            .res
+            .and_then(|r| r.devices.get(&VOLUME))
+            .and_then(|d| d.disk.as_deref());
+        if self.vol.spec.source.is_some() && !self.initialized() {
+            return holds_data(disk);
+        }
+        created || holds_data(disk) || disk == Some("Inconsistent")
     }
 
     fn initial_node(&self) -> bool {
