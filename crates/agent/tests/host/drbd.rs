@@ -623,7 +623,9 @@ async fn restore_case(h: &Host, factor: u64, max_received: u64) {
     let tags = l.tags(VG).await.unwrap();
     for lv in ["rw-a", "rw-b"] {
         assert!(
-            tags[lv].iter().any(|t| t == "r-drbd.from.uid-rw-snap"),
+            tags[lv]
+                .iter()
+                .any(|t| *t == format!("r-drbd.from.uid-{lv}.uid-rw-snap")),
             "{lv}: {:?}",
             tags[lv]
         );
