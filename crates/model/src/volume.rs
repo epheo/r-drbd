@@ -43,7 +43,8 @@ pub struct VolumeSpec {
     #[schemars(length(min = 1, max = 63))]
     #[x_kube(validation = Rule::new("self == oldSelf").message("tier is immutable"))]
     pub tier: String,
-    /// Placement pins, read at placement and by every evict move.
+    /// Placement pins, read at placement and by every evict move. pool
+    /// holds every diskful replica, node one of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 253))]
     pub pool: Option<String>,
@@ -62,13 +63,14 @@ pub struct VolumeSpec {
     #[x_kube(merge_strategy = ListMerge::Set)]
     pub attachments: Vec<String>,
     /// Nodes whose replica must be placed elsewhere (a dead or retired
-    /// node). The controller honours one node at a time. Every move needs
-    /// no resolve pending, no split brain, no Snapshot round between
-    /// Suspending and Resuming, and the node's agent stale, or fresh with
-    /// the replica neither attached nor in use. A diskful move also needs
-    /// status.initializedAt set, another UpToDate replica with quorum from
-    /// a fresh agent, every other reachable diskful replica UpToDate, and
-    /// no pin to the evicted node. A node listed here never receives a
+    /// node). The controller makes one move per pass, for the first node
+    /// by name that can act. Every move needs no resolve pending, no split
+    /// brain, no Snapshot round between Suspending and Resuming, and the
+    /// replica neither attached nor in use, unless the node's Node object is
+    /// gone. A diskful move also needs replicas above 1, status.initializedAt
+    /// set unless the node is not the initial one, another UpToDate replica
+    /// with quorum from a fresh agent, every other reachable diskful replica
+    /// UpToDate, and no pin to the evicted node. A node listed here never receives a
     /// diskless entry either. A node leaves the list once it holds no entry
     /// and no attachment. The replaced node keeps its LV as an orphan.
     #[serde(default)]
