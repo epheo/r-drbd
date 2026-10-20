@@ -106,9 +106,18 @@ async fn drbd_clean(names: &[&str]) {
     }
 }
 
-fn pool(node: &str) -> Arc<Pool> {
+/// The test Pool on `node`, with the chunk size the agent's pool pass reads
+/// from the thin pool: without it the resource files lack
+/// rs-discard-granularity and a resync sends zero blocks as data.
+async fn pool(node: &str) -> Arc<Pool> {
     let mut p = (*super::pool()).clone();
     node.clone_into(&mut p.spec.node);
+    let rows = lvm().lvs(VG).await.unwrap();
+    let cap = agent::storage::pool_capacity(&rows, super::THIN).unwrap();
+    p.status = Some(model::PoolStatus {
+        chunk_bytes: Some(cap.chunk_bytes),
+        ..model::PoolStatus::default()
+    });
     Arc::new(p)
 }
 
@@ -295,7 +304,7 @@ async fn settle<F: Fn(&Tracker) -> bool>(
     what: &str,
     done: F,
 ) {
-    let pools = [pool(&h.node)];
+    let pools = [pool(&h.node).await];
     for _ in 0..120 {
         for m in members.iter_mut() {
             m.pass(&pools, &[]).await;
@@ -316,7 +325,7 @@ async fn settle<F: Fn(&Tracker) -> bool>(
 
 async fn delete(h: &Host, m: &mut Member) {
     m.vol.metadata.deletion_timestamp = Some(now());
-    m.pass(&[pool(&h.node)], &[]).await;
+    m.pass(&[pool(&h.node).await], &[]).await;
     assert_eq!(m.error(), None, "{}", m.res);
 }
 
@@ -380,7 +389,7 @@ async fn drbd_fresh_volume_starts_without_sync() {
         assert_eq!(d, "");
     }
     for p in [&mut *a, &mut *b] {
-        p.pass(&[pool(&h.node)], &[]).await;
+        p.pass(&[pool(&h.node).await], &[]).await;
         assert_eq!(p.error(), None);
     }
     assert_eq!(
@@ -526,7 +535,7 @@ async fn drbd_no_start_without_quorum() {
     let h = start().await;
     let mut g = group(&h, 64 * MIB, &[A, B], &[(0, 1)], None);
     let a = &mut g[0];
-    let pools = [pool(&h.node)];
+    let pools = [pool(&h.node).await];
     for _ in 0..20 {
         a.pass(&pools, &[]).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -585,7 +594,7 @@ async fn restore_case(h: &Host, factor: u64, max_received: u64) {
         ..SnapshotStatus::default()
     });
     let snaps = [Arc::new(snap)];
-    let pools = [pool(&h.node)];
+    let pools = [pool(&h.node).await];
     let mut g = group(h, size, &[A, B], &[], Some("rw-snap"));
     let mut proven = [false, false];
     let mut done = false;
@@ -752,7 +761,7 @@ async fn drbd_replicated_lifecycle() {
     }
     drbd_clean(EVERY).await;
     let h = start().await;
-    let pools = [pool(&h.node)];
+    let pools = [pool(&h.node).await];
     let mut g = group(&h, GIB, &[A], &[], None);
     let a = &mut g[0];
     settle(&h, &mut [&mut *a], "UpToDate alone", |t| {
@@ -878,7 +887,7 @@ async fn drbd_lost_lv_is_rebuilt_and_synced() {
             .status
             .get_or_insert_with(Default::default)
             .initialized_at = Some(now());
-        m.pass(&[pool(&h.node)], &[]).await;
+        m.pass(&[pool(&h.node).await], &[]).await;
     }
     assert!(b.entry.as_ref().is_some_and(|e| e.present));
 
@@ -1123,7 +1132,7 @@ async fn drbd_blocked_port_is_reported() {
     assert!(e.unwrap().starts_with("bind 192.0.2.1"));
 
     let h = start().await;
-    let pools = [pool(&h.node)];
+    let pools = [pool(&h.node).await];
     let mut g = group(&h, GIB, &[A, B], &[], None);
     let [a, b] = &mut g[..] else { unreachable!() };
     let started = tokio::time::Instant::now();
