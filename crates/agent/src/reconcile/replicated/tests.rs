@@ -363,7 +363,26 @@ fn source_snapshot() -> Snapshot {
     let mut s = snapshot(SnapshotPhase::Ready);
     s.spec.volume = "pvc-0".into();
     s.metadata.uid = Some(SNAP_UID.into());
-    s.status.as_mut().unwrap().size_bytes = Some(GIB);
+    let st = s.status.as_mut().unwrap();
+    st.size_bytes = Some(GIB);
+    st.acks = ["n1", "n2"]
+        .map(|n| SnapshotAck {
+            node: n.into(),
+            phase: SnapshotPhase::Taking,
+            pool: Some(format!("pool-{n}")),
+            ok: true,
+            error: None,
+        })
+        .to_vec();
+    s
+}
+
+/// The source as an older version made it Ready: acks in a removed phase.
+fn old_source_snapshot() -> Snapshot {
+    let mut s = source_snapshot();
+    for a in &mut s.status.as_mut().unwrap().acks {
+        a.phase = SnapshotPhase::Unknown;
+    }
     s
 }
 
@@ -1059,6 +1078,40 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
     let err = e.last_error.unwrap();
     assert!(err.contains("the empty LV failed too"), "{err}");
     assert!(!seen(&x, "drbdadm"));
+}
+
+/// Copies an older version took may differ: one copy, the initial node's,
+/// and the other replicas full-sync from it, even when they say otherwise.
+#[tokio::test]
+async fn a_snapshot_an_older_version_took_restores_by_sync() {
+    let mut r = Rig::on("n2", &[], FakeHost::default());
+    let x = r.x.clone();
+    reads(&x, &[source_lv()]);
+    expect_create(&x, &[source_lv()]);
+    let e = n2_restore_pass(&mut r, &[old_source_snapshot()]).await;
+    assert_eq!((e.last_error, e.restored_from), (None, None));
+    assert!(
+        !seen(&x, "--snapshot")
+            && !x
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.contains(&"pvc-0+snap-1".to_owned()))
+    );
+
+    // The initial node: the source at once, no proof awaited, no clear.
+    let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    x.expect(argv::start_as_source("pvc-1"), ok(""));
+    let vol = with_entries(restored(volume(GIB)), vec![peer_entry("n2", true)]);
+    r.pass(&[vol], &[old_source_snapshot()]).await;
+    assert!(!seen(&x, "--clear-bitmap"));
 }
 
 #[tokio::test]

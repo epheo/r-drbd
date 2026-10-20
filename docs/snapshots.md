@@ -90,6 +90,7 @@ Rules:
 - A replicated restore needs `replicas` equal to the number of nodes holding the snapshot.
   Every node holding the snapshot restores it from its own copy, so the restore is instant, shares blocks on every node and needs no sync.
   The copies are identical because the snapshot was taken with IO suspended on every replica.
+  A snapshot taken by an older r-drbd version restores from the first node's copy only; the other replicas full-sync from it.
 - A holder whose node is down, whose agent is stale or whose Pool is not Available keeps the restore Pending, reason `Insufficient`, naming it.
 - A replicated restore larger than its snapshot starts at the snapshot's size with identical copies, then grows online.
   The new area syncs between the replicas; zero blocks travel as discards, so it costs little network and no thin pool space.

@@ -101,6 +101,15 @@ pub(super) fn snapshot_round_active(snapshots: &[Arc<Snapshot>], volume: &str) -
         .any(|s| s.spec.volume == volume && in_round(s))
 }
 
+/// The copies of `snap` are the same bytes: every holder acked Taking ok
+/// in this version's round. An older version suspended with a block
+/// device freeze, which left the Primary's copy newer than its peers'.
+fn copies_identical(snap: &Snapshot) -> bool {
+    let acks = snap.status.as_ref().map_or(&[][..], |st| &st.acks);
+    let mut holders = acks.iter().filter(|a| a.pool.is_some()).peekable();
+    holders.peek().is_some() && holders.all(|a| a.phase == SnapshotPhase::Taking && a.ok)
+}
+
 /// Disk states that hold data a just-created replica must not override.
 fn holds_data(disk: Option<&str>) -> bool {
     matches!(disk, Some("UpToDate" | "Consistent" | "Outdated"))
@@ -841,7 +850,9 @@ impl Reconciler {
 
         if diskful {
             let lost = *rebuilt || s.prev_lost() || self.rebuilt_seen.contains(&name);
-            self.first_data(s, &name, lost, copy.as_ref()).await?;
+            let identical = source.is_some_and(copies_identical);
+            self.first_data(s, &name, lost, copy.as_ref(), identical)
+                .await?;
         }
         Ok(complete)
     }
@@ -1019,7 +1030,13 @@ impl Reconciler {
         desired: u64,
     ) -> (Result<(), String>, bool) {
         let vg = place.vg.as_str();
-        match self.create_lv(rows, source, place, s.vol, lv, desired).await {
+        let created = if s.initial_node() || source.is_some_and(copies_identical) {
+            self.create_lv(rows, source, place, s.vol, lv, desired)
+                .await
+        } else {
+            Err("the snapshot's copies may differ: only the initial node's is used".to_owned())
+        };
+        match created {
             Err(e) if !s.initial_node() => {
                 tracing::warn!(
                     lv,
@@ -1252,6 +1269,7 @@ impl Reconciler {
         name: &str,
         lost: bool,
         copy: Option<&Copy>,
+        identical: bool,
     ) -> Result<(), String> {
         if s.initialized() || !s.initial_node() {
             self.init_started.remove(name);
@@ -1293,7 +1311,8 @@ impl Reconciler {
             ));
         }
         let at_snapshot_size = copy.is_some_and(|c| c.at_size);
-        let proving = source.filter(|_| at_snapshot_size);
+        // Copies that may differ prove nothing: the peers sync from here.
+        let proving = source.filter(|_| at_snapshot_size && identical);
         let cached = s.vol.status.as_ref().map_or(&[][..], |st| &st.replicas);
         let mut waiting = unready_peers(s, r, &self.node, proving, cached);
         if proving.is_some() && waiting.is_empty() {
@@ -1326,7 +1345,7 @@ impl Reconciler {
             );
             return Ok(());
         }
-        if source.is_some() && (!at_snapshot_size || !waiting.is_empty()) {
+        if source.is_some() && (!identical || !at_snapshot_size || !waiting.is_empty()) {
             tracing::warn!(
                 volume = name,
                 ?waiting,
