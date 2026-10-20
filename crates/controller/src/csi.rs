@@ -657,36 +657,10 @@ impl Csi {
         let uid = created.metadata.uid.clone();
         // A status from before the latest spec (old pins) must not decide.
         let generation = created.metadata.generation.unwrap_or(0);
+        let requested = created.spec.size_bytes;
         wait::until(&self.stores, self.cfg.ready_timeout, |s| {
             let v = s.volume(name).filter(|v| v.metadata.uid == uid)?;
-            let st = v.status.as_ref()?;
-            if st.observed_generation.unwrap_or(0) < generation {
-                return None;
-            }
-            let c = condition::get(&st.conditions, condition::types::READY);
-            let insufficient = c.is_some_and(|c| c.reason == crate::volume::reason::INSUFFICIENT);
-            match st.phase {
-                VolumePhase::Ready | VolumePhase::Degraded => Some(Ok(v)),
-                VolumePhase::Pending if insufficient => {
-                    let reported = v.metadata.uid.clone().zip(st.observed_generation);
-                    Some(Err((
-                        Status::resource_exhausted(format!(
-                            "volume {name}: {}",
-                            c.map(|c| c.message.as_str()).unwrap_or_default()
-                        )),
-                        reported,
-                    )))
-                }
-                VolumePhase::Failed => {
-                    let msg = format!(
-                        "volume {name} failed: {}",
-                        c.map(|c| format!("{}: {}", c.reason, c.message))
-                            .unwrap_or_default()
-                    );
-                    Some(Err((Status::failed_precondition(msg), None)))
-                }
-                _ => None,
-            }
+            ready_outcome(name, v, generation, requested)
         })
         .await
         .ok_or_else(|| {
@@ -1310,10 +1284,73 @@ impl Controller for Csi {
     }
 }
 
+type Outcome = Result<Arc<Volume>, (Status, Option<(String, i64)>)>;
+
+/// What one Volume read tells CreateVolume: Ok once Ready or Degraded at
+/// least at the requested size, an error when it can never be, None to
+/// wait. The size check holds even if the Ready rule changes: a restore
+/// starts below its size.
+fn ready_outcome(name: &str, v: Arc<Volume>, generation: i64, requested: u64) -> Option<Outcome> {
+    let st = v.status.as_ref()?;
+    if st.observed_generation.unwrap_or(0) < generation {
+        return None;
+    }
+    let c = condition::get(&st.conditions, condition::types::READY);
+    let insufficient = c.is_some_and(|c| c.reason == crate::volume::reason::INSUFFICIENT);
+    let big_enough = st.usable_bytes.is_some_and(|u| u >= requested);
+    match st.phase {
+        VolumePhase::Ready | VolumePhase::Degraded if big_enough => Some(Ok(v)),
+        VolumePhase::Pending if insufficient => {
+            let reported = v.metadata.uid.clone().zip(st.observed_generation);
+            Some(Err((
+                Status::resource_exhausted(format!(
+                    "volume {name}: {}",
+                    c.map(|c| c.message.as_str()).unwrap_or_default()
+                )),
+                reported,
+            )))
+        }
+        VolumePhase::Failed => {
+            let msg = format!(
+                "volume {name} failed: {}",
+                c.map(|c| format!("{}: {}", c.reason, c.message))
+                    .unwrap_or_default()
+            );
+            Some(Err((Status::failed_precondition(msg), None)))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ::csi::v1::volume_capability::{BlockVolume, MountVolume};
+
+    #[test]
+    fn create_never_returns_a_volume_below_its_size() {
+        let at = |phase: VolumePhase, usable: Option<u64>| {
+            let mut v: Volume = serde_json::from_value(serde_json::json!({
+                "apiVersion": "r-drbd.io/v1alpha1",
+                "kind": "Volume",
+                "metadata": { "name": "v", "generation": 1 },
+                "spec": { "sizeBytes": 2048, "tier": "t" },
+            }))
+            .unwrap();
+            v.status = Some(model::VolumeStatus {
+                phase,
+                usable_bytes: usable,
+                observed_generation: Some(1),
+                ..model::VolumeStatus::default()
+            });
+            ready_outcome("v", Arc::new(v), 1, 2048).map(|r| r.is_ok())
+        };
+        assert_eq!(at(VolumePhase::Ready, Some(2048)), Some(true));
+        assert_eq!(at(VolumePhase::Degraded, Some(4096)), Some(true));
+        assert_eq!(at(VolumePhase::Ready, Some(1024)), None);
+        assert_eq!(at(VolumePhase::Ready, None), None);
+        assert_eq!(at(VolumePhase::Provisioning, Some(2048)), None);
+    }
 
     fn params(kv: &[(&str, &str)]) -> HashMap<String, String> {
         kv.iter()
