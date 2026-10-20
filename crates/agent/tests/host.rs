@@ -265,12 +265,31 @@ fn guest_res_file(disk: &str) -> String {
     )
 }
 
-async fn guest_clean(lvm: &Lvm) {
-    if std::path::Path::new(&guest_res()).exists() {
-        let _ = sh(&["drbdadm", "-c", &guest_res(), "down", GUEST_RES]).await;
+/// Every rw-* DRBD resource the kernel has and every rw-* LV, whichever
+/// test left them: a failed run leaves them holding each other open, and
+/// any one of them fails the next run.
+async fn clean_rw(lvm: &Lvm) {
+    let out = sh(&["drbdsetup", "status", "--json"]).await;
+    assert_eq!(out.exit_code, Some(0), "{out:?}");
+    let status: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    for r in status.as_array().into_iter().flatten() {
+        let Some(name) = r["name"].as_str().filter(|n| n.starts_with("rw-")) else {
+            continue;
+        };
+        for d in r["devices"].as_array().into_iter().flatten() {
+            if let Some(minor) = d["minor"].as_u64() {
+                let _ = sh(&["drbdsetup", "resume-io", &minor.to_string()]).await;
+            }
+        }
+        let down = sh(&["drbdsetup", "down", name]).await;
+        assert_eq!(down.exit_code, Some(0), "down {name}: {down:?}");
     }
     let _ = std::fs::remove_dir_all(format!("{TEST_DIR}/l2"));
-    clean(lvm, "rw-l-g").await;
+    clean(lvm, "rw-").await;
+}
+
+async fn guest_clean(lvm: &Lvm) {
+    clean_rw(lvm).await;
 }
 
 /// A PV and a VG `vg` on `dev`, written with a config that sees only `dev`.

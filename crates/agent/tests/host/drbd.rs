@@ -86,8 +86,17 @@ async fn wait<F: Fn(&Tracker) -> bool>(tracker: &Mutex<Tracker>, what: &str, f: 
 /// address another test needs.
 const EVERY: &[&str] = &["rw-a", "rw-b", "rw-c", "rw-d", "rw-e", "rw-src"];
 
-/// Leftovers of an earlier failed run.
+/// Leftovers of an earlier failed run: every rw-* resource, LV and
+/// resource file, `names` among them.
 async fn drbd_clean(names: &[&str]) {
+    super::clean_rw(&lvm()).await;
+    for e in std::fs::read_dir(RES_DIR).into_iter().flatten().flatten() {
+        let file = e.file_name();
+        let file = file.to_string_lossy();
+        if file.starts_with("rw-") || file.starts_with(".rw-") {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
     for n in names {
         let _ = sh(&["drbdadm", "resume-io", n]).await;
         let _ = sh(&["drbdsetup", "down", n]).await;
