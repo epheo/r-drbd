@@ -174,8 +174,8 @@ fn moved(s: Step) -> (Assignment, Option<(String, String)>, String) {
 #[test]
 fn idle_clear_and_wait() {
     assert_eq!(Case::new(&[]).decide(), Step::Idle);
-    // Not in the assignment, not attached: leaves the list; only the
-    // smallest node is looked at.
+    // Not in the assignment, not attached: leaves the list, the smallest
+    // name first.
     assert_eq!(
         Case::new(&["n9", "n7"]).decide(),
         Step::Clear {
@@ -193,15 +193,82 @@ fn idle_clear_and_wait() {
 }
 
 #[test]
-fn blocked_reasons() {
+fn a_blocked_node_holds_no_other() {
+    // n1 is blocked (in use), n2 can move: n2 moves.
+    let c = Case::new(&["n1", "n2"]);
+    let (next, _, _) = moved(c.decide());
+    assert!(!next.replicas.iter().any(|r| r.node == "n2"));
+    // A Wait ahead does not hold a Clear behind.
+    let mut c = Case::new(&["n0", "n7"]);
+    c.spec.attachments = vec!["n0".into()];
+    assert_eq!(
+        c.decide(),
+        Step::Clear {
+            node: "n7".into(),
+            rest: vec!["n0".into()]
+        }
+    );
+    // Nothing acts: the first Blocked is reported over any Wait.
+    let mut c = Case::new(&["n0", "n1"]);
+    c.spec.attachments = vec!["n0".into()];
+    assert_eq!(message(&c.decide()), "eviction of n1 blocked: in use on n1");
+}
+
+#[test]
+fn only_a_deleted_node_waives_the_workload_guard() {
     let base = || Case::new(&["n2"]);
-    let mut c = base();
-    c.initialized = false;
-    // The text names the way out.
+    // In use, even as last reported by a stale agent; only a deleted Node
+    // proves the workload is gone.
+    let mut c = Case::new(&["n1"]);
+    assert_eq!(message(&c.decide()), "eviction of n1 blocked: in use on n1");
+    c.stale = vec!["n1"];
     assert_eq!(
         message(&c.decide()),
-        "eviction of n2 blocked: status.initializedAt is not set: the volume was never Ready, or its status was lost; an operator may set it once an UpToDate replica holds the data"
+        "eviction of n1 blocked: in use on n1 (agent stale; delete its Node once fenced)"
     );
+    c.gone = vec!["n1"];
+    assert!(matches!(c.decide(), Step::Move { .. }));
+    // Attached, even when not in use.
+    let mut c = base();
+    c.spec.attachments = vec!["n2".into()];
+    assert_eq!(
+        message(&c.decide()),
+        "eviction of n2 blocked: attached to n2; unpublish it first"
+    );
+    c.stale = vec!["n2"];
+    assert!(message(&c.decide()).ends_with("(agent stale; delete its Node once fenced)"));
+    c.gone = vec!["n2"];
+    assert!(matches!(c.decide(), Step::Move { .. }));
+    // A local volume has nowhere to move.
+    let mut c = base();
+    c.spec.replicas = 1;
+    c.a.replicas.truncate(1);
+    c.spec.evict = vec!["n1".into()];
+    c.gone = vec!["n1"];
+    assert_eq!(
+        message(&c.decide()),
+        "eviction of n1 blocked: a local volume has no other copy; remove n1 from spec.evict"
+    );
+}
+
+#[test]
+fn blocked_reasons() {
+    let base = || Case::new(&["n2"]);
+    // Never Ready: only the initial node is refused, and the text names
+    // the way out; n2 joins n1 as on any move.
+    let mut c = Case::new(&["n1"]);
+    c.initialized = false;
+    c.entries[0].in_use = false;
+    assert_eq!(
+        message(&c.decide()),
+        "eviction of n1 blocked: status.initializedAt is not set and n1 makes the first data: a volume never Ready holds nothing, delete and recreate it; if its status was lost, an operator may set initializedAt once an UpToDate replica holds the data"
+    );
+    let mut c = base();
+    c.initialized = false;
+    assert!(matches!(c.decide(), Step::Move { .. }));
+    // The initial node must still hold the data.
+    c.entries[0].disk_state = Some("Inconsistent".into());
+    assert!(message(&c.decide()).contains("no UpToDate replica with quorum"));
     let mut c = base();
     c.snapshot = Some("snap-1");
     assert_eq!(
@@ -248,20 +315,6 @@ fn blocked_reasons() {
     assert!(m.starts_with("eviction of n2 blocked: "), "{m}");
     // A stale lagging peer does not block.
     c.stale = vec!["n5"];
-    assert!(matches!(c.decide(), Step::Move { .. }));
-    // In use on a reachable node; a stale one may still read in use.
-    let mut c = Case::new(&["n1"]);
-    assert_eq!(message(&c.decide()), "eviction of n1 blocked: in use on n1");
-    c.stale = vec!["n1"];
-    assert!(matches!(c.decide(), Step::Move { .. }));
-    // Attached on a fresh node, even when not in use; a stale one may go.
-    let mut c = base();
-    c.spec.attachments = vec!["n2".into()];
-    assert_eq!(
-        message(&c.decide()),
-        "eviction of n2 blocked: attached to n2; unpublish it first"
-    );
-    c.stale = vec!["n2"];
     assert!(matches!(c.decide(), Step::Move { .. }));
     // Pins.
     let mut c = base();
@@ -451,16 +504,15 @@ fn tiebreaker_moves_or_goes() {
     c.entries[0].disk_state = Some("Inconsistent".into());
     c.entries[1].quorum = Some(false);
     assert!(matches!(c.decide(), Step::Move { .. }));
-    // Attached or in use on a fresh node blocks the tiebreaker too; a stale
-    // one may go.
+    // Attached or in use blocks the tiebreaker too, until its Node is gone.
     c.spec.attachments = vec!["n3".into()];
     assert_eq!(
         message(&c.decide()),
         "eviction of n3 blocked: attached to n3; unpublish it first"
     );
-    c.stale = vec!["n3"];
+    c.gone = vec!["n3"];
     assert!(matches!(c.decide(), Step::Move { .. }));
-    c.stale.clear();
+    c.gone.clear();
     c.spec.attachments.clear();
     c.entries[2].in_use = true;
     assert_eq!(message(&c.decide()), "eviction of n3 blocked: in use on n3");

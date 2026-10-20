@@ -1,6 +1,7 @@
 //! spec.evict: re-placing the replica a dead or retired node holds.
 //! The controller never fills the list itself; an operator or a human
-//! does, because only they know a node is fenced. One node per volume at a time, the smallest name first.
+//! does, because only they know a node is fenced. One move per volume and
+//! pass: the first listed node by name that can act.
 
 use std::collections::BTreeSet;
 
@@ -131,25 +132,34 @@ fn common_precondition(i: &Input<'_>, node: &str) -> Option<String> {
     if let Some(snap) = i.snapshot_in_progress {
         return Some(format!("snapshot {snap} in progress"));
     }
-    // A stale node cannot report either; its Lease is the operator's proof.
-    if (i.fresh)(node) {
-        if i.spec.attachments.iter().any(|n| n == node) {
-            return Some(format!("attached to {node}; unpublish it first"));
-        }
-        if i.entries.iter().any(|e| e.node == node && e.in_use) {
-            return Some(format!("in use on {node}"));
-        }
+    // A stale Lease shows only that the agent is down, not that the node
+    // stopped serving; a deleted Node is the operator's proof it did.
+    if !(i.node_exists)(node) {
+        return None;
+    }
+    let hint = if (i.fresh)(node) {
+        ""
+    } else {
+        " (agent stale; delete its Node once fenced)"
+    };
+    if i.spec.attachments.iter().any(|n| n == node) {
+        return Some(format!("attached to {node}; unpublish it first{hint}"));
+    }
+    if i.entries.iter().any(|e| e.node == node && e.in_use) {
+        return Some(format!("in use on {node}{hint}"));
     }
     None
 }
 
 /// What a diskful move needs on top, as the blocking reason.
 fn diskful_precondition(i: &Input<'_>, node: &str) -> Option<String> {
-    if !i.initialized {
-        return Some(
-            "status.initializedAt is not set: the volume was never Ready, or its status was lost; an operator may set it once an UpToDate replica holds the data"
-                .into(),
-        );
+    // Before initializedAt only the initial node makes data; any other
+    // replica joins it as on any move.
+    let initial = i.assignment.initial_up_to_date_node.as_deref();
+    if !i.initialized && initial.is_none_or(|n| n == node) {
+        return Some(format!(
+            "status.initializedAt is not set and {node} makes the first data: a volume never Ready holds nothing, delete and recreate it; if its status was lost, an operator may set initializedAt once an UpToDate replica holds the data"
+        ));
     }
     let entry = |n: &str| i.entries.iter().find(|e| e.node == n);
     let others: Vec<&str> = i
@@ -332,11 +342,28 @@ fn move_tiebreaker(i: &Input<'_>, gone: &AssignedReplica) -> Step {
     }
 }
 
-/// The step for the smallest node in spec.evict.
+/// The first step of spec.evict, by node name, that moves or clears; else
+/// the first Blocked, so its Event stays the same pass after pass; else the
+/// first Wait.
 pub fn decide(i: &Input<'_>) -> Step {
-    let Some(node) = i.spec.evict.iter().min() else {
-        return Step::Idle;
-    };
+    let nodes: BTreeSet<&String> = i.spec.evict.iter().collect();
+    let mut held = None;
+    for node in nodes {
+        let step = decide_node(i, node);
+        match step {
+            Step::Move { .. } | Step::Clear { .. } => return step,
+            Step::Blocked { .. } if !matches!(held, Some(Step::Blocked { .. })) => {
+                held = Some(step);
+            }
+            _ => {
+                held.get_or_insert(step);
+            }
+        }
+    }
+    held.unwrap_or(Step::Idle)
+}
+
+fn decide_node(i: &Input<'_>, node: &String) -> Step {
     let held = i.assignment.replicas.iter().find(|r| &r.node == node);
     let attached = i.spec.attachments.contains(node);
     let Some(r) = held else {
@@ -351,6 +378,12 @@ pub fn decide(i: &Input<'_>) -> Step {
     };
     if r.role == Role::Diskless {
         return Step::Wait { node: node.clone() };
+    }
+    if r.role == Role::Diskful && i.spec.replicas < 2 {
+        return blocked(
+            node,
+            format!("a local volume has no other copy; remove {node} from spec.evict"),
+        );
     }
     let why = common_precondition(i, node).or_else(|| {
         (r.role == Role::Diskful)
