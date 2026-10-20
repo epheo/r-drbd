@@ -981,17 +981,17 @@ async fn write(memory: &mut Memory, api: &Api<Volume>, v: &Volume, wanted: Owned
 struct Placing {
     views: Vec<placer::PoolView>,
     used: Used,
-    ready_nodes: Vec<String>,
+    live_nodes: Vec<String>,
 }
 
 impl Placing {
     fn new(stores: &Stores, usage: &Usage, memory: &Memory, volumes: &[Arc<Volume>]) -> Self {
         let pools = Stores::sorted(&stores.pools);
-        let ready_nodes = stores.ready_nodes();
+        let live_nodes = stores.live_nodes();
         Self {
-            views: pool_views(&pools, usage, &ready_nodes),
+            views: pool_views(&pools, usage, &live_nodes),
             used: memory.used(volumes),
-            ready_nodes,
+            live_nodes,
         }
     }
 
@@ -1018,10 +1018,10 @@ impl Placing {
     }
 }
 
-fn pool_views(pools: &[Arc<Pool>], usage: &Usage, ready_nodes: &[String]) -> Vec<placer::PoolView> {
+fn pool_views(pools: &[Arc<Pool>], usage: &Usage, live_nodes: &[String]) -> Vec<placer::PoolView> {
     pools
         .iter()
-        .map(|p| crate::pool::view(p, usage, ready_nodes))
+        .map(|p| crate::pool::view(p, usage, live_nodes))
         .collect()
 }
 
@@ -1105,12 +1105,7 @@ pub(crate) struct Health {
 }
 
 impl Health {
-    fn new(
-        stores: &Stores,
-        ready_nodes: &[String],
-        volumes: &[Arc<Volume>],
-        memory: &Memory,
-    ) -> Self {
+    fn new(stores: &Stores, volumes: &[Arc<Volume>], memory: &Memory) -> Self {
         let mut holding: HashSet<&str> = volumes
             .iter()
             .filter_map(|v| memory.assignment(v))
@@ -1128,7 +1123,7 @@ impl Health {
             .map(str::to_owned)
             .collect();
         Self {
-            ready: ready_nodes.iter().cloned().collect(),
+            ready: stores.ready_nodes().into_iter().collect(),
             unreachable,
             exists: stores.nodes.state().iter().map(|n| n.name_any()).collect(),
             leases: stores
@@ -1197,7 +1192,7 @@ pub(crate) async fn reconcile_all(ctx: &Ctx<'_>, memory: &mut Memory) {
     let volumes = Stores::sorted(&ctx.stores.volumes);
     let usage = crate::pool::usage(&volumes, memory);
     let mut placing = Placing::new(ctx.stores, &usage, memory, &volumes);
-    let health = Health::new(ctx.stores, &placing.ready_nodes, &volumes, memory);
+    let health = Health::new(ctx.stores, &volumes, memory);
     for v in &volumes {
         reconcile(ctx, memory, &mut placing, &health, &api, v).await;
     }
@@ -1447,7 +1442,7 @@ async fn evict_step(
         fresh: &fresh,
         node_exists: &|n| ctx.stores.node(n).is_some(),
         views: &placing.views,
-        ready_nodes: &placing.ready_nodes,
+        live_nodes: &placing.live_nodes,
         used: &placing.used,
     });
     if !matches!(step, crate::evict::Step::Blocked { .. }) {
@@ -1952,7 +1947,7 @@ fn restore_holders(
 fn assign(placing: &Placing, v: &Volume, diskful: &[placer::Chosen]) -> Placement {
     let nodes: Vec<String> = diskful.iter().map(|c| c.node.clone()).collect();
     let tiebreaker = if nodes.len() >= 2 && nodes.len().is_multiple_of(2) {
-        let t = placer::tiebreaker(&nodes, &placing.ready_nodes, &placing.views, &v.spec.tier);
+        let t = placer::tiebreaker(&nodes, &placing.live_nodes, &placing.views, &v.spec.tier);
         if t.is_none() {
             warn!(volume = v.name_any(), "no node for the quorum tiebreaker");
         }

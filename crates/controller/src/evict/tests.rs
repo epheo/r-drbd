@@ -32,7 +32,7 @@ fn view(node: &str, free: u64) -> placer::PoolView {
         name: format!("p-{node}"),
         node: node.into(),
         tier: "fast".into(),
-        node_ready: true,
+        live: true,
         available: true,
         total_bytes: 100 * G,
         free_bytes: free,
@@ -121,6 +121,21 @@ impl Case {
         let fresh = move |n: &str| !stale.contains(&n);
         let gone = self.gone.clone();
         let exists = move |n: &str| !gone.contains(&n);
+        // As in production: liveness folds in a fresh agent and the Node.
+        let live: Vec<String> = self
+            .ready
+            .iter()
+            .filter(|n| fresh(n) && exists(n))
+            .cloned()
+            .collect();
+        let views: Vec<placer::PoolView> = self
+            .views
+            .iter()
+            .map(|v| placer::PoolView {
+                live: v.live && live.contains(&v.node),
+                ..v.clone()
+            })
+            .collect();
         decide(&Input {
             name: "vol",
             spec: &self.spec,
@@ -131,8 +146,8 @@ impl Case {
             snapshot_in_progress: self.snapshot,
             fresh: &fresh,
             node_exists: &exists,
-            views: &self.views,
-            ready_nodes: &self.ready,
+            views: &views,
+            live_nodes: &live,
             used: &self.used,
         })
     }
@@ -292,17 +307,17 @@ fn candidate_filter() {
         view("n5", G),
         view("n6", G),
     ];
-    let fresh = |n: &str| n != "n5";
     // n7 left the assignment but its agent has not dropped the entry yet.
     let mut views = views;
     views.push(view("n7", G));
     let entries = vec![up("n1", false), up("n2", false), tb("n3"), up("n7", false)];
-    let got: Vec<String> = candidates(&views, &a, &entries, &["n2".into(), "n6".into()], &fresh)
+    let got: Vec<String> = candidates(&views, &a, &entries, &["n2".into(), "n6".into()])
         .into_iter()
         .map(|p| p.node)
         .collect();
     // n3 holds only the tiebreaker: allowed, its entry is in the assignment.
-    assert_eq!(got, ["n3", "n4"]);
+    // Liveness is the placer's.
+    assert_eq!(got, ["n3", "n4", "n5"]);
 }
 
 #[test]

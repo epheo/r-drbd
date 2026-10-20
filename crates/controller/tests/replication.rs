@@ -622,6 +622,29 @@ async fn stale_lease_marks_node_unreachable() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn placement_skips_nodes_without_a_live_agent() {
+    let assets = require_envtest!();
+    let (_env, client, _cfg, _ctl) = setup(&assets).await;
+    cluster(&client).await;
+    // Ready Nodes whose agent never renewed: neither a pool nor the
+    // tiebreaker may land there.
+    support::delete_agent_lease(&client, "n2").await;
+    support::delete_agent_lease(&client, "n3").await;
+    create_volume(&client, "rep", volume_spec(GIB, 2, "fast")).await;
+    let v = volume_where(&client, "rep", |v| {
+        ready_reason(v).as_deref() == Some("Insufficient")
+    })
+    .await;
+    let message = &cond(&v, types::READY).unwrap().message;
+    assert!(message.contains("n2/p2 NodeUnreachable"), "{message}");
+    support::agent_lease(&client, "n2", Duration::ZERO, false).await;
+    let v = volume_where(&client, "rep", |v| v.spec.assignment.is_some()).await;
+    assert_eq!(role_of(&v, "n2"), Some(Role::Diskful));
+    assert_eq!(role_of(&v, "n3"), None);
+    assert_eq!(role_of(&v, "n4"), Some(Role::Tiebreaker));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deletion_with_gone_or_stale_nodes() {
     let assets = require_envtest!();
     let (_env, client, _cfg, _ctl) = setup_with(&assets, |c| c.lease_stale = SHORT_STALE).await;

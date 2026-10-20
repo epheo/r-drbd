@@ -26,11 +26,11 @@ fn every_reason_in_order() {
     req.node = Some("n1".to_string());
 
     let mut p = pool("q", "n2", 0);
-    p.node_ready = false;
+    p.live = false;
     p.available = false;
     p.tier = "slow".to_string();
-    assert_eq!(only_reason(&req, p.clone()), Reason::NodeNotReady);
-    p.node_ready = true;
+    assert_eq!(only_reason(&req, p.clone()), Reason::NodeUnreachable);
+    p.live = true;
     assert_eq!(only_reason(&req, p.clone()), Reason::PoolUnavailable);
     p.available = true;
     assert_eq!(only_reason(&req, p.clone()), Reason::WrongTier);
@@ -52,13 +52,13 @@ fn reasons_name_each_rejected_pool_once_in_input_order() {
     a.tier = "slow".to_string();
     let b = pool("b", "n2", 50 * GIB);
     let mut c = pool("c", "n3", 0);
-    c.node_ready = false;
+    c.live = false;
     let got = reasons(place(&req, &[a, b, c]));
     assert_eq!(
         got,
         vec![
             ("a".to_string(), Reason::WrongTier),
-            ("c".to_string(), Reason::NodeNotReady),
+            ("c".to_string(), Reason::NodeUnreachable),
         ]
     );
 }

@@ -106,7 +106,8 @@ impl Stores {
             .map(|d| d + Duration::from_millis(100))
     }
 
-    /// Names of the Ready nodes, sorted for binary search.
+    /// Names of the Ready nodes, sorted for binary search. Reporting only:
+    /// placement uses `live_nodes`.
     pub fn ready_nodes(&self) -> Vec<String> {
         let mut out: Vec<String> = self
             .nodes
@@ -116,6 +117,13 @@ impl Stores {
             .map(|n| n.name_any())
             .collect();
         out.sort();
+        out
+    }
+
+    /// Nodes placement may use: Ready, with a fresh agent; sorted.
+    pub fn live_nodes(&self) -> Vec<String> {
+        let mut out = self.ready_nodes();
+        out.retain(|n| self.agent_fresh(n));
         out
     }
 

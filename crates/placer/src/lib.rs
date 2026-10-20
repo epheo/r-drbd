@@ -11,7 +11,8 @@ pub struct PoolView {
     pub name: String,
     pub node: String,
     pub tier: String,
-    pub node_ready: bool,
+    /// The node is Ready and its agent fresh.
+    pub live: bool,
     pub available: bool,
     pub total_bytes: u64,
     pub free_bytes: u64,
@@ -65,7 +66,7 @@ pub struct Rejected {
 /// rejects it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
-    NodeNotReady,
+    NodeUnreachable,
     PoolUnavailable,
     WrongTier,
     NotThePinnedPool,
@@ -104,6 +105,12 @@ pub fn promise(pool: &PoolView) -> u64 {
 
 fn reserve(pool: &PoolView) -> u128 {
     (u128::from(pool.total_bytes) * u128::from(pool.reserve_percent)).div_ceil(100)
+}
+
+/// Placement may use the pool at all: its node is live and the pool
+/// Available. Capacity is apart, see `fits`.
+pub fn usable(pool: &PoolView) -> bool {
+    pool.live && pool.available
 }
 
 /// A pool with total 0 (capacity not reported yet) never fits.
@@ -170,8 +177,8 @@ pub fn place(req: &Request, pools: &[PoolView]) -> Result<Vec<Chosen>, Insuffici
 }
 
 fn reject(req: &Request, pool: &PoolView) -> Option<Reason> {
-    if !pool.node_ready {
-        Some(Reason::NodeNotReady)
+    if !pool.live {
+        Some(Reason::NodeUnreachable)
     } else if !pool.available {
         Some(Reason::PoolUnavailable)
     } else if pool.tier != req.tier {
@@ -185,16 +192,16 @@ fn reject(req: &Request, pool: &PoolView) -> Option<Reason> {
     }
 }
 
-/// Tiebreaker node for an even diskful count: a ready node that holds no
+/// Tiebreaker node for an even diskful count: a live node that holds no
 /// replica, preferring nodes with no pool of this tier (such as a control plane node),
 /// then the node with the fewest volumes, then by name.
 pub fn tiebreaker(
     diskful_nodes: &[String],
-    ready_nodes: &[String],
+    live_nodes: &[String],
     pools: &[PoolView],
     tier: &str,
 ) -> Option<String> {
-    ready_nodes
+    live_nodes
         .iter()
         .filter(|n| !diskful_nodes.contains(n))
         .min_by_key(|n| {

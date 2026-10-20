@@ -1048,9 +1048,9 @@ impl Controller for Csi {
             .as_ref()
             .and_then(|t| t.segments.get(TOPOLOGY_KEY))
             .map(String::as_str);
-        let ready_nodes = self.stores.ready_nodes();
+        let live_nodes = self.stores.live_nodes();
         let pools = Stores::sorted(&self.stores.pools);
-        let bytes = crate::capacity::answer(&pools, &ready_nodes, &req.parameters, segment)
+        let bytes = crate::capacity::answer(&pools, &live_nodes, &req.parameters, segment)
             .map_err(Status::invalid_argument)?;
         Ok(Response::new(GetCapacityResponse {
             available_capacity: to_i64(bytes),

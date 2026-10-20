@@ -183,7 +183,7 @@ Pick the link of the whole disk (no `-part` suffix); the target (`../../nvme1n1`
 | `totalBytes`, `freeBytes` | Thin pool data size and free space |
 | `chunkBytes` | Thin pool chunk size; DRBD discards are aligned to it |
 | `committedBytes` | Sum of the sizes of the volumes with a diskful replica here |
-| `placeableBytes` | Largest new volume placement accepts here now, rounded down to MiB; 0 when the Pool is not Available, its node is not Ready, or it is being deleted |
+| `placeableBytes` | Largest new volume placement accepts here now, rounded down to MiB; 0 when the Pool is not Available, its node is not Ready or its agent is down, or it is being deleted |
 | `volumes` | Volumes with a diskful replica here |
 | `devices` | Devices mode: one row per listed path with `state`, `sizeBytes`, `model`, `serial` and `message` |
 | `conditions` | `Available`; `Released` while a Pool under `reclaimPolicy: Delete` is deleted |

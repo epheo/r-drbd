@@ -38,16 +38,16 @@ pub(crate) fn usage(volumes: &[Arc<Volume>], memory: &Memory) -> Usage {
     out
 }
 
-/// Placer input for one Pool: capacity from the agent, readiness from the
-/// core Node, committed sizes from every assignment.
-pub(crate) fn view(p: &Pool, usage: &Usage, ready_nodes: &[String]) -> placer::PoolView {
+/// Placer input for one Pool: capacity from the agent, liveness from the
+/// core Node and the agent Lease, committed sizes from every assignment.
+pub(crate) fn view(p: &Pool, usage: &Usage, live_nodes: &[String]) -> placer::PoolView {
     let name = p.name_any();
     let held = usage.get(&(p.spec.node.clone(), name.clone()));
     let status = p.status.as_ref();
     placer::PoolView {
         node: p.spec.node.clone(),
         tier: p.spec.tier.clone(),
-        node_ready: ready_nodes.binary_search(&p.spec.node).is_ok(),
+        live: live_nodes.binary_search(&p.spec.node).is_ok(),
         available: p.metadata.deletion_timestamp.is_none()
             && status.is_some_and(|s| condition::is_true(&s.conditions, types::AVAILABLE)),
         total_bytes: status.and_then(|s| s.total_bytes).unwrap_or(0),
@@ -66,7 +66,7 @@ const PLACEABLE_STEP: u64 = 1 << 20;
 
 /// What status.placeableBytes shows: 0 for a pool placement skips.
 pub(crate) fn placeable(view: &placer::PoolView) -> u64 {
-    if !(view.node_ready && view.available) {
+    if !placer::usable(view) {
         return 0;
     }
     placer::room(view) / PLACEABLE_STEP * PLACEABLE_STEP
@@ -124,7 +124,7 @@ pub(crate) async fn reconcile_all(ctx: &Ctx<'_>, memory: &Memory) {
         .iter()
         .filter_map(|v| v.spec.pool.as_deref())
         .collect();
-    let ready_nodes = ctx.stores.ready_nodes();
+    let live_nodes = ctx.stores.live_nodes();
     let snapshots = ctx.stores.snapshots.state();
     // A snapshot LV outlives its Volume; the pool must too.
     let snapshot_held: HashSet<(&str, &str)> = snapshots
@@ -157,7 +157,7 @@ pub(crate) async fn reconcile_all(ctx: &Ctx<'_>, memory: &Memory) {
             set_finalizer(&api, pool.as_ref(), FINALIZER_POOL, true).await;
             continue;
         }
-        let view = view(&pool, &usage, &ready_nodes);
+        let view = view(&pool, &usage, &live_nodes);
         let shown = (Some(view.committed_bytes), Some(placeable(&view)));
         let current_shown = pool
             .status
@@ -282,12 +282,12 @@ mod tests {
     #[test]
     fn placeable_is_zero_where_placement_skips_and_rounds_to_mib() {
         let p = pool("p1", "n1", 100 * G, 50 * G + 12345);
-        let ready = ["n1".to_owned()];
-        let v = view(&p, &Usage::new(), &ready);
+        let live = ["n1".to_owned()];
+        let v = view(&p, &Usage::new(), &live);
         assert_eq!(placeable(&v), 45 * G);
         assert_eq!(placeable(&view(&p, &Usage::new(), &[])), 0);
         let mut gone = (*p).clone();
         gone.status.as_mut().unwrap().conditions.clear();
-        assert_eq!(placeable(&view(&gone, &Usage::new(), &ready)), 0);
+        assert_eq!(placeable(&view(&gone, &Usage::new(), &live)), 0);
     }
 }

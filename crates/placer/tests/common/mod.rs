@@ -9,7 +9,7 @@ pub(crate) fn pool(name: &str, node: &str, free: u64) -> PoolView {
         name: name.to_string(),
         node: node.to_string(),
         tier: "fast".to_string(),
-        node_ready: true,
+        live: true,
         available: true,
         total_bytes: 100 * GIB,
         free_bytes: free,

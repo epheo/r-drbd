@@ -26,9 +26,10 @@ pub struct Input<'a> {
     /// The core Node object exists; deleting it is the operator's proof
     /// that a node is dead for good.
     pub node_exists: &'a dyn Fn(&str) -> bool,
+    /// Every Pool as placement sees it: `live` folds in `fresh`.
     pub views: &'a [placer::PoolView],
-    /// Nodes whose Node Ready condition is True, sorted.
-    pub ready_nodes: &'a [String],
+    /// Nodes placement may use (Ready, agent fresh), sorted.
+    pub live_nodes: &'a [String],
     pub used: &'a Used,
 }
 
@@ -95,18 +96,17 @@ fn departing(a: &Assignment, entries: &[ReplicaStatus], node: &str) -> bool {
     entries.iter().any(|e| e.node == node) && !a.replicas.iter().any(|r| r.node == node)
 }
 
-/// Pools a moved diskful replica may land in: fresh agent, no diskful
-/// entry of this volume, not being evicted itself, not departing.
+/// Pools a moved diskful replica may land in: no diskful entry of this
+/// volume, not being evicted itself, not departing. The placer checks the
+/// rest.
 pub fn candidates(
     views: &[placer::PoolView],
     a: &Assignment,
     entries: &[ReplicaStatus],
     evict: &[String],
-    fresh: &dyn Fn(&str) -> bool,
 ) -> Vec<placer::PoolView> {
     views
         .iter()
-        .filter(|p| fresh(&p.node))
         .filter(|p| !evict.contains(&p.node))
         .filter(|p| !departing(a, entries, &p.node))
         .filter(|p| {
@@ -184,7 +184,7 @@ fn diskful_precondition(i: &Input<'_>, node: &str) -> Option<String> {
 }
 
 /// A tiebreaker for `next` when it has none and two diskful replicas:
-/// a ready node with a fresh agent and no entry, not being evicted.
+/// a live node with no entry, not being evicted.
 fn add_tiebreaker(i: &Input<'_>, next: &mut Assignment, retired: u8) -> Option<String> {
     let diskful: Vec<String> = next
         .replicas
@@ -198,16 +198,15 @@ fn add_tiebreaker(i: &Input<'_>, next: &mut Assignment, retired: u8) -> Option<S
     {
         return None;
     }
-    let ready: Vec<String> = i
-        .ready_nodes
+    let live: Vec<String> = i
+        .live_nodes
         .iter()
-        .filter(|n| (i.fresh)(n))
         .filter(|n| !i.spec.evict.contains(n))
         .filter(|n| !departing(i.assignment, i.entries, n))
         .filter(|n| !next.replicas.iter().any(|r| &r.node == *n))
         .cloned()
         .collect();
-    let node = placer::tiebreaker(&diskful, &ready, i.views, &i.spec.tier)?;
+    let node = placer::tiebreaker(&diskful, &live, i.views, &i.spec.tier)?;
     let node_id = free_node_id(next, retired)?;
     let port = i.used.lowest_free_port(&node)?;
     next.replicas.push(AssignedReplica {
@@ -228,7 +227,7 @@ fn move_diskful(i: &Input<'_>, gone: &AssignedReplica) -> Step {
     if i.spec.node.as_deref() == Some(node) || pinned_pool_here {
         return blocked(node, format!("pinned to {node}"));
     }
-    let pools = candidates(i.views, i.assignment, i.entries, &i.spec.evict, i.fresh);
+    let pools = candidates(i.views, i.assignment, i.entries, &i.spec.evict);
     let req = placer::Request {
         size_bytes: i.spec.size_bytes,
         replicas: 1,
@@ -256,7 +255,7 @@ fn move_diskful(i: &Input<'_>, gone: &AssignedReplica) -> Step {
         let mut leaving: Vec<&str> = i
             .views
             .iter()
-            .filter(|v| v.tier == i.spec.tier && (i.fresh)(&v.node))
+            .filter(|v| v.tier == i.spec.tier && v.live)
             .filter(|v| !i.spec.evict.contains(&v.node))
             .map(|v| v.node.as_str())
             .filter(|n| departing(i.assignment, i.entries, n))
