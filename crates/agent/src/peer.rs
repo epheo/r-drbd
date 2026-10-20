@@ -57,10 +57,8 @@ pub fn classify(r: &io::Result<()>) -> (ProbeResult, Option<String>) {
     }
 }
 
-/// Whole seconds: the API stores no more, and a finer value would make
-/// every status comparison see a change.
 pub fn wall_now() -> Time {
-    Time(Timestamp::from_second(Timestamp::now().as_second()).unwrap_or(Timestamp::UNIX_EPOCH))
+    model::time::now()
 }
 
 /// A peer's agent Lease as this agent sees it.

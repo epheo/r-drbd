@@ -14,6 +14,7 @@ pub mod keys;
 pub mod nodedisks;
 pub mod pool;
 pub mod snapshot;
+pub mod time;
 pub mod volume;
 
 pub use condition::Condition;

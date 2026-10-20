@@ -89,6 +89,21 @@ fn log_file(dir: &Path, name: &str) -> Stdio {
     Stdio::from(std::fs::File::create(dir.join(name)).expect("log file"))
 }
 
+/// Logs only Volume status patches, once each, so a test can count the
+/// writes that reached the apiserver, no-ops included.
+const AUDIT_POLICY: &str = "apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages: [RequestReceived]
+rules:
+- level: Metadata
+  verbs: [patch]
+  resources:
+  - group: r-drbd.io
+    resources: [volumes/status]
+- level: None
+";
+const AUDIT_LOG: &str = "audit.log";
+
 pub struct Env {
     pub dir: TempDir,
     pub kubeconfig: PathBuf,
@@ -163,6 +178,7 @@ impl Env {
             "test-token,admin,admin,system:masters\n",
         )
         .expect("token file");
+        std::fs::write(d.join("audit-policy.yaml"), AUDIT_POLICY).expect("audit policy");
         let apiserver = Command::new(assets.join("kube-apiserver"))
             .args([
                 format!("--etcd-servers=http://127.0.0.1:{client_port}"),
@@ -178,6 +194,11 @@ impl Env {
                 "--service-cluster-ip-range=10.0.0.0/24".to_owned(),
                 "--disable-admission-plugins=ServiceAccount".to_owned(),
                 "--allow-privileged=true".to_owned(),
+                format!(
+                    "--audit-policy-file={}",
+                    d.join("audit-policy.yaml").display()
+                ),
+                format!("--audit-log-path={}", d.join(AUDIT_LOG).display()),
             ])
             .stdout(log_file(d, "apiserver.log"))
             .stderr(log_file(d, "apiserver.err"))
@@ -209,6 +230,23 @@ impl Env {
             .await
             .expect("kube config");
         Client::try_from(cfg).expect("client")
+    }
+
+    /// Status patches of Volume `name` sent under the controller's field
+    /// manager so far.
+    pub fn controller_status_patches(&self, name: &str) -> usize {
+        let log = std::fs::read_to_string(self.dir.path().join(AUDIT_LOG)).unwrap_or_default();
+        let manager = format!("fieldManager={}", model::keys::CONTROLLER_FIELD_MANAGER);
+        log.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|e| {
+                e["objectRef"]["name"] == name
+                    && e["objectRef"]["subresource"] == "status"
+                    && e["requestURI"]
+                        .as_str()
+                        .is_some_and(|u| u.contains(&manager))
+            })
+            .count()
     }
 
     async fn wait_up(&self) {

@@ -43,6 +43,39 @@ async fn ready_local(client: &Client, agent: &FakeAgent, name: &str, size: u64) 
     volume_where(client, name, |v| phase_of(v) == VolumePhase::Ready).await
 }
 
+/// Once a Volume this leader made Ready is quiet, passes send it nothing:
+/// the remembered initializedAt equals the stored copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quiet_volume_gets_no_status_patch() {
+    let assets = require_envtest!();
+    let (env, client, _ctl) = setup(&assets, |_| {}).await;
+    node(&client, "n1", true).await;
+    pool(&client, "p1", "n1", "fast", 100 * GIB).await;
+    let agent = FakeAgent::new(&client, "n1");
+    ready_local(&client, &agent, "quiet", GIB).await;
+    volume_where(&client, "quiet", |v| {
+        v.status
+            .as_ref()
+            .is_some_and(|s| s.initialized_at.is_some())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let before = env.controller_status_patches("quiet");
+    assert!(before > 0, "the audit log sees the controller's patches");
+    // Each Node change wakes a pass.
+    let nodes = Api::<k8s_openapi::api::core::v1::Node>::all(client.clone());
+    for i in 0..5 {
+        let label = json!({ "metadata": { "labels": { "wake": i.to_string() } } });
+        nodes
+            .patch("n1", &PatchParams::default(), &Patch::Merge(&label))
+            .await
+            .expect("label node");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(env.controller_status_patches("quiet"), before);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pool_finalizer_and_volumes() {
     let assets = require_envtest!();

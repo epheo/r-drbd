@@ -408,9 +408,8 @@ async fn emit(client: &Client, v: &model::Volume, type_: &str, reason: &str, mes
     }
 }
 
-/// Current time as a metav1.Time.
 pub(crate) fn now() -> Time {
-    Time(k8s_openapi::jiff::Timestamp::now())
+    model::time::now()
 }
 
 pub(crate) fn has_finalizer<K: Resource>(obj: &K, finalizer: &str) -> bool {
