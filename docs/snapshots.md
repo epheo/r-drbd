@@ -74,7 +74,11 @@ Rules:
 - A replicated restore needs `replicas` equal to the number of nodes holding the snapshot.
   Every node holding the snapshot restores it from its own copy, so the restore is instant, shares blocks on every node and needs no sync.
   The copies are identical because the snapshot was taken with IO suspended on every replica.
-- A replicated restore larger than its snapshot is copied in full from one node to the others, as is a replica that could not restore its copy.
+- A replicated restore larger than its snapshot starts at the snapshot's size with identical copies, then grows online.
+  The new area syncs between the replicas; zero blocks travel as discards, so it costs little network and no thin pool space.
+  During that sync the other replica is Inconsistent on the new area only, and the volume is not Ready yet.
+  The claim is usable once the volume is Ready at the requested size.
+- A replica that could not restore its copy is copied in full from another one.
 - The requested size may be larger than the snapshot; it may not be smaller.
 - Pins that point away from the snapshot's nodes or Pools fail the restore with reason `RestoreNodeConflict`.
 - The claim must still fit the scheduler's capacity check (see [Scheduling](volumes.md#scheduling)), although placement never charges a restore against capacity.
