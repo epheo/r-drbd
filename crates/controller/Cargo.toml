@@ -24,15 +24,6 @@ tokio-stream = { version = "0.1.19", features = ["net"] }
 # The csi crate builds tonic without a server transport; the controller needs one for the Unix socket.
 tonic = { version = "0.14.6", default-features = false, features = ["transport"] }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter", "ansi"], optional = true }
-
-[features]
-# Temporary dev binary until crates/r-drbd wires the controller role.
-dev-bin = ["dep:tracing-subscriber"]
-
-[[bin]]
-name = "controller-dev"
-required-features = ["dev-bin"]
 
 [dev-dependencies]
 agent = { path = "../agent" }

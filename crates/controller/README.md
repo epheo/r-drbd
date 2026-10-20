@@ -14,7 +14,6 @@ One leader, one reflector per kind, one reconcile loop that walks every object i
 - `volume`: placement (replicated restore from the snapshot holders), assignment write (no fileSystem seed on restores), diskless entries converged to `spec.attachments`, status aggregation (Ready, Degraded, QuorumLost, SplitBrain, NodeUnreachable), `spec.resolve`, deletion.
 - `snapshot`: the snapshot round state machine and deletion.
 - `csi`: CSI Identity and Controller services on the sidecars' Unix socket.
-- `bin/controller-dev`: temporary entry point (feature `dev-bin`) until crates/r-drbd wires the role.
 
 ## Volume status: notes for consumers
 
@@ -44,7 +43,6 @@ One leader, one reflector per kind, one reconcile loop that walks every object i
 - `tracing`: structured logs.
 - `getrandom`: the DRBD shared secret, straight from the OS.
 - `base64`: encoding of the shared secret.
-- `tracing-subscriber` (optional, `dev-bin` only): log output of the dev binary.
 
 Dev-dependencies: `tempfile` for envtest directories, `tracing-subscriber` for test logs.
 
