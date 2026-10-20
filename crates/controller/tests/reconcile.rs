@@ -4,6 +4,7 @@ mod support;
 
 use std::time::Duration;
 
+use controller::volume::Outcome;
 use kube::api::{DeleteParams, Patch, PatchParams};
 use kube::{Api, Client};
 use model::keys::{FINALIZER_POOL, MINOR_RANGE, PORT_RANGE};
@@ -758,7 +759,10 @@ async fn assignment_write_conflict() {
         secret: None,
         initial_up_to_date_node: None,
     };
-    assert!(!controller::volume::write_assignment(&api, &stale, &a).await);
+    assert_eq!(
+        controller::volume::write_assignment(&api, &stale, &a).await,
+        Outcome::Rejected
+    );
     assert!(
         get_volume(&client, "racy")
             .await
@@ -768,7 +772,10 @@ async fn assignment_write_conflict() {
             .is_none()
     );
     let fresh = get_volume(&client, "racy").await.unwrap();
-    assert!(controller::volume::write_assignment(&api, &fresh, &a).await);
+    assert_eq!(
+        controller::volume::write_assignment(&api, &fresh, &a).await,
+        Outcome::Applied
+    );
     assert_eq!(
         get_volume(&client, "racy").await.unwrap().spec.assignment,
         Some(a)
@@ -988,7 +995,10 @@ async fn taking_without_start_gets_one() {
         secret: None,
         initial_up_to_date_node: None,
     };
-    assert!(controller::volume::write_assignment(&vols, &v, &a).await);
+    assert_eq!(
+        controller::volume::write_assignment(&vols, &v, &a).await,
+        Outcome::Applied
+    );
     create_snapshot(&client, "snap", "vol").await;
     let status = json!({
         "apiVersion": "r-drbd.io/v1alpha1",

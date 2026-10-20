@@ -182,7 +182,7 @@ Pool `Released`: `Removed` (True: thin pool, VG and PV labels removed), `RemoveB
 
 Pool Events: `DeviceNotUsable` (Warning: an appended path is not blank and stays out of the pool), `PoolNotGrown` (Warning: a growth step failed, or the metadata maximum leaves VG space out of the pool).
 
-Volume Events: `Evicted`, `EvictionBlocked`, `SplitBrainResolved`, `PeerUnreachable` (Warning), `PeersReachable`, `AttachmentFailed` (Warning, once per distinct message).
+Volume Events: `Evicted`, `EvictionBlocked`, `SplitBrainResolved`, `PeerUnreachable` (Warning), `PeersReachable`, `AttachmentFailed` (Warning, once per distinct message), `StatusApplyFailed` (Warning, once per error kind until an apply succeeds), `DuplicateAssignment` (Warning on each holder of a minor or port held twice; never rewritten).
 
 ## CSI driver
 
@@ -209,7 +209,7 @@ Topology key: `r-drbd.io/node`, on local volumes only.
 |---|---|---|
 | `--csi-endpoint` | `CSI_ENDPOINT` | `unix:///csi/csi.sock` |
 | `--namespace` | `POD_NAMESPACE` | `r-drbd-system` |
-| `--identity` (controller) | `POD_NAME` | hostname |
+| `--identity` (controller) | `POD_NAME` | hostname; a random suffix is added per process |
 | `--node` (agent) | `NODE_NAME` | required |
 | `--res-dir` (agent) | `R_DRBD_RES_DIR` | `/var/lib/r-drbd` |
 

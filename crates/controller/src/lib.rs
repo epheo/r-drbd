@@ -18,7 +18,7 @@ pub mod store;
 pub mod volume;
 pub mod wait;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
@@ -26,7 +26,7 @@ use kube::api::{Patch, PatchParams};
 use kube::{Api, Client, Resource, ResourceExt};
 use model::Assignment;
 use serde::de::DeserializeOwned;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::store::Stores;
 
@@ -39,7 +39,8 @@ pub struct Config {
     pub namespace: String,
     /// `unix:///path` or a plain path.
     pub csi_endpoint: String,
-    /// Lease holder identity: the pod name or the hostname.
+    /// Lease holder identity: the pod name or the hostname; `run` makes it
+    /// unique per process.
     pub identity: String,
     /// Bound of the snapshot take round.
     pub take_timeout: Duration,
@@ -125,10 +126,14 @@ pub fn valid_volume_name(name: &str) -> bool {
 }
 
 /// Bounds of every call but the watches: a half-open connection fails
-/// the call instead of stalling the pass, CSI or the Lease for good. The
-/// read timeout is a socket idle timeout, which a quiet watch would hit.
+/// the call instead of stalling the pass, CSI or the Lease for good.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// The read timeout is a socket idle timeout: a quiet watch idles up to
+/// the server's watch timeout (290 s at most), so the bound sits above it.
+/// It still ends a LIST hung on a half-open connection, which would
+/// otherwise freeze that store.
+const WATCH_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The controller's two kube clients.
 #[derive(Clone)]
@@ -149,10 +154,16 @@ impl Clients {
     pub fn new(config: kube::Config) -> Result<Self, Error> {
         let build = |c| Client::try_from(c).map_err(|e| Error::kube("building the kube client", e));
         Ok(Self {
-            watch: build(config.clone())?,
+            watch: build(watch_config(config.clone()))?,
             request: build(request_config(config))?,
         })
     }
+}
+
+fn watch_config(mut config: kube::Config) -> kube::Config {
+    config.connect_timeout = Some(CONNECT_TIMEOUT);
+    config.read_timeout = Some(WATCH_READ_TIMEOUT);
+    config
 }
 
 fn request_config(mut config: kube::Config) -> kube::Config {
@@ -164,7 +175,8 @@ fn request_config(mut config: kube::Config) -> kube::Config {
 /// Connects with the in-cluster or kubeconfig credentials and runs until
 /// SIGTERM (Ok, Lease released) or until leadership is lost or a component
 /// fails (Err); the caller exits the process.
-pub async fn run(cfg: Config) -> Result<(), Error> {
+pub async fn run(mut cfg: Config) -> Result<(), Error> {
+    cfg.identity = leader::per_process(&cfg.identity);
     let config = kube::Config::infer().await.map_err(Error::KubeConfig)?;
     Box::pin(run_with_clients(cfg, Clients::new(config)?)).await
 }
@@ -227,6 +239,11 @@ pub(crate) struct Memory {
     /// a recreated Volume of the same name apart. Once the store moves past
     /// that resourceVersion it holds the write (or a later state).
     pub(crate) assigned: HashMap<String, (Option<String>, Assignment)>,
+    /// Assignment writes of unknown outcome, keyed as `assigned`. They hold
+    /// their minor and ports but do not make the Volume assigned: once the
+    /// store moves past that resourceVersion, the write is in it or never
+    /// lands.
+    pub(crate) pending: HashMap<String, (Option<String>, Assignment)>,
     /// Split-brain pairs latched per Volume uid (volume::drbd_conditions).
     pub(crate) split: HashMap<String, BTreeSet<volume::Pair>>,
     /// Volume uids whose spec.resolve has seen SplitBrain True; only those
@@ -241,6 +258,11 @@ pub(crate) struct Memory {
     /// Per Volume uid: the EvictionBlocked text last sent as an Event, so a
     /// block that lasts emits one Event per reason, not one per pass.
     pub(crate) evict_blocked: HashMap<String, String>,
+    /// Per Volume uid: the kind of the status apply failure last sent as
+    /// an Event; cleared once an apply succeeds.
+    pub(crate) status_failed: HashMap<String, String>,
+    /// Duplicate minors and ports already announced, by message.
+    pub(crate) duplicates: BTreeSet<String>,
     /// Per Volume uid: the attached nodes without a replica, and the
     /// message last sent as an Event.
     pub(crate) attach_failed: HashMap<String, (Vec<String>, String)>,
@@ -262,6 +284,24 @@ impl Memory {
             .filter(|(rv, _)| *rv == v.metadata.resource_version)
             .map(|(_, a)| a);
         pending.or(v.spec.assignment.as_ref())
+    }
+
+    /// Minors and ports held by stored, written and pending assignments.
+    pub(crate) fn used(&self, volumes: &[std::sync::Arc<model::Volume>]) -> alloc::Used {
+        let mut used =
+            alloc::Used::from_assignments(volumes.iter().filter_map(|v| self.assignment(v)));
+        for v in volumes {
+            let pending = v
+                .metadata
+                .uid
+                .as_deref()
+                .and_then(|uid| self.pending.get(uid))
+                .filter(|(rv, _)| *rv == v.metadata.resource_version);
+            if let Some((_, a)) = pending {
+                used.add(a);
+            }
+        }
+        used
     }
 
     /// Latched split pairs; after a restart, the ones the SplitBrain
@@ -325,6 +365,23 @@ impl Memory {
                 .insert(uid, (v.metadata.resource_version.clone(), a));
         }
     }
+
+    /// Notes a failed status apply; true when this kind is new for the
+    /// Volume and deserves an Event.
+    pub(crate) fn status_failure(&mut self, uid: &str, kind: String) -> bool {
+        if self.status_failed.get(uid) == Some(&kind) {
+            return false;
+        }
+        self.status_failed.insert(uid.to_owned(), kind);
+        true
+    }
+
+    pub(crate) fn reserve(&mut self, v: &model::Volume, a: Assignment) {
+        if let Some(uid) = v.metadata.uid.clone() {
+            self.pending
+                .insert(uid, (v.metadata.resource_version.clone(), a));
+        }
+    }
 }
 
 pub(crate) struct Ctx<'a> {
@@ -370,14 +427,15 @@ async fn pass(ctx: &Ctx<'_>, memory: &mut Memory) -> Option<Duration> {
         .iter()
         .filter_map(|v| Some((v.metadata.uid.clone()?, v.metadata.resource_version.clone())))
         .collect();
-    memory
-        .assigned
-        .retain(|uid, (rv, _)| seen.get(uid).is_some_and(|cur| cur == rv));
+    let current = |uid: &String, rv: &Option<String>| seen.get(uid).is_some_and(|cur| cur == rv);
+    memory.assigned.retain(|uid, (rv, _)| current(uid, rv));
+    memory.pending.retain(|uid, (rv, _)| current(uid, rv));
     memory.split.retain(|uid, _| seen.contains_key(uid));
     memory.resolving.retain(|uid| seen.contains_key(uid));
     memory.initialized.retain(|uid, _| seen.contains_key(uid));
     memory.evict_blocked.retain(|uid, _| seen.contains_key(uid));
     memory.attach_failed.retain(|uid, _| seen.contains_key(uid));
+    memory.status_failed.retain(|uid, _| seen.contains_key(uid));
     memory
         .peer_unreachable
         .retain(|uid, _| seen.contains_key(uid));
@@ -391,6 +449,7 @@ async fn pass(ctx: &Ctx<'_>, memory: &mut Memory) -> Option<Duration> {
         .filter_map(|s| s.metadata.uid.clone())
         .collect();
     memory.rounds.retain(|uid, _| snapshots.contains(uid));
+    report_duplicates(ctx, memory).await;
     volume::reconcile_all(ctx, memory).await;
     pool::reconcile_all(ctx, memory).await;
     let snapshots = snapshot::reconcile_all(ctx, memory).await;
@@ -400,6 +459,65 @@ async fn pass(ctx: &Ctx<'_>, memory: &mut Memory) -> Option<Duration> {
         .flatten()
         .min()
 }
+
+/// Every stored minor and per-node port held by more than one Volume, with
+/// its holders. Allocation should make this empty.
+pub(crate) fn duplicates(
+    volumes: &[std::sync::Arc<model::Volume>],
+) -> Vec<(String, Vec<std::sync::Arc<model::Volume>>)> {
+    let mut minors: BTreeMap<u32, Vec<_>> = BTreeMap::new();
+    let mut ports: BTreeMap<(&str, u16), Vec<_>> = BTreeMap::new();
+    for v in volumes {
+        let Some(a) = &v.spec.assignment else {
+            continue;
+        };
+        if let Some(m) = a.minor {
+            minors.entry(m).or_default().push(v.clone());
+        }
+        for r in &a.replicas {
+            if let Some(p) = r.port {
+                ports.entry((&r.node, p)).or_default().push(v.clone());
+            }
+        }
+    }
+    let names = |held: &[std::sync::Arc<model::Volume>]| {
+        held.iter()
+            .map(|v| v.name_any())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let minors = minors
+        .into_iter()
+        .filter(|(_, held)| held.len() > 1)
+        .map(|(m, held)| (format!("minor {m} held by {}", names(&held)), held));
+    let ports = ports
+        .into_iter()
+        .filter(|(_, held)| held.len() > 1)
+        .map(|((n, p), held)| (format!("port {p} on {n} held by {}", names(&held)), held));
+    minors.chain(ports).collect()
+}
+
+/// Both values are immutable once stored, so a duplicate is only reported:
+/// an error and one Warning Event per holder, once while it lasts.
+async fn report_duplicates(ctx: &Ctx<'_>, memory: &mut Memory) {
+    let found = duplicates(&ctx.stores.volumes.state());
+    for (message, held) in &found {
+        if memory.duplicates.contains(message) {
+            continue;
+        }
+        error!(message, "duplicate DRBD assignment; not rewritten");
+        for v in held {
+            warning_event(ctx.client, v, DUPLICATE_ASSIGNMENT, message).await;
+        }
+    }
+    memory.duplicates = found.into_iter().map(|(m, _)| m).collect();
+}
+
+/// Warning Event: two Volumes hold the same minor or port.
+pub(crate) const DUPLICATE_ASSIGNMENT: &str = "DuplicateAssignment";
+
+/// Warning Event: the controller's own status apply failed.
+pub(crate) const STATUS_APPLY_FAILED: &str = "StatusApplyFailed";
 
 /// A Normal core/v1 Event on a Volume; cluster-scoped objects get theirs
 /// in "default", as kubectl describe looks there. Failure only logs: the
@@ -503,7 +621,27 @@ where
 /// Server-side apply of the controller's status fields, forced, under the
 /// controller field manager. `status` must hold only controller-owned
 /// fields: anything in it becomes ours, anything we stop sending is removed.
-pub(crate) async fn apply_status<K>(api: &Api<K>, name: &str, status: serde_json::Value)
+/// False when it did not apply; a failure is logged.
+pub(crate) async fn apply_status<K>(api: &Api<K>, name: &str, status: serde_json::Value) -> bool
+where
+    K: Resource<DynamicType = ()> + Clone + DeserializeOwned + std::fmt::Debug,
+{
+    match try_apply_status(api, name, status).await {
+        Ok(()) => true,
+        Err(kube::Error::Api(s)) if s.is_not_found() => false,
+        Err(e) => {
+            warn!(kind = %K::kind(&()), name, error = %e, "status apply failed");
+            false
+        }
+    }
+}
+
+/// `apply_status` that hands the error back instead of logging it.
+pub(crate) async fn try_apply_status<K>(
+    api: &Api<K>,
+    name: &str,
+    status: serde_json::Value,
+) -> Result<(), kube::Error>
 where
     K: Resource<DynamicType = ()> + Clone + DeserializeOwned + std::fmt::Debug,
 {
@@ -514,24 +652,164 @@ where
         "status": status,
     });
     let pp = PatchParams::apply(model::keys::CONTROLLER_FIELD_MANAGER).force();
-    match api.patch_status(name, &pp, &Patch::Apply(&patch)).await {
-        Ok(_) => debug!(kind = %K::kind(&()), name, "status applied"),
-        Err(kube::Error::Api(s)) if s.is_not_found() => {}
-        Err(e) => warn!(kind = %K::kind(&()), name, error = %e, "status apply failed"),
+    api.patch_status(name, &pp, &Patch::Apply(&patch)).await?;
+    debug!(kind = %K::kind(&()), name, "status applied");
+    Ok(())
+}
+
+/// What a failed write is filed under, so a lasting failure is announced
+/// once per kind, not once per pass.
+pub(crate) fn error_kind(e: &kube::Error) -> String {
+    match e {
+        kube::Error::Api(s) if !s.reason.is_empty() => format!("{} {}", s.code, s.reason),
+        kube::Error::Api(s) => s.code.to_string(),
+        _ => "request failed".into(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CONNECT_TIMEOUT, READ_TIMEOUT, request_config, valid_name, valid_volume_name};
+    use std::sync::Arc;
+
+    use std::time::Duration;
+
+    use super::{
+        CONNECT_TIMEOUT, Memory, READ_TIMEOUT, WATCH_READ_TIMEOUT, request_config, valid_name,
+        valid_volume_name, watch_config,
+    };
+    use crate::volume::Outcome;
+    use kube::ResourceExt;
+    use model::keys::{MINOR_RANGE, PORT_RANGE};
+
+    fn volume(uid: &str, rv: &str, assignment: Option<serde_json::Value>) -> Arc<model::Volume> {
+        let mut spec = serde_json::json!({ "sizeBytes": 1 << 30, "replicas": 2, "tier": "t" });
+        if let Some(a) = assignment {
+            spec["assignment"] = a;
+        }
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "r-drbd.io/v1alpha1",
+                "kind": "Volume",
+                "metadata": { "name": uid, "uid": uid, "resourceVersion": rv },
+                "spec": spec,
+            }))
+            .expect("volume"),
+        )
+    }
+
+    fn assignment(minor: u32, node: &str, port: u16) -> serde_json::Value {
+        serde_json::json!({
+            "minor": minor,
+            "replicas": [{ "node": node, "nodeId": 0, "port": port, "role": "diskful", "pool": "p" }],
+        })
+    }
 
     #[test]
-    fn only_requests_time_out() {
-        let watch = kube::Config::new("https://127.0.0.1:6443".parse().expect("url"));
-        assert_eq!(watch.read_timeout, None, "kube default; a watch idles");
-        let request = request_config(watch);
+    fn write_outcomes() {
+        let api = |code| -> Result<(), kube::Error> {
+            Err(kube::Error::Api(Box::new(kube::core::Status {
+                code,
+                ..kube::core::Status::default()
+            })))
+        };
+        assert_eq!(Outcome::of(&Ok::<_, kube::Error>(())), Outcome::Applied);
+        for code in [400, 403, 404, 409, 422] {
+            assert_eq!(Outcome::of(&api(code)), Outcome::Rejected, "{code}");
+        }
+        // A 5xx or a lost answer may still commit.
+        for code in [0, 500, 503, 504] {
+            assert_eq!(Outcome::of(&api(code)), Outcome::Unknown, "{code}");
+        }
+        let transport = Err::<(), _>(kube::Error::LinesCodecMaxLineLengthExceeded);
+        assert_eq!(Outcome::of(&transport), Outcome::Unknown);
+    }
+
+    #[test]
+    fn an_unknown_write_holds_its_minor_and_port_until_the_volume_moves() {
+        let (minor, port) = (*MINOR_RANGE.start(), *PORT_RANGE.start());
+        let mut memory = Memory::default();
+        let unsure = volume("a", "1", None);
+        let a = serde_json::from_value(assignment(minor, "n1", port)).expect("assignment");
+        memory.reserve(&unsure, a);
+        let used = memory.used(std::slice::from_ref(&unsure));
+        assert_eq!(used.lowest_free_minor(), Some(minor + 1));
+        assert_eq!(used.lowest_free_port("n1"), Some(port + 1));
+        assert_eq!(used.lowest_free_port("n2"), Some(port));
+        // Pending only reserves: the Volume itself is still unassigned.
+        assert!(memory.assignment(&unsure).is_none());
+        // Moved without the write: nothing held.
+        let moved = volume("a", "2", None);
+        assert_eq!(memory.used(&[moved]).lowest_free_minor(), Some(minor));
+        // Moved with it: held by the stored assignment.
+        let landed = volume("a", "2", Some(assignment(minor, "n1", port)));
+        assert_eq!(memory.used(&[landed]).lowest_free_minor(), Some(minor + 1));
+    }
+
+    #[test]
+    fn a_lasting_status_failure_is_announced_once_per_kind() {
+        let api = |code, reason: &str| {
+            kube::Error::Api(Box::new(kube::core::Status {
+                code,
+                reason: reason.into(),
+                ..kube::core::Status::default()
+            }))
+        };
+        let invalid = super::error_kind(&api(422, "Invalid"));
+        let forbidden = super::error_kind(&api(403, "Forbidden"));
+        assert_eq!(invalid, "422 Invalid");
+        assert_eq!(super::error_kind(&api(500, "")), "500");
+        let mut memory = Memory::default();
+        assert!(memory.status_failure("a", invalid.clone()));
+        assert!(!memory.status_failure("a", invalid.clone()));
+        assert!(memory.status_failure("b", invalid.clone()));
+        assert!(memory.status_failure("a", forbidden));
+        // An apply that succeeds forgets it.
+        memory.status_failed.remove("a");
+        assert!(memory.status_failure("a", invalid));
+    }
+
+    #[test]
+    fn duplicate_minors_and_ports_are_found() {
+        let (minor, port) = (*MINOR_RANGE.start(), *PORT_RANGE.start());
+        let vols = [
+            volume("a", "1", Some(assignment(minor, "n1", port))),
+            volume("b", "1", Some(assignment(minor, "n2", port))),
+            volume("c", "1", Some(assignment(minor + 1, "n1", port))),
+            volume("d", "1", Some(assignment(minor + 2, "n2", port + 1))),
+            volume("e", "1", None),
+        ];
+        let found: Vec<(String, Vec<String>)> = super::duplicates(&vols)
+            .into_iter()
+            .map(|(m, held)| (m, held.iter().map(|v| v.name_any()).collect()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    format!("minor {minor} held by a, b"),
+                    vec!["a".into(), "b".into()]
+                ),
+                (
+                    format!("port {port} on n1 held by a, c"),
+                    vec!["a".into(), "c".into()]
+                ),
+            ]
+        );
+        assert_eq!(super::duplicates(&vols[2..]), vec![]);
+    }
+
+    #[test]
+    fn every_call_times_out() {
+        let base = kube::Config::new("https://127.0.0.1:6443".parse().expect("url"));
+        assert_eq!(base.read_timeout, None, "kube default");
+        let request = request_config(base.clone());
         assert_eq!(request.connect_timeout, Some(CONNECT_TIMEOUT));
         assert_eq!(request.read_timeout, Some(READ_TIMEOUT));
+        let watch = watch_config(base);
+        assert_eq!(watch.connect_timeout, Some(CONNECT_TIMEOUT));
+        assert_eq!(watch.read_timeout, Some(WATCH_READ_TIMEOUT));
+        // Above the longest server-side watch timeout plus margin.
+        assert!(WATCH_READ_TIMEOUT > Duration::from_secs(295));
     }
 
     #[test]

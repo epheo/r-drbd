@@ -26,7 +26,7 @@ pub struct Stores {
     pub volumes: Store<Volume>,
     pub snapshots: Store<Snapshot>,
     pub nodes: Store<Node>,
-    /// Leases of the product namespace; agent heartbeats among them.
+    /// Agent heartbeat Leases of the product namespace, by label.
     pub leases: Store<Lease>,
     /// Per agent Lease name: when this process last saw its renewTime
     /// change. Staleness is judged on this clock, as leader.rs does, so
@@ -182,10 +182,10 @@ pub fn start(
         let c = client;
         async move {
             tokio::select! {
-                e = drive(Api::<Pool>::all(c.clone()), pw, tx1, "pools", |_| {}) => e,
-                e = drive(Api::<Volume>::all(c.clone()), vw, tx2, "volumes", |_| {}) => e,
-                e = drive(Api::<Snapshot>::all(c.clone()), sw, tx3, "snapshots", |_| {}) => e,
-                e = drive(Api::<Node>::all(c), nw, tx4, "nodes", slim_node) => e,
+                e = drive(Api::<Pool>::all(c.clone()), pw, tx1, "pools", |_| {}, None) => e,
+                e = drive(Api::<Volume>::all(c.clone()), vw, tx2, "volumes", |_| {}, None) => e,
+                e = drive(Api::<Snapshot>::all(c.clone()), sw, tx3, "snapshots", |_| {}, None) => e,
+                e = drive(Api::<Node>::all(c), nw, tx4, "nodes", slim_node, Some(node_ready)) => e,
                 e = drive_leases(lease_api, lw, tx, renewals, lease_stale) => e,
             }
         }
@@ -204,12 +204,15 @@ fn slim_node(node: &mut Node) {
     }
 }
 
+/// `watched`: an update wakes the passes only when it changes this value;
+/// None wakes on every update. Adds and deletes always wake.
 async fn drive<K>(
     api: Api<K>,
     writer: Writer<K>,
     tx: Arc<watch::Sender<u64>>,
     kind: &'static str,
     slim: fn(&mut K),
+    watched: Option<fn(&K) -> bool>,
 ) -> Error
 where
     K: Resource + Clone + DeserializeOwned + Debug + Send + Sync + 'static,
@@ -223,14 +226,50 @@ where
         })
         .reflect(writer);
     let mut stream = std::pin::pin!(stream);
+    let mut last: HashMap<String, bool> = HashMap::new();
     while let Some(event) = stream.next().await {
         match event {
-            Ok(watcher::Event::Init | watcher::Event::InitApply(_)) => {}
-            Ok(_) => tx.send_modify(|n| *n = n.wrapping_add(1)),
+            Ok(event) => {
+                if wakes(&mut last, watched, &event) {
+                    tx.send_modify(|n| *n = n.wrapping_add(1));
+                }
+            }
             Err(e) => warn!(kind, error = %e, "watch error; backing off"),
         }
     }
     Error::WatchEnded(kind)
+}
+
+/// Whether a watch event wakes the passes; `last` holds the watched value
+/// per object.
+fn wakes<K: Resource>(
+    last: &mut HashMap<String, bool>,
+    watched: Option<fn(&K) -> bool>,
+    event: &watcher::Event<K>,
+) -> bool {
+    match event {
+        // A relist wakes at InitDone; cleared so an object deleted
+        // meanwhile counts as new when it comes back.
+        watcher::Event::Init => {
+            last.clear();
+            false
+        }
+        watcher::Event::InitApply(o) => {
+            if let Some(f) = watched {
+                last.insert(o.name_any(), f(o));
+            }
+            false
+        }
+        watcher::Event::Apply(o) => watched.is_none_or(|f| {
+            let now = f(o);
+            last.insert(o.name_any(), now) != Some(now)
+        }),
+        watcher::Event::Delete(o) => {
+            last.remove(&o.name_any());
+            true
+        }
+        watcher::Event::InitDone => true,
+    }
 }
 
 fn wall_stale(renew: Option<&MicroTime>, stale: Duration) -> bool {
@@ -251,8 +290,8 @@ async fn drive_leases(
 ) -> Error {
     type Seen = HashMap<String, (Option<MicroTime>, Instant)>;
     type Listed = Vec<(String, Option<MicroTime>)>;
-    let prefix = model::keys::agent_lease_name("");
-    let stream = watcher(api, watcher::Config::default())
+    let selector = format!("{}=true", model::keys::AGENT_LEASE_LABEL);
+    let stream = watcher(api, watcher::Config::default().labels(&selector))
         .default_backoff()
         .modify(|o: &mut Lease| o.managed_fields_mut().clear())
         .reflect(writer);
@@ -266,15 +305,16 @@ async fn drive_leases(
         let now = Instant::now();
         let wake = match event {
             Ok(watcher::Event::Init) => {
-                relist = Some((std::mem::take(&mut seen), Vec::new()));
+                // A failed list page starts a second Init: keep the
+                // observations the first one took.
+                let (_, listed) =
+                    relist.get_or_insert_with(|| (std::mem::take(&mut seen), Vec::new()));
+                listed.clear();
                 false
             }
             Ok(watcher::Event::InitApply(l)) => {
-                let name = l.name_any();
-                if let Some((_, listed)) = relist.as_mut()
-                    && name.starts_with(&prefix)
-                {
-                    listed.push((name, renew_of(&l)));
+                if let Some((_, listed)) = relist.as_mut() {
+                    listed.push((l.name_any(), renew_of(&l)));
                 }
                 false
             }
@@ -298,9 +338,6 @@ async fn drive_leases(
             }
             Ok(watcher::Event::Apply(l)) => {
                 let name = l.name_any();
-                if !name.starts_with(&prefix) {
-                    continue;
-                }
                 let renew = renew_of(&l);
                 match seen.get(&name) {
                     Some((r, _)) if *r == renew => false,
@@ -327,4 +364,50 @@ async fn drive_leases(
         }
     }
     Error::WatchEnded("leases")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(name: &str, ready: &str, label: &str) -> Node {
+        serde_json::from_value(serde_json::json!({
+            "metadata": { "name": name, "labels": { "x": label } },
+            "status": { "conditions": [{ "type": "Ready", "status": ready }] },
+        }))
+        .expect("node")
+    }
+
+    #[test]
+    fn a_node_wakes_only_on_readiness_and_existence() {
+        use watcher::Event::{Apply, Delete, Init, InitApply, InitDone};
+        let mut last = HashMap::new();
+        let w = Some(node_ready as fn(&Node) -> bool);
+        let mut wakes = |e: watcher::Event<Node>| wakes(&mut last, w, &e);
+        assert!(!wakes(Init));
+        assert!(!wakes(InitApply(node("n1", "True", "a"))));
+        assert!(wakes(InitDone));
+        assert!(!wakes(Apply(node("n1", "True", "b"))), "label churn");
+        assert!(wakes(Apply(node("n1", "False", "b"))));
+        assert!(wakes(Apply(node("n2", "False", "a"))), "new node");
+        assert!(wakes(Delete(node("n2", "False", "a"))));
+        assert!(wakes(Apply(node("n2", "False", "a"))), "back after delete");
+        // n2 went away during a relist: its return is new again.
+        assert!(!wakes(Init));
+        assert!(!wakes(InitApply(node("n1", "False", "a"))));
+        assert!(wakes(InitDone));
+        assert!(wakes(Apply(node("n2", "False", "a"))));
+        // Unwatched kinds wake on every update.
+        let mut last = HashMap::new();
+        assert!(super::wakes::<Node>(
+            &mut last,
+            None,
+            &Apply(node("n1", "True", "a"))
+        ));
+        assert!(super::wakes::<Node>(
+            &mut last,
+            None,
+            &Apply(node("n1", "True", "a"))
+        ));
+    }
 }
