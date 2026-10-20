@@ -234,7 +234,6 @@ fn move_diskful(i: &Input<'_>, gone: &AssignedReplica) -> Step {
         tier: i.spec.tier.clone(),
         pool: i.spec.pool.clone(),
         node: None,
-        holds_data: false,
     };
     let mut full: Vec<String> = Vec::new();
     let chosen = match placer::place(&req, &pools) {

@@ -34,10 +34,6 @@ pub struct Request {
     pub pool: Option<String>,
     /// The first diskful replica goes to this node; the others go anywhere.
     pub node: Option<String>,
-    /// The pinned pool already holds this volume's blocks (a restore from
-    /// its snapshot): the volume has nowhere else to go, so capacity is not
-    /// checked there. It still counts in `committed_bytes` afterwards.
-    pub holds_data: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,7 +181,7 @@ fn reject(req: &Request, pool: &PoolView) -> Option<Reason> {
         Some(Reason::WrongTier)
     } else if req.pool.as_ref().is_some_and(|p| *p != pool.name) {
         Some(Reason::NotThePinnedPool)
-    } else if !((req.holds_data && req.pool.is_some()) || fits(pool, req.size_bytes)) {
+    } else if !fits(pool, req.size_bytes) {
         Some(Reason::NoCapacity)
     } else {
         None

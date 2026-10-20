@@ -1,7 +1,7 @@
 mod common;
 
-use common::{GIB, pool, request};
-use placer::{Reason, fits, place, promise, room};
+use common::{GIB, pool};
+use placer::{fits, promise, room};
 
 // common::pool: total 100 GiB, overcommit 100, reserve 5, committed 0.
 
@@ -106,25 +106,4 @@ fn promise_alone_ignores_free() {
     p.committed_bytes = 90 * GIB;
     assert_eq!(promise(&p), 5 * GIB);
     assert_eq!(room(&p), 0);
-}
-
-#[test]
-fn a_pool_holding_the_data_is_not_gated() {
-    // A 60 GiB volume and its snapshot fill a 100 GiB pool: a 60 GiB
-    // restore fails both bounds, yet it can only go there.
-    let mut p = pool("p", "n1", 0);
-    p.committed_bytes = 60 * GIB;
-    let mut req = request(1);
-    req.size_bytes = 60 * GIB;
-    req.pool = Some("p".into());
-    req.node = Some("n1".into());
-    assert!(matches!(
-        place(&req, &[p.clone()]),
-        Err(i) if i.rejected[0].reason == Reason::NoCapacity
-    ));
-    req.holds_data = true;
-    assert!(place(&req, &[p.clone()]).is_ok());
-    // Only a pinned pool can hold the data; the flag alone exempts nothing.
-    req.pool = None;
-    assert!(place(&req, &[p]).is_err());
 }

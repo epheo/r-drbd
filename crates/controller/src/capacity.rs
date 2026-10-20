@@ -100,7 +100,6 @@ fn placed(views: &[PoolView], tier: &str, replicas: u32, node: Option<&str>, siz
         tier: tier.to_owned(),
         pool: None,
         node: node.map(str::to_owned),
-        holds_data: false,
     };
     placer::place(&request, views).is_ok()
 }

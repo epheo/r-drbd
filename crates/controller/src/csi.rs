@@ -527,24 +527,35 @@ impl Csi {
                     )));
                 }
                 size = Some(size.unwrap_or(0).max(snap_size));
-                // Restores land where the snapshot lives.
-                if let Some((node, _)) = crate::volume::snapshot_holder(&snap).filter(|_| local) {
+                // Restores land where the snapshot lives: a local one on a
+                // holder in the requisite topology, one with a live agent
+                // first.
+                let holders = crate::volume::snapshot_holders(&snap);
+                if local && !holders.is_empty() {
                     let requisite = req
                         .accessibility_requirements
                         .as_ref()
                         .map(|t| t.requisite.as_slice())
                         .unwrap_or_default();
-                    if !requisite.is_empty()
-                        && !requisite
-                            .iter()
-                            .any(|t| t.segments.get(TOPOLOGY_KEY) == Some(&node))
-                    {
+                    let mut allowed: Vec<String> = holders
+                        .into_iter()
+                        .map(|(n, _)| n)
+                        .filter(|n| {
+                            requisite.is_empty()
+                                || requisite
+                                    .iter()
+                                    .any(|t| t.segments.get(TOPOLOGY_KEY) == Some(n))
+                        })
+                        .collect();
+                    if allowed.is_empty() {
                         self.discard_unassigned(name, None).await;
                         return Err(Status::resource_exhausted(format!(
-                            "snapshot {id} lives on {node}, outside the requisite topology"
+                            "snapshot {id} lives outside the requisite topology"
                         )));
                     }
-                    holder_node = Some(node);
+                    let live = self.stores.live_nodes();
+                    allowed.sort_by_key(|n| live.binary_search(n).is_err());
+                    holder_node = allowed.into_iter().next();
                 }
                 Some(VolumeSource {
                     snapshot: id.to_owned(),
