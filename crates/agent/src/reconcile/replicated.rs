@@ -194,12 +194,13 @@ fn unready_peers<'a>(
     r: &Resource,
     node: &str,
     source: Option<&str>,
+    entries: &[ReplicaStatus],
 ) -> Vec<&'a str> {
     // present and devicePath: the entry was written after the LV existed,
     // so a report from before a lost LV never counts.
     let restored = |peer: &str| {
         source.is_none_or(|snap| {
-            s.vol.status.iter().flat_map(|st| &st.replicas).any(|e| {
+            entries.iter().any(|e| {
                 e.node == peer
                     && e.present
                     && e.device_path.is_some()
@@ -786,6 +787,9 @@ impl Reconciler {
             Some((b, _, place)) => self.restore_copy(reads, source, s, place, &b.row).await?,
             None => None,
         };
+        if self.awaiting_own_entry(s, copy.as_ref()).await {
+            return Ok(false);
+        }
         if let Some((b, _, place)) = &backing
             && let Err(e) = self.ensure_metadata(reads, s, place, b).await
         {
@@ -1044,6 +1048,73 @@ impl Reconciler {
         }
     }
 
+    /// The peers still unproven on a live read of the Volume, None when the
+    /// read failed: the cache may lag behind a peer's committed entry while
+    /// its connection already shows, so the clear-bitmap rests on this read,
+    /// and a failed one waits.
+    async fn live_unready<'a>(
+        &self,
+        s: &'a Step<'_>,
+        r: &Resource,
+        proving: Option<&str>,
+    ) -> Option<Vec<&'a str>> {
+        let name = s.vol.name_any();
+        let live = match self.live.get(&name).await {
+            Ok(v) if v.metadata.uid == s.vol.metadata.uid => v,
+            Ok(_) => {
+                tracing::debug!(volume = name, "live read found another Volume: waiting");
+                return None;
+            }
+            Err(e) => {
+                tracing::debug!(volume = name, error = %e, "live read failed: waiting");
+                return None;
+            }
+        };
+        let entries = live.status.as_ref().map_or(&[][..], |st| &st.replicas);
+        Some(unready_peers(s, r, &self.node, proving, entries))
+    }
+
+    /// A peer of a restore whose LV is not a proven copy brings its disk up
+    /// only once a live read shows its own entry without restoredFrom: an
+    /// entry from before the LV was lost must never sit in the API server
+    /// while this disk can connect. Until then the step ends, without an
+    /// error, and the pass's write carries the entry.
+    async fn awaiting_own_entry(&self, s: &Step<'_>, copy: Option<&Copy>) -> bool {
+        let Some(c) = copy else { return false };
+        if s.initial_node() || (c.tagged && c.at_size) {
+            return false;
+        }
+        let attached = s
+            .res
+            .and_then(|r| r.devices.get(&VOLUME))
+            .is_some_and(|d| drbd::disk_has_metadata(d.disk.as_deref()));
+        if attached {
+            return false;
+        }
+        let name = s.vol.name_any();
+        match self.live.get(&name).await {
+            Ok(v) if v.metadata.uid == s.vol.metadata.uid => {
+                let stale = v
+                    .status
+                    .iter()
+                    .flat_map(|st| &st.replicas)
+                    .any(|e| e.node == self.node && e.restored_from.is_some());
+                if stale {
+                    tracing::debug!(volume = name, "awaiting the entry without restoredFrom");
+                }
+                stale
+            }
+            Ok(_) => {
+                tracing::debug!(volume = name, "live read found another Volume: waiting");
+                true
+            }
+            Err(e) => {
+                tracing::debug!(volume = name, error = %e, "live read failed: awaiting the entry");
+                true
+            }
+        }
+    }
+
     /// What this replica's LV is to a restore not yet initialized, None for
     /// any other volume. Read from LVM each pass, never remembered; a read
     /// error fails the pass, so no first-data decision rests on it.
@@ -1229,7 +1300,15 @@ impl Reconciler {
             ));
         }
         let at_snapshot_size = copy.is_some_and(|c| c.at_size);
-        let waiting = unready_peers(s, r, &self.node, source.filter(|_| at_snapshot_size));
+        let proving = source.filter(|_| at_snapshot_size);
+        let cached = s.vol.status.as_ref().map_or(&[][..], |st| &st.replicas);
+        let mut waiting = unready_peers(s, r, &self.node, proving, cached);
+        if proving.is_some() && waiting.is_empty() {
+            let Some(live) = self.live_unready(s, r, proving).await else {
+                return Ok(());
+            };
+            waiting = live;
+        }
         let since = *self
             .init_started
             .entry(name.to_owned())

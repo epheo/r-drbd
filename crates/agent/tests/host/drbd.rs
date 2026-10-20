@@ -216,10 +216,27 @@ struct Spec {
     role: Role,
 }
 
+/// The API server of a member: the Volume its pass was last given, so a
+/// live read agrees with what the member saw.
+#[derive(Debug, Default)]
+struct MemberLive(Mutex<Option<Volume>>);
+
+#[async_trait::async_trait]
+impl agent::reconcile::LiveVolumes for MemberLive {
+    async fn get(&self, _: &str) -> Result<Volume, String> {
+        self.0
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "no pass yet".to_owned())
+    }
+}
+
 struct Member {
     res: &'static str,
     minor: u32,
     rec: Reconciler,
+    live: Arc<MemberLive>,
     vol: Volume,
     entry: Option<ReplicaStatus>,
 }
@@ -233,10 +250,9 @@ impl Member {
     }
 
     async fn pass(&mut self, pools: &[Arc<Pool>], snaps: &[Arc<Snapshot>]) -> Vec<StatusWrite> {
-        let w = self
-            .rec
-            .pass(pools, &[Arc::new(self.current())], snaps)
-            .await;
+        let v = self.current();
+        *self.live.0.lock().unwrap() = Some(v.clone());
+        let w = self.rec.pass(pools, &[Arc::new(v)], snaps).await;
         for x in &w {
             match x {
                 StatusWrite::Volume { name, entry } if name == self.res => {
@@ -321,7 +337,10 @@ fn group(
             vol.metadata.uid = Some(format!("uid-{}", s.res));
             let mut env = DrbdEnv::new(Some(h.features), RES_DIR, h.tracker.clone());
             env.init_wait = Duration::from_secs(3);
-            let mut rec = Reconciler::new(h.node.clone(), h.exec.clone()).with_drbd(env);
+            let live = Arc::new(MemberLive::default());
+            let mut rec = Reconciler::new(h.node.clone(), h.exec.clone())
+                .with_drbd(env)
+                .with_live(live.clone());
             rec.set_addresses(
                 (0..specs.len())
                     .map(|j| (name_of(me, j), addr(me, j)))
@@ -331,6 +350,7 @@ fn group(
                 res: s.res,
                 minor: s.minor,
                 rec,
+                live,
                 vol,
                 entry: None,
             }
@@ -1114,6 +1134,7 @@ impl Member {
             (*name).clone_into(&mut e.node);
             st.replicas.push(e);
         }
+        *self.live.0.lock().unwrap() = Some(v.clone());
         let w = self.rec.pass(pools, &[Arc::new(v)], snaps).await;
         for x in &w {
             if let StatusWrite::Volume { name, entry } = x

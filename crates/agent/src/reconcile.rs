@@ -30,7 +30,9 @@ use crate::events2::Tracker;
 use crate::storage::{self, Lvm, PoolCapacity};
 
 mod devices;
+mod live;
 mod replicated;
+pub use live::{KubeLiveVolumes, LiveVolumes, NoLiveVolumes};
 pub use replicated::DrbdEnv;
 
 const DISK_UP_TO_DATE: &str = "UpToDate";
@@ -361,6 +363,8 @@ pub struct Reconciler {
     device_rows: HashMap<String, Vec<DeviceStatus>>,
     /// Shared with the NodeDisks inventory.
     disk_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Live reads for the restore decisions the watch cache cannot prove.
+    live: Arc<dyn LiveVolumes>,
 }
 
 impl Reconciler {
@@ -395,7 +399,14 @@ impl Reconciler {
             disks_changed: false,
             device_rows: HashMap::new(),
             disk_lock: Arc::default(),
+            live: Arc::new(NoLiveVolumes),
         }
+    }
+
+    #[must_use]
+    pub fn with_live(mut self, live: Arc<dyn LiveVolumes>) -> Self {
+        self.live = live;
+        self
     }
 
     #[must_use]

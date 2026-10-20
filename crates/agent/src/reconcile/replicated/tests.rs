@@ -124,7 +124,32 @@ fn healthy() -> Vec<String> {
     up("UpToDate", "UpToDate")
 }
 
+/// Live reads for the tests: by default what the pass was given, the API
+/// server agreeing with the cache; a test may script another answer.
+#[derive(Debug, Default)]
+struct ScriptedLive {
+    echo: Mutex<Option<Volume>>,
+    scripted: Mutex<Option<Result<Volume, String>>>,
+    reads: AtomicU32,
+}
+
+#[async_trait::async_trait]
+impl crate::reconcile::LiveVolumes for ScriptedLive {
+    async fn get(&self, _: &str) -> Result<Volume, String> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        if let Some(r) = self.scripted.lock().unwrap().clone() {
+            return r;
+        }
+        self.echo
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "nothing to read".to_owned())
+    }
+}
+
 struct Rig {
+    live: Arc<ScriptedLive>,
     x: Arc<ScriptedExec>,
     rec: Reconciler,
     dir: PathBuf,
@@ -147,9 +172,13 @@ impl Rig {
         env.host = host.clone();
         env.down_wait = Duration::ZERO;
         env.adjust_retry = vec![Duration::ZERO; 2];
-        let mut rec = Reconciler::new(node, x.clone()).with_drbd(env);
+        let live = Arc::new(ScriptedLive::default());
+        let mut rec = Reconciler::new(node, x.clone())
+            .with_drbd(env)
+            .with_live(live.clone());
         rec.set_addresses(addresses(&["n1", "n2", "n3"]));
         Self {
+            live,
             x,
             rec,
             dir,
@@ -168,6 +197,7 @@ impl Rig {
         vols: &[Volume],
         snaps: &[Snapshot],
     ) -> Vec<StatusWrite> {
+        *self.live.echo.lock().unwrap() = vols.first().cloned();
         let vols: Vec<Arc<Volume>> = vols.iter().cloned().map(Arc::new).collect();
         let snaps: Vec<Arc<Snapshot>> = snaps.iter().cloned().map(Arc::new).collect();
         let w = self.rec.pass(pools, &vols, &snaps).await;
@@ -1120,6 +1150,112 @@ async fn restored_again_without_a_grown_peer_stays_at_the_snapshot_size() {
     up_plan(&x);
     r.pass(&[vol], &[source_snapshot()]).await;
     assert!(!seen(&x, "lvextend"));
+}
+
+#[tokio::test]
+async fn fallback_peer_attaches_only_once_the_live_entry_drops_restored_from() {
+    // n2's empty fallback LV exists; its entry with restoredFrom from before
+    // the loss is still in the cache and, the write having failed, in the
+    // API server.
+    let stale = ReplicaStatus {
+        allocated_bytes: Some(LV_KIB * 1024),
+        ..peer_entry("n2", true)
+    };
+    let vol = with_entries(restored(volume(GIB)), vec![stale]);
+    let mut r = Rig::on("n2", &[], FakeHost::default());
+    let x = r.x.clone();
+    *r.live.scripted.lock().unwrap() = Some(Ok(vol.clone()));
+    reads(&x, &[lv(LV_KIB)]);
+    r.expect_check();
+    expect_lv_tags(&x, &[("pvc-1", &[NEW])]);
+    let w = r
+        .pass_pools(
+            &[pool_on("n2")],
+            std::slice::from_ref(&vol),
+            &[source_snapshot()],
+        )
+        .await;
+    assert_eq!(entry_of(&w).restored_from, None, "the write goes again");
+    assert!(!seen(&x, "create-md") && !seen(&x, "adjust"));
+
+    // A failed live read waits too.
+    *r.live.scripted.lock().unwrap() = Some(Err("unreachable".into()));
+    reads_again(&x, &[lv(LV_KIB)]);
+    expect_lv_tags(&x, &[("pvc-1", &[NEW])]);
+    let w = r
+        .pass_pools(
+            &[pool_on("n2")],
+            std::slice::from_ref(&vol),
+            &[source_snapshot()],
+        )
+        .await;
+    assert_eq!(entry_of(&w).last_error, None);
+    assert!(!seen(&x, "create-md") && !seen(&x, "adjust"));
+
+    // The API server has the entry without restoredFrom: metadata, then up.
+    let committed = with_entries(
+        restored(volume(GIB)),
+        vec![ReplicaStatus {
+            restored_from: None,
+            ..peer_entry("n2", false)
+        }],
+    );
+    *r.live.scripted.lock().unwrap() = Some(Ok(committed));
+    reads_again(&x, &[lv(LV_KIB)]);
+    expect_lv_tags(&x, &[("pvc-1", &[NEW])]);
+    expect_md_as(&x, "r-drbd.md.uid-1.1", &[NEW]);
+    up_plan(&x);
+    r.pass_pools(&[pool_on("n2")], &[vol], &[source_snapshot()])
+        .await;
+}
+
+#[tokio::test]
+async fn initial_node_clears_the_bitmap_only_on_the_live_proof() {
+    let cached = with_entries(restored(volume(GIB)), vec![peer_entry("n2", true)]);
+    // The cache shows n2's proof, the API server no longer does.
+    let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    r.rec.drbd.init_wait = Duration::ZERO;
+    let x = r.x.clone();
+    *r.live.scripted.lock().unwrap() = Some(Ok(with_entries(
+        restored(volume(GIB)),
+        vec![peer_entry("n2", false)],
+    )));
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    x.expect(argv::start_as_source("pvc-1"), ok(""));
+    r.pass(std::slice::from_ref(&cached), &[source_snapshot()])
+        .await;
+    assert!(!seen(&x, "--clear-bitmap"));
+
+    // A failed live read: no uuid step of either kind.
+    let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    r.rec.drbd.init_wait = Duration::ZERO;
+    let x = r.x.clone();
+    *r.live.scripted.lock().unwrap() = Some(Err("unreachable".into()));
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    r.pass(std::slice::from_ref(&cached), &[source_snapshot()])
+        .await;
+    assert!(!seen(&x, "new-current-uuid"));
+    assert_eq!(r.live.reads.load(Ordering::Relaxed), 1);
+
+    // Live and cache agree on the proof: the bitmap is cleared.
+    let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    x.expect(argv::start_without_sync("pvc-1"), ok(""));
+    r.pass(&[cached], &[source_snapshot()]).await;
+    assert_eq!(r.live.reads.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]
