@@ -88,6 +88,8 @@ pub enum Error {
     },
     #[error("CSI server: {0}")]
     Transport(#[from] tonic::transport::Error),
+    #[error("kube config")]
+    KubeConfig(#[source] kube::config::InferConfigError),
     #[error("lost the leader Lease {0}")]
     LostLease(String),
     #[error("watch of {0} ended")]
@@ -122,50 +124,86 @@ pub fn valid_volume_name(name: &str) -> bool {
     valid_name(name) && lvm::names::reserved_prefix(name).is_none()
 }
 
+/// Bounds of every call but the watches: a half-open connection fails
+/// the call instead of stalling the pass, CSI or the Lease for good. The
+/// read timeout is a socket idle timeout, which a quiet watch would hit.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The controller's two kube clients.
+#[derive(Clone)]
+pub struct Clients {
+    /// The reflectors' watches.
+    pub watch: Client,
+    /// Reconcile, CSI and Lease calls.
+    pub request: Client,
+}
+
+impl std::fmt::Debug for Clients {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Clients").finish_non_exhaustive()
+    }
+}
+
+impl Clients {
+    pub fn new(config: kube::Config) -> Result<Self, Error> {
+        let build = |c| Client::try_from(c).map_err(|e| Error::kube("building the kube client", e));
+        Ok(Self {
+            watch: build(config.clone())?,
+            request: build(request_config(config))?,
+        })
+    }
+}
+
+fn request_config(mut config: kube::Config) -> kube::Config {
+    config.connect_timeout = Some(CONNECT_TIMEOUT);
+    config.read_timeout = Some(READ_TIMEOUT);
+    config
+}
+
 /// Connects with the in-cluster or kubeconfig credentials and runs until
 /// SIGTERM (Ok, Lease released) or until leadership is lost or a component
 /// fails (Err); the caller exits the process.
 pub async fn run(cfg: Config) -> Result<(), Error> {
-    let client = Client::try_default()
-        .await
-        .map_err(|e| Error::kube("building the kube client", e))?;
-    Box::pin(run_with_client(cfg, client)).await
+    let config = kube::Config::infer().await.map_err(Error::KubeConfig)?;
+    Box::pin(run_with_clients(cfg, Clients::new(config)?)).await
 }
 
-/// `run` with a given client; tests point it at envtest.
-pub async fn run_with_client(cfg: Config, client: Client) -> Result<(), Error> {
+/// `run` with given clients; tests point them at envtest.
+pub async fn run_with_clients(cfg: Config, clients: Clients) -> Result<(), Error> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| Error::Io {
             context: "installing the SIGTERM handler".into(),
             source: e,
         })?;
-    Box::pin(run_until(cfg, client, async move {
+    Box::pin(run_until(cfg, clients, async move {
         term.recv().await;
     }))
     .await
 }
 
-/// `run_with_client` that stops when `shutdown` resolves: reconcilers and
+/// `run_with_clients` that stops when `shutdown` resolves: reconcilers and
 /// CSI stop first, then the Lease is released for the successor.
 pub async fn run_until(
     cfg: Config,
-    client: Client,
+    clients: Clients,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
+    let Clients { watch, request } = clients;
     let mut shutdown = std::pin::pin!(shutdown);
     tokio::select! {
-        r = leader::acquire(&client, &cfg.namespace, &cfg.identity) => r?,
+        r = leader::acquire(&request, &cfg.namespace, &cfg.identity) => r?,
         () = &mut shutdown => return Ok(()),
     }
     info!(
         identity = cfg.identity,
         "leader; starting reconcilers and CSI"
     );
-    let (stores, watchers) = store::start(client.clone(), &cfg.namespace, cfg.lease_stale);
+    let (stores, watchers) = store::start(watch, &cfg.namespace, cfg.lease_stale);
     let (namespace, identity) = (cfg.namespace.clone(), cfg.identity.clone());
-    let hold = leader::hold(client.clone(), &namespace, &identity);
-    let reconcile = reconcile_loop(client.clone(), stores.clone(), cfg.clone());
-    let csi = csi::serve(client.clone(), stores, cfg);
+    let hold = leader::hold(request.clone(), &namespace, &identity);
+    let reconcile = reconcile_loop(request.clone(), stores.clone(), cfg.clone());
+    let csi = csi::serve(request.clone(), stores, cfg);
     let result = tokio::select! {
         e = hold => return Err(e),
         e = watchers => Err(e),
@@ -176,7 +214,7 @@ pub async fn run_until(
             Ok(())
         }
     };
-    leader::release(client, &namespace, &identity).await;
+    leader::release(request, &namespace, &identity).await;
     result
 }
 
@@ -203,6 +241,9 @@ pub(crate) struct Memory {
     /// Per Volume uid: the EvictionBlocked text last sent as an Event, so a
     /// block that lasts emits one Event per reason, not one per pass.
     pub(crate) evict_blocked: HashMap<String, String>,
+    /// Per Volume uid: the attached nodes without a replica, and the
+    /// message last sent as an Event.
+    pub(crate) attach_failed: HashMap<String, (Vec<String>, String)>,
     /// Per Volume uid: when each PeerUnreachable probe record was first seen.
     pub(crate) probes: HashMap<String, volume::ProbesSeen>,
     /// Volume uids with a probe record awaiting a Lease renewal.
@@ -336,6 +377,7 @@ async fn pass(ctx: &Ctx<'_>, memory: &mut Memory) -> Option<Duration> {
     memory.resolving.retain(|uid| seen.contains_key(uid));
     memory.initialized.retain(|uid, _| seen.contains_key(uid));
     memory.evict_blocked.retain(|uid, _| seen.contains_key(uid));
+    memory.attach_failed.retain(|uid, _| seen.contains_key(uid));
     memory
         .peer_unreachable
         .retain(|uid, _| seen.contains_key(uid));
@@ -374,7 +416,7 @@ pub(crate) async fn warning_event(client: &Client, v: &model::Volume, reason: &s
 async fn emit(client: &Client, v: &model::Volume, type_: &str, reason: &str, message: &str) {
     use k8s_openapi::api::core::v1::{Event, EventSource, ObjectReference};
     let name = v.name_any();
-    let now = now();
+    let now = model::time::now();
     let ev = Event {
         metadata: kube::api::ObjectMeta {
             generate_name: Some(format!("{name}.")),
@@ -408,9 +450,8 @@ async fn emit(client: &Client, v: &model::Volume, type_: &str, reason: &str, mes
     }
 }
 
-/// Current time as a metav1.Time.
 pub(crate) fn now() -> Time {
-    Time(k8s_openapi::jiff::Timestamp::now())
+    model::time::now()
 }
 
 pub(crate) fn has_finalizer<K: Resource>(obj: &K, finalizer: &str) -> bool {
@@ -482,7 +523,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{valid_name, valid_volume_name};
+    use super::{CONNECT_TIMEOUT, READ_TIMEOUT, request_config, valid_name, valid_volume_name};
+
+    #[test]
+    fn only_requests_time_out() {
+        let watch = kube::Config::new("https://127.0.0.1:6443".parse().expect("url"));
+        assert_eq!(watch.read_timeout, None, "kube default; a watch idles");
+        let request = request_config(watch);
+        assert_eq!(request.connect_timeout, Some(CONNECT_TIMEOUT));
+        assert_eq!(request.read_timeout, Some(READ_TIMEOUT));
+    }
 
     #[test]
     fn names() {

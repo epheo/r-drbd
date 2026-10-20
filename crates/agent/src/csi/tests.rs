@@ -261,6 +261,11 @@ async fn failed_label_clear_is_internal_and_unmarked() {
         );
     let e = stage_mount(&env).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::Internal);
+    assert!(
+        e.message().starts_with("clear mkfs label"),
+        "{}",
+        e.message()
+    );
     assert_eq!(env.fs.writes(), vec![]);
     env.x.assert_done();
 }
@@ -380,6 +385,7 @@ async fn stage_blkid_failure_never_formats() {
         .await
         .unwrap_err();
     assert_eq!(e.code(), tonic::Code::Internal);
+    assert!(e.message().starts_with("blkid"), "{}", e.message());
     env.x.assert_done();
 }
 

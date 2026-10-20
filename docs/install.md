@@ -77,15 +77,17 @@ Host paths it writes:
 
 ## Install the manifests
 
-Install the CRDs, printed by the binary itself:
+Install the CRDs, printed by the binary itself; use the tag `deploy/base` pins, so the CRDs match the controller and agents:
 
-    podman run --rm ghcr.io/epheo/r-drbd:latest crds | kubectl apply -f -
+    podman run --rm ghcr.io/epheo/r-drbd:sha-6765eba crds | kubectl apply -f -
 
 Install the controller, the agent, RBAC, the CSIDriver and default StorageClasses:
 
     kubectl apply -k deploy/base
 
 Everything runs in namespace `r-drbd-system`.
+The base pins one build (a `sha-` tag, `imagePullPolicy: IfNotPresent`) for the controller and every agent; use it for anything that holds data.
+`kubectl apply -k deploy/dev` follows `:latest` with `Always` instead, for development; see `deploy/README.md`.
 
 OpenShift and MicroShift: `deploy/base/00-namespace-rbac.yaml` already binds the privileged SCC to the agent's service account.
 On plain Kubernetes that binding is harmless: its role does not exist.

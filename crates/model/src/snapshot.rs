@@ -71,7 +71,8 @@ pub struct SnapshotStatus {
     /// count from it and survive a controller restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase_since: Option<Time>,
-    /// One entry per diskful node, written by that node's agent.
+    /// One entry per replica of the assignment, diskless ones included,
+    /// written by that node's agent.
     #[serde(default)]
     #[x_kube(merge_strategy = ListMerge::Map(vec!["node".into()]))]
     pub acks: Vec<SnapshotAck>,

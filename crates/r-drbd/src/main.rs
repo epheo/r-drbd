@@ -80,12 +80,7 @@ fn host_exec(ns_dir: &str, argv: &[String]) -> Result<(), Box<dyn std::error::Er
 /// R_DRBD_HOST_NS is set.
 fn host_exec_prefix() -> Option<Vec<String>> {
     let ns = std::env::var("R_DRBD_HOST_NS").ok()?;
-    Some(vec![
-        "/proc/self/exe".to_owned(),
-        "host-exec".to_owned(),
-        ns,
-        "--".to_owned(),
-    ])
+    Some(agent::exec::host_exec_prefix("/proc/self/exe", &ns))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -102,8 +97,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", serde_json::to_string_pretty(&list)?);
         return Ok(());
     }
+    // The fmt layer writes to stdout and colours unconditionally; pod logs keep escapes verbatim.
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+                .from_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .with_target(false)
         .compact()
         .init();
@@ -148,4 +150,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Role::Crds | Role::HostExec { .. } => unreachable!(),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_exec_prefix_parses_as_host_exec() {
+        let mut argv = agent::exec::host_exec_prefix("/r-drbd", "/proc/1/ns");
+        argv.extend(["lvs".to_owned(), "--noheadings".to_owned()]);
+        match Cli::try_parse_from(argv).unwrap().role {
+            Role::HostExec { ns, argv } => {
+                assert_eq!(ns, "/proc/1/ns");
+                assert_eq!(argv, ["lvs", "--noheadings"]);
+            }
+            r => panic!("host-exec expected: {r:?}"),
+        }
+    }
 }

@@ -117,7 +117,7 @@ async fn csi_sanity() {
     let cfg = support::config(&env, "sanity");
     let endpoint = cfg.csi_endpoint.clone();
     let sock = std::path::PathBuf::from(endpoint.trim_start_matches("unix://"));
-    let _ctl = support::spawn(client.clone(), cfg);
+    let _ctl = support::spawn(env.clients().await, cfg);
     let agent = FakeAgent::new(&client, "n1").spawn_auto();
     support::eventually(std::time::Duration::from_secs(30), || async {
         sock.exists().then_some(())

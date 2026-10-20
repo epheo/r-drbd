@@ -9,6 +9,9 @@ pub mod types {
     pub const QUORUM_LOST: &str = "QuorumLost";
     pub const SPLIT_BRAIN: &str = "SplitBrain";
     pub const PEER_UNREACHABLE: &str = "PeerUnreachable";
+    /// Volume: some node in spec.attachments has no diskless replica;
+    /// status.attachmentErrors says which and why.
+    pub const ATTACHMENT_FAILED: &str = "AttachmentFailed";
     pub const AVAILABLE: &str = "Available";
     /// Pool, reclaimPolicy Delete: the agent removed the VG; the finalizer may go.
     pub const RELEASED: &str = "Released";

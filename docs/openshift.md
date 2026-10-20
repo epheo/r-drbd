@@ -137,7 +137,7 @@ Wait for the pools, then check one node:
 
 As in [Install](install.md):
 
-    podman run --rm ghcr.io/epheo/r-drbd:latest crds | oc apply -f -
+    podman run --rm ghcr.io/epheo/r-drbd:sha-6765eba crds | oc apply -f -
     oc apply -k deploy/base
 
 The namespace is labelled `pod-security.kubernetes.io/enforce: privileged`, and the agent's service account is bound to the `privileged` SCC by the manifests.

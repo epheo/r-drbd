@@ -56,7 +56,7 @@ async fn waits_for_an_expired_lease() {
         .expect("create lease");
     let cfg = support::config(&env, "second");
     let sock = socket(&cfg).to_owned();
-    let _b = support::spawn(client.clone(), cfg);
+    let _b = support::spawn(env.clients().await, cfg);
     tokio::time::sleep(Duration::from_secs(15)).await;
     assert_eq!(holder(&client).await.as_deref(), Some("ghost"));
     assert!(!sock.exists(), "CSI started before leadership");
@@ -76,14 +76,14 @@ async fn second_controller_stays_standby() {
     support::init_tracing();
     let env = Env::start(&assets).await;
     let client = env.client().await;
-    let a = support::spawn(client.clone(), support::config(&env, "first"));
+    let a = support::spawn(env.clients().await, support::config(&env, "first"));
     support::eventually(Duration::from_secs(20), || async {
         (holder(&client).await.as_deref() == Some("first")).then_some(())
     })
     .await;
     let cfg = support::config(&env, "second");
     let sock = socket(&cfg).to_owned();
-    let _b = support::spawn(client.clone(), cfg);
+    let _b = support::spawn(env.clients().await, cfg);
     // Longer than a renew period: the first keeps the lease.
     tokio::time::sleep(Duration::from_secs(15)).await;
     assert_eq!(holder(&client).await.as_deref(), Some("first"));
@@ -109,7 +109,7 @@ async fn released_on_shutdown() {
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let a = tokio::spawn(controller::run_until(
         support::config(&env, "first"),
-        client.clone(),
+        env.clients().await,
         async move {
             let _ = stopped.await;
         },
@@ -118,7 +118,7 @@ async fn released_on_shutdown() {
         (holder(&client).await.as_deref() == Some("first")).then_some(())
     })
     .await;
-    let _b = support::spawn(client.clone(), support::config(&env, "second"));
+    let _b = support::spawn(env.clients().await, support::config(&env, "second"));
     stop.send(()).expect("signal shutdown");
     let result = tokio::time::timeout(Duration::from_secs(10), a)
         .await

@@ -1,16 +1,20 @@
 //! Real commands against a test VG with a thin pool on a test host.
 //! Ignored by default; run as root with
 //! `R_DRBD_HOST_TEST=1 R_DRBD_HOST_IP=<address> ./host-<hash> --ignored --test-threads=1`.
-//! The VG, thin pool and scratch directory are fixed at build time from
-//! `R_DRBD_TEST_VG`, `R_DRBD_TEST_THIN` and `R_DRBD_TEST_DIR`: the static
-//! binary is built for one host, and the names stay plain constants.
+//! The VG, thin pool and scratch directory come from `R_DRBD_TEST_VG`,
+//! `R_DRBD_TEST_THIN` and `R_DRBD_TEST_DIR` at run time, so one static
+//! binary serves any host.
+//! With `R_DRBD_HOST_NS` set, as in the agent's pod, host tools run through
+//! the host-exec of the r-drbd binary (`R_DRBD_HOST_EXEC`, default /r-drbd)
+//! and drbd-utils from the image, as the agent runs them; unset, everything
+//! runs from this process's PATH.
 //! Only LVs named rw-* or pvc-test-host* and paths under the scratch directory are touched;
 //! the DRBD volume tests live in host/drbd.rs.
 
 #![allow(clippy::unnecessary_wraps, clippy::too_many_lines)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use agent::csi::{FsMarker, Lookup, NodeService, PUBLISH_DEVICE_PATH, VolumeFacts, VolumeLookup};
 use agent::exec::TokioExec;
@@ -28,18 +32,52 @@ use model::{
     SnapshotStatus, Volume, VolumeSource, VolumeSpec,
 };
 
-const VG: &str = match option_env!("R_DRBD_TEST_VG") {
-    Some(v) => v,
-    None => "vg-test",
-};
-const THIN: &str = match option_env!("R_DRBD_TEST_THIN") {
-    Some(v) => v,
-    None => "thin",
-};
-const TEST_DIR: &str = match option_env!("R_DRBD_TEST_DIR") {
-    Some(v) => v,
-    None => "/var/tmp/r-drbd-hosttest",
-};
+/// A setting read from the environment once. Used as `&Setting`, it
+/// passes where a `&str` goes and formats as one, so the tests keep
+/// writing `VG` as they did when it was a constant.
+struct Setting {
+    var: &'static str,
+    default: &'static str,
+    value: OnceLock<String>,
+}
+
+impl Setting {
+    const fn new(var: &'static str, default: &'static str) -> Self {
+        Self {
+            var,
+            default,
+            value: OnceLock::new(),
+        }
+    }
+}
+
+impl std::ops::Deref for Setting {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.value
+            .get_or_init(|| std::env::var(self.var).unwrap_or_else(|_| self.default.to_owned()))
+    }
+}
+
+impl std::fmt::Display for Setting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self)
+    }
+}
+
+impl From<&Setting> for String {
+    fn from(s: &Setting) -> Self {
+        (**s).to_owned()
+    }
+}
+
+static VG_SETTING: Setting = Setting::new("R_DRBD_TEST_VG", "vg-test");
+static THIN_SETTING: Setting = Setting::new("R_DRBD_TEST_THIN", "thin");
+static TEST_DIR_SETTING: Setting = Setting::new("R_DRBD_TEST_DIR", "/var/tmp/r-drbd-hosttest");
+static VG: &Setting = &VG_SETTING;
+static THIN: &Setting = &THIN_SETTING;
+static TEST_DIR: &Setting = &TEST_DIR_SETTING;
 const GIB: u64 = 1 << 30;
 
 fn enabled() -> bool {
@@ -50,8 +88,36 @@ fn enabled() -> bool {
     on
 }
 
+/// The agent's own prefix when `R_DRBD_HOST_NS` is set.
+fn host_prefix() -> Option<Vec<String>> {
+    static PREFIX: OnceLock<Option<Vec<String>>> = OnceLock::new();
+    PREFIX
+        .get_or_init(|| {
+            let ns = std::env::var("R_DRBD_HOST_NS").ok()?;
+            let exe = std::env::var("R_DRBD_HOST_EXEC").unwrap_or_else(|_| "/r-drbd".to_owned());
+            Some(agent::exec::host_exec_prefix(&exe, &ns))
+        })
+        .clone()
+}
+
+fn exec() -> TokioExec {
+    TokioExec::new(host_prefix())
+}
+
+/// A host tool run directly rather than through Exec: the image has none.
+fn host_command(program: &str) -> std::process::Command {
+    match host_prefix() {
+        Some(p) => {
+            let mut c = std::process::Command::new(&p[0]);
+            c.args(&p[1..]).arg(program);
+            c
+        }
+        None => std::process::Command::new(program),
+    }
+}
+
 fn lvm() -> Lvm {
-    Lvm::new(Arc::new(TokioExec::default()))
+    Lvm::new(Arc::new(exec()))
 }
 
 async fn lv_names(lvm: &Lvm) -> Vec<String> {
@@ -65,7 +131,7 @@ async fn lv_names(lvm: &Lvm) -> Vec<String> {
 
 async fn sh(parts: &[&str]) -> agent::Output {
     use agent::Exec;
-    TokioExec::default()
+    exec()
         .run(&agent::exec::argv(parts), agent::exec::DEFAULT_TIMEOUT)
         .await
         .unwrap()
@@ -118,7 +184,7 @@ async fn lvm_lifecycle() {
     assert_eq!(a1.size_bytes, GIB);
     assert!(a1.active && !a1.open);
     assert_eq!(a1.path, format!("/dev/{VG}/rw-l-a1"));
-    assert_eq!(a1.pool.as_deref(), Some(THIN));
+    assert_eq!(a1.pool.as_deref(), Some(&**THIN));
     assert_eq!(lvm.tags(VG).await.unwrap()["rw-l-a1"], ["rw-l.t1"]);
 
     lvm.extend(VG, "rw-l-a1", 2 * GIB).await.unwrap();
@@ -149,8 +215,9 @@ async fn lvm_lifecycle() {
     assert_eq!(lvm.tags(VG).await.unwrap()["rw-l-a2"], ["rw-l.t3"]);
 
     // lvremove of an open LV: the report shows it open, remove says so.
-    let held = tokio::process::Command::new("sleep")
-        .arg("30")
+    let mut sleep = host_command("sleep");
+    sleep.arg("30");
+    let held = tokio::process::Command::from(sleep)
         .stdin(std::fs::File::open(format!("/dev/{VG}/rw-l-a2")).unwrap())
         .kill_on_drop(true)
         .spawn()
@@ -198,18 +265,39 @@ fn guest_res_file(disk: &str) -> String {
     )
 }
 
-async fn guest_clean(lvm: &Lvm) {
-    if std::path::Path::new(&guest_res()).exists() {
-        let _ = sh(&["drbdadm", "-c", &guest_res(), "down", GUEST_RES]).await;
+/// Every rw-* DRBD resource the kernel has and every rw-* LV, whichever
+/// test left them: a failed run leaves them holding each other open, and
+/// any one of them fails the next run.
+async fn clean_rw(lvm: &Lvm) {
+    let out = sh(&["drbdsetup", "status", "--json"]).await;
+    assert_eq!(out.exit_code, Some(0), "{out:?}");
+    let status: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    for r in status.as_array().into_iter().flatten() {
+        let Some(name) = r["name"].as_str().filter(|n| n.starts_with("rw-")) else {
+            continue;
+        };
+        for d in r["devices"].as_array().into_iter().flatten() {
+            if let Some(minor) = d["minor"].as_u64() {
+                let _ = sh(&["drbdsetup", "resume-io", &minor.to_string()]).await;
+            }
+        }
+        let down = sh(&["drbdsetup", "down", name]).await;
+        assert_eq!(down.exit_code, Some(0), "down {name}: {down:?}");
     }
     let _ = std::fs::remove_dir_all(format!("{TEST_DIR}/l2"));
-    clean(lvm, "rw-l-g").await;
+    clean(lvm, "rw-").await;
+}
+
+async fn guest_clean(lvm: &Lvm) {
+    clean_rw(lvm).await;
 }
 
 /// A PV and a VG `vg` on `dev`, written with a config that sees only `dev`.
+/// A guest writes its label whatever the host's LVM config says, so the
+/// host's global_filter is opened up too.
 async fn guest_vg(dev: &str, vg: &str, scan_lvs: u8) {
     let config = format!(
-        "devices {{ use_devicesfile = 0 scan_lvs = {scan_lvs} filter = [ \"a|^{dev}$|\", \"r|.*|\" ] }} {NO_BACKUP}"
+        "devices {{ use_devicesfile = 0 scan_lvs = {scan_lvs} global_filter = [ \"a|.*|\" ] filter = [ \"a|^{dev}$|\", \"r|.*|\" ] }} {NO_BACKUP}"
     );
     for cmd in [
         vec!["pvcreate", "--config", &config, dev],
@@ -309,7 +397,8 @@ async fn guest_signatures_stay_hidden() {
     assert!(!duplicate_pv_warning(&text), "{text}");
 
     // Control: without the rules both guests show, the DRBD one twice.
-    let (names, text) = seen("devices { use_devicesfile = 0 scan_lvs = 1 }").await;
+    let (names, text) =
+        seen("devices { use_devicesfile = 0 scan_lvs = 1 global_filter = [ \"a|.*|\" ] }").await;
     println!("control: {:?}", guests(&names));
     assert_eq!(guests(&names).len(), 2, "{names:?}");
     assert!(
@@ -389,7 +478,7 @@ async fn reconcile_decision_table() {
         return;
     }
     clean(&lvm(), "rw-l-r").await;
-    let mut rec = Reconciler::new("host", Arc::new(TokioExec::default()));
+    let mut rec = Reconciler::new("host", Arc::new(exec()));
     let pools = [pool()];
 
     let v1 = volume("rw-l-r1", GIB, None);
@@ -510,7 +599,7 @@ fn node_service() -> NodeService {
     let state = NoLookup::default();
     NodeService::new(
         "host".into(),
-        Arc::new(TokioExec::default()),
+        Arc::new(exec()),
         Arc::new(state.clone()),
         Arc::new(state),
     )
@@ -526,9 +615,9 @@ struct Cleanup {
 impl Drop for Cleanup {
     fn drop(&mut self) {
         for m in self.mounts.iter().rev() {
-            let _ = std::process::Command::new("umount").arg(m).output();
+            let _ = host_command("umount").arg(m).output();
         }
-        let _ = std::process::Command::new("lvremove")
+        let _ = host_command("lvremove")
             .args(["-f", &format!("{VG}/{}", self.lv)])
             .output();
     }
@@ -753,7 +842,7 @@ async fn stage_refuses_partition_table() {
         e.message()
     );
     assert_eq!(e.code(), csi::tonic::Code::FailedPrecondition);
-    let out = std::process::Command::new("blkid")
+    let out = host_command("blkid")
         .args(["-p", "-o", "export", &dev])
         .output()
         .unwrap();
@@ -802,10 +891,10 @@ struct Unwind {
 impl Drop for Unwind {
     fn drop(&mut self) {
         for m in self.mounts.iter().rev() {
-            let _ = std::process::Command::new("umount").arg(m).output();
+            let _ = host_command("umount").arg(m).output();
         }
         for lv in &self.lvs {
-            let _ = std::process::Command::new("lvremove")
+            let _ = host_command("lvremove")
                 .args(["-f", &format!("{VG}/{lv}")])
                 .output();
         }
@@ -813,7 +902,7 @@ impl Drop for Unwind {
 }
 
 fn fs_uuid(dev: &str) -> String {
-    let out = std::process::Command::new("blkid")
+    let out = host_command("blkid")
         .args(["-p", "-s", "UUID", "-o", "value", dev])
         .output()
         .unwrap();
@@ -854,7 +943,7 @@ async fn restored_xfs_mounts_next_to_its_source() {
     stage(&node_service(), src, &staging1).await.unwrap();
     std::fs::write(format!("{staging1}/hello"), b"source").unwrap();
     // Data on disk, the log still dirty: what a snapshot of a live volume sees.
-    std::process::Command::new("sync").status().unwrap();
+    host_command("sync").status().unwrap();
 
     // Snapshot of a mounted file system: dirty log, same UUID as the source.
     lvm.snapshot(VG, src, snap).await.unwrap();
@@ -866,7 +955,7 @@ async fn restored_xfs_mounts_next_to_its_source() {
     let marker = Restored::default();
     let svc = NodeService::new(
         "host".into(),
-        Arc::new(TokioExec::default()),
+        Arc::new(exec()),
         Arc::new(marker.clone()),
         Arc::new(marker.clone()),
     );
@@ -885,7 +974,7 @@ async fn restored_xfs_mounts_next_to_its_source() {
 }
 
 fn fs_label(dev: &str) -> String {
-    let out = std::process::Command::new("blkid")
+    let out = host_command("blkid")
         .args(["-p", "-s", "LABEL", "-o", "value", dev])
         .output()
         .unwrap();
@@ -915,7 +1004,7 @@ async fn stage_adopts_xfs_without_a_record() {
     let svc = || {
         NodeService::new(
             "host".into(),
-            Arc::new(TokioExec::default()),
+            Arc::new(exec()),
             Arc::new(state.clone()),
             Arc::new(state.clone()),
         )
@@ -964,7 +1053,7 @@ async fn stage_adopts_xfs_without_a_record() {
         .unwrap();
 
     // An mkfs cut short before the label clear: formatted again.
-    let out = std::process::Command::new("mkfs.xfs")
+    let out = host_command("mkfs.xfs")
         .args(["-q", "-f", "-K", "-L", agent::csi::MKFS_LABEL, &dev])
         .output()
         .unwrap();

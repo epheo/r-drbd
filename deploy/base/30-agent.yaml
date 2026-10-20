@@ -23,7 +23,7 @@ spec:
         - operator: Exists
       containers:
         - name: agent
-          image: ghcr.io/epheo/r-drbd:latest
+          image: ghcr.io/epheo/r-drbd:sha-6765eba
           imagePullPolicy: IfNotPresent
           args: ["agent"]
           securityContext:

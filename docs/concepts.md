@@ -13,13 +13,14 @@ Everything you can see or change is a Kubernetes object.
 
 ## Objects
 
-All three kinds are cluster scoped, in group `r-drbd.io/v1alpha1`.
+All four kinds are cluster scoped, in group `r-drbd.io/v1alpha1`.
 
 - **Pool**: one LVM thin pool on one node, labelled with a tier.
 - **Volume**: one block device, local or replicated.
   The CSI driver creates one per PersistentVolume; its name is the PV name (`pvc-<uuid>`).
 - **Snapshot**: a crash-consistent thin snapshot of a Volume.
   The CSI driver creates one per VolumeSnapshotContent.
+- **NodeDisks**: the whole disks of one node, as its agent sees them; read-only.
 
 Nodes are the Kubernetes Node objects.
 A node's DRBD address is its InternalIP.
@@ -59,7 +60,8 @@ Every object reports typed, watchable status.
 
 - Pool: capacity, chunk size, the Volumes using it, an `Available` condition.
 - Volume: phase, primary node, usable size, one entry per replica (disk state, sync progress, peers, quorum, device path, last error) and conditions `Ready`, `Degraded`, `QuorumLost`, `SplitBrain`, `PeerUnreachable`.
-- Snapshot: phase, size, and one acknowledgement per node.
+- Snapshot: phase, size, one acknowledgement per node and a `Ready` condition.
+- NodeDisks: every whole disk of the node with its state, and the count of `Blank` ones.
 
 Each agent writes only its own replica entries.
 An agent heartbeat is a Lease `r-drbd-agent-<node>`, renewed every 10 s.

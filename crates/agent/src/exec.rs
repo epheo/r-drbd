@@ -56,6 +56,13 @@ pub const MKFS_TIMEOUT: ExecMode = ExecMode::Timeout {
 /// drbd-utils, so the host needs only the kernel module.
 const IMAGE_TOOLS: [&str; 3] = ["drbdadm", "drbdsetup", "drbdmeta"];
 
+/// The prefix for [`TokioExec::new`] that runs each command in the mount
+/// namespace under `ns` (e.g. /proc/1/ns) through the host-exec role of the
+/// r-drbd binary `exe`.
+pub fn host_exec_prefix(exe: &str, ns: &str) -> Vec<String> {
+    argv(&[exe, "host-exec", ns, "--"])
+}
+
 #[derive(Debug, Clone)]
 pub struct TokioExec {
     prefix: Vec<String>,
@@ -80,8 +87,8 @@ impl Drop for Finishing {
 
 impl TokioExec {
     /// `prefix` goes in front of every argv at spawn time, e.g.
-    /// `[/proc/self/exe, host-exec, <ns>, --]` to run in the host mount
-    /// namespace. Logs and errors keep naming the original command.
+    /// [`host_exec_prefix`] to run in the host mount namespace.
+    /// Logs and errors keep naming the original command.
     pub fn new(prefix: Option<Vec<String>>) -> Self {
         Self {
             prefix: prefix.unwrap_or_default(),
@@ -370,6 +377,9 @@ pub fn argv(parts: &[&str]) -> Vec<String> {
 #[cfg(test)]
 pub(crate) mod scripted {
     //! Test double: expects argv in order, returns scripted outputs.
+    //! An unexpected command is recorded, not panicked on: the CSI node
+    //! runs its ops in a spawned task, which turns a panic into an ordinary
+    //! Internal status a test may well expect.
 
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -383,6 +393,7 @@ pub(crate) mod scripted {
     pub(crate) struct ScriptedExec {
         steps: Mutex<VecDeque<Step>>,
         pub(crate) seen: Mutex<Vec<Vec<String>>>,
+        unexpected: Mutex<Vec<String>>,
     }
 
     pub(crate) fn ok(stdout: &str) -> Result<Output, String> {
@@ -414,8 +425,26 @@ pub(crate) mod scripted {
         }
 
         pub(crate) fn assert_done(&self) {
+            self.assert_none_unexpected();
             let left = self.steps.lock().unwrap();
             assert!(left.is_empty(), "unconsumed scripted steps: {left:?}");
+        }
+
+        fn assert_none_unexpected(&self) {
+            let bad = self
+                .unexpected
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(bad.is_empty(), "unexpected commands: {bad:#?}");
+        }
+    }
+
+    /// Catches a test that never calls `assert_done`.
+    impl Drop for ScriptedExec {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                self.assert_none_unexpected();
+            }
         }
     }
 
@@ -423,13 +452,57 @@ pub(crate) mod scripted {
     impl Exec for ScriptedExec {
         async fn run(&self, argv: &[String], _mode: ExecMode) -> Result<Output, ExecError> {
             self.seen.lock().unwrap().push(argv.to_vec());
-            let next = self.steps.lock().unwrap().pop_front();
-            let Some((want, out)) = next else {
-                panic!("unexpected command (script empty): {argv:?}");
+            let mut steps = self.steps.lock().unwrap();
+            let why = match steps.front() {
+                Some((want, _)) if argv == want.as_slice() => {
+                    let (_, out) = steps.pop_front().expect("front");
+                    return out
+                        .map_err(|e| ExecError::Spawn(argv[0].clone(), std::io::Error::other(e)));
+                }
+                // Left in place: the order check goes on for later commands
+                // and `assert_done` reports it as unconsumed.
+                Some((want, _)) => format!("{argv:?}, expected {want:?}"),
+                None => format!("{argv:?}, script empty"),
             };
-            assert_eq!(argv, want.as_slice(), "unexpected command");
-            out.map_err(|e| ExecError::Spawn(argv[0].clone(), std::io::Error::other(e)))
+            drop(steps);
+            self.unexpected.lock().unwrap().push(why);
+            Err(ExecError::Spawn(
+                argv[0].clone(),
+                std::io::Error::other("unexpected command"),
+            ))
         }
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "unexpected commands")]
+    async fn wrong_command_fails_assert_done() {
+        let x = ScriptedExec::new();
+        x.expect_s(&["blkid", "/dev/x"], ok(""));
+        assert!(
+            x.run(
+                &super::argv(&["mkfs.xfs", "/dev/x"]),
+                super::DEFAULT_TIMEOUT
+            )
+            .await
+            .is_err()
+        );
+        // The expected step stays first, so the order check goes on.
+        x.run(&super::argv(&["blkid", "/dev/x"]), super::DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        x.assert_done();
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "unexpected commands")]
+    async fn extra_command_fails_on_drop() {
+        let x = ScriptedExec::new();
+        let _ = x
+            .run(
+                &super::argv(&["mkfs.xfs", "/dev/x"]),
+                super::DEFAULT_TIMEOUT,
+            )
+            .await;
     }
 }
 
@@ -483,6 +556,14 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(3));
         assert_eq!(out.exit_code, Some(0));
         assert_eq!(out.stdout, "hi\n");
+    }
+
+    #[test]
+    fn host_exec_prefix_shape() {
+        assert_eq!(
+            host_exec_prefix("/r-drbd", "/proc/1/ns"),
+            ["/r-drbd", "host-exec", "/proc/1/ns", "--"]
+        );
     }
 
     #[tokio::test]

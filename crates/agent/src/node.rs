@@ -509,8 +509,7 @@ pub async fn heartbeat(client: Client, namespace: String, node: String, tools: T
     // more, and the controller compares the two for equality. Fixed for
     // this process, so overlapping pods of one node alternate between two
     // runs instead of minting a new one per renewal.
-    let started =
-        Timestamp::from_second(Timestamp::now().as_second()).unwrap_or(Timestamp::UNIX_EPOCH);
+    let started = model::time::now().0;
     let mut tick = tokio::time::interval(Duration::from_secs(keys::LEASE_RENEW_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {

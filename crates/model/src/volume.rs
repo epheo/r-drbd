@@ -43,7 +43,7 @@ pub struct VolumeSpec {
     #[schemars(length(min = 1, max = 63))]
     #[x_kube(validation = Rule::new("self == oldSelf").message("tier is immutable"))]
     pub tier: String,
-    /// Placement pins, read once at assignment time.
+    /// Placement pins, read at placement and by every evict move.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 253))]
     pub pool: Option<String>,
@@ -62,11 +62,15 @@ pub struct VolumeSpec {
     #[x_kube(merge_strategy = ListMerge::Set)]
     pub attachments: Vec<String>,
     /// Nodes whose replica must be placed elsewhere (a dead or retired
-    /// node). The controller honours one node at a time, only once
-    /// status.initializedAt is set, no resolve is pending and another diskful
-    /// replica is UpToDate; a node listed here never receives a diskless
-    /// entry either. A node leaves the list once it holds no entry and no
-    /// attachment. The replaced node keeps its LV as an orphan.
+    /// node). The controller honours one node at a time. Every move needs
+    /// no resolve pending, no split brain, no Snapshot round between
+    /// Suspending and Resuming, and the node's agent stale, or fresh with
+    /// the replica neither attached nor in use. A diskful move also needs
+    /// status.initializedAt set, another UpToDate replica with quorum from
+    /// a fresh agent, every other reachable diskful replica UpToDate, and
+    /// no pin to the evicted node. A node listed here never receives a
+    /// diskless entry either. A node leaves the list once it holds no entry
+    /// and no attachment. The replaced node keeps its LV as an orphan.
     #[serde(default)]
     #[x_kube(merge_strategy = ListMerge::Set)]
     pub evict: Vec<String>,
@@ -171,7 +175,9 @@ pub enum VolumePhase {
     Ready,
     /// Usable, but a replica is missing, out of date or unknown.
     Degraded,
-    /// Placement impossible with the current pools; retried on pool changes.
+    /// Cannot proceed as specified: an invalid name, no free minor, port
+    /// or node id, an LV name too long for the VG, or a restore that cannot
+    /// proceed. A lack of capacity is Pending with reason Insufficient.
     Failed,
     Deleting,
 }
@@ -211,8 +217,33 @@ pub struct VolumeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 16))]
     pub file_system: Option<String>,
+    /// Nodes in spec.attachments the controller could not give a diskless
+    /// replica, as of observedGeneration. An entry goes once its node has
+    /// a replica or leaves spec.attachments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[x_kube(merge_strategy = ListMerge::Map(vec!["node".into()]))]
+    pub attachment_errors: Vec<AttachmentError>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
+}
+
+/// An attached node without a diskless replica, and why.
+#[derive(KubeSchema, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentError {
+    #[schemars(length(min = 1, max = 253))]
+    pub node: String,
+    pub reason: AttachmentErrorReason,
+    #[schemars(length(max = 1024))]
+    pub message: String,
+}
+
+#[derive(JsonSchema, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentErrorReason {
+    /// Every DRBD port of the node is taken.
+    NoPort,
+    /// Every DRBD node id of the volume is taken.
+    TooManyPeers,
 }
 
 /// What one agent sees of its replica. `observed_generation` is the spec

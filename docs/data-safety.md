@@ -25,7 +25,9 @@ These are the guarantees.
 
 - r-drbd touches only LVs inside the thin pool of a Pool.
   An LV with the expected name elsewhere in the VG is an error, never resized or removed.
-- LVs are deactivated before removal, so an LV still in use fails loudly instead of being torn away.
+- A volume or snapshot LV is removed only when its Volume or Snapshot is deleted, or when the agent created it in the same pass and it never held data.
+- Before removal the agent reads the LV report and waits while the LV is open; lvremove itself refuses an LV in use.
+- That lvremove passes `--yes`: it answers LVM's prompt for an active LV, not the in-use refusal.
 - The DRBD metadata on an LV belongs to the Volume and node named in an LVM tag on that LV.
   A later volume reusing the name never takes over an old LV's metadata.
 - Thin pool zeroing is turned on, so a new LV never exposes blocks of a deleted one.
@@ -35,7 +37,7 @@ These are the guarantees.
 
 - A disk is written only when a Pool lists it under `devices`, and only after the same pass found it blank: no signature, no partition, not held, not a multipath path, and an exclusive open succeeded.
 - One wrong path stops the whole Pool before anything is created.
-- LVM commands run without `--yes` or `--force`, so LVM's own refusal of a used disk stays in force.
+- The commands that build or remove a Pool from `devices` run without `--yes` or `--force`, so LVM's own refusal of a used disk stays in force.
 - A volume group without the Pool's tag is never adopted, touched or removed.
 - Nothing is ever wiped; a disk with old data stays as it is until you wipe it yourself.
 - NodeDisks only reads; a disk in use is never opened by the inventory.

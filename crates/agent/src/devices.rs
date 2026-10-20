@@ -861,6 +861,17 @@ mod tests {
 }
 "#;
 
+    /// Every disk scan runs this, Pool member or not: without `--no-act`
+    /// wipefs erases signatures. Literal so a builder change cannot move
+    /// the expectation with it.
+    #[test]
+    fn wipefs_argv_only_reads() {
+        assert_eq!(
+            wipefs_argv("/dev/vdb"),
+            ["wipefs", "--no-act", "--json", "/dev/vdb"]
+        );
+    }
+
     #[test]
     fn wipefs_shapes() {
         assert_eq!(parse_wipefs(WIPEFS_BLANK).unwrap(), []);

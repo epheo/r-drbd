@@ -67,7 +67,7 @@ async fn controller_calls() {
     pool(&client, "p2a", "n2", "fast", 50 * GIB).await;
     pool(&client, "p2b", "n2", "fast", 40 * GIB).await;
     let cfg = support::config(&env, "ctl");
-    let _ctl = support::spawn(client.clone(), cfg.clone());
+    let _ctl = support::spawn(env.clients().await, cfg.clone());
     let _agents = [
         FakeAgent::new(&client, "n1").spawn_auto(),
         FakeAgent::new(&client, "n2").spawn_auto(),
@@ -359,7 +359,7 @@ async fn wffc_reschedule_and_restore_topology() {
     pool(&client, "full", "n1", "fast", 0).await;
     pool(&client, "p2", "n2", "fast", 100 * GIB).await;
     let cfg = support::config(&env, "ctl");
-    let _ctl = support::spawn(client.clone(), cfg.clone());
+    let _ctl = support::spawn(env.clients().await, cfg.clone());
     let _agents = [
         FakeAgent::new(&client, "n1").spawn_auto(),
         FakeAgent::new(&client, "n2").spawn_auto(),
@@ -512,7 +512,7 @@ async fn read_write_many() {
     pool(&client, "p1", "n1", "fast", 100 * GIB).await;
     pool(&client, "p2", "n2", "fast", 100 * GIB).await;
     let cfg = support::config(&env, "ctl");
-    let _ctl = support::spawn(client.clone(), cfg.clone());
+    let _ctl = support::spawn(env.clients().await, cfg.clone());
     let _agents: Vec<_> = ["n1", "n2", "n3", "n4"]
         .iter()
         .map(|n| FakeAgent::new(&client, n).spawn_auto())
@@ -645,7 +645,7 @@ async fn publish_lost(
     pool(&client, "p2", "n2", "fast", 100 * GIB).await;
     let mut cfg = support::config(&env, "ctl");
     cfg.ready_timeout = ready_timeout;
-    let _ctl = support::spawn(client.clone(), cfg.clone());
+    let _ctl = support::spawn(env.clients().await, cfg.clone());
     let mut spec = support::volume_spec(GIB, replicas, "fast");
     if replicas == 1 {
         spec.node = Some("n1".into());
@@ -708,4 +708,150 @@ async fn lost_replica_of_a_replicated_volume_still_waits() {
     let (err, _) = publish_lost(&assets, 2, Duration::from_secs(2)).await;
     assert_eq!(err.code(), Code::DeadlineExceeded, "{err}");
     assert!(err.message().contains("not recreated"), "{err}");
+}
+
+/// An attached node that gets no diskless replica (here the last free DRBD
+/// node id went to another node) fails its own publish at once, never
+/// another node's, and the failure clears once the node detaches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
+async fn attachment_failure_is_per_node() {
+    use csi::v1::ControllerUnpublishVolumeRequest;
+    use model::condition::{self, types};
+
+    let assets = require_envtest!();
+    support::init_tracing();
+    let env = Env::start(&assets).await;
+    let client = env.client().await;
+    for n in ["na", "nb"] {
+        node(&client, n, true).await;
+    }
+    let cfg = support::config(&env, "ctl");
+    let _ctl = support::spawn(env.clients().await, cfg.clone());
+    let _agent = FakeAgent::new(&client, "nb").spawn_auto();
+    let mut spec = support::volume_spec(GIB, 2, "fast");
+    spec.access_mode = model::AccessMode::ReadWriteMany;
+    // Node ids 0 to 30 held: one left for a diskless entry.
+    spec.assignment = Some(model::Assignment {
+        replicas: (0..model::keys::NODE_ID_MAX)
+            .map(|id| model::AssignedReplica {
+                node: format!("m{id}"),
+                pool: Some("p".into()),
+                node_id: id,
+                port: Some(*model::keys::PORT_RANGE.start()),
+                role: model::Role::Diskful,
+            })
+            .collect(),
+        minor: Some(*model::keys::MINOR_RANGE.start()),
+        secret: None,
+        initial_up_to_date_node: None,
+    });
+    support::create_volume(&client, "pvc-crowded", spec).await;
+    support::volume_where(&client, "pvc-crowded", |v| v.status.is_some()).await;
+    let (stores, watchers) = controller::store::start(
+        client.clone(),
+        support::NAMESPACE,
+        controller::store::LEASE_STALE,
+    );
+    let _watchers = tokio::spawn(watchers);
+    stores.wait_ready().await.unwrap();
+    let svc = controller::csi::Csi::new(client.clone(), stores, cfg.clone());
+    let publish = |node: &str| ControllerPublishVolumeRequest {
+        volume_id: "pvc-crowded".into(),
+        node_id: node.into(),
+        volume_capability: Some(block(Mode::MultiNodeMultiWriter)),
+        ..ControllerPublishVolumeRequest::default()
+    };
+    let device = |r: csi::v1::ControllerPublishVolumeResponse| {
+        r.publish_context
+            .values()
+            .next()
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    let b = svc
+        .controller_publish_volume(Request::new(publish("nb")))
+        .await
+        .expect("nb takes the last node id");
+    let b = device(b.into_inner());
+    assert!(b.starts_with("/dev/drbd"), "{b}");
+
+    let start = Instant::now();
+    let err = svc
+        .controller_publish_volume(Request::new(publish("na")))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::ResourceExhausted, "{err}");
+    assert!(err.message().contains("on na: more than 32"), "{err}");
+    assert!(
+        start.elapsed() < cfg.ready_timeout / 4,
+        "{:?}",
+        start.elapsed()
+    );
+
+    // na's failure is not nb's: a repeat publish on nb still answers.
+    let again = svc
+        .controller_publish_volume(Request::new(publish("nb")))
+        .await
+        .expect("nb publish beside na's failure");
+    assert_eq!(device(again.into_inner()), b);
+
+    let v = get_volume(&client, "pvc-crowded").await.unwrap();
+    let st = v.status.unwrap();
+    let nodes: Vec<&str> = st
+        .attachment_errors
+        .iter()
+        .map(|e| e.node.as_str())
+        .collect();
+    assert_eq!(nodes, ["na"]);
+    assert_eq!(
+        st.attachment_errors[0].reason,
+        model::AttachmentErrorReason::TooManyPeers
+    );
+    let failed = condition::get(&st.conditions, types::ATTACHMENT_FAILED).unwrap();
+    assert_eq!(failed.status, "True");
+    assert!(failed.message.contains("na"), "{}", failed.message);
+    let ready = condition::get(&st.conditions, types::READY).unwrap();
+    assert_ne!(ready.reason, "AttachmentFailed", "Ready keeps its meaning");
+
+    svc.controller_unpublish_volume(Request::new(ControllerUnpublishVolumeRequest {
+        volume_id: "pvc-crowded".into(),
+        node_id: "na".into(),
+        ..ControllerUnpublishVolumeRequest::default()
+    }))
+    .await
+    .expect("unpublish na");
+    let v = support::volume_where(&client, "pvc-crowded", |v| {
+        v.status.as_ref().is_some_and(|s| {
+            s.attachment_errors.is_empty()
+                && condition::get(&s.conditions, types::ATTACHMENT_FAILED)
+                    .is_some_and(|c| c.status == "False")
+        })
+    })
+    .await;
+    assert!(
+        v.spec
+            .assignment
+            .unwrap()
+            .replicas
+            .iter()
+            .any(|r| r.node == "nb"),
+        "nb keeps its replica"
+    );
+
+    // Several passes ran with na failing; one Event says so.
+    let events = Api::<k8s_openapi::api::core::v1::Event>::namespaced(client.clone(), "default")
+        .list(&kube::api::ListParams::default())
+        .await
+        .unwrap();
+    let failures = events
+        .items
+        .iter()
+        .filter(|e| {
+            e.involved_object.name.as_deref() == Some("pvc-crowded")
+                && e.reason.as_deref() == Some("AttachmentFailed")
+        })
+        .count();
+    assert_eq!(failures, 1);
 }

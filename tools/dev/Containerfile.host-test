@@ -1,0 +1,7 @@
+# The host tests on the agent's image: drbd-utils and /etc/drbd.conf from
+# the image, host tools through /r-drbd host-exec. The build context holds
+# host-test, the static binary of `cargo test -p agent --test host --no-run`.
+ARG BASE=localhost/r-drbd:dev
+FROM ${BASE}
+COPY host-test /host-test
+ENTRYPOINT ["/host-test"]

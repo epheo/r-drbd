@@ -30,6 +30,15 @@ fn command_lines() {
     );
     assert_eq!(j(argv::connect_peer("r", "n2")), "drbdadm connect r:n2");
     assert_eq!(j(argv::status_json("r")), "drbdsetup status --json r");
+    assert_eq!(j(argv::status("r")), "drbdsetup status r");
+    assert_eq!(j(argv::down("r")), "drbdsetup down r");
+    assert_eq!(j(argv::disconnect("r")), "drbdadm disconnect r");
+    assert_eq!(j(argv::suspend_io("r")), "drbdadm suspend-io r");
+    assert_eq!(j(argv::resume_io("r")), "drbdadm resume-io r");
+    assert_eq!(
+        j(argv::dump_superblock(1000, "/dev/vg/r_00000")),
+        "drbdmeta --force 1000 v09 /dev/vg/r_00000 internal dump-superblock --output-format=json"
+    );
 }
 
 #[test]
