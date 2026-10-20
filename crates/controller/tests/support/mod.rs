@@ -34,6 +34,10 @@ const MAX_PARALLEL: usize = 4;
 static SLOTS: Mutex<usize> = Mutex::new(0);
 static FREED: Condvar = Condvar::new();
 
+/// Set in CI: a missing envtest install fails every controller test
+/// instead of letting them pass as skipped.
+const REQUIRE_ENVTEST: &str = "R_DRBD_REQUIRE_ENVTEST";
+
 /// The envtest binaries, or None with the reason printed.
 pub fn assets() -> Option<PathBuf> {
     let dir = std::env::var_os("KUBEBUILDER_ASSETS")
@@ -47,17 +51,23 @@ pub fn assets() -> Option<PathBuf> {
         .unwrap_or_default();
     for bin in ["etcd", "kube-apiserver"] {
         if !dir.join(bin).is_file() {
-            eprintln!(
-                "SKIPPED: envtest binary {} missing (set KUBEBUILDER_ASSETS)",
+            let why = format!(
+                "envtest binary {} missing (set KUBEBUILDER_ASSETS)",
                 dir.join(bin).display()
             );
+            assert!(
+                std::env::var_os(REQUIRE_ENVTEST).is_none_or(|v| v.is_empty() || v == "0"),
+                "{why}; {REQUIRE_ENVTEST} is set"
+            );
+            eprintln!("SKIPPED: {why}");
             return None;
         }
     }
     Some(dir)
 }
 
-/// Returns from the test when the envtest binaries are missing.
+/// Returns from the test when the envtest binaries are missing, unless
+/// R_DRBD_REQUIRE_ENVTEST is set: then the test fails.
 #[macro_export]
 macro_rules! require_envtest {
     () => {

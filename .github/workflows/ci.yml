@@ -14,7 +14,34 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # envtest runs a real etcd and kube-apiserver for the controller tests;
+      # the require flag turns a broken install into failures, not skips.
+      - id: tools
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/tools
+          key: ${{ runner.os }}-envtest-1.33.0-csi-test-v5.6.0
+      - if: steps.tools.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - if: steps.tools.outputs.cache-hit != 'true'
+        env:
+          TOOLS: ${{ runner.temp }}/tools
+        run: |
+          mkdir -p "$TOOLS"
+          curl -sSfL -o "$RUNNER_TEMP/envtest.tar.gz" \
+            https://github.com/kubernetes-sigs/controller-tools/releases/download/envtest-v1.33.0/envtest-v1.33.0-linux-amd64.tar.gz
+          echo "2cb7f5468ed7cea1492f971b715bcc27069e824cf7d5927b7f127f1e8c75cf086eea050543cdb5f79faee0a2bf775f160adf27443aa7ee845d962d04e9d43ac9  $RUNNER_TEMP/envtest.tar.gz" | sha512sum -c -
+          tar -xzf "$RUNNER_TEMP/envtest.tar.gz" -C "$TOOLS" --strip-components=2
+          GOBIN="$TOOLS" go install github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@v5.6.0
       - run: cargo test --workspace
+        env:
+          KUBEBUILDER_ASSETS: ${{ runner.temp }}/tools
+          R_DRBD_REQUIRE_ENVTEST: "1"
+          R_DRBD_CSI_SANITY: "1"
+          CSI_SANITY: ${{ runner.temp }}/tools/csi-sanity
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses bans advisories
