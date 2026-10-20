@@ -1,6 +1,6 @@
 # Golden images
 
-Status: design, agreed, not built. Measured numbers come from one small test bed and give orders of magnitude.
+Status: the target architecture; what is built is in section 3.
 
 r-drbd as the storage plane of a KubeVirt hypervisor: VM disks created from golden images in seconds, sharing the image's blocks on every node, with local reads and the same data-safety rules as any replicated volume.
 
@@ -34,19 +34,26 @@ Under protocol C a write waits for a peer's flush wherever the VM runs. A local 
 
 Not in this design (section 13): backing chains or qcow2, asynchronous replication, a partial block cache, storage following a migrated VM, a node health label.
 
-## 3. Today
+## 3. Roadmap and status
 
-- A replicated restore lands on the nodes holding the snapshot and comes up without a sync. A VM on any other node attaches over the network: every read crosses it, and a re-read crosses it again.
-- A restore larger than its snapshot starts at the snapshot's size and grows with a synced resize. The grown area syncs at the resync rate: on the test bed an 8 GiB restore reached its full size in 48 s with 48 MiB received, about 6 s per GiB. A 2 GiB cloud image into a 40 GiB disk waits about 4 minutes before the claim is usable. That is the common KubeVirt case.
-- A replica rebuilt after a node loss, or moved by an eviction, starts empty and syncs in full; it ends fully allocated, so repairs turn thin disks thick.
-- The scheduler's node under WaitForFirstConsumer is honored only for local volumes; replicated classes report the same capacity on every node, nodes without a Pool included.
-- A Snapshot finds its source Volume by name; a restore is charged only for its growth beyond the snapshot, never for its full size.
-- A grow of an in-use volume marks the old metadata area in sync although its bytes differ per node.
+| Step | What | State |
+|---|---|---|
+| Preconditions | Identical holder copies under buffered writeback (the snapshot round's freeze fix); the snapshot LV location and sizes in the acks; a synced resize for every grow. | planned |
+| Restore at full size | Section 7 and the pages it changes; its own change after the preconditions, independent of the rest. | planned |
+| Capacity | Image-based replicas charged at full size (10.2). | planned |
+| Measurements | Section 14, read latency first. | planned |
+| Image lifecycle | Section 6. | planned |
+| Repairs and warm copies | Sections 8 and 9. | planned |
+| Placement | Section 10: the `capacity` parameter, labels, the manager contract, the KubeVirt guide. | planned |
+
+- The state column is the part of this document that changes as steps land; the rest describes the target.
+- If the read-latency measurement shows local reads are not clearly faster, the copy rank at birth and `capacity: node` lose their reason; the rest stands.
+- Measured numbers in this document come from one small test bed and give orders of magnitude.
 
 ## 4. Concepts
 
 - Image: a Snapshot (the r-drbd kind behind a VolumeSnapshot) used as the source of disks; immutable for its life; never written.
-- Holder: a node whose successful Taking ack carries `takenPool` for the image; its snapshot LV is the holder copy. The snapshot round makes holder copies identical (section 16).
+- Holder: a node whose successful Taking ack carries `takenPool` for the image; its snapshot LV is the holder copy. The snapshot round makes holder copies identical (section 3).
 - Warm copy: a full copy of an image in a Pool of a non-holder node, made by a warm Volume; tagged `r-drbd.warm.<snapshot uid>`.
 - Warm Volume: an internal Volume with `spec.purpose: WarmCopy` that makes one warm copy and is then deleted, leaving the copy behind.
 - Local image copy: a holder copy or a warm copy in the Pool where a replica is placed.
@@ -66,7 +73,7 @@ Not in this design (section 13): backing chains or qcow2, asynchronous replicati
 
 ## 5. Invariants
 
-- X1 Identical holder copies and the synced resize for every grow (section 16, preconditions) are merged before any no-sync start of this design ships.
+- X1 Identical holder copies and the synced resize for every grow (section 3, preconditions) are merged before any no-sync start of this design ships.
 - X2 r-drbd writes an LV's data only through: lvcreate of a thin snapshot, write-zeroes of a dead tail, create-md, and DRBD itself. lvextend and tag changes alter no data. An image copy, holder or warm, is never written after its tag says so.
 - X3 The no-sync start declares in sync only replicas whose proof holds on a live read; a fallback is never connected with a disk at that moment.
 - X4 Every count that keeps an image alive is read from Volume specs, never from status or memory.
@@ -102,7 +109,7 @@ Not in this design (section 13): backing chains or qcow2, asynchronous replicati
   3. Above zero: stay Retired; the next pass comes from Volume events.
   4. Zero: phase `Deleting`; the holders remove their snapshot LVs; the finalizer goes when every holder acked.
 - A Retired Snapshot never returns to Ready, never starts a new disk and never gets a new warm copy. Repairs still use its copies.
-- Warm Volumes are never references. An uninitialized restore is a reference, which replaces today's guard.
+- Warm Volumes are never references. An uninitialized restore is a reference.
 - The creation race is closed by order. CreateVolume writes the Volume, then re-reads the Snapshot live; if it is gone, deleting, Retired or of another uid, it deletes the Volume and answers NotFound. The controller writes Retired, then lists live, then releases. Either the list sees the Volume or the re-read sees Retired: a Volume can never reference a released image. An idempotent retry that finds its Volume runs the re-read first; it may delete a Volume the list had already counted, which is harmless: an unpublished Volume holds no data and the claim is provisioned again.
 - `Pool.status.retainedImageBytes`: allocated bytes of holder copies and warm copies of Retired images in the Pool, not reclaimable while referenced.
 
@@ -196,12 +203,12 @@ A parser test on captured real dump-md output pins the fields: a value parsed wr
 - Peer classes, for each assigned diskful peer: proven (connected, Inconsistent, its entry present with its device path, `copyOf` and the initial node's `zeroedFrom`; the device path guards against a report from before a lost LV); fallback (entry marked, not connected with a disk); connected fallback; warming (no LV, a warm Volume exists for its Pool); connected unproven (connected with a disk, not proven, no fallback mark); unknown.
 - The initial node, once its own proof holds, waits while a peer is warming (the warm Volume's bound), unknown or connected unproven (60 s). A connected fallback ends the wait at once.
 - Then it reads the Volume live and classifies again. With no peer connected unproven or connected fallback, it runs `new-current-uuid --clear-bitmap`: the connected proven peers become UpToDate with no sync; every other peer joins later with just-created metadata and syncs in full, alone (a fallback plainly, a late copy with checksums). Otherwise it runs `new-current-uuid --force-resync` and every connected peer syncs in full; `RestoreFullSync` names each one and, for a `zeroedFrom` mismatch, both values.
-- Difference from today: today the initial node becomes the sync source whenever any peer is unproven after the wait, so every proven peer syncs in full and loses its thin sharing. Here only a peer connected with a disk and unproven forces that.
-- Ready is unchanged: the first Ready needs every diskful replica UpToDate at full size, so a fallback delays the claim by its sync (decision 12).
+- Only a peer connected with a disk and unproven forces the sync source. A slow or absent peer joins later and syncs alone, so proven peers never lose their thin sharing to a timeout.
+- The first Ready needs every diskful replica UpToDate at full size, so a fallback delays the claim by its sync (decision 12).
 
 ### 7.6 Growth after first data
 
-- A restore never grows before its first data. Every DRBD resize of an in-use volume is the synced one: the old metadata area turns into data and syncs. The `--assume-clean` path goes.
+- A restore never grows before its first data. Every DRBD resize of an in-use volume syncs: the old metadata area turns into data and syncs; `--assume-clean` is never passed.
 - A size raised before the first data: the LVs keep their G; the synced resize runs after.
 - An LV grows only before its metadata exists (the preparation's lvextend, or a new LV) or under an attached disk, where DRBD moves its metadata online.
 
@@ -297,7 +304,7 @@ With checksums, both ends read each block and only differing blocks cross the ne
 
 ### 9.5 Where an eviction joins, and quorum
 
-The eviction's placement ranks Pools with a copy first, then by room; a Pool without a copy gives an empty join. Quorum rules are unchanged: one move per Volume and pass, refused while no other diskful replica is UpToDate with quorum, or a previous rebuild still runs. After every seeded join in the tests, `drbdadm verify` on the joining connection must end with zero out-of-sync blocks; a difference fails the test and is never resynced silently.
+The eviction's placement ranks Pools with a copy first, then by room; a Pool without a copy gives an empty join. Quorum rules: one move per Volume and pass, refused while no other diskful replica is UpToDate with quorum, or a previous rebuild still runs. After every seeded join in the tests, `drbdadm verify` on the joining connection must end with zero out-of-sync blocks; a difference fails the test and is never resynced silently.
 
 ## 10. Placement and scheduling
 
@@ -305,14 +312,14 @@ The eviction's placement ranks Pools with a copy first, then by room; a Pool wit
 
 1. Resolve the Snapshot; answer NotFound for a Retired or deleting one, with no Volume written; refuse a single-replica source with `UnsupportedRestore`.
 2. Size: the request, at least S; the disk starts at its full size.
-3. First-replica node: the PVC pin if set; else the scheduler's node (`preferred[0]` under WaitForFirstConsumer) for an image-based replicated volume or a local one; else none. Today the scheduler's node is read only for local volumes.
+3. First-replica node: the PVC pin if set; else the scheduler's node (`preferred[0]` under WaitForFirstConsumer) for an image-based replicated volume or a local one; else none.
 4. Write the Volume with the source name and uid, then re-read the Snapshot live (6.3).
 5. Placement runs in the controller pass; CreateVolume answers ResourceExhausted on Insufficient, never a final error, so the provisioner drops the selected node and the scheduler picks again.
 
 ### 10.2 Placement
 
 - Candidate Pools: usable (node live, Pool Available) for the tier. Order: the first-replica node first; then Pools with a local copy (an ack with `takenPool` there, or an entry in `warmCopies`); then warmable Pools (every warm-copy check except existence would pass); then room descending; then names. One Pool per node; never partial.
-- Every image-based replica is charged to `committed` at the disk's full size. Today's restore exemption, which charges only the growth beyond the snapshot, goes: at golden-image scale it would let one Pool take unlimited instances. Until warm copies exist, a busy image stops instancing at the holders' cap with ResourceExhausted.
+- Every image-based replica is charged to `committed` at the disk's full size. There is no exemption for restores: charging only the growth beyond the snapshot would let one Pool take unlimited instances at golden-image scale. Until warm copies exist, a busy image stops instancing at the holders' cap with ResourceExhausted.
 - The initial node is picked among the chosen replicas as 7.5 says; a placement in which no chosen replica can get a copy is Insufficient, never a restore that cannot start. This rule is for births; a repair onto a cold Pool is an empty join.
 - A Pool chosen without a copy gets a warm Volume and the disk waits with `WaitingForImageCopy`; a Pool chosen without a copy and not warmable gives a fallback replica.
 - A birth whose first replica is not on the scheduler's node emits `PlacedOffSchedulerNode` with the node and the reason.
@@ -321,7 +328,7 @@ The eviction's placement ranks Pools with a copy first, then by room; a Pool wit
 ### 10.3 Capacity seen by the scheduler
 
 - A new StorageClass parameter `capacity`: `cluster` (default) or `node`; `node` is accepted only with replicas 2 or 3, and the class parse answers InvalidArgument otherwise, at CreateVolume and at GetCapacity.
-- With `node`, GetCapacity answers on each node the largest size whose whole placement fits with that node as the first replica, and 0 when none fits; the scheduler then never sends a birth to a node without a Pool or with a full Pool. With `cluster`, every node reports the cluster-wide value, as today.
+- With `node`, GetCapacity answers on each node the largest size whose whole placement fits with that node as the first replica, and 0 when none fits; the scheduler then never sends a birth to a node without a Pool or with a full Pool. With `cluster`, every node reports the cluster-wide value.
 - The coupling applies at birth only: the scheduler reads capacity for unbound WaitForFirstConsumer claims; restarts and migrations of bound volumes are never gated by it.
 - Capacity objects are published with a lag, so births can still race a change; ResourceExhausted plus a reschedule stays the recovery. The pinned answer removes the systematic loop, not every race.
 
@@ -346,7 +353,7 @@ Volume:
 - `spec.source.snapshotUid` (controller, required with a source, immutable).
 - `spec.purpose`: `Disk` (default) or `WarmCopy` (controller, immutable; WarmCopy needs a source, replicas 2 and ReadWriteOnce). Why not `role`: it already names replica roles.
 - `spec.assignment` of a WarmCopy Volume is written by the controller at creation.
-- `status.replicas[].copyOf`, `zeroedFrom`, `fallback` (values `NoLocalCopy`, `CopyNotUsable`, `RestoreFailed`, `ProofFailed`, `SnapshotNotFound`, `Unknown`), `seededFrom`; all agent-written from tags. `restoredFrom` is removed.
+- `status.replicas[].copyOf`, `zeroedFrom`, `fallback` (values `NoLocalCopy`, `CopyNotUsable`, `RestoreFailed`, `ProofFailed`, `SnapshotNotFound`, `Unknown`), `seededFrom`; all agent-written from tags.
 - Ready reasons `WaitingForImageCopy`, `SnapshotRetired`, `SnapshotUidMismatch`; `UnsupportedRestore` also covers a single-replica source.
 
 Snapshot:
@@ -364,11 +371,11 @@ Events: `RestoreFullSync`, `MetadataSizeDiffers`, `ReplicaSeeded`, `ReplicaFullS
 
 Constants: warm eviction grace 24 h; minimum idle before an over-budget eviction 10 min; warm Volume progress bound 10 min; seed connect bound 10 min; `csums-alg` sha256 on joining connections; `verify-alg` sha256 everywhere; image label cap 32 per node.
 
-RBAC: nothing new; the agent already patches Nodes and creates Events.
+RBAC: the agent patches Nodes and creates Events; the controller creates, patches and deletes Volumes and writes Snapshot status; a manager reading the replica-node contract needs get, list and watch on volumes.
 
 ## 12. Decisions
 
-1. Order of work: the preconditions, then the no-grow restore, the capacity fix, the measurements, the image lifecycle, repairs with warm copies, placement (section 16).
+1. Order of work: the preconditions, then the restore at full size, the capacity rule, the measurements, the image lifecycle, repairs with warm copies, placement (section 3).
 2. An image outlives its VolumeSnapshot while any disk references it, through the Retired phase. Blocking the deletion instead would make tools that rotate image versions retry forever and would full-sync every repair of a disk whose image is gone.
 3. Full warm copies per Pool, no partial cache. No stock kernel target gives copy-on-read with the guarantees needed, and a userspace cache would put r-drbd on the data path; a full copy costs the image's allocated size once per Pool and shares with every disk there. A partial cache stays a later option if warm copies prove too costly.
 4. Warm copy budget 20 percent of a Pool by default.
@@ -376,10 +383,10 @@ RBAC: nothing new; the agent already patches Nodes and creates Events.
 6. No node health label. A node whose DRBD or LVM is broken while kubelet is healthy already raises a Node Event; adding a topology term later costs nothing.
 7. Storage following a migrated VM is not part of this design. With the manager's node preference it would serve only VMs that fall through on every drain, at the cost of reading the whole disk on two nodes per move; revisited after the measurements of section 14.
 8. Image node labels off by default; the lineage rule is specified so turning them on is a switch.
-9. The no-grow restore: every replica starts at the full size with its dead tail zeroed, proven by tags, a flush and equal zero starts. This replaces the restore-then-grow behaviour of today for restores; grows of in-use volumes stay synced.
+9. The restore at full size: every replica starts at the requested size with its dead tail zeroed, proven by tags, a flush and equal zero starts. A restore at the image size followed by a synced grow would walk the grown area at the resync rate, about 6 s per GiB measured, so a 2 GiB cloud image into a 40 GiB disk would wait about 4 minutes; sizing images at the disk size would multiply copies by size class. Grows of in-use volumes are synced.
 10. Per-node capacity is built as the class parameter `capacity`, default `cluster`. The VM class sets `node` once the read-latency measurement shows that locality at birth is worth keeping new VMs off nodes with full Pools.
 11. A `purpose` field on Volume rather than a separate kind: one store, one allocator, one placement path.
-12. A restored claim is usable only after every replica's first sync, as today. In the designed steady state every replica is a proven copy and the claim is immediate anyway; the early form would add a Degraded-from-birth state whose quorum behaviour is unmeasured, and it can become a class parameter later.
+12. A restored claim is usable only after every replica's first sync. In the designed steady state every replica is a proven copy and the claim is immediate anyway; the early form would add a Degraded-from-birth state whose quorum behaviour is unmeasured, and it can become a class parameter later.
 
 ## 13. Not in this design
 
@@ -391,9 +398,9 @@ RBAC: nothing new; the agent already patches Nodes and creates Events.
 - Limiting a join's resync to the disk's changed ranges by crafting DRBD metadata; rejected. Using thin_delta to drive a range-limited resync is a study item with the default answer no.
 - Moving the initial node of a restore to another copy replica while it is down: a later liveness item.
 
-## 14. Measurements before the build
+## 14. Open measurements
 
-By hand, no code change; each result goes into the design before the step it gates.
+Each result goes into this document before the step it gates; the list shrinks as results land.
 
 - Read latency inside a VM, local replica against a network attachment: random 4k and sequential 1 MiB reads at p50 and p99, a boot and a package install, fixed guest memory, cold and warm. KubeVirt runs QEMU with cache none on block, so the guest page cache is the only cache and a re-read crosses the network only on a guest miss. Decides the value of locality, the copy rank at birth, the `capacity` default and whether follow is ever revisited. The bar: p50 read latency at least twice lower, or a VM-like load at least 20 percent shorter, cold.
 - The checksum resync: a 10 GiB image plus a 500 MiB delta, a seed cut from a copy, bytes on the wire, time, allocation on the target, verify clean, at DRBD's default and a raised rate limit, VM latency during it, sha256 against crc32c; whether DRBD refuses a connect whose ends disagree on `csums-alg` or `verify-alg`, and whether a live change needs a reconnect; which configuration section carries the per-peer-device rate options and which end's values the resync uses.
@@ -445,21 +452,7 @@ Placement:
 - With `capacity: node`: capacity objects per node, zero for a node without a Pool and for a full one, a claim never scheduled to a Pool-less node, cluster-wide classes unchanged.
 - On a multi-node KubeVirt cluster: N VMs on one replica node with the manager's preference set; drain; count local landings; drain again; count heals; no VM loses its disk.
 
-## 16. Order of work
-
-| Step | What |
-|---|---|
-| Preconditions | Identical holder copies under buffered writeback (the snapshot round's freeze fix); the snapshot LV location and sizes in the acks; the synced resize for every grow. |
-| No-grow restore | Its own change after the preconditions, independent of the image work: sections 7 and the public pages it changes. |
-| Capacity | Image-based replicas gated at full size; the restore exemption removed. |
-| Measurements | Section 14, read latency first. |
-| Image lifecycle | Section 6. |
-| Repairs and warm copies | Sections 8 and 9. |
-| Placement | Section 10, the `capacity` parameter, labels, the manager contract, the KubeVirt guide. |
-
-If the read-latency measurement shows local reads are not clearly faster: the copy rank at birth and `capacity: node` lose their reason, the rest stands.
-
-## 17. Documentation that changes
+## 16. Documentation
 
 - snapshots.md and data-safety.md: a replicated restore starts at its requested size with no grow and no sync; the proof in plain words (each replica's copy is tagged at creation, the old metadata area is zeroed and flushed, the replicas agree on where the image ends); a replica that cannot use its copy starts empty, waits for the first data, and alone is copied in full; every later grow syncs; a warm copy as the third owner of an LV; deleting a VolumeSnapshot keeps the image while disks use it.
 - pools.md: no restore exemption; warm copies, their budget and eviction; retained bytes.
