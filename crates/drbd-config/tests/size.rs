@@ -61,3 +61,29 @@ fn sweep_around_bitmap_block_edges() {
         }
     }
 }
+
+/// The agent rounds the gross size up to the VG extent; the device must
+/// still reach the requested size, or a fresh volume never becomes Ready
+/// (Ready waits for usable >= requested). Six peer slots as the agent uses.
+#[test]
+fn extent_rounded_backing_reaches_every_requested_size() {
+    const EXTENT: u64 = 4 * MIB;
+    const SLOTS: u8 = 6;
+    let mut nets = vec![];
+    let mut net = 64 * MIB;
+    while net < 4 * 1024 * GIB {
+        nets.push(net);
+        net = net * 3 / 2;
+    }
+    nets.push(4 * 1024 * GIB);
+    for net in nets {
+        for n in [net - 1, net, net + 1, net + 4096, net + 3 * MIB + 12345] {
+            let backing = gross_bytes(n, SLOTS).next_multiple_of(EXTENT);
+            assert!(
+                usable_bytes(backing, SLOTS) >= n,
+                "requested {n}: backing {backing} gives {}",
+                usable_bytes(backing, SLOTS)
+            );
+        }
+    }
+}
