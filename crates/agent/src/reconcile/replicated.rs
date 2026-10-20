@@ -116,6 +116,8 @@ struct Backing {
     rebuilt: bool,
     /// Created this pass from the source snapshot.
     restored: bool,
+    /// Created empty this pass because this peer could not restore its copy.
+    fallback: bool,
 }
 
 /// This replica's LV as a copy of a restore's source snapshot.
@@ -132,19 +134,6 @@ struct Copy {
 
 fn snapshot_lv_name(snap: &Snapshot) -> String {
     lvm::names::snapshot_lv(&snap.spec.volume, &snap.name_any())
-}
-
-/// A peer whose pool lacks its snapshot LV starts empty and syncs in full
-/// from the initial node; the initial node has nothing to sync from, so
-/// its restore error stands.
-fn copy_missing(s: &Step<'_>, source: Option<&Snapshot>, rows: &[LvRow], place: &Place) -> bool {
-    !s.initial_node()
-        && source.is_some_and(|snap| {
-            matches!(
-                find_in_pool(rows, &snapshot_lv_name(snap), &place.thin),
-                Ok(None)
-            )
-        })
 }
 
 /// A dry-run plan that came back after its adjust succeeded.
@@ -191,21 +180,24 @@ fn timeout_blocker(s: &Step<'_>, r: &Resource, lost: bool) -> Option<&'static st
 }
 
 /// Diskful peers the first data still waits for: not connected, not
-/// Inconsistent, or, for a restore from `source`, not reporting that
-/// snapshot in restoredFrom.
+/// Inconsistent, or, for a restore from `source`, without a present entry
+/// reporting that snapshot in restoredFrom.
 fn unready_peers<'a>(
     s: &'a Step<'_>,
     r: &Resource,
     node: &str,
     source: Option<&str>,
 ) -> Vec<&'a str> {
+    // present and devicePath: the entry was written after the LV existed,
+    // so a report from before a lost LV never counts.
     let restored = |peer: &str| {
         source.is_none_or(|snap| {
-            s.vol
-                .status
-                .iter()
-                .flat_map(|st| &st.replicas)
-                .any(|e| e.node == peer && e.restored_from.as_deref() == Some(snap))
+            s.vol.status.iter().flat_map(|st| &st.replicas).any(|e| {
+                e.node == peer
+                    && e.present
+                    && e.device_path.is_some()
+                    && e.restored_from.as_deref() == Some(snap)
+            })
         })
     };
     s.a.replicas
@@ -744,18 +736,10 @@ impl Reconciler {
         let name = s.vol.name_any();
         let diskful = s.mine.role == Role::Diskful;
         let mut complete = true;
-        let source = s
-            .vol
-            .spec
-            .source
-            .as_ref()
-            .and_then(|src| snapshots.iter().find(|x| x.name_any() == src.snapshot))
-            .map(AsRef::as_ref);
+        let source = super::source_snapshot(s.vol, snapshots);
         let backing = if diskful {
             let place = self.place(pools, s.mine.pool.as_deref())?;
-            let b = self
-                .ensure_drbd_lv(reads, snapshots, source, s, &place)
-                .await?;
+            let b = self.ensure_drbd_lv(reads, source, s, &place).await?;
             *rebuilt = b.rebuilt;
             if b.restored {
                 self.rebuilt_seen.remove(&name);
@@ -764,6 +748,12 @@ impl Reconciler {
             }
             complete &= b.grown;
             facts.allocated_bytes = Some(b.row.size_bytes);
+            if b.fallback {
+                // Its status must land first: the entry, without
+                // restoredFrom, reaches the initial node before this
+                // replica's DRBD disk can show up Inconsistent beside it.
+                return Ok(false);
+            }
             let chunk = pools
                 .iter()
                 .find(|p| p.name_any() == place.pool)
@@ -911,7 +901,6 @@ impl Reconciler {
     async fn ensure_drbd_lv(
         &self,
         reads: &mut Reads,
-        snapshots: &[Arc<Snapshot>],
         source: Option<&Snapshot>,
         s: &Step<'_>,
         place: &Place,
@@ -924,15 +913,8 @@ impl Reconciler {
         let extent = reads.vg(&self.lvm, vg).await?.extent_bytes;
         let desired = storage::desired_bytes(gross_bytes(vol), extent);
         let rebuilt = row.is_none() && lost_after_report(prev);
-        let mut restore = row.is_none() && s.restoring();
-        if restore && copy_missing(s, source, &rows, place) {
-            tracing::warn!(
-                lv,
-                vg,
-                "snapshot copy missing here: empty LV, full sync from the initial node"
-            );
-            restore = false;
-        }
+        let restore = row.is_none() && s.restoring();
+        let mut fallback = false;
         if row.is_none() {
             let created = if restore {
                 if rebuilt {
@@ -942,9 +924,11 @@ impl Reconciler {
                         "restoring the lost backing LV again: not initialized yet"
                     );
                 }
-                self.create_lv(&rows, snapshots, place, vol, &lv, desired)
-                    .await
-                    .map_err(|e| format!("restore before the volume was initialized: {e}; the volume cannot start without its source"))
+                let (r, fell_back) = self
+                    .restore_or_fall_back(&rows, source, s, place, &lv, desired)
+                    .await;
+                fallback = fell_back;
+                r
             } else if rebuilt {
                 tracing::warn!(lv, vg, bytes = desired, "rebuilding lost backing LV");
                 self.lvm
@@ -1013,8 +997,44 @@ impl Reconciler {
             grown,
             created,
             rebuilt,
-            restored: restore,
+            restored: restore && !fallback,
+            fallback,
         })
+    }
+
+    /// Restores this replica's LV from its copy. A peer that cannot starts
+    /// empty and syncs in full from the initial node (true); the initial
+    /// node has nothing to sync from, so its error stands.
+    async fn restore_or_fall_back(
+        &self,
+        rows: &[LvRow],
+        source: Option<&Snapshot>,
+        s: &Step<'_>,
+        place: &Place,
+        lv: &str,
+        desired: u64,
+    ) -> (Result<(), String>, bool) {
+        let vg = place.vg.as_str();
+        match self.create_lv(rows, source, place, s.vol, lv, desired).await {
+            Err(e) if !s.initial_node() => {
+                tracing::warn!(
+                    lv,
+                    vg,
+                    error = %e,
+                    "cannot restore this node's copy: empty LV, full sync from the initial node"
+                );
+                let r = self
+                    .lvm
+                    .create(vg, &place.thin, lv, desired, &[storage::NEW_TAG])
+                    .await
+                    .map_err(|e2| format!("restore failed: {e}; the empty LV failed too: {e2}"));
+                (r, true)
+            }
+            r => (
+                r.map_err(|e| format!("restore before the volume was initialized: {e}; the volume cannot start without its source")),
+                false,
+            ),
+        }
     }
 
     /// What this replica's LV is to a restore not yet initialized, None for

@@ -78,7 +78,8 @@ Rules:
   The new area syncs between the replicas; zero blocks travel as discards, so it costs little network and no thin pool space.
   During that sync the other replica is Inconsistent on the new area only, and the volume is not Ready yet.
   The claim is usable once the volume is Ready at the requested size.
-- A replica that could not restore its copy is copied in full from another one.
+- A replica that cannot restore from its own copy, for any reason (the Snapshot, its snapshot LV or the lvcreate), starts empty and is copied in full from the first one; a full thin pool stays an error.
+  The first replica must hold its copy: without it the restore does not start.
 - The requested size may be larger than the snapshot; it may not be smaller.
 - Pins that point away from the snapshot's nodes or Pools fail the restore with reason `RestoreNodeConflict`.
 - The claim must still fit the scheduler's capacity check (see [Scheduling](volumes.md#scheduling)), although placement never charges a restore against capacity.

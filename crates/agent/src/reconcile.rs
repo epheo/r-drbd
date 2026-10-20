@@ -741,8 +741,15 @@ impl Reconciler {
                 let res = if lost_after_report(prev) {
                     Err(LV_LOST.to_owned())
                 } else {
-                    self.create_lv(&rows, snapshots, place, vol, &lv, desired)
-                        .await
+                    self.create_lv(
+                        &rows,
+                        source_snapshot(vol, snapshots),
+                        place,
+                        vol,
+                        &lv,
+                        desired,
+                    )
+                    .await
                 };
                 match res {
                     Ok(()) => {
@@ -802,7 +809,7 @@ impl Reconciler {
     async fn create_lv(
         &self,
         rows: &[Lv],
-        snapshots: &[Arc<Snapshot>],
+        source: Option<&Snapshot>,
         place: &Place,
         vol: &Volume,
         lv: &str,
@@ -812,10 +819,7 @@ impl Reconciler {
         let tags: &[&str] = if drbd { &[storage::NEW_TAG] } else { &[] };
         if let Some(src) = &vol.spec.source {
             let snapshot = &src.snapshot;
-            let snap = snapshots
-                .iter()
-                .find(|s| s.name_any() == *snapshot)
-                .ok_or_else(|| format!("source snapshot {snapshot} not found"))?;
+            let snap = source.ok_or_else(|| format!("source snapshot {snapshot} not found"))?;
             // In the same lvcreate, so a restored DRBD backing LV never
             // exists without its proof.
             let from = if drbd {
@@ -1164,6 +1168,15 @@ fn ack(
         ok: res.is_ok(),
         error: res.err(),
     }
+}
+
+/// The Snapshot a volume restores from, when it exists.
+fn source_snapshot<'a>(vol: &Volume, snapshots: &'a [Arc<Snapshot>]) -> Option<&'a Snapshot> {
+    let src = vol.spec.source.as_ref()?;
+    snapshots
+        .iter()
+        .find(|x| x.name_any() == src.snapshot)
+        .map(AsRef::as_ref)
 }
 
 /// This node's Volume status entry from the LV row after the pass.

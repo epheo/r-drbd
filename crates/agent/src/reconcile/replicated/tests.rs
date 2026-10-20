@@ -343,6 +343,7 @@ fn peer_entry(node: &str, restored: bool) -> ReplicaStatus {
         node: node.into(),
         present: true,
         disk_state: Some("Inconsistent".into()),
+        device_path: Some("/dev/drbd50000".into()),
         restored_from: restored.then(|| "snap-1".into()),
         ..ReplicaStatus::default()
     }
@@ -874,28 +875,50 @@ async fn restore_holder_without_its_snapshot_lv_reports_an_error_and_creates_not
 
 #[tokio::test]
 async fn restore_peer_without_its_copy_starts_empty_and_full_syncs() {
-    // n2's pool lacks the snapshot LV: an empty LV, no proof tag.
+    // n2 reported its restored copy, then lost its LV and its snapshot LV:
+    // an empty LV, no proof tag, and nothing of DRBD before the entry that
+    // drops restoredFrom is written.
+    let stale = ReplicaStatus {
+        node: "n2".into(),
+        allocated_bytes: Some(LV_KIB * 1024),
+        observed_generation: Some(3),
+        ..peer_entry("n2", true)
+    };
+    let vol = with_entries(restored(volume(GIB)), vec![stale]);
     let mut r = Rig::on("n2", &[], FakeHost::default());
     let x = r.x.clone();
     reads(&x, &[]);
     expect_create(&x, &[]);
-    r.expect_check();
-    expect_lv_tags(&x, &[("pvc-1", &[NEW])]);
-    expect_md_as(&x, "r-drbd.md.uid-1.1", &[NEW]);
-    up_plan(&x);
     let w = r
         .pass_pools(
             &[pool_on("n2")],
-            &[restored(volume(GIB))],
+            std::slice::from_ref(&vol),
             &[source_snapshot()],
         )
         .await;
     let e = entry_of(&w);
-    assert_eq!(
-        (e.last_error.clone(), e.restored_from.clone()),
-        (None, None)
+    assert_eq!(e.restored_from, None);
+    assert!(!seen(&x, "drbdadm") && !seen(&x, "--snapshot"));
+
+    // The next pass carries on: metadata, then up.
+    reads_again(&x, &[lv(LV_KIB)]);
+    r.expect_check();
+    expect_lv_tags(&x, &[("pvc-1", &[NEW])]);
+    expect_md_as(&x, "r-drbd.md.uid-1.1", &[NEW]);
+    up_plan(&x);
+    // Nothing changed in the entry until DRBD reports: no write.
+    let w = r
+        .pass_pools(
+            &[pool_on("n2")],
+            &[with_entries(restored(volume(GIB)), vec![e.clone()])],
+            &[source_snapshot()],
+        )
+        .await;
+    assert!(
+        !w.iter()
+            .any(|w| matches!(w, StatusWrite::Volume { name, .. } if name == "pvc-1")),
+        "{w:?}"
     );
-    assert!(!seen(&x, "--snapshot"));
 
     // The initial node sees n2 without restoredFrom: it is the sync source.
     let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
@@ -914,6 +937,91 @@ async fn restore_peer_without_its_copy_starts_empty_and_full_syncs() {
     let vol = with_entries(restored(volume(GIB)), vec![n2]);
     r.pass(&[vol], &[source_snapshot()]).await;
     assert!(!seen(&x, "--clear-bitmap"));
+}
+
+/// One pass of n2 restoring pvc-1 from `snaps`, script set by the caller.
+async fn n2_restore_pass(r: &mut Rig, snaps: &[Snapshot]) -> ReplicaStatus {
+    let w = r
+        .pass_pools(&[pool_on("n2")], &[restored(volume(GIB))], snaps)
+        .await;
+    entry_of(&w)
+}
+
+#[tokio::test]
+async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
+    let empty = || lvm::cmd::create_thin(VG, THIN, "pvc-1", LV_KIB * 1024, &[NEW]);
+    // No Snapshot object.
+    let mut r = Rig::on("n2", &[], FakeHost::default());
+    let x = r.x.clone();
+    reads(&x, &[source_lv()]);
+    expect_create(&x, &[source_lv()]);
+    let e = n2_restore_pass(&mut r, &[]).await;
+    assert_eq!((e.last_error, e.restored_from), (None, None));
+
+    // The snapshot LV lives in another pool.
+    let mut snap = source_snapshot();
+    snap.status.as_mut().unwrap().acks = vec![SnapshotAck {
+        node: "n2".into(),
+        phase: SnapshotPhase::Ready,
+        pool: Some("pool-elsewhere".into()),
+        ok: true,
+        error: None,
+    }];
+    let mut r = Rig::on("n2", &[], FakeHost::default());
+    let x = r.x.clone();
+    reads(&x, &[source_lv()]);
+    expect_create(&x, &[source_lv()]);
+    let e = n2_restore_pass(&mut r, &[snap]).await;
+    assert_eq!(e.last_error, None);
+
+    // The restore lvcreate fails.
+    let mut r = Rig::on("n2", &[], FakeHost::default());
+    let x = r.x.clone();
+    reads(&x, &[source_lv()]);
+    x.expect(
+        lvm::cmd::restore(VG, "pvc-0+snap-1", "pvc-1", &[NEW, FROM]),
+        code(5, "", "lvcreate failed"),
+    );
+    expect_create(&x, &[source_lv()]);
+    let e = n2_restore_pass(&mut r, &[source_snapshot()]).await;
+    assert_eq!(e.last_error, None);
+    assert!(x.seen.lock().unwrap().contains(&empty()));
+
+    // A full pool fails the empty LV too: an error entry.
+    let mut r = Rig::on("n2", &[], FakeHost::default());
+    let x = r.x.clone();
+    reads(&x, &[]);
+    x.expect(empty(), code(5, "", "insufficient free space"));
+    expect_lvs(&x, &[]);
+    let e = n2_restore_pass(&mut r, &[source_snapshot()]).await;
+    let err = e.last_error.unwrap();
+    assert!(err.contains("the empty LV failed too"), "{err}");
+    assert!(!seen(&x, "drbdadm"));
+}
+
+#[tokio::test]
+async fn a_stale_peer_entry_never_clears_the_bitmap() {
+    // restoredFrom without a present entry and a device: written before
+    // the LV it speaks of.
+    for (present, device) in [(false, true), (true, false)] {
+        let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+        r.rec.drbd.init_wait = Duration::ZERO;
+        let x = r.x.clone();
+        reads(&x, &[source_lv(), lv(LV_KIB)]);
+        r.expect_check();
+        r.expect_sweep();
+        expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+        dry(&x, "");
+        x.expect(argv::start_as_source("pvc-1"), ok(""));
+        let n2 = ReplicaStatus {
+            present,
+            device_path: device.then(|| "/dev/drbd50000".into()),
+            ..peer_entry("n2", true)
+        };
+        let vol = with_entries(restored(volume(GIB)), vec![n2]);
+        r.pass(&[vol], &[source_snapshot()]).await;
+        assert!(!seen(&x, "--clear-bitmap"));
+    }
 }
 
 #[tokio::test]
