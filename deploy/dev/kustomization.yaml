@@ -1,0 +1,16 @@
+# Development: the newest main build on every pod restart. Agents can run
+# different builds, and a registry outage keeps a restarted pod down.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../base
+images:
+  - name: ghcr.io/epheo/r-drbd
+    newTag: latest
+patches:
+  - target: {kind: Deployment, name: r-drbd-controller}
+    patch: |
+      - {op: replace, path: /spec/template/spec/containers/0/imagePullPolicy, value: Always}
+  - target: {kind: DaemonSet, name: r-drbd-agent}
+    patch: |
+      - {op: replace, path: /spec/template/spec/containers/0/imagePullPolicy, value: Always}

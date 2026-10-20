@@ -35,8 +35,8 @@ spec:
         - {key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute, tolerationSeconds: 30}
       containers:
         - name: controller
-          image: ghcr.io/epheo/r-drbd:latest
-          imagePullPolicy: Always
+          image: ghcr.io/epheo/r-drbd
+          imagePullPolicy: IfNotPresent
           args: ["controller"]
           env:
             - name: CSI_ENDPOINT

@@ -6,3 +6,8 @@ resources:
   - 20-controller.yaml
   - 30-agent.yaml
   - 40-storageclasses.yaml
+# One immutable build for the controller and every agent; a release
+# bumps this tag. deploy/dev follows :latest instead.
+images:
+  - name: ghcr.io/epheo/r-drbd
+    newTag: sha-ace4402
