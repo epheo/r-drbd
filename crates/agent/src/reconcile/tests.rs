@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use model::{
@@ -297,6 +298,114 @@ async fn pool_unchanged_writes_nothing() {
         .await;
     assert!(w.is_empty(), "{w:?}");
     x.assert_done();
+}
+
+/// A thin pool LVM flags, or with its metadata nearly full, takes no new
+/// volumes; its capacity and chunk stay in the write.
+#[tokio::test]
+async fn unhealthy_thin_pool_is_unavailable_with_its_capacity() {
+    for (extra, why) in [
+        (
+            r#""metadata_percent":"85.00""#,
+            "metadata 85.00 percent used, over 80",
+        ),
+        (r#""lv_health_status":"out_of_data""#, "health: out_of_data"),
+    ] {
+        let x = Arc::new(ScriptedExec::new());
+        let row = pool_row().replace(
+            r#""chunk_size":"65536""#,
+            &format!(r#""chunk_size":"65536", {extra}"#),
+        );
+        x.expect(lvm::cmd::lvs(VG), ok(&json("lv", &[row])));
+        expect_vgs(&x);
+        let w = Reconciler::new(NODE, x.clone())
+            .pass(&[pool()], &[], &[])
+            .await;
+        x.assert_done();
+        let body = w[0].body();
+        let cond = &body["status"]["conditions"][0];
+        assert_eq!(cond["status"], "False", "{why}");
+        assert_eq!(cond["reason"], REASON_UNAVAILABLE);
+        assert!(cond["message"].as_str().unwrap().ends_with(why), "{cond}");
+        assert_eq!(body["status"]["totalBytes"], POOL_BYTES);
+        assert_eq!(body["status"]["chunkBytes"], 65536);
+    }
+    let x = Arc::new(ScriptedExec::new());
+    let row = pool_row().replace(
+        r#""chunk_size":"65536""#,
+        r#""chunk_size":"65536", "metadata_percent":"80.00""#,
+    );
+    x.expect(lvm::cmd::lvs(VG), ok(&json("lv", &[row])));
+    expect_vgs(&x);
+    let w = Reconciler::new(NODE, x.clone())
+        .pass(&[pool()], &[], &[])
+        .await;
+    assert_eq!(w[0].body()["status"]["conditions"][0]["status"], "True");
+}
+
+/// A failed probe keeps the chunk the Pool was created with.
+#[tokio::test]
+async fn failed_probe_keeps_chunk_bytes() {
+    let x = Arc::new(ScriptedExec::new());
+    x.expect(lvm::cmd::lvs(VG), report_fail("Volume group not found"));
+    let mut p = (*pool()).clone();
+    p.status = Some(PoolStatus {
+        total_bytes: Some(POOL_BYTES),
+        chunk_bytes: Some(65536),
+        ..PoolStatus::default()
+    });
+    let w = Reconciler::new(NODE, x.clone())
+        .pass(&[Arc::new(p)], &[], &[])
+        .await;
+    x.assert_done();
+    let body = w[0].body();
+    assert_eq!(body["status"]["conditions"][0]["status"], "False");
+    assert!(body["status"].get("totalBytes").is_none());
+    assert_eq!(body["status"]["chunkBytes"], 65536);
+}
+
+#[derive(Debug, Default)]
+struct Recorded(std::sync::Mutex<Vec<Vec<String>>>);
+
+#[async_trait::async_trait]
+impl Publish for Recorded {
+    async fn publish(&self, writes: Vec<StatusWrite>) -> Vec<String> {
+        let names = writes.iter().map(|w| w.name().to_owned()).collect();
+        self.0.lock().unwrap().push(names);
+        Vec::new()
+    }
+}
+
+/// Each step's writes go out as the step ends, not after the pass.
+#[tokio::test]
+async fn writes_publish_after_each_step() {
+    let x = Arc::new(ScriptedExec::new());
+    reads(
+        &x,
+        &[
+            lv_row("pvc-1", GIB_KIB, St::Active),
+            lv_row("pvc-2", GIB_KIB, St::Active),
+        ],
+    );
+    let sent = Arc::new(Recorded::default());
+    let vols = [
+        Arc::new(volume("pvc-1", GIB, 1)),
+        Arc::new(volume("pvc-2", GIB, 1)),
+    ];
+    let left = Reconciler::new(NODE, x.clone())
+        .with_publish(sent.clone())
+        .pass(&[pool()], &vols, &[])
+        .await;
+    x.assert_done();
+    assert!(left.is_empty(), "{left:?}");
+    assert_eq!(
+        *sent.0.lock().unwrap(),
+        [
+            vec![POOL.to_owned()],
+            vec!["pvc-1".into()],
+            vec!["pvc-2".into()]
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1040,4 +1149,73 @@ fn lv_lost_is_never_double_wrapped() {
     };
     assert_eq!(keep_lost(Some(&healthy), "x".into()), "x");
     assert_eq!(keep_lost(None, "x".into()), "x");
+}
+
+/// When the Lease was renewed over 60 s while a pass waits for the disk
+/// lock, held by the inventory for `hold`, then runs a 60 s step.
+async fn renewals_behind_the_scan(hold: Duration) -> Vec<u64> {
+    use crate::node::{Liveness, Progress, renew_loop};
+    let progress = Progress::default();
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    let scan = lock.clone().lock_owned().await;
+    tokio::spawn(async move {
+        tokio::time::sleep(hold).await;
+        drop(scan);
+    });
+    let x = Arc::new(ScriptedExec::new());
+    let rec = Reconciler::new(NODE, x)
+        .with_disk_lock(lock)
+        .with_progress(progress.clone());
+    // The last await before the lock ended just now.
+    progress.within(Duration::ZERO);
+    let step = progress.clone();
+    let pass = tokio::spawn(async move {
+        let _g = rec.lock_disks().await;
+        step.within(Duration::from_secs(60));
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+    let live = Liveness::new(progress, None);
+    let base = tokio::time::Instant::now();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rec_seen = seen.clone();
+    let hb = tokio::spawn(renew_loop(
+        Duration::from_secs(10),
+        k8s_openapi::jiff::Timestamp::now,
+        move || live.may_renew(),
+        move |_| {
+            rec_seen.lock().unwrap().push(base.elapsed().as_secs());
+            async { Ok(()) }
+        },
+    ));
+    tokio::time::sleep(Duration::from_secs(65)).await;
+    hb.abort();
+    pass.abort();
+    seen.lock().unwrap().clone()
+}
+
+#[tokio::test(start_paused = true)]
+async fn waiting_for_the_disk_lock_keeps_the_lease_within_the_scan_bound() {
+    let hold = crate::inventory::scan::LOCK_HOLD_MAX;
+    assert_eq!(
+        renewals_behind_the_scan(hold).await,
+        [0, 10, 20, 30, 40, 50, 60]
+    );
+    // Past the last await's slack, still waiting: the wait is declared.
+    let progress = crate::node::Progress::default();
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    let scan = lock.clone().lock_owned().await;
+    let rec = Reconciler::new(NODE, Arc::new(ScriptedExec::new()))
+        .with_disk_lock(lock)
+        .with_progress(progress.clone());
+    progress.within(Duration::ZERO);
+    let waiter = tokio::spawn(async move { drop(rec.lock_disks().await) });
+    tokio::time::sleep(hold.saturating_sub(Duration::from_millis(100))).await;
+    assert!(progress.alive());
+    drop(scan);
+    waiter.await.unwrap();
+    // A scan hung past its bound: renewals stop after the bound and slack.
+    assert_eq!(
+        renewals_behind_the_scan(Duration::from_secs(3600)).await,
+        [0, 10, 20]
+    );
 }

@@ -204,6 +204,7 @@ fn resource_as_each_node_sees_it() {
     let (a, addr) = (assignment(), addresses());
     let tb = FileInputs {
         node: "node-c",
+        host_name: "node-c",
         volume: "pvc-1",
         assignment: &a,
         backing: None,
@@ -223,6 +224,7 @@ fn resource_as_each_node_sees_it() {
 
     let diskful = FileInputs {
         node: "node-a",
+        host_name: "node-a",
         backing: Some("/dev/vg/pvc-1"),
         ..tb.clone()
     };
@@ -260,6 +262,37 @@ fn resource_as_each_node_sees_it() {
 }
 
 #[test]
+fn local_on_section_uses_the_host_name() {
+    let (a, addr) = (assignment(), addresses());
+    let i = FileInputs {
+        node: "node-a",
+        host_name: "host-a.example",
+        volume: "pvc-1",
+        assignment: &a,
+        backing: Some("/dev/vg/pvc-1"),
+        addresses: &addr,
+        chunk_bytes: None,
+        access_mode: model::AccessMode::ReadWriteOnce,
+    };
+    let text = drbd_config::render(&resource(&i).unwrap(), ALL)
+        .unwrap()
+        .text;
+    assert!(text.contains("on \"host-a.example\" {"));
+    assert!(text.contains("host \"host-a.example\" address ipv4 10.0.0.11:11000;"));
+    assert!(!text.contains("\"node-a\""));
+    assert!(text.contains("on \"node-b\" {"));
+
+    let clash = FileInputs {
+        host_name: "node-b",
+        ..i
+    };
+    assert_eq!(
+        resource(&clash).unwrap_err(),
+        "host name node-b is also the node name of a peer"
+    );
+}
+
+#[test]
 fn files_candidate_install_remove() {
     let dir = std::env::temp_dir().join(format!("agent-resfiles-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -267,6 +300,7 @@ fn files_candidate_install_remove() {
     let (a, addr) = (assignment(), addresses());
     let inputs = FileInputs {
         node: "node-c",
+        host_name: "node-c",
         volume: "pvc-1",
         assignment: &a,
         backing: None,
@@ -275,16 +309,16 @@ fn files_candidate_install_remove() {
         access_mode: model::AccessMode::ReadWriteOnce,
     };
     let r = drbd_config::render(&resource(&inputs).unwrap(), ALL).unwrap();
-    assert!(!f.installed("pvc-1", &r.hash).unwrap());
+    assert!(!f.installed("pvc-1", &r.text).unwrap());
     let c = f.write_candidate("pvc-1", &r.text).unwrap();
     assert_eq!(c, dir.join(".pvc-1.candidate"));
     assert!(!f.exists("pvc-1"));
     f.install("pvc-1").unwrap();
-    assert!(f.installed("pvc-1", &r.hash).unwrap() && !c.exists());
+    assert!(f.installed("pvc-1", &r.text).unwrap() && !c.exists());
     // A hand edit is a change.
     let edited = r.text.replace("11002", "11009");
     std::fs::write(f.path("pvc-1"), edited).unwrap();
-    assert!(!f.installed("pvc-1", &r.hash).unwrap());
+    assert!(!f.installed("pvc-1", &r.text).unwrap());
     f.write_candidate("pvc-1", "x").unwrap();
     f.remove("pvc-1").unwrap();
     f.remove("pvc-1").unwrap();

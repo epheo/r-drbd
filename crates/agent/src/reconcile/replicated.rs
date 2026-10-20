@@ -48,6 +48,10 @@ pub struct DrbdEnv {
     pub init_wait: Duration,
     /// First wait before a plan that came back is adjusted again.
     pub repeat_backoff: Duration,
+    /// This host's kernel node name, for its own `on` section: drbdadm
+    /// finds its host by uname, which may differ from the Kubernetes
+    /// node name. None uses the node name.
+    pub host_name: Option<String>,
 }
 
 impl DrbdEnv {
@@ -73,6 +77,7 @@ impl DrbdEnv {
             init_wait: Duration::from_secs(60),
             // One pass interval: a plan back on the next pass waits a pass.
             repeat_backoff: Duration::from_secs(30),
+            host_name: None,
         }
     }
 }
@@ -762,10 +767,12 @@ impl Reconciler {
                 // replica's DRBD disk can show up Inconsistent beside it.
                 return Ok(false);
             }
-            let chunk = pools
-                .iter()
-                .find(|p| p.name_any() == place.pool)
-                .and_then(|p| p.status.as_ref()?.chunk_bytes);
+            let chunk = reads.chunk_bytes(&place).or_else(|| {
+                pools
+                    .iter()
+                    .find(|p| p.name_any() == place.pool)
+                    .and_then(|p| p.status.as_ref()?.chunk_bytes)
+            });
             Some((b, chunk, place))
         } else {
             None
@@ -862,6 +869,7 @@ impl Reconciler {
     ) -> Result<(), String> {
         let inputs = FileInputs {
             node: &self.node,
+            host_name: self.drbd.host_name.as_deref().unwrap_or(&self.node),
             volume: name,
             assignment: s.a,
             backing: backing.map(|(p, _)| p),
@@ -879,7 +887,7 @@ impl Reconciler {
             );
         }
         let files = &self.drbd.files;
-        if files.installed(name, &rendered.hash)? {
+        if files.installed(name, &rendered.text)? {
             return Ok(());
         }
         let candidate = files.write_candidate(name, &rendered.text)?;
@@ -893,11 +901,7 @@ impl Reconciler {
             let _ = std::fs::remove_file(&candidate);
             return Err(format!("drbdadm rejects the new resource file: {e}"));
         }
-        tracing::info!(
-            volume = name,
-            hash = rendered.hash,
-            "installing resource file"
-        );
+        tracing::info!(volume = name, "installing resource file");
         self.drbd.files.install(name)
     }
 

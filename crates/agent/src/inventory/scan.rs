@@ -22,6 +22,20 @@ const WIPEFS_WAIT: ExecMode = ExecMode::Timeout {
     kill: Duration::from_secs(2),
 };
 
+/// The longest the scan holds the disk lock at once: one wipefs or one
+/// exclusive open. The lock is fair, so a waiter waits one hold at most.
+pub(crate) const LOCK_HOLD_MAX: Duration = {
+    let ExecMode::Timeout { wait, term, kill } = WIPEFS_WAIT else {
+        unreachable!()
+    };
+    let wipefs = wait.saturating_add(term).saturating_add(kill);
+    if wipefs.as_nanos() > devices::OPEN_WAIT.as_nanos() {
+        wipefs
+    } else {
+        devices::OPEN_WAIT
+    }
+};
+
 const LVM_SIGNATURE: &str = "LVM2_member";
 
 /// What LVM says about the node's disks.

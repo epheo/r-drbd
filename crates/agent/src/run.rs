@@ -20,7 +20,8 @@ const DRBD_INCLUDE_FILE: &str = "r-drbd.res";
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Kubernetes node name; also the DRBD host name and the CSI node id.
+    /// Kubernetes node name; also the CSI node id and the DRBD name peers
+    /// know this host by.
     pub node: String,
     /// Namespace of the heartbeat Lease.
     pub namespace: String,
@@ -45,8 +46,8 @@ pub enum Error {
     },
     #[error("kubernetes client: {0}")]
     Kube(#[from] kube::Error),
-    #[error("kubernetes config: {0}")]
-    KubeConfig(String),
+    #[error("kubernetes config")]
+    KubeConfig(#[source] kube::config::InferConfigError),
     #[error("watch caches: {0}")]
     Watch(String),
     #[error("csi server: {0}")]
@@ -69,11 +70,26 @@ impl Error {
 /// watches keep their own client without it.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// One request on the writes client; a backoff sleep fits the progress slack.
+const REQUEST_BOUND: Duration = CONNECT_TIMEOUT.saturating_add(READ_TIMEOUT);
+
+/// Live reads on the writes client, bounded like a write.
+#[derive(Debug)]
+struct ProgressLive {
+    inner: KubeLiveVolumes,
+    progress: node::Progress,
+}
+
+#[async_trait::async_trait]
+impl crate::reconcile::LiveVolumes for ProgressLive {
+    async fn get(&self, volume: &str) -> Result<model::Volume, String> {
+        self.progress.within(REQUEST_BOUND);
+        self.inner.get(volume).await
+    }
+}
 
 async fn clients() -> Result<(Client, Client), Error> {
-    let config = kube::Config::infer()
-        .await
-        .map_err(|e| Error::KubeConfig(e.to_string()))?;
+    let config = kube::Config::infer().await.map_err(Error::KubeConfig)?;
     let watch = Client::try_from(config.clone())?;
     let mut writes = config;
     writes.connect_timeout = Some(CONNECT_TIMEOUT);
@@ -99,6 +115,9 @@ const CHANGE_WAIT_LOG: Duration = Duration::from_secs(30);
 /// error or when the CSI server dies. On a signal the running pass, its
 /// status writes and in-flight CSI operations finish first (bounded).
 pub async fn run(cfg: Config) -> Result<(), Error> {
+    // Before any startup work: from here on a SIGTERM waits for the guard
+    // instead of killing the process with the default action.
+    let signals = Signals::install()?;
     prepare_host(&cfg.res_dir, Path::new(DRBD_CONF_DIR))?;
     let (client, watch_client) = clients().await?;
     let runner = Arc::new(TokioExec::new(cfg.host_exec_prefix.clone()));
@@ -117,12 +136,17 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
         tracing::warn!("DRBD not found: replicated volumes cannot be served on this node");
     }
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    // Closed at SIGTERM: the running pass finishes, no new one starts, so no
+    // LVM change begins that kubelet's kill could cut while the guard runs.
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
     let inv = spawn_inventory(&cfg.node, &client, &exec, &stores, &stop_rx);
-    let reconciler = Reconciler::new(cfg.node.clone(), exec.clone())
-        .with_drbd(DrbdEnv::new(features, cfg.res_dir.clone(), tracker.clone()))
-        .with_disks(inv.disks.clone())
-        .with_disk_lock(inv.lock.clone())
-        .with_live(Arc::new(KubeLiveVolumes::new(client.clone())));
+    // Shared by the reconcile loop, which sets a deadline before each of its
+    // awaits, and the heartbeat, which renews only while it is kept.
+    let progress = node::Progress::default();
+    let rexec = Arc::new(node::ProgressExec::new(exec.clone(), progress.clone()));
+    let liveness = node::Liveness::new(progress.clone(), events.is_some().then(|| tracker.clone()));
+    let writer = Arc::new(Writer::new(client.clone(), &cfg.node, progress.clone()));
+    let reconciler = reconciler(&cfg, &rexec, &writer, features, &tracker, &inv);
 
     let listener = ::csi::bind_unix(&cfg.csi_endpoint)
         .and_then(tokio::net::UnixListener::from_std)
@@ -144,10 +168,11 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
         cfg.namespace.clone(),
         cfg.node.clone(),
         tools,
+        liveness,
     ));
     let mut reconcile = tokio::spawn(reconcile_loop(
-        client,
-        exec.clone(),
+        writer,
+        rexec,
         reconciler,
         stores,
         Triggers {
@@ -156,6 +181,7 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
             disks: inv.wakes,
             ready: inv.ready,
         },
+        gate_rx,
         stop_rx,
     ));
 
@@ -168,7 +194,7 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
         })),
         // The other arms are only borrowed: while the guard runs, the
         // reconcile and CSI tasks keep running and the drain below waits for them.
-        r = signalled(&guard) => r,
+        () = signalled(signals, &gate_tx, &guard) => Ok(()),
         () = restart.notified() => Ok(()),
     };
     let _ = stop_tx.send(true);
@@ -197,6 +223,37 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
         e.abort();
     }
     result
+}
+
+/// The kernel node name (uname -n); the pod shares the host's with hostNetwork.
+fn host_name() -> Option<String> {
+    let name = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .inspect_err(|e| tracing::warn!(error = %e, "host name unreadable; using the node name"))
+        .ok()?;
+    Some(name.trim().to_owned()).filter(|n| !n.is_empty())
+}
+
+/// The reconciler, on the runner that keeps the loop's deadlines.
+fn reconciler(
+    cfg: &Config,
+    exec: &Arc<node::ProgressExec>,
+    writer: &Arc<Writer>,
+    features: Option<drbd_config::Features>,
+    tracker: &Arc<Mutex<Tracker>>,
+    inv: &Inventory,
+) -> Reconciler {
+    let mut drbd = DrbdEnv::new(features, cfg.res_dir.clone(), tracker.clone());
+    drbd.host_name = host_name();
+    Reconciler::new(cfg.node.clone(), exec.clone())
+        .with_drbd(drbd)
+        .with_disks(inv.disks.clone())
+        .with_disk_lock(inv.lock.clone())
+        .with_progress(exec.progress().clone())
+        .with_live(Arc::new(ProgressLive {
+            inner: KubeLiveVolumes::new(writer.client.clone()),
+            progress: exec.progress().clone(),
+        }))
+        .with_publish(writer.clone())
 }
 
 /// `drbdsetup events2` from the image (no host prefix) feeding the tracker.
@@ -367,13 +424,13 @@ struct Triggers {
     ready: tokio::sync::watch::Sender<bool>,
 }
 
-/// Passes and refreshes run to completion; `stop` is only looked at between them.
 async fn reconcile_loop(
-    client: Client,
-    exec: Arc<dyn Exec>,
-    mut rec: Reconciler,
+    writer: Arc<Writer>,
+    exec: Arc<node::ProgressExec>,
+    rec: Reconciler,
     stores: watch::Stores,
     triggers: Triggers,
+    gate: tokio::sync::watch::Receiver<bool>,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Error> {
     tokio::select! {
@@ -383,50 +440,135 @@ async fn reconcile_loop(
     triggers.ready.send_replace(true);
     let node = rec.node().to_owned();
     tracing::info!(node, "caches ready, reconciling");
-    let (mut lvm_checked, mut lvm_probed) = (false, false);
-    let mut pool_set = PoolSet::default();
+    let progress = exec.progress().clone();
+    let mut work = LoopWork {
+        writer,
+        exec,
+        rec,
+        stores,
+        node,
+        disks: triggers.disks,
+        lvm_checked: false,
+        lvm_probed: false,
+        pool_set: PoolSet::default(),
+    };
+    let schedule = Schedule {
+        pass: triggers.pass,
+        changes: triggers.changes,
+        gate,
+        stop,
+        progress,
+    };
+    drive(&mut work, schedule).await;
+    Ok(())
+}
+
+/// What the loop runs; the schedule decides when.
+#[async_trait::async_trait]
+trait Work: Send {
+    /// One pass, its writes applied.
+    async fn pass(&mut self);
+    /// A status refresh of what events2 touched; true when a pass is wanted.
+    async fn refresh(&mut self) -> bool;
+}
+
+struct Schedule {
+    pass: Arc<Trigger>,
+    changes: Arc<Trigger>,
+    /// True once no new pass may start.
+    gate: tokio::sync::watch::Receiver<bool>,
+    stop: tokio::sync::watch::Receiver<bool>,
+    /// Idle, the loop promises to wake by the resync.
+    progress: node::Progress,
+}
+
+/// Passes and refreshes run to completion; `stop` and the gate are only
+/// looked at between them. With the gate closed only refreshes run: they
+/// change nothing on the host and keep the controller's view current.
+async fn drive(work: &mut dyn Work, mut s: Schedule) {
     loop {
-        rec.set_addresses(addresses(&stores));
-        rec.set_peer_leases(peer_leases(&stores));
-        let pools = stores.pools.state();
-        let has_pool = pools.iter().any(|p| p.spec.node == node);
-        if !lvm_checked && (has_pool || !lvm_probed) {
-            lvm_probed = true;
-            lvm_checked = check_lvm(exec.as_ref(), &mut rec, has_pool).await;
-        }
-        let volumes = stores.volumes.state();
-        let snapshots = stores.snapshots.state();
-        let writes = rec.pass(&pools, &volumes, &snapshots).await;
-        for pool in apply(&client, &node, writes).await {
-            rec.events_unsent(&pool);
-        }
-        let pool_set_changed = pool_set.update(&pools, &node);
-        if rec.take_disks_changed() || pool_set_changed {
-            let _ = triggers.disks.send(crate::inventory::Wake::Lvm);
+        let open = !*s.gate.borrow_and_update();
+        if open {
+            work.pass().await;
         }
         // Fixed per pass so a stream of refreshes cannot push the resync out.
         let resync = tokio::time::Instant::now() + watch::RESYNC;
         loop {
+            if open {
+                s.progress.until(resync + watch::COALESCE);
+            } else {
+                s.progress.within(watch::RESYNC);
+            }
             tokio::select! {
                 biased;
-                () = stopped(&mut stop) => return Ok(()),
-                () = triggers.pass.changed() => {
-                    tokio::time::sleep(watch::COALESCE).await;
-                    triggers.pass.drain();
+                () = stopped(&mut s.stop) => return,
+                r = s.gate.changed(), if open => {
+                    if r.is_err() {
+                        return;
+                    }
                     break;
                 }
-                () = tokio::time::sleep_until(resync) => break,
-                () = triggers.changes.changed() => {
+                () = s.pass.changed(), if open => {
                     tokio::time::sleep(watch::COALESCE).await;
-                    triggers.changes.drain();
-                    let volumes = stores.volumes.state();
-                    apply(&client, &node, rec.refresh(&volumes).await).await;
-                    if rec.take_pass_wanted() {
+                    s.pass.drain();
+                    break;
+                }
+                () = tokio::time::sleep_until(resync), if open => break,
+                () = s.changes.changed() => {
+                    tokio::time::sleep(watch::COALESCE).await;
+                    s.changes.drain();
+                    if work.refresh().await && open {
                         break;
                     }
                 }
             }
         }
+    }
+}
+
+struct LoopWork {
+    writer: Arc<Writer>,
+    exec: Arc<node::ProgressExec>,
+    rec: Reconciler,
+    stores: watch::Stores,
+    node: String,
+    disks: tokio::sync::mpsc::UnboundedSender<crate::inventory::Wake>,
+    lvm_checked: bool,
+    lvm_probed: bool,
+    pool_set: PoolSet,
+}
+
+#[async_trait::async_trait]
+impl Work for LoopWork {
+    async fn pass(&mut self) {
+        let (rec, stores, node) = (&mut self.rec, &self.stores, &self.node);
+        rec.set_addresses(addresses(stores));
+        rec.set_peer_leases(peer_leases(stores));
+        let pools = stores.pools.state();
+        let has_pool = pools.iter().any(|p| &p.spec.node == node);
+        if !self.lvm_checked && (has_pool || !self.lvm_probed) {
+            self.lvm_probed = true;
+            self.lvm_checked = check_lvm(self.exec.as_ref(), rec, has_pool).await;
+        }
+        let volumes = stores.volumes.state();
+        let snapshots = stores.snapshots.state();
+        self.writer.revive();
+        let writes = rec.pass(&pools, &volumes, &snapshots).await;
+        for pool in self.writer.apply(writes).await {
+            rec.events_unsent(&pool);
+        }
+        let pool_set_changed = self.pool_set.update(&pools, node);
+        if rec.take_disks_changed() || pool_set_changed {
+            let _ = self.disks.send(crate::inventory::Wake::Lvm);
+        }
+    }
+
+    async fn refresh(&mut self) -> bool {
+        let volumes = self.stores.volumes.state();
+        self.writer.revive();
+        let writes = self.rec.refresh(&volumes).await;
+        self.writer.apply(writes).await;
+        self.rec.take_pass_wanted()
     }
 }
 
@@ -461,59 +603,128 @@ fn addresses(stores: &watch::Stores) -> BTreeMap<String, std::net::IpAddr> {
         .collect()
 }
 
-/// Applies the writes; returns the Pools whose Events did not get through.
-async fn apply(
-    client: &Client,
-    node: &str,
-    writes: Vec<crate::reconcile::StatusWrite>,
-) -> Vec<String> {
-    let results = crate::retry::each_with_backoff(
-        &writes,
-        &crate::retry::BACKOFF,
-        crate::retry::retryable,
-        |w| w.apply(client, node),
-    )
-    .await;
-    let mut skipped = 0;
-    let mut unsent = Vec::new();
-    for (w, res) in writes.iter().zip(results) {
-        if matches!(w, crate::reconcile::StatusWrite::Event { .. }) && !matches!(res, Some(Ok(())))
-        {
-            unsent.push(w.name().to_owned());
-        }
-        match res {
-            Some(Err(e)) => {
-                tracing::warn!(object = w.name(), error = %e, "status write failed, retried next pass");
-            }
-            None => skipped += 1,
-            Some(Ok(())) => {}
-        }
-    }
-    if skipped > 0 {
-        tracing::warn!(
-            skipped,
-            "API unreachable: remaining status writes left to the next pass"
-        );
-    }
-    unsent
+/// Status writes of the reconcile loop. Once the API proves unreachable
+/// the rest of the pass or refresh is skipped: against a dead connection
+/// each try still costs a connect or read timeout. Writes are diffs
+/// against the cache, so the next pass rebuilds them.
+struct Writer {
+    client: Client,
+    node: String,
+    progress: node::Progress,
+    dead: std::sync::atomic::AtomicBool,
 }
 
-/// The shutdown guard runs before the drain.
-async fn signalled(guard: &shutdown::Guard) -> Result<(), Error> {
-    shutdown().await?;
+impl std::fmt::Debug for Writer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Writer")
+            .field("node", &self.node)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Writer {
+    fn new(client: Client, node: &str, progress: node::Progress) -> Self {
+        Self {
+            client,
+            node: node.to_owned(),
+            progress,
+            dead: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// A new pass or refresh tries the API again.
+    fn revive(&self) {
+        self.dead.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Applies the writes; returns the Pools whose Events did not get through.
+    async fn apply(&self, writes: Vec<crate::reconcile::StatusWrite>) -> Vec<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let results = if self.dead.load(Relaxed) {
+            writes.iter().map(|_| None).collect()
+        } else {
+            crate::retry::each_with_backoff(
+                &writes,
+                &crate::retry::BACKOFF,
+                crate::retry::retryable,
+                |w| {
+                    self.progress.within(REQUEST_BOUND);
+                    w.apply(&self.client, &self.node)
+                },
+            )
+            .await
+        };
+        let mut skipped = 0;
+        let mut unsent = Vec::new();
+        for (w, res) in writes.iter().zip(results) {
+            if matches!(w, crate::reconcile::StatusWrite::Event { .. })
+                && !matches!(res, Some(Ok(())))
+            {
+                unsent.push(w.name().to_owned());
+            }
+            match res {
+                Some(Err(e)) => {
+                    if crate::retry::retryable(&e) {
+                        self.dead.store(true, Relaxed);
+                    }
+                    tracing::warn!(object = w.name(), error = %e, "status write failed, retried next pass");
+                }
+                None => skipped += 1,
+                Some(Ok(())) => {}
+            }
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                skipped,
+                "API unreachable: remaining status writes left to the next pass"
+            );
+        }
+        unsent
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::reconcile::Publish for Writer {
+    async fn publish(&self, writes: Vec<crate::reconcile::StatusWrite>) -> Vec<String> {
+        self.apply(writes).await
+    }
+}
+
+/// The pass gate closes first, then the shutdown guard runs, before the drain.
+async fn signalled(
+    mut signals: Signals,
+    gate: &tokio::sync::watch::Sender<bool>,
+    guard: &shutdown::Guard,
+) {
+    signals.recv().await;
+    gate.send_replace(true);
     guard.on_signal().await;
     tracing::info!(bound = ?SHUTDOWN_MAX, "shutting down");
-    Ok(())
 }
 
-async fn shutdown() -> Result<(), Error> {
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(|e| Error::io("install SIGTERM handler", e))?;
-    tokio::select! {
-        _ = term.recv() => {}
-        r = tokio::signal::ctrl_c() => r.map_err(|e| Error::io("install SIGINT handler", e))?,
+/// SIGTERM and SIGINT, caught from the moment of install.
+struct Signals {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    fn install() -> Result<Self, Error> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            term: signal(SignalKind::terminate())
+                .map_err(|e| Error::io("install SIGTERM handler", e))?,
+            int: signal(SignalKind::interrupt())
+                .map_err(|e| Error::io("install SIGINT handler", e))?,
+        })
     }
-    Ok(())
+
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.term.recv() => {}
+            _ = self.int.recv() => {}
+        }
+    }
 }
 
 /// Creates the res dir and, when DRBD is configured on the host, the include
@@ -637,6 +848,71 @@ mod tests {
             p.metadata.resource_version = Some("7".into());
         });
         assert!(!set.update(&[status], "n1"), "status only");
+    }
+
+    #[derive(Default)]
+    struct Counted {
+        started: u32,
+        finished: u32,
+        refreshes: u32,
+    }
+
+    /// Passes take 20 s.
+    struct FakeWork(Arc<Mutex<Counted>>);
+
+    #[async_trait::async_trait]
+    impl Work for FakeWork {
+        async fn pass(&mut self) {
+            self.0.lock().unwrap().started += 1;
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            self.0.lock().unwrap().finished += 1;
+        }
+
+        async fn refresh(&mut self) -> bool {
+            self.0.lock().unwrap().refreshes += 1;
+            true
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sigterm_lets_the_pass_finish_and_starts_no_new_one() {
+        let counted = Arc::new(Mutex::new(Counted::default()));
+        let (pass, changes) = (Arc::new(Trigger::default()), Arc::new(Trigger::default()));
+        let (gate_tx, gate) = tokio::sync::watch::channel(false);
+        let (stop_tx, stop) = tokio::sync::watch::channel(false);
+        let schedule = Schedule {
+            pass: pass.clone(),
+            changes: changes.clone(),
+            gate,
+            stop,
+            progress: node::Progress::default(),
+        };
+        let mut work = FakeWork(counted.clone());
+        let task = tokio::spawn(async move { drive(&mut work, schedule).await });
+        let count = || {
+            let c = counted.lock().unwrap();
+            (c.started, c.finished, c.refreshes)
+        };
+
+        tokio::time::sleep(Duration::from_secs(25)).await;
+        assert_eq!(count(), (1, 1, 0));
+        pass.fire();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(count(), (2, 1, 0), "second pass running");
+        gate_tx.send_replace(true);
+        pass.fire();
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert_eq!(count(), (2, 2, 0), "finished, none started");
+
+        // Refreshes go on, and their pass wish, the trigger and the resync
+        // all start nothing.
+        changes.fire();
+        pass.fire();
+        tokio::time::sleep(watch::RESYNC * 3).await;
+        assert_eq!(count(), (2, 2, 1));
+
+        stop_tx.send_replace(true);
+        task.await.unwrap();
     }
 
     #[test]

@@ -12,7 +12,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::api::{Patch, PatchParams};
 use kube::{Api, Client, ResourceExt};
 use lvm::report::{Lv, Vg};
@@ -62,6 +61,10 @@ pub enum StatusWrite {
         name: String,
         generation: Option<i64>,
         capacity: Result<PoolCapacity, String>,
+        /// From the probe, else the last one written: the chunk is fixed at
+        /// creation, and a value that vanished while the probe fails would
+        /// re-render every replicated volume of the Pool.
+        chunk_bytes: Option<u64>,
         available: Condition,
         /// Pools built from devices only.
         devices: Option<Vec<DeviceStatus>>,
@@ -108,6 +111,7 @@ impl StatusWrite {
                 name,
                 generation,
                 capacity,
+                chunk_bytes,
                 available,
                 devices,
                 released,
@@ -124,7 +128,9 @@ impl StatusWrite {
                 if let Ok(c) = capacity {
                     status["totalBytes"] = json!(c.total_bytes);
                     status["freeBytes"] = json!(c.free_bytes);
-                    status["chunkBytes"] = json!(c.chunk_bytes);
+                }
+                if let Some(c) = chunk_bytes {
+                    status["chunkBytes"] = json!(c);
                 }
                 json!({
                     "apiVersion": api_version,
@@ -169,7 +175,7 @@ impl StatusWrite {
         else {
             return Event::default();
         };
-        let now = Time(k8s_openapi::jiff::Timestamp::now());
+        let now = model::time::now();
         Event {
             metadata: ObjectMeta {
                 generate_name: Some(format!("{name}.")),
@@ -286,6 +292,15 @@ impl Reads {
         }
     }
 
+    /// The thin pool's chunk from this pass's lvs, when already read.
+    fn chunk_bytes(&self, place: &Place) -> Option<u64> {
+        let rows = self.lvs.get(&place.vg)?.as_ref().ok()?;
+        rows.iter()
+            .find(|r| r.name == place.thin && r.thin_pool)
+            .map(|r| r.chunk_bytes)
+            .filter(|&c| c > 0)
+    }
+
     fn invalidate(&mut self, vg: &str) {
         self.lvs.remove(vg);
         self.vgs.remove(vg);
@@ -363,8 +378,20 @@ pub struct Reconciler {
     device_rows: HashMap<String, Vec<DeviceStatus>>,
     /// Shared with the NodeDisks inventory.
     disk_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The loop's deadline, kept while waiting for the disk lock.
+    progress: crate::node::Progress,
     /// Live reads for the restore decisions the watch cache cannot prove.
     live: Arc<dyn LiveVolumes>,
+    /// Applies writes during the pass; None returns them all from it.
+    publish: Option<Arc<dyn Publish>>,
+}
+
+/// Where a pass sends its writes as each step ends, so statuses trail the
+/// host by one step, not by a whole pass.
+#[async_trait::async_trait]
+pub trait Publish: std::fmt::Debug + Send + Sync {
+    /// Applies `writes`; returns the Pools whose Events did not get through.
+    async fn publish(&self, writes: Vec<StatusWrite>) -> Vec<String>;
 }
 
 impl Reconciler {
@@ -399,7 +426,28 @@ impl Reconciler {
             disks_changed: false,
             device_rows: HashMap::new(),
             disk_lock: Arc::default(),
+            progress: crate::node::Progress::default(),
             live: Arc::new(NoLiveVolumes),
+            publish: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_publish(mut self, publish: Arc<dyn Publish>) -> Self {
+        self.publish = Some(publish);
+        self
+    }
+
+    /// Sends the writes so far when a publisher is set.
+    async fn flush(&mut self, writes: &mut Vec<StatusWrite>) {
+        let Some(p) = self.publish.clone() else {
+            return;
+        };
+        if writes.is_empty() {
+            return;
+        }
+        for pool in p.publish(std::mem::take(writes)).await {
+            self.events_unsent(&pool);
         }
     }
 
@@ -407,6 +455,19 @@ impl Reconciler {
     pub fn with_live(mut self, live: Arc<dyn LiveVolumes>) -> Self {
         self.live = live;
         self
+    }
+
+    #[must_use]
+    pub fn with_progress(mut self, progress: crate::node::Progress) -> Self {
+        self.progress = progress;
+        self
+    }
+
+    /// The disk lock, the wait declared to the heartbeat: the inventory
+    /// holds it for one bounded step at a time.
+    async fn lock_disks(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.progress.within(crate::inventory::scan::LOCK_HOLD_MAX);
+        self.disk_lock.clone().lock_owned().await
     }
 
     #[must_use]
@@ -449,7 +510,8 @@ impl Reconciler {
     }
 
     /// One pass over the current objects. Returns only writes that change
-    /// something, so an idle node writes nothing.
+    /// something, so an idle node writes nothing; with a publisher, only
+    /// those it has not sent after a step.
     pub async fn pass(
         &mut self,
         pools: &[Arc<Pool>],
@@ -469,6 +531,7 @@ impl Reconciler {
         for pool in &pools {
             writes.extend(self.pool(&mut reads, pool).await);
         }
+        self.flush(&mut writes).await;
         // A bad name never reaches an lvm argv, not even through lvs.
         self.invalid_pools = pools
             .iter()
@@ -486,6 +549,7 @@ impl Reconciler {
         for vol in &vols {
             if let Some(w) = self.volume(&mut reads, &pools, snapshots, vol).await {
                 writes.push(w);
+                self.flush(&mut writes).await;
             }
         }
         self.probe_peers(&vols, &mut writes).await;
@@ -528,7 +592,9 @@ impl Reconciler {
         };
         let generation = pool.metadata.generation;
         let (status, reason, message) = match &probed {
-            Ok(_) => (
+            // Capacity and chunk stay in the write: existing volumes go on.
+            Ok((_, Some(sick))) => (condition::FALSE, REASON_UNAVAILABLE, sick.clone()),
+            Ok((_, None)) => (
                 condition::TRUE,
                 REASON_READY,
                 built
@@ -538,12 +604,12 @@ impl Reconciler {
             ),
             Err((reason, e)) => (condition::FALSE, *reason, e.clone()),
         };
-        let capacity = probed.map_err(|(_, e)| e);
-        if let Err(e) = &capacity {
-            tracing::warn!(pool = pool.name_any(), error = %e, "pool unavailable");
+        let capacity = probed.map(|(c, _)| c).map_err(|(_, e)| e);
+        if status == condition::FALSE {
+            tracing::warn!(pool = pool.name_any(), error = %message, "pool unavailable");
         }
         let current = pool.status.clone().unwrap_or_default();
-        let now = Time(k8s_openapi::jiff::Timestamp::now());
+        let now = model::time::now();
         let mut conditions = current.conditions.clone();
         condition::set(
             &mut conditions,
@@ -580,9 +646,10 @@ impl Reconciler {
             return writes;
         };
         let cap = capacity.as_ref().ok();
+        let chunk_bytes = cap.map(|c| c.chunk_bytes).or(current.chunk_bytes);
         let unchanged = current.total_bytes == cap.map(|c| c.total_bytes)
             && current.free_bytes == cap.map(|c| c.free_bytes)
-            && current.chunk_bytes == cap.map(|c| c.chunk_bytes)
+            && current.chunk_bytes == chunk_bytes
             && current.observed_generation == generation
             && condition::get(&current.conditions, condition::types::AVAILABLE) == Some(&available)
             && devices.as_ref().is_none_or(|d| *d == current.devices)
@@ -592,6 +659,7 @@ impl Reconciler {
                 name: pool.name_any(),
                 generation,
                 capacity,
+                chunk_bytes,
                 available,
                 devices,
                 released,
@@ -600,7 +668,8 @@ impl Reconciler {
         writes
     }
 
-    /// Capacity of a usable thin pool. Pool zeroing is switched on first:
+    /// Capacity of a usable thin pool, with why it should take no new
+    /// volumes if it is unhealthy. Pool zeroing is switched on first:
     /// without it a new thin LV can expose blocks of deleted ones.
     /// The VG read here serves every volume of the pass.
     async fn probe_pool(
@@ -608,7 +677,7 @@ impl Reconciler {
         reads: &mut Reads,
         vg: &str,
         thin: &str,
-    ) -> Result<PoolCapacity, (&'static str, String)> {
+    ) -> Result<(PoolCapacity, Option<String>), (&'static str, String)> {
         let unavailable = |e: String| (REASON_UNAVAILABLE, e);
         let mut lvs = reads.lvs(&self.lvm, vg).await.map_err(unavailable)?;
         if lvs
@@ -622,7 +691,8 @@ impl Reconciler {
             lvs = reads.lvs(&self.lvm, vg).await.map_err(unavailable)?;
         }
         reads.vg(&self.lvm, vg).await.map_err(unavailable)?;
-        storage::pool_capacity(&lvs, thin).map_err(unavailable)
+        let capacity = storage::pool_capacity(&lvs, thin).map_err(unavailable)?;
+        Ok((capacity, storage::pool_health(&lvs, thin)))
     }
 
     fn my_replica<'a>(&self, vol: &'a Volume) -> Option<&'a AssignedReplica> {

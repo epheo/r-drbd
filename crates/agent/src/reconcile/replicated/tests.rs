@@ -571,6 +571,29 @@ async fn initial_node_waits_for_its_peers_then_starts_alone() {
     r.pass(&[volume(GIB)], &[]).await;
 }
 
+/// The chunk comes from this pass's lvs: a Pool status without chunkBytes
+/// (a failed probe) leaves the file as it is.
+#[tokio::test]
+async fn chunk_from_lvs_keeps_the_file() {
+    let mut r = Rig::new(&healthy(), up_host());
+    let x = r.x.clone();
+    let vol = initialized(volume(GIB));
+    reads(&x, &[lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    dry(&x, "");
+    r.pass(std::slice::from_ref(&vol), &[]).await;
+    let before = r.res_file().unwrap();
+    assert!(before.contains("rs-discard-granularity 65536;"));
+
+    let mut p = (*pool()).clone();
+    p.status = None;
+    reads_again(&x, &[lv(LV_KIB)]);
+    dry(&x, "");
+    r.pass_pools(&[Arc::new(p)], &[vol], &[]).await;
+    assert_eq!(r.res_file().unwrap(), before);
+}
+
 #[tokio::test]
 async fn only_the_initial_node_of_an_uninitialized_volume_starts_it() {
     // n2 is not the initial node.

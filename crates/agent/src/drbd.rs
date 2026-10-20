@@ -304,6 +304,8 @@ pub fn features(help: [&str; 3]) -> Features {
 #[derive(Debug, Clone)]
 pub struct FileInputs<'a> {
     pub node: &'a str,
+    /// The name of this host's `on` section; peers keep their node names.
+    pub host_name: &'a str,
     pub volume: &'a str,
     pub assignment: &'a Assignment,
     /// Backing LV path when this replica is diskful.
@@ -368,6 +370,15 @@ pub fn resource<'a>(i: &'a FileInputs<'a>) -> Result<FileResource<'a>, String> {
         (true, None) => return Err("diskful replica without a backing LV".to_owned()),
         (false, _) => Disk::None,
     };
+    if a.replicas
+        .iter()
+        .any(|r| r.node != i.node && r.node == i.host_name)
+    {
+        return Err(format!(
+            "host name {} is also the node name of a peer",
+            i.host_name
+        ));
+    }
     let peers = peers(a, me)
         .into_iter()
         .map(|p| {
@@ -386,7 +397,10 @@ pub fn resource<'a>(i: &'a FileInputs<'a>) -> Result<FileResource<'a>, String> {
         version: env!("CARGO_PKG_VERSION"),
         minor,
         secret,
-        local: host(me, local_disk)?,
+        local: FileHost {
+            name: i.host_name,
+            ..host(me, local_disk)?
+        },
         peers,
         two_primaries: i.access_mode == model::AccessMode::ReadWriteMany,
         discard_granularity: i.chunk_bytes,
@@ -419,11 +433,11 @@ impl ResFiles {
         self.path(res).exists()
     }
 
-    /// Whether the installed file already carries content of `hash`.
-    pub fn installed(&self, res: &str, hash: &str) -> Result<bool, String> {
+    /// Whether the installed file already holds `text`.
+    pub fn installed(&self, res: &str, text: &str) -> Result<bool, String> {
         let path = self.path(res);
         match std::fs::read_to_string(&path) {
-            Ok(text) => Ok(drbd_config::header_hash(&text).as_deref() == Some(hash)),
+            Ok(have) => Ok(drbd_config::same_content(&have, text)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(format!("read {}: {e}", path.display())),
         }
@@ -600,7 +614,7 @@ pub struct Notify {
 /// quick; the cap bounds how stale status can get while drbdsetup keeps
 /// failing.
 const RESTART_FIRST: Duration = Duration::from_secs(1);
-const RESTART_MAX: Duration = Duration::from_secs(30);
+pub(crate) const RESTART_MAX: Duration = Duration::from_secs(30);
 /// A stream that ran this long without ending was healthy: the next end
 /// starts the schedule over.
 const QUIET: Duration = Duration::from_secs(60);

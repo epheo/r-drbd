@@ -217,15 +217,56 @@ fn blkid(x: &ScriptedExec, dev: &str, out: Result<crate::Output, String>) {
     );
 }
 
+/// blkid finds nothing and the first block reads.
+fn blank(x: &ScriptedExec, dev: &str) {
+    blkid(x, dev, code(2, "", ""));
+    x.expect(direct_read(dev), ok(""));
+}
+
+fn direct_read(dev: &str) -> Vec<String> {
+    crate::exec::argv(&[
+        "dd",
+        &format!("if={dev}"),
+        "of=/dev/null",
+        "bs=4096",
+        "count=1",
+        "iflag=direct",
+        "status=none",
+    ])
+}
+
+/// blkid exits 2 also when it cannot open the device: a failed read is
+/// Unavailable, never an empty device to format.
+#[tokio::test]
+async fn unreadable_device_is_never_formatted() {
+    let env = Env::new("stage-unreadable");
+    findmnt(&env.x, &env.path("staging"), false);
+    blkid(&env.x, &env.dev, code(2, "", ""));
+    env.x
+        .expect(direct_read(&env.dev), code(1, "", "Wrong medium type"));
+    let e = stage_mount(&env).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::Unavailable);
+    assert!(
+        !env.x
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|a| a[0] == "mkfs.xfs")
+    );
+    assert_eq!(env.fs.writes(), vec![]);
+    env.x.assert_done();
+}
+
 #[tokio::test]
 async fn stage_formats_empty_device() {
     let env = Env::new("stage-empty");
     let staging = env.path("staging");
     findmnt(&env.x, &staging, false);
-    blkid(&env.x, &env.dev, code(2, "", ""));
+    blank(&env.x, &env.dev);
     env.x
         .expect_s(
-            &["mkfs.xfs", "-q", "-f", "-K", "-L", MKFS_LABEL, &env.dev],
+            &["mkfs.xfs", "-q", "-K", "-L", MKFS_LABEL, &env.dev],
             ok(""),
         )
         .expect_s(&["xfs_admin", "-L", "--", &env.dev], ok(""))
@@ -240,8 +281,8 @@ async fn stage_formats_empty_device() {
         env.fs.writes(),
         vec![("pvc-1".to_owned(), "xfs".to_owned())]
     );
-    // findmnt, blkid, mkfs, xfs_admin, then the marker, then mount.
-    assert_eq!(*env.fs.commands_at_write.lock().unwrap(), vec![4]);
+    // findmnt, blkid, dd, mkfs, xfs_admin, then the marker, then mount.
+    assert_eq!(*env.fs.commands_at_write.lock().unwrap(), vec![5]);
     env.x.assert_done();
 }
 
@@ -249,10 +290,10 @@ async fn stage_formats_empty_device() {
 async fn failed_label_clear_is_internal_and_unmarked() {
     let env = Env::new("stage-label-fail");
     findmnt(&env.x, &env.path("staging"), false);
-    blkid(&env.x, &env.dev, code(2, "", ""));
+    blank(&env.x, &env.dev);
     env.x
         .expect_s(
-            &["mkfs.xfs", "-q", "-f", "-K", "-L", MKFS_LABEL, &env.dev],
+            &["mkfs.xfs", "-q", "-K", "-L", MKFS_LABEL, &env.dev],
             ok(""),
         )
         .expect_s(
@@ -465,10 +506,10 @@ async fn operation_survives_client_cancel() {
     let env = Env::new("cancel");
     let staging = env.path("staging");
     findmnt(&env.x, &staging, false);
-    blkid(&env.x, &env.dev, code(2, "", ""));
+    blank(&env.x, &env.dev);
     env.x
         .expect_s(
-            &["mkfs.xfs", "-q", "-f", "-K", "-L", MKFS_LABEL, &env.dev],
+            &["mkfs.xfs", "-q", "-K", "-L", MKFS_LABEL, &env.dev],
             ok(""),
         )
         .expect_s(&["xfs_admin", "-L", "--", &env.dev], ok(""))
@@ -864,7 +905,7 @@ async fn empty_device_with_marker_is_failed_precondition() {
     let env = Env::new("fs-empty-marked");
     env.fs.set(Some("xfs"), false);
     findmnt(&env.x, &env.path("staging"), false);
-    blkid(&env.x, &env.dev, code(2, "", ""));
+    blank(&env.x, &env.dev);
     let e = stage_mount(&env).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::FailedPrecondition);
     assert_eq!(e.message(), "volume records xfs but the device is empty");
@@ -876,7 +917,7 @@ async fn restored_empty_device_is_failed_precondition() {
     let env = Env::new("fs-restored-empty");
     env.fs.set(None, true);
     findmnt(&env.x, &env.path("staging"), false);
-    blkid(&env.x, &env.dev, code(2, "", ""));
+    blank(&env.x, &env.dev);
     let e = stage_mount(&env).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::FailedPrecondition);
     assert_eq!(e.message(), "restored volume has no file system");
@@ -911,10 +952,10 @@ async fn own_marker_guards_even_when_cache_and_api_fail() {
     let env = Env::new("fs-own-marker");
     let svc = env.svc(Lookup::default());
     findmnt(&env.x, &env.path("staging"), false);
-    blkid(&env.x, &env.dev, code(2, "", ""));
+    blank(&env.x, &env.dev);
     env.x
         .expect_s(
-            &["mkfs.xfs", "-q", "-f", "-K", "-L", MKFS_LABEL, &env.dev],
+            &["mkfs.xfs", "-q", "-K", "-L", MKFS_LABEL, &env.dev],
             ok(""),
         )
         .expect_s(&["xfs_admin", "-L", "--", &env.dev], ok(""));
@@ -952,10 +993,10 @@ async fn own_marker_guards_even_when_cache_and_api_fail() {
 async fn mark_then_wipe(env: &Env, svc: &NodeService) -> usize {
     let staging = env.path("staging");
     findmnt(&env.x, &staging, false);
-    blkid(&env.x, &env.dev, code(2, "", ""));
+    blank(&env.x, &env.dev);
     env.x
         .expect_s(
-            &["mkfs.xfs", "-q", "-f", "-K", "-L", MKFS_LABEL, &env.dev],
+            &["mkfs.xfs", "-q", "-K", "-L", MKFS_LABEL, &env.dev],
             ok(""),
         )
         .expect_s(&["xfs_admin", "-L", "--", &env.dev], ok(""));
@@ -1003,7 +1044,7 @@ async fn marked_volume_with_wiped_record_and_empty_device_is_refused() {
     let svc = env.svc(Lookup::default());
     let from = mark_then_wipe(&env, &svc).await;
     findmnt(&env.x, &env.path("staging"), false);
-    blkid(&env.x, &env.dev, code(2, "", ""));
+    blank(&env.x, &env.dev);
     let e = svc
         .stage(stage_req(&env, mount_cap("", &[])))
         .await
@@ -1020,10 +1061,10 @@ async fn marker_write_failure_means_no_mount() {
     let env = Env::new("fs-write-fail");
     env.fs.fail.store(true, std::sync::atomic::Ordering::SeqCst);
     findmnt(&env.x, &env.path("staging"), false);
-    blkid(&env.x, &env.dev, code(2, "", ""));
+    blank(&env.x, &env.dev);
     env.x
         .expect_s(
-            &["mkfs.xfs", "-q", "-f", "-K", "-L", MKFS_LABEL, &env.dev],
+            &["mkfs.xfs", "-q", "-K", "-L", MKFS_LABEL, &env.dev],
             ok(""),
         )
         .expect_s(&["xfs_admin", "-L", "--", &env.dev], ok(""));
@@ -1157,7 +1198,7 @@ async fn empty_device_with_a_live_marker_only_is_failed_precondition() {
     let env = Env::new("fs-empty-live");
     env.fs.server(Ok(Some("xfs")));
     findmnt(&env.x, &env.path("staging"), false);
-    blkid(&env.x, &env.dev, code(2, "", ""));
+    blank(&env.x, &env.dev);
     let e = stage_mount(&env).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::FailedPrecondition);
     assert_eq!(e.message(), "volume records xfs but the device is empty");
@@ -1237,10 +1278,10 @@ async fn plain_volume_keeps_its_uuid() {
     // A plain volume being formatted never runs the UUID step.
     let env = Env::new("fs-plain");
     findmnt(&env.x, &env.path("staging"), false);
-    blkid(&env.x, &env.dev, code(2, "", ""));
+    blank(&env.x, &env.dev);
     env.x
         .expect_s(
-            &["mkfs.xfs", "-q", "-f", "-K", "-L", MKFS_LABEL, &env.dev],
+            &["mkfs.xfs", "-q", "-K", "-L", MKFS_LABEL, &env.dev],
             ok(""),
         )
         .expect_s(&["xfs_admin", "-L", "--", &env.dev], ok(""));

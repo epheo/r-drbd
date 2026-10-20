@@ -100,12 +100,11 @@ impl TokioExec {
         let argv = cmd.argv.clone();
         self.finishing.send_modify(|n| *n += 1);
         let guard = Finishing(self.finishing.clone());
-        let (pid_tx, pid_rx) = tokio::sync::oneshot::channel();
         // Spawned: dropping this future drops only the JoinHandle, never the
         // task that owns and reaps the child.
         let mut task = tokio::spawn(async move {
             let _guard = guard;
-            cmd.finish(pid_tx).await
+            cmd.finish().await
         });
         if let Ok(joined) = tokio::time::timeout(wait, &mut task).await {
             return joined.unwrap_or_else(|e| {
@@ -115,13 +114,9 @@ impl TokioExec {
                 ))
             });
         }
-        // LVM defers SIGTERM while devices are suspended. The command may
-        // still complete after this error; callers re-read on the next pass.
-        if let Ok(pid) = pid_rx.await
-            && let Some(pid) = rustix::process::Pid::from_raw(pid)
-        {
-            let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
-        }
+        // Never signalled: the child may already be reaped (pipe drain), and
+        // with hostPID a recycled pid can be any host process. The command
+        // may still complete after this error; callers re-read on the next pass.
         tracing::warn!(argv = ?argv, ?wait, "command still running after its wait, left to finish");
         Err(ExecError::Timeout(wait, argv.join(" ")))
     }
@@ -180,8 +175,8 @@ struct Spawn {
 }
 
 impl Spawn {
-    /// Runs to the end, never signalled from here; the pid goes out first.
-    async fn finish(self, pid_tx: tokio::sync::oneshot::Sender<i32>) -> Result<Output, ExecError> {
+    /// Runs to the end, never signalled.
+    async fn finish(self) -> Result<Output, ExecError> {
         let name = self.argv[0].clone();
         let started = Instant::now();
         let mut child = Command::new(&self.program)
@@ -192,9 +187,6 @@ impl Spawn {
             .kill_on_drop(false)
             .spawn()
             .map_err(|e| ExecError::Spawn(name.clone(), e))?;
-        if let Some(pid) = child.id().and_then(|id| i32::try_from(id).ok()) {
-            let _ = pid_tx.send(pid);
-        }
         let stdout = Pipe::spawn(child.stdout.take());
         let stderr = Pipe::spawn(child.stderr.take());
         let status = child.wait().await.map_err(|e| {
@@ -670,9 +662,15 @@ mod tests {
         assert!(x.wait_idle(Duration::from_secs(5)).await);
         assert!(done.exists(), "the process ran to its end");
 
-        // Past its wait, ignoring SIGTERM: a Timeout error, never a kill.
+        // Past its wait: a Timeout error, never a signal, so a reaped pid
+        // is never signalled either.
         let late = dir.join("late");
-        let script = format!("trap '' TERM; sleep 0.5; touch {}", late.display());
+        let termed = dir.join("termed");
+        let script = format!(
+            "trap 'touch {}' TERM; sleep 0.5; touch {}",
+            termed.display(),
+            late.display()
+        );
         let mode = ExecMode::Finish {
             wait: Duration::from_millis(100),
         };
@@ -680,6 +678,7 @@ mod tests {
         assert!(matches!(r, Err(ExecError::Timeout(..))), "{r:?}");
         assert!(x.wait_idle(Duration::from_secs(5)).await);
         assert!(late.exists(), "still completed after the error");
+        assert!(!termed.exists(), "no signal after the wait");
 
         // The same under Timeout is killed with the caller.
         let gone = dir.join("gone");

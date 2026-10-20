@@ -6,7 +6,6 @@ license.workspace = true
 description = "r-drbd: DRBD resource file rendering and internal metadata sizing (pure)"
 
 [dependencies]
-ring = { version = "0.17.14", default-features = false }
 thiserror = "2.0.21"
 
 [lints]

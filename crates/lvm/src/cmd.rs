@@ -66,7 +66,7 @@ pub const FILTER_IGNORED_NOTICE: &str =
     "Please remove the lvm.conf filter, it is ignored with the devices file.";
 
 /// Fields of the LV report: what the reconciler and the pool probe read.
-pub const LV_FIELDS: &str = "lv_name,lv_path,lv_size,segtype,pool_lv,lv_active_locally,lv_device_open,zero,data_percent,chunk_size";
+pub const LV_FIELDS: &str = "lv_name,lv_path,lv_size,segtype,pool_lv,lv_active_locally,lv_device_open,zero,data_percent,chunk_size,metadata_percent,lv_health_status";
 pub const TAG_FIELDS: &str = "lv_name,lv_tags";
 pub const VG_FIELDS: &str = "vg_name,vg_extent_size";
 /// Every VG of the host, for a Pool built from devices.

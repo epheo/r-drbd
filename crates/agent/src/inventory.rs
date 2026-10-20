@@ -22,7 +22,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::Instant;
 
 pub mod events;
-mod scan;
+pub(crate) mod scan;
 
 pub use events::Watcher;
 pub use scan::{Lvm, Scanner};

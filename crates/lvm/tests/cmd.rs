@@ -33,7 +33,7 @@ fn reports() {
     };
     let mut want = head("lvs");
     want.extend(v(&[
-        "lv_name,lv_path,lv_size,segtype,pool_lv,lv_active_locally,lv_device_open,zero,data_percent,chunk_size",
+        "lv_name,lv_path,lv_size,segtype,pool_lv,lv_active_locally,lv_device_open,zero,data_percent,chunk_size,metadata_percent,lv_health_status",
         "vg1",
     ]));
     assert_eq!(cmd::lvs("vg1"), want);

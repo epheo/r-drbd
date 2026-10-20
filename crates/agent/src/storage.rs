@@ -487,6 +487,24 @@ pub fn pool_capacity(lvs: &[Lv], thin: &str) -> Result<PoolCapacity, String> {
     })
 }
 
+/// Thin pool metadata use past which the Pool takes no new volumes: a pool
+/// whose metadata fills up stops every LV in it.
+pub const METADATA_FULL_PERCENT: u64 = 80;
+
+/// Why a thin pool that reports its capacity should still take no new
+/// volumes: LVM flags its health, or its metadata is nearly full.
+pub fn pool_health(lvs: &[Lv], thin: &str) -> Option<String> {
+    let pool = lvs.iter().find(|r| r.name == thin && r.thin_pool)?;
+    if !pool.health.is_empty() {
+        return Some(format!("thin pool {thin} health: {}", pool.health));
+    }
+    pool.metadata_used
+        .filter(|m| m.above(METADATA_FULL_PERCENT))
+        .map(|m| {
+            format!("thin pool {thin} metadata {m} percent used, over {METADATA_FULL_PERCENT}")
+        })
+}
+
 /// sizeBytes rounded up to the VG extent size.
 pub fn desired_bytes(size_bytes: u64, extent_bytes: u64) -> u64 {
     if extent_bytes == 0 {

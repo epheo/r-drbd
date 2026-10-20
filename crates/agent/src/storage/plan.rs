@@ -2,6 +2,8 @@
 //! Pure: the caller observes, asks for one step, runs it and observes
 //! again, so a crash between any two steps resumes from what is there.
 
+use std::collections::BTreeSet;
+
 use lvm::report::{PoolLv, VgFull};
 use model::{DeviceState, DeviceStatus};
 
@@ -318,17 +320,30 @@ pub enum Release {
 /// `lvs`: names of the visible LVs of the VG, the thin pool's included,
 /// with whether the thin pool is active. `orphans`: listed paths that are
 /// PVs without a VG and that this Pool's status last showed as Member.
+/// `devices`: this look's rows of the listed paths; `members`: the paths
+/// the status last showed as Member.
 pub fn release(
     t: &Target<'_>,
     vg: Option<&VgFull>,
     lvs: &[(String, bool)],
     orphans: &[String],
+    devices: &[DeviceStatus],
+    members: &BTreeSet<&str>,
 ) -> Result<Release, String> {
     let Some(vg) = vg else {
-        if orphans.is_empty() {
+        if !orphans.is_empty() {
+            return Ok(Release::RemovePvs(orphans.to_vec()));
+        }
+        // No VG in sight is no proof: its disks may be hidden or gone.
+        let held = unreleased(devices, members);
+        if held.is_empty() {
             return Ok(Release::Done);
         }
-        return Ok(Release::RemovePvs(orphans.to_vec()));
+        return Err(format!(
+            "volume group {} not found, but not every disk reads blank: {}",
+            t.vg,
+            describe(&held)
+        ));
     };
     if !vg.tags.iter().any(|g| g == t.tag) {
         return Err(format!(
@@ -359,6 +374,20 @@ pub fn release(
         Some((_, false)) => Release::RemovePool,
         None => Release::RemoveVg,
     })
+}
+
+/// Rows that do not prove the disk free of the VG. A member must read
+/// Blank; another path may also be gone or hold something else, since no
+/// VG of ours was ever built on it. A disk that cannot be read proves nothing.
+fn unreleased<'a>(devices: &'a [DeviceStatus], members: &BTreeSet<&str>) -> Vec<&'a DeviceStatus> {
+    devices
+        .iter()
+        .filter(|d| match d.state {
+            DeviceState::Blank => false,
+            DeviceState::Missing | DeviceState::NotEmpty => members.contains(d.path.as_str()),
+            DeviceState::Member | DeviceState::Busy | DeviceState::NotADisk => true,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -663,40 +692,79 @@ mod tests {
 
     #[test]
     fn release_rows() {
+        let none = BTreeSet::new();
         let ours = vg(8 * GIB, 0, TAG);
         let lv = |n: &str, active: bool| (n.to_owned(), active);
         assert_eq!(
-            release(&T, Some(&ours), &[lv("thin", true)], &[]),
+            release(&T, Some(&ours), &[lv("thin", true)], &[], &[], &none),
             Ok(Release::Deactivate)
         );
         assert_eq!(
-            release(&T, Some(&ours), &[lv("thin", false)], &[]),
+            release(&T, Some(&ours), &[lv("thin", false)], &[], &[], &none),
             Ok(Release::RemovePool)
         );
-        assert_eq!(release(&T, Some(&ours), &[], &[]), Ok(Release::RemoveVg));
+        assert_eq!(
+            release(&T, Some(&ours), &[], &[], &[], &none),
+            Ok(Release::RemoveVg)
+        );
         // Restart after vgremove: only the recorded members are cleared.
         assert_eq!(
-            release(&T, None, &[], &[A.into()]),
+            release(&T, None, &[], &[A.into()], &[], &none),
             Ok(Release::RemovePvs(vec![A.into()]))
         );
-        assert_eq!(release(&T, None, &[], &[]), Ok(Release::Done));
         // Anything else in the VG stops it, named.
         assert_eq!(
             release(
                 &T,
                 Some(&ours),
                 &[lv("thin", true), lv("pvc-1", true), lv("mine", false)],
-                &[]
+                &[],
+                &[],
+                &none
             ),
             Err("volume group vg1 holds LV pvc-1, mine: nothing removed".into())
         );
         let foreign = vg(8 * GIB, 0, &[]);
         assert_eq!(
-            release(&T, Some(&foreign), &[], &[]),
+            release(&T, Some(&foreign), &[], &[], &[], &none),
             Err("volume group vg1 has no tag r-drbd.pool.p1: nothing removed".into())
         );
         let mut partial = vg(8 * GIB, 0, TAG);
         partial.missing_pvs = 2;
-        assert!(release(&T, Some(&partial), &[], &[]).is_err());
+        assert!(release(&T, Some(&partial), &[], &[], &[], &none).is_err());
+    }
+
+    #[test]
+    fn release_without_a_vg_needs_proof() {
+        use DeviceState::*;
+        let members: BTreeSet<&str> = [A, B].into();
+        let none = BTreeSet::new();
+        let done = |d: &[DeviceStatus], m: &BTreeSet<&str>| release(&T, None, &[], &[], d, m);
+        assert_eq!(
+            done(&[row(A, Blank), row(B, Blank)], &members),
+            Ok(Release::Done)
+        );
+        // All devices gone: proof only for paths that never were members.
+        assert_eq!(
+            done(&[row(A, Missing), row(B, Missing)], &none),
+            Ok(Release::Done)
+        );
+        let e = done(&[row(A, Missing), row(B, Blank)], &members).unwrap_err();
+        assert_eq!(
+            e,
+            format!("volume group vg1 not found, but not every disk reads blank: {A} is Missing")
+        );
+        // A disk that still shows the VG (hidden from the VG report).
+        let e = done(&[row(A, Member), row(B, Blank)], &members).unwrap_err();
+        assert!(e.ends_with(&format!("{A} is Member")), "{e}");
+        // A disk that cannot be read.
+        let mut busy = row(B, Busy);
+        busy.message = Some("open failed".into());
+        let e = done(&[row(A, Blank), busy], &members).unwrap_err();
+        assert!(e.ends_with(&format!("{B} is Busy: open failed")), "{e}");
+        // Never a member: something else on it is not ours.
+        assert_eq!(done(&[row(A, NotEmpty)], &none), Ok(Release::Done));
+        assert!(done(&[row(A, NotEmpty)], &members).is_err());
+        assert!(done(&[row(C, NotADisk)], &none).is_err());
     }
 }

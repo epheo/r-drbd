@@ -181,7 +181,7 @@ Pick the link of the whole disk (no `-part` suffix); the target (`../../nvme1n1`
 | Field | Meaning |
 |---|---|
 | `totalBytes`, `freeBytes` | Thin pool data size and free space |
-| `chunkBytes` | Thin pool chunk size; DRBD discards are aligned to it |
+| `chunkBytes` | Thin pool chunk size; DRBD resync discards are aligned to it, capped at 1 MiB |
 | `committedBytes` | Sum of the sizes of the volumes with a diskful replica here |
 | `placeableBytes` | Largest new volume placement accepts here now, rounded down to MiB; 0 when the Pool is not Available, its node is not Ready or its agent is down, or it is being deleted |
 | `volumes` | Volumes with a diskful replica here |
@@ -193,7 +193,7 @@ Pick the link of the whole disk (no `-part` suffix); the target (`../../nvme1n1`
 | Reason | Status | Meaning |
 |---|---|---|
 | `ThinPoolReady` | True | The thin pool is usable |
-| `ThinPoolUnavailable` | False | The VG or thin pool is missing or unreadable; the message holds the LVM error |
+| `ThinPoolUnavailable` | False | The VG or thin pool is missing or unreadable, or LVM flags its health, or its metadata is over 80 percent used; the message says which. In the last two cases capacity stays reported and existing volumes keep running, but no new volume is placed there |
 | `ZeroingDisabled` | False | Zeroing is off and turning it on failed |
 | `InvalidName` | False | `vg` or `thinPool` is not a valid LVM name |
 | `DeviceNotEmpty` | False | Devices mode: a path holds a signature or partitions |

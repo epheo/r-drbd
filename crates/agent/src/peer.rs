@@ -57,10 +57,6 @@ pub fn classify(r: &io::Result<()>) -> (ProbeResult, Option<String>) {
     }
 }
 
-pub fn wall_now() -> Time {
-    model::time::now()
-}
-
 /// A peer's agent Lease as this agent sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerLease {
@@ -123,7 +119,10 @@ pub struct Seen {
 pub type Due = (String, String, SocketAddr);
 
 fn age(t: &Time) -> Duration {
-    let secs = wall_now().0.as_second().saturating_sub(t.0.as_second());
+    let secs = model::time::now()
+        .0
+        .as_second()
+        .saturating_sub(t.0.as_second());
     Duration::from_secs(u64::try_from(secs).unwrap_or(0))
 }
 
@@ -188,7 +187,7 @@ impl Watch {
             }
             let (down_at, since) = match prior {
                 Some(p) => (back(now, age(&p.since)), p.since.clone()),
-                None => (now, wall_now()),
+                None => (now, model::time::now()),
             };
             if prior.is_none()
                 && self
@@ -270,7 +269,7 @@ impl Watch {
             port: target.port(),
             since: c.since.clone(),
             result,
-            probed_at: wall_now(),
+            probed_at: model::time::now(),
             error,
             peer_run: c.epoch.map(Time),
         };
@@ -522,7 +521,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_restart_resumes_from_the_last_status() {
-        let ten = Time(Timestamp::from_second(wall_now().0.as_second() - 100).unwrap());
+        let ten = Time(Timestamp::from_second(model::time::now().0.as_second() - 100).unwrap());
         let prior = PeerProbe {
             node: "n2".into(),
             address: "10.0.0.2".into(),
