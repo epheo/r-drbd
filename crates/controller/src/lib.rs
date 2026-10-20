@@ -165,9 +165,7 @@ fn request_config(mut config: kube::Config) -> kube::Config {
 /// SIGTERM (Ok, Lease released) or until leadership is lost or a component
 /// fails (Err); the caller exits the process.
 pub async fn run(cfg: Config) -> Result<(), Error> {
-    let config = kube::Config::infer()
-        .await
-        .map_err(Error::KubeConfig)?;
+    let config = kube::Config::infer().await.map_err(Error::KubeConfig)?;
     Box::pin(run_with_clients(cfg, Clients::new(config)?)).await
 }
 
@@ -418,7 +416,7 @@ pub(crate) async fn warning_event(client: &Client, v: &model::Volume, reason: &s
 async fn emit(client: &Client, v: &model::Volume, type_: &str, reason: &str, message: &str) {
     use k8s_openapi::api::core::v1::{Event, EventSource, ObjectReference};
     let name = v.name_any();
-    let now = now();
+    let now = model::time::now();
     let ev = Event {
         metadata: kube::api::ObjectMeta {
             generate_name: Some(format!("{name}.")),

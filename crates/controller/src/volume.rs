@@ -827,7 +827,9 @@ impl Owned {
         let mut conditions = build_conditions(existing, conds, generation);
         conditions.sort_by(|a, b| a.type_.cmp(&b.type_));
         // Only the candidate; `write` carries an earlier value first.
-        let initialized_at = summary.filter(|s| s.initialized).map(|_| crate::now());
+        let initialized_at = summary
+            .filter(|s| s.initialized)
+            .map(|_| model::time::now());
         Self {
             phase,
             conditions,
@@ -886,7 +888,7 @@ pub(crate) fn build_conditions(
                 c.reason,
                 c.message.clone(),
                 generation,
-                crate::now(),
+                model::time::now(),
             ),
         );
     }
