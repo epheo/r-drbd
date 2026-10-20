@@ -38,6 +38,10 @@ static FREED: Condvar = Condvar::new();
 /// instead of letting them pass as skipped.
 const REQUIRE_ENVTEST: &str = "R_DRBD_REQUIRE_ENVTEST";
 
+pub fn envtest_required() -> bool {
+    std::env::var_os(REQUIRE_ENVTEST).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 /// The envtest binaries, or None with the reason printed.
 pub fn assets() -> Option<PathBuf> {
     let dir = std::env::var_os("KUBEBUILDER_ASSETS")
@@ -55,10 +59,7 @@ pub fn assets() -> Option<PathBuf> {
                 "envtest binary {} missing (set KUBEBUILDER_ASSETS)",
                 dir.join(bin).display()
             );
-            assert!(
-                std::env::var_os(REQUIRE_ENVTEST).is_none_or(|v| v.is_empty() || v == "0"),
-                "{why}; {REQUIRE_ENVTEST} is set"
-            );
+            assert!(!envtest_required(), "{why}; {REQUIRE_ENVTEST} is set");
             eprintln!("SKIPPED: {why}");
             return None;
         }

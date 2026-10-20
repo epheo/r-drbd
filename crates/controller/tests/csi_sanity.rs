@@ -1,5 +1,7 @@
 //! csi-sanity against the CSI controller plugin, with a fake agent on one
-//! node. Opt in with R_DRBD_CSI_SANITY=1 (tools/harness/csi-sanity.sh).
+//! node. Runs with R_DRBD_CSI_SANITY=1 (tools/harness/csi-sanity.sh) or
+//! R_DRBD_REQUIRE_ENVTEST=1; the binary is CSI_SANITY, else csi-sanity in
+//! the Go bin dir or on PATH.
 
 mod support;
 
@@ -76,6 +78,20 @@ impl Node for FakeNode {
     }
 }
 
+fn sanity_bin() -> String {
+    if let Ok(bin) = std::env::var("CSI_SANITY") {
+        return bin;
+    }
+    let go_bin = std::env::var_os("GOPATH")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join("go")))
+        .map(|d| d.join("bin/csi-sanity"));
+    match go_bin {
+        Some(p) if p.is_file() => p.display().to_string(),
+        _ => "csi-sanity".to_owned(),
+    }
+}
+
 /// Runs csi-sanity once; returns (success, summary lines).
 async fn sanity(bin: &str, args: Vec<String>) -> (bool, Vec<String>) {
     let mut cmd = Command::new(bin);
@@ -103,12 +119,14 @@ async fn sanity(bin: &str, args: Vec<String>) -> (bool, Vec<String>) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn csi_sanity() {
-    if std::env::var_os("R_DRBD_CSI_SANITY").is_none() {
+    // The require flag covers this test too, so a CI edit cannot turn it
+    // into a silent pass.
+    if std::env::var_os("R_DRBD_CSI_SANITY").is_none() && !support::envtest_required() {
         eprintln!("SKIPPED: set R_DRBD_CSI_SANITY=1 to run csi-sanity");
         return;
     }
     let assets = require_envtest!();
-    let bin = std::env::var("CSI_SANITY").unwrap_or_else(|_| "csi-sanity".to_owned());
+    let bin = sanity_bin();
     support::init_tracing();
     let env = Env::start(&assets).await;
     let client = env.client().await;

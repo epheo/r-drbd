@@ -41,7 +41,6 @@ jobs:
         env:
           KUBEBUILDER_ASSETS: ${{ runner.temp }}/tools
           R_DRBD_REQUIRE_ENVTEST: "1"
-          R_DRBD_CSI_SANITY: "1"
           CSI_SANITY: ${{ runner.temp }}/tools/csi-sanity
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
