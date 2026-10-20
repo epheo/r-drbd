@@ -93,4 +93,6 @@ Snapshot it, then restore the snapshot.
 ## Deleting
 
 Deleting the VolumeSnapshot (deletion policy Delete) deletes the Snapshot, and each node removes its snapshot LV.
-A Snapshot that a restore still reads from stays until the restored volume is first Ready; a node holding a copy for that restore keeps it until then.
+A Snapshot waits for the restores from it that are not yet initialized: it stays until each restored volume is first Ready, and a node holding a copy for such a restore keeps it until then.
+A restore that cannot start says why in its Ready condition, for example "LV <vg>/<lv> is not this restore's copy of snapshot <name>; delete the claim and restore again".
+Deleting a stuck claim removes its LVs and releases the Snapshot.

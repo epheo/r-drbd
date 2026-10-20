@@ -4,7 +4,7 @@
 //! Suspended and Taken are markers the controller passes through on its
 //! own: the next round starts on the following pass without new acks.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
@@ -279,9 +279,10 @@ async fn write(api: &Api<Snapshot>, s: &Snapshot, mut wanted: Owned) {
 pub(crate) async fn reconcile_all(ctx: &Ctx<'_>, memory: &mut Memory) -> Option<Duration> {
     let api: Api<Snapshot> = Api::all(ctx.client.clone());
     let snapshots = Stores::sorted(&ctx.stores.snapshots);
+    let restores = restoring_from(&Stores::sorted(&ctx.stores.volumes));
     let mut wake: Option<Duration> = None;
     for s in snapshots {
-        if let Some(d) = reconcile(ctx, memory, &api, &s).await {
+        if let Some(d) = reconcile(ctx, memory, &api, &s, &restores).await {
             wake = Some(wake.map_or(d, |w| w.min(d)));
         }
     }
@@ -293,6 +294,7 @@ async fn reconcile(
     memory: &mut Memory,
     api: &Api<Snapshot>,
     s: &Snapshot,
+    restores: &BTreeMap<String, String>,
 ) -> Option<Duration> {
     let name = s.name_any();
     let current = Owned::current(s);
@@ -307,9 +309,8 @@ async fn reconcile(
         .map(|r| r.node.clone())
         .collect();
     if s.metadata.deletion_timestamp.is_some() {
-        let volumes = Stores::sorted(&ctx.stores.volumes);
-        let restoring = restoring_from(&volumes, &name);
-        delete(api, s, current, &diskful, restoring.as_deref()).await;
+        let restoring = restores.get(&name).map(String::as_str);
+        delete(api, s, current, &diskful, restoring).await;
         return None;
     }
     if !has_finalizer(s, FINALIZER_SNAPSHOT) {
@@ -618,24 +619,25 @@ async fn apply_step(
     }
 }
 
-/// A placed restore from `snapshot` without its first data yet. Its holders
-/// still need their copy: a lost LV is restored again until initializedAt,
-/// and a replica without a copy turns the restore into a full sync.
-pub fn restoring_from(volumes: &[std::sync::Arc<Volume>], snapshot: &str) -> Option<String> {
-    volumes
-        .iter()
-        .find(|v| {
-            v.spec
-                .source
+/// Snapshot name to one placed restore from it without its first data yet.
+/// Its holders still need their copy: a lost LV is restored again until
+/// initializedAt, and a replica without a copy turns the restore into a
+/// full sync. Built once per pass.
+pub fn restoring_from(volumes: &[std::sync::Arc<Volume>]) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for v in volumes {
+        let Some(src) = &v.spec.source else { continue };
+        let waiting = v.spec.assignment.is_some()
+            && v.metadata.deletion_timestamp.is_none()
+            && v.status
                 .as_ref()
-                .is_some_and(|src| src.snapshot == snapshot)
-                && v.spec.assignment.is_some()
-                && v.metadata.deletion_timestamp.is_none()
-                && v.status
-                    .as_ref()
-                    .is_none_or(|st| st.initialized_at.is_none())
-        })
-        .map(|v| v.name_any())
+                .is_none_or(|st| st.initialized_at.is_none());
+        if waiting {
+            out.entry(src.snapshot.clone())
+                .or_insert_with(|| v.name_any());
+        }
+    }
+    out
 }
 
 /// Releases the finalizer once every node that may hold the LV removed it,
@@ -1001,11 +1003,9 @@ mod tests {
             Volume::new(name, spec)
         };
         let v = restore("v", "snap");
-        assert_eq!(
-            restoring_from(&[Arc::new(v.clone())], "snap").as_deref(),
-            Some("v")
-        );
-        assert_eq!(restoring_from(&[Arc::new(v.clone())], "other"), None);
+        let held = restoring_from(&[Arc::new(v.clone())]);
+        assert_eq!(held.get("snap").map(String::as_str), Some("v"));
+        assert_eq!(held.get("other"), None);
         let mut init = v.clone();
         init.status = Some(VolumeStatus {
             initialized_at: Some(Time(Timestamp::now())),
@@ -1016,7 +1016,7 @@ mod tests {
         let mut deleting = v;
         deleting.metadata.deletion_timestamp = Some(Time(Timestamp::now()));
         for x in [init, unplaced, deleting] {
-            assert_eq!(restoring_from(&[Arc::new(x)], "snap"), None);
+            assert!(restoring_from(&[Arc::new(x)]).is_empty());
         }
     }
 
