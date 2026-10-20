@@ -829,13 +829,24 @@ async fn drbd_snapshot_copies_match_under_a_writer() {
                 },
             );
             s.metadata.uid = Some(format!("uid-{}-s{i}", m.res));
+            // rw-b names rw-a's node m0: it suspends only after the
+            // Primary's ack, which a is about to write in this order.
+            let primary = model::SnapshotAck {
+                node: "m0".into(),
+                phase: SnapshotPhase::Suspending,
+                pool: None,
+                ok: true,
+                error: None,
+            };
             s.status = Some(SnapshotStatus {
                 phase,
+                acks: vec![primary],
                 ..SnapshotStatus::default()
             });
             Arc::new(s)
         };
-        // Every replica suspends before any takes, as in a real round.
+        // The Primary suspends first, then the Secondary; every replica
+        // before any takes, as in a real round.
         for phase in [SnapshotPhase::Suspending, SnapshotPhase::Taking] {
             for m in [&mut *a, &mut *b] {
                 let s = snap(m, phase);

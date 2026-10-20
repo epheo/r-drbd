@@ -48,6 +48,9 @@ pub struct DrbdEnv {
     pub init_wait: Duration,
     /// First wait before a plan that came back is adjusted again.
     pub repeat_backoff: Duration,
+    /// How long a suspended Primary waits for its writes in flight to
+    /// land before it acks; well inside the suspend bound.
+    pub drain_wait: Duration,
     /// This host's kernel node name, for its own `on` section: drbdadm
     /// finds its host by uname, which may differ from the Kubernetes
     /// node name. None uses the node name.
@@ -68,6 +71,7 @@ impl DrbdEnv {
             // Down is a local state change; events2 reports it within
             // milliseconds, and drbdsetup status decides after anyway.
             down_wait: Duration::from_secs(5),
+            drain_wait: Duration::from_secs(10),
             // A resync finishing on a fresh small volume takes seconds;
             // a longer one leaves the adjust to the next pass.
             adjust_retry: vec![Duration::from_secs(1), Duration::from_secs(3)],
@@ -1824,7 +1828,49 @@ impl Reconciler {
                 mine: true,
             },
         );
+        if r.is_primary() {
+            self.drained(volume).await?;
+        }
         Ok(())
+    }
+
+    /// A Primary acks its suspend only once nothing it wrote is still on
+    /// its way to its disk or a peer: the Secondaries suspend after that
+    /// ack, so they then hold every write the Primary's copy holds.
+    async fn drained(&self, volume: &str) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + self.drbd.drain_wait;
+        loop {
+            let out = self
+                .drbd_cmd(&argv::status_stats_json(volume), DRBD_TIMEOUT)
+                .await?;
+            let Some(busy) = drbd::json_in_flight(&out) else {
+                return Ok(());
+            };
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!("writes still in flight after the suspend: {busy}"));
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
+    /// The other replicas of `vol` that are Primary: from this node's view
+    /// of a connected peer, else from the peer's last status entry.
+    pub(super) fn other_primaries(&self, vol: &Volume) -> Vec<String> {
+        let r = self.tracked(&vol.name_any());
+        let entries = vol.status.as_ref().map_or(&[][..], |st| &st.replicas);
+        vol.spec
+            .assignment
+            .iter()
+            .flat_map(|a| &a.replicas)
+            .filter(|x| x.node != self.node)
+            .filter(
+                |x| match r.as_ref().and_then(|r| r.connections.get(&x.node)) {
+                    Some(c) if c.state == "Connected" => c.peer_role.as_deref() == Some("Primary"),
+                    _ => entries.iter().any(|e| e.node == x.node && e.in_use),
+                },
+            )
+            .map(|x| x.node.clone())
+            .collect()
     }
 
     /// Status of the replicated volumes events2 touched since the last call,

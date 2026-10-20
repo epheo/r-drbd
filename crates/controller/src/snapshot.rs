@@ -118,6 +118,19 @@ pub fn start_blocker(r: &Round<'_>) -> Option<String> {
     }
     let entries = st.map(|s| s.replicas.as_slice()).unwrap_or_default();
     let entry = |n: &str| entries.iter().find(|e| e.node == n);
+    // Each Secondary suspends after the Primary drained; with two
+    // Primaries (a live migration) neither order holds for both.
+    let primaries: Vec<&str> = r
+        .nodes(None)
+        .into_iter()
+        .filter(|n| entry(n).is_some_and(|e| e.in_use))
+        .collect();
+    if primaries.len() > 1 {
+        return Some(format!(
+            "more than one Primary ({}): no round while two nodes write",
+            primaries.join(", ")
+        ));
+    }
     let diskful = r.nodes(Some(Role::Diskful));
     let mut problems = Vec::new();
     for n in &diskful {
@@ -984,6 +997,19 @@ mod tests {
                 "resize",
             ),
         ];
+        let two_primaries: Edit = |c| {
+            c.status().replicas[0].in_use = true;
+            c.status().replicas[1].in_use = true;
+        };
+        let cases = &[
+            cases,
+            &[(
+                "two primaries",
+                two_primaries,
+                "more than one Primary (n1, n2)",
+            )],
+        ]
+        .concat();
         for (what, edit, needle) in cases {
             let mut c = Case::new(P::Pending, &[]);
             edit(&mut c);
@@ -991,6 +1017,10 @@ mod tests {
             assert!(matches!(step, Step::Hold(_)), "{what}: {step:?}");
             held(&step, needle);
         }
+        // One Primary is the common case.
+        let mut c = Case::new(P::Pending, &[]);
+        c.status().replicas[0].in_use = true;
+        assert_eq!(c.next(), go(P::Suspending, None));
         // A cut tiebreaker writes nothing: no hold.
         let mut c = Case::new(P::Pending, &[]);
         c.status().replicas[2].peers.clear();

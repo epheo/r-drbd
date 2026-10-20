@@ -2376,11 +2376,114 @@ async fn diskless_replica_suspends_and_acks_without_pool() {
     r.expect_check();
     dry(&r.x, "");
     r.x.expect(argv::suspend_io(50000), ok(""));
+    // A diskless Primary has no disk counter; its peers drained.
+    r.x.expect(
+        argv::status_stats_json("pvc-1"),
+        ok(&stats(None, &[("n1", 0, 0), ("n2", 0, 0)])),
+    );
     let w = r
         .pass(&[volume(GIB)], &[snapshot(SnapshotPhase::Suspending)])
         .await;
     let a = acks(&w);
     assert_eq!((a[0].ok, a[0].pool.as_deref()), (true, None));
+}
+
+/// `drbdsetup status --json --statistics` of pvc-1: the disk's
+/// lower-pending, then (peer, pending, unacked) per connection.
+fn stats(lower: Option<u64>, peers: &[(&str, u64, u64)]) -> String {
+    let device = lower.map_or(
+        serde_json::json!({ "volume": 0 }),
+        |l| serde_json::json!({ "volume": 0, "lower-pending": l, "upper-pending": 7 }),
+    );
+    let conns: Vec<_> = peers
+        .iter()
+        .map(|(n, p, u)| {
+            serde_json::json!({ "name": n, "peer_devices": [
+                { "volume": 0, "pending": p, "unacked": u }
+            ]})
+        })
+        .collect();
+    serde_json::json!([{ "name": "pvc-1", "devices": [device], "connections": conns }]).to_string()
+}
+
+/// A Secondary suspends only once every Primary of the volume acked its
+/// own suspend: suspended first, it could miss a write the Primary holds.
+#[tokio::test]
+async fn a_secondary_suspends_after_the_primary() {
+    let mut lines = healthy();
+    lines[1] = "exists connection name:pvc-1 peer-node-id:1 conn-name:n2 connection:Connected role:Primary".into();
+    let mut r = Rig::new(&lines, up_host());
+    reads(&r.x, &[lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    dry(&r.x, "");
+    let w = r
+        .pass(&[volume(GIB)], &[snapshot(SnapshotPhase::Suspending)])
+        .await;
+    assert_eq!(acks(&w), vec![]);
+    assert!(!seen(&r.x, "suspend-io"));
+
+    let primary = SnapshotAck {
+        node: "n2".into(),
+        phase: SnapshotPhase::Suspending,
+        pool: Some("pool-n2".into()),
+        ok: true,
+        error: None,
+    };
+    let mut snap = snapshot(SnapshotPhase::Suspending);
+    snap.status.as_mut().unwrap().acks = vec![primary];
+    reads_again(&r.x, &[lv(LV_KIB)]);
+    dry(&r.x, "");
+    r.x.expect(argv::suspend_io(50000), ok(""));
+    let w = r.pass(&[volume(GIB)], &[snap]).await;
+    assert_eq!(acks(&w), vec![round_ack(SnapshotPhase::Suspending, true)]);
+}
+
+/// A Primary acks only once its writes left: nothing pending on its disk,
+/// nothing pending or unacked toward a peer.
+#[tokio::test]
+async fn a_primary_acks_only_once_drained() {
+    let mut lines = healthy();
+    lines[0] = "exists resource name:pvc-1 role:Primary suspended:no".into();
+    let mut r = Rig::new(&lines, up_host());
+    r.rec.drbd.drain_wait = Duration::ZERO;
+    reads(&r.x, &[lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    dry(&r.x, "");
+    r.x.expect(argv::suspend_io(50000), ok(""));
+    r.x.expect(
+        argv::status_stats_json("pvc-1"),
+        ok(&stats(Some(0), &[("n2", 0, 3), ("n3", 0, 0)])),
+    );
+    let w = r
+        .pass(&[volume(GIB)], &[snapshot(SnapshotPhase::Suspending)])
+        .await;
+    let a = &acks(&w)[0];
+    assert!(!a.ok);
+    assert_eq!(
+        a.error.as_deref(),
+        Some("writes still in flight after the suspend: unacked 3 to n2")
+    );
+
+    let mut r = Rig::new(&lines, up_host());
+    reads(&r.x, &[lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    dry(&r.x, "");
+    r.x.expect(argv::suspend_io(50000), ok(""));
+    r.x.expect(
+        argv::status_stats_json("pvc-1"),
+        ok(&stats(Some(1), &[("n2", 0, 0), ("n3", 0, 0)])),
+    );
+    r.x.expect(
+        argv::status_stats_json("pvc-1"),
+        ok(&stats(Some(0), &[("n2", 0, 0), ("n3", 0, 0)])),
+    );
+    let w = r
+        .pass(&[volume(GIB)], &[snapshot(SnapshotPhase::Suspending)])
+        .await;
+    assert_eq!(acks(&w), vec![round_ack(SnapshotPhase::Suspending, true)]);
 }
 
 fn resolving(survivor: &str, split: bool) -> Volume {

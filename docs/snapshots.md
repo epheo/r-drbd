@@ -35,12 +35,13 @@ A snapshot of a replicated volume therefore waits in Pending, saying why in `las
 - every diskful replica is UpToDate, and every diskful or attached replica is connected to every diskful replica;
 - every diskful replica applied the current spec;
 - no other snapshot of the same volume is suspending or taking.
+- at most one replica is Primary: no snapshot runs during a two-Primary live migration.
 
 A replica whose agent is down holds every snapshot of its volume; evict or detach it to take one.
 
 Then:
 
-1. Every replica suspends IO, diskless and tiebreaker included, within 30 s.
+1. Every replica suspends IO, diskless and tiebreaker included, within 30 s: the Primary first, and it acks once none of its writes is still on its way to a disk; the others suspend after that ack.
 2. Every diskful node creates a thin snapshot of its LV, and every other replica confirms its IO is still suspended, within 2 minutes.
 3. The snapshot is Ready, or Failed with the reason; every replica resumes IO on its own when it sees the round end.
 

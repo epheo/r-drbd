@@ -30,6 +30,10 @@ fn command_lines() {
     );
     assert_eq!(j(argv::connect_peer("r", "n2")), "drbdadm connect r:n2");
     assert_eq!(j(argv::status_json("r")), "drbdsetup status --json r");
+    assert_eq!(
+        j(argv::status_stats_json("r")),
+        "drbdsetup status --json --statistics r"
+    );
     assert_eq!(j(argv::status("r")), "drbdsetup status r");
     assert_eq!(j(argv::down("r")), "drbdsetup down r");
     assert_eq!(j(argv::disconnect("r")), "drbdadm disconnect r");
@@ -392,4 +396,28 @@ fn slot_holders_from_the_superblock() {
         argv::dump_superblock(50000, "/dev/vg/pvc-1").join(" "),
         "drbdmeta --force 50000 v09 /dev/vg/pvc-1 internal dump-superblock --output-format=json"
     );
+}
+
+#[test]
+fn in_flight_from_the_statistics() {
+    let status = |lower: u64, pending: u64, unacked: u64| {
+        format!(
+            r#"[{{"name":"r","devices":[{{"volume":0,"lower-pending":{lower},"upper-pending":3}}],
+            "connections":[{{"name":"n2","peer_devices":[{{"volume":0,"pending":{pending},"unacked":{unacked}}}]}},
+            {{"name":"n3","peer_devices":[{{"volume":0,"pending":0,"unacked":0}}]}}]}}]"#
+        )
+    };
+    // Frozen application requests (upper-pending) are no data in flight.
+    assert_eq!(super::json_in_flight(&status(0, 0, 0)), None);
+    assert_eq!(
+        super::json_in_flight(&status(0, 1, 2)).as_deref(),
+        Some("pending 1 to n2, unacked 2 to n2")
+    );
+    assert_eq!(
+        super::json_in_flight(&status(4, 0, 0)).as_deref(),
+        Some("lower-pending 4")
+    );
+    let blind = r#"[{"name":"r","devices":[],"connections":[{"name":"n2","peer_devices":[{"volume":0}]}]}]"#;
+    assert!(super::json_in_flight(blind).is_some());
+    assert!(super::json_in_flight("not json").is_some());
 }
