@@ -397,7 +397,8 @@ async fn guest_signatures_stay_hidden() {
     assert!(!duplicate_pv_warning(&text), "{text}");
 
     // Control: without the rules both guests show, the DRBD one twice.
-    let (names, text) = seen("devices { use_devicesfile = 0 scan_lvs = 1 }").await;
+    let (names, text) =
+        seen("devices { use_devicesfile = 0 scan_lvs = 1 global_filter = [ \"a|.*|\" ] }").await;
     println!("control: {:?}", guests(&names));
     assert_eq!(guests(&names).len(), 2, "{names:?}");
     assert!(
