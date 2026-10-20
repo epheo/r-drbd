@@ -72,9 +72,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn clients() -> Result<(Client, Client), Error> {
-    let config = kube::Config::infer()
-        .await
-        .map_err(Error::KubeConfig)?;
+    let config = kube::Config::infer().await.map_err(Error::KubeConfig)?;
     let watch = Client::try_from(config.clone())?;
     let mut writes = config;
     writes.connect_timeout = Some(CONNECT_TIMEOUT);
@@ -100,6 +98,9 @@ const CHANGE_WAIT_LOG: Duration = Duration::from_secs(30);
 /// error or when the CSI server dies. On a signal the running pass, its
 /// status writes and in-flight CSI operations finish first (bounded).
 pub async fn run(cfg: Config) -> Result<(), Error> {
+    // Before any startup work: from here on a SIGTERM waits for the guard
+    // instead of killing the process with the default action.
+    let signals = Signals::install()?;
     prepare_host(&cfg.res_dir, Path::new(DRBD_CONF_DIR))?;
     let (client, watch_client) = clients().await?;
     let runner = Arc::new(TokioExec::new(cfg.host_exec_prefix.clone()));
@@ -118,6 +119,9 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
         tracing::warn!("DRBD not found: replicated volumes cannot be served on this node");
     }
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    // Closed at SIGTERM: the running pass finishes, no new one starts, so no
+    // LVM change begins that kubelet's kill could cut while the guard runs.
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
     let inv = spawn_inventory(&cfg.node, &client, &exec, &stores, &stop_rx);
     let mut drbd_env = DrbdEnv::new(features, cfg.res_dir.clone(), tracker.clone());
     drbd_env.host_name = host_name();
@@ -159,6 +163,7 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
             disks: inv.wakes,
             ready: inv.ready,
         },
+        gate_rx,
         stop_rx,
     ));
 
@@ -171,7 +176,7 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
         })),
         // The other arms are only borrowed: while the guard runs, the
         // reconcile and CSI tasks keep running and the drain below waits for them.
-        r = signalled(&guard) => r,
+        () = signalled(signals, &gate_tx, &guard) => Ok(()),
         () = restart.notified() => Ok(()),
     };
     let _ = stop_tx.send(true);
@@ -378,13 +383,13 @@ struct Triggers {
     ready: tokio::sync::watch::Sender<bool>,
 }
 
-/// Passes and refreshes run to completion; `stop` is only looked at between them.
 async fn reconcile_loop(
     client: Client,
     exec: Arc<dyn Exec>,
-    mut rec: Reconciler,
+    rec: Reconciler,
     stores: watch::Stores,
     triggers: Triggers,
+    gate: tokio::sync::watch::Receiver<bool>,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Error> {
     tokio::select! {
@@ -394,50 +399,123 @@ async fn reconcile_loop(
     triggers.ready.send_replace(true);
     let node = rec.node().to_owned();
     tracing::info!(node, "caches ready, reconciling");
-    let (mut lvm_checked, mut lvm_probed) = (false, false);
-    let mut pool_set = PoolSet::default();
+    let mut work = LoopWork {
+        client,
+        exec,
+        rec,
+        stores,
+        node,
+        disks: triggers.disks,
+        lvm_checked: false,
+        lvm_probed: false,
+        pool_set: PoolSet::default(),
+    };
+    let schedule = Schedule {
+        pass: triggers.pass,
+        changes: triggers.changes,
+        gate,
+        stop,
+    };
+    drive(&mut work, schedule).await;
+    Ok(())
+}
+
+/// What the loop runs; the schedule decides when.
+#[async_trait::async_trait]
+trait Work: Send {
+    /// One pass, its writes applied.
+    async fn pass(&mut self);
+    /// A status refresh of what events2 touched; true when a pass is wanted.
+    async fn refresh(&mut self) -> bool;
+}
+
+struct Schedule {
+    pass: Arc<Trigger>,
+    changes: Arc<Trigger>,
+    /// True once no new pass may start.
+    gate: tokio::sync::watch::Receiver<bool>,
+    stop: tokio::sync::watch::Receiver<bool>,
+}
+
+/// Passes and refreshes run to completion; `stop` and the gate are only
+/// looked at between them. With the gate closed only refreshes run: they
+/// change nothing on the host and keep the controller's view current.
+async fn drive(work: &mut dyn Work, mut s: Schedule) {
     loop {
-        rec.set_addresses(addresses(&stores));
-        rec.set_peer_leases(peer_leases(&stores));
-        let pools = stores.pools.state();
-        let has_pool = pools.iter().any(|p| p.spec.node == node);
-        if !lvm_checked && (has_pool || !lvm_probed) {
-            lvm_probed = true;
-            lvm_checked = check_lvm(exec.as_ref(), &mut rec, has_pool).await;
-        }
-        let volumes = stores.volumes.state();
-        let snapshots = stores.snapshots.state();
-        let writes = rec.pass(&pools, &volumes, &snapshots).await;
-        for pool in apply(&client, &node, writes).await {
-            rec.events_unsent(&pool);
-        }
-        let pool_set_changed = pool_set.update(&pools, &node);
-        if rec.take_disks_changed() || pool_set_changed {
-            let _ = triggers.disks.send(crate::inventory::Wake::Lvm);
+        let open = !*s.gate.borrow_and_update();
+        if open {
+            work.pass().await;
         }
         // Fixed per pass so a stream of refreshes cannot push the resync out.
         let resync = tokio::time::Instant::now() + watch::RESYNC;
         loop {
             tokio::select! {
                 biased;
-                () = stopped(&mut stop) => return Ok(()),
-                () = triggers.pass.changed() => {
-                    tokio::time::sleep(watch::COALESCE).await;
-                    triggers.pass.drain();
+                () = stopped(&mut s.stop) => return,
+                r = s.gate.changed(), if open => {
+                    if r.is_err() {
+                        return;
+                    }
                     break;
                 }
-                () = tokio::time::sleep_until(resync) => break,
-                () = triggers.changes.changed() => {
+                () = s.pass.changed(), if open => {
                     tokio::time::sleep(watch::COALESCE).await;
-                    triggers.changes.drain();
-                    let volumes = stores.volumes.state();
-                    apply(&client, &node, rec.refresh(&volumes).await).await;
-                    if rec.take_pass_wanted() {
+                    s.pass.drain();
+                    break;
+                }
+                () = tokio::time::sleep_until(resync), if open => break,
+                () = s.changes.changed() => {
+                    tokio::time::sleep(watch::COALESCE).await;
+                    s.changes.drain();
+                    if work.refresh().await && open {
                         break;
                     }
                 }
             }
         }
+    }
+}
+
+struct LoopWork {
+    client: Client,
+    exec: Arc<dyn Exec>,
+    rec: Reconciler,
+    stores: watch::Stores,
+    node: String,
+    disks: tokio::sync::mpsc::UnboundedSender<crate::inventory::Wake>,
+    lvm_checked: bool,
+    lvm_probed: bool,
+    pool_set: PoolSet,
+}
+
+#[async_trait::async_trait]
+impl Work for LoopWork {
+    async fn pass(&mut self) {
+        let (rec, stores, node) = (&mut self.rec, &self.stores, &self.node);
+        rec.set_addresses(addresses(stores));
+        rec.set_peer_leases(peer_leases(stores));
+        let pools = stores.pools.state();
+        let has_pool = pools.iter().any(|p| &p.spec.node == node);
+        if !self.lvm_checked && (has_pool || !self.lvm_probed) {
+            self.lvm_probed = true;
+            self.lvm_checked = check_lvm(self.exec.as_ref(), rec, has_pool).await;
+        }
+        let volumes = stores.volumes.state();
+        let snapshots = stores.snapshots.state();
+        let writes = rec.pass(&pools, &volumes, &snapshots).await;
+        for pool in apply(&self.client, node, writes).await {
+            rec.events_unsent(&pool);
+        }
+        let pool_set_changed = self.pool_set.update(&pools, node);
+        if rec.take_disks_changed() || pool_set_changed {
+            let _ = self.disks.send(crate::inventory::Wake::Lvm);
+        }
+    }
+
+    async fn refresh(&mut self) -> bool {
+        let volumes = self.stores.volumes.state();
+        apply(&self.client, &self.node, self.rec.refresh(&volumes).await).await;
+        self.rec.take_pass_wanted()
     }
 }
 
@@ -509,22 +587,41 @@ async fn apply(
     unsent
 }
 
-/// The shutdown guard runs before the drain.
-async fn signalled(guard: &shutdown::Guard) -> Result<(), Error> {
-    shutdown().await?;
+/// The pass gate closes first, then the shutdown guard runs, before the drain.
+async fn signalled(
+    mut signals: Signals,
+    gate: &tokio::sync::watch::Sender<bool>,
+    guard: &shutdown::Guard,
+) {
+    signals.recv().await;
+    gate.send_replace(true);
     guard.on_signal().await;
     tracing::info!(bound = ?SHUTDOWN_MAX, "shutting down");
-    Ok(())
 }
 
-async fn shutdown() -> Result<(), Error> {
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(|e| Error::io("install SIGTERM handler", e))?;
-    tokio::select! {
-        _ = term.recv() => {}
-        r = tokio::signal::ctrl_c() => r.map_err(|e| Error::io("install SIGINT handler", e))?,
+/// SIGTERM and SIGINT, caught from the moment of install.
+struct Signals {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    fn install() -> Result<Self, Error> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            term: signal(SignalKind::terminate())
+                .map_err(|e| Error::io("install SIGTERM handler", e))?,
+            int: signal(SignalKind::interrupt())
+                .map_err(|e| Error::io("install SIGINT handler", e))?,
+        })
     }
-    Ok(())
+
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.term.recv() => {}
+            _ = self.int.recv() => {}
+        }
+    }
 }
 
 /// Creates the res dir and, when DRBD is configured on the host, the include
@@ -648,6 +745,70 @@ mod tests {
             p.metadata.resource_version = Some("7".into());
         });
         assert!(!set.update(&[status], "n1"), "status only");
+    }
+
+    #[derive(Default)]
+    struct Counted {
+        started: u32,
+        finished: u32,
+        refreshes: u32,
+    }
+
+    /// Passes take 20 s.
+    struct FakeWork(Arc<Mutex<Counted>>);
+
+    #[async_trait::async_trait]
+    impl Work for FakeWork {
+        async fn pass(&mut self) {
+            self.0.lock().unwrap().started += 1;
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            self.0.lock().unwrap().finished += 1;
+        }
+
+        async fn refresh(&mut self) -> bool {
+            self.0.lock().unwrap().refreshes += 1;
+            true
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sigterm_lets_the_pass_finish_and_starts_no_new_one() {
+        let counted = Arc::new(Mutex::new(Counted::default()));
+        let (pass, changes) = (Arc::new(Trigger::default()), Arc::new(Trigger::default()));
+        let (gate_tx, gate) = tokio::sync::watch::channel(false);
+        let (stop_tx, stop) = tokio::sync::watch::channel(false);
+        let schedule = Schedule {
+            pass: pass.clone(),
+            changes: changes.clone(),
+            gate,
+            stop,
+        };
+        let mut work = FakeWork(counted.clone());
+        let task = tokio::spawn(async move { drive(&mut work, schedule).await });
+        let count = || {
+            let c = counted.lock().unwrap();
+            (c.started, c.finished, c.refreshes)
+        };
+
+        tokio::time::sleep(Duration::from_secs(25)).await;
+        assert_eq!(count(), (1, 1, 0));
+        pass.fire();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(count(), (2, 1, 0), "second pass running");
+        gate_tx.send_replace(true);
+        pass.fire();
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert_eq!(count(), (2, 2, 0), "finished, none started");
+
+        // Refreshes go on, and their pass wish, the trigger and the resync
+        // all start nothing.
+        changes.fire();
+        pass.fire();
+        tokio::time::sleep(watch::RESYNC * 3).await;
+        assert_eq!(count(), (2, 2, 1));
+
+        stop_tx.send_replace(true);
+        task.await.unwrap();
     }
 
     #[test]
