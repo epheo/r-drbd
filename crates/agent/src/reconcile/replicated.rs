@@ -161,6 +161,56 @@ fn timeout_blocker(s: &Step<'_>, r: &Resource, lost: bool) -> Option<&'static st
     None
 }
 
+/// A restore larger than its snapshot: each LV grew past its old DRBD
+/// metadata, which differs per node and now lies inside the data area, so
+/// the copies are not identical. Without a size on record, assumed grown.
+fn restore_grown(vol: &Volume, snapshots: &[Arc<Snapshot>]) -> bool {
+    let Some(src) = &vol.spec.source else {
+        return false;
+    };
+    snapshots
+        .iter()
+        .find(|x| x.name_any() == src.snapshot)
+        .and_then(|x| x.status.as_ref()?.size_bytes)
+        != Some(vol.spec.size_bytes)
+}
+
+/// Diskful peers the first data still waits for: not connected, not
+/// Inconsistent, or, for a restore from `source`, not reporting that
+/// snapshot in restoredFrom.
+fn unready_peers<'a>(
+    s: &'a Step<'_>,
+    r: &Resource,
+    node: &str,
+    source: Option<&str>,
+) -> Vec<&'a str> {
+    let restored = |peer: &str| {
+        source.is_none_or(|snap| {
+            s.vol
+                .status
+                .iter()
+                .flat_map(|st| &st.replicas)
+                .any(|e| e.node == peer && e.restored_from.as_deref() == Some(snap))
+        })
+    };
+    s.a.replicas
+        .iter()
+        .filter(|p| p.node != node && drbd::is_diskful(p))
+        .filter(|p| {
+            let connected = r
+                .connections
+                .get(&p.node)
+                .is_some_and(|c| c.state == "Connected");
+            let inconsistent = r
+                .peer_devices
+                .get(&(p.node.clone(), VOLUME))
+                .is_some_and(|d| d.peer_disk.as_deref() == Some("Inconsistent"));
+            !(connected && inconsistent && restored(&p.node))
+        })
+        .map(|p| p.node.as_str())
+        .collect()
+}
+
 /// Why this pass must not adjust, if anything.
 fn adjust_blocker(s: &Step<'_>, snapshots: &[Arc<Snapshot>], resolved: bool) -> Option<String> {
     let r = s.res?;
@@ -772,7 +822,9 @@ impl Reconciler {
 
         if diskful {
             let lost = *rebuilt || s.prev_lost() || self.rebuilt_seen.contains(&name);
-            self.first_data(s, &name, lost).await?;
+            let grown = restore_grown(s.vol, snapshots);
+            self.first_data(s, &name, lost, restored.is_some(), grown)
+                .await?;
         }
         Ok(complete)
     }
@@ -1052,19 +1104,31 @@ impl Reconciler {
     }
 
     /// Makes the first data current, on the initial node of a volume not
-    /// yet initialized, while no replica holds data:
-    /// - restore: this replica becomes the source, every peer full-syncs
-    ///   (before initializedAt its LV only ever comes from the snapshot);
-    /// - fresh: once every diskful peer is connected and Inconsistent, the
-    ///   bitmap is cleared and nobody syncs; after `init_wait` the same
-    ///   runs with whoever is there, when DRBD reports quorum, and late
-    ///   peers full-sync.
+    /// yet initialized, while no replica holds data. Once every diskful
+    /// peer is connected and Inconsistent the bitmap is cleared and nobody
+    /// syncs; after `init_wait` the volume starts with whoever is there,
+    /// when DRBD reports quorum, and late peers full-sync.
+    ///
+    /// A restore counts a peer as ready only when its entry also reports
+    /// the source snapshot in restoredFrom: clearing the bitmap beside an
+    /// empty disk would declare it in sync. Without that on every peer it
+    /// starts after `init_wait` as the sync source; a `grown` restore
+    /// always does, its copies differ where the old metadata was. A node
+    /// that cannot prove its own copy (`restored` false) never starts a
+    /// restore.
     ///
     /// `lost`: this replica was rebuilt. A rebuilt replica may still take
     /// the all-connected path (nobody holds data then), never the timeout
     /// path: a second clear-bitmap beside data made by the first would
     /// leave two unrelated data sets.
-    async fn first_data(&mut self, s: &Step<'_>, name: &str, lost: bool) -> Result<(), String> {
+    async fn first_data(
+        &mut self,
+        s: &Step<'_>,
+        name: &str,
+        lost: bool,
+        restored: bool,
+        grown: bool,
+    ) -> Result<(), String> {
         if s.initialized() || !s.initial_node() {
             self.init_started.remove(name);
             self.rebuilt_seen.remove(name);
@@ -1093,33 +1157,15 @@ impl Reconciler {
             self.init_started.entry(name.to_owned()).or_insert(None);
             return Ok(());
         }
-        if s.vol.spec.source.is_some() {
-            tracing::info!(
-                volume = name,
-                "restored data becomes current: peers full-sync"
-            );
-            self.drbd_cmd(&argv::start_as_source(name), DRBD_TIMEOUT)
-                .await?;
-            self.init_started.remove(name);
-            return Ok(());
+        let source = s.vol.spec.source.as_ref().map(|x| x.snapshot.as_str());
+        if let Some(snap) = source
+            && !restored
+        {
+            return Err(format!(
+                "this node's copy is not proven to come from snapshot {snap}: the restore does not start"
+            ));
         }
-        let waiting: Vec<&str> =
-            s.a.replicas
-                .iter()
-                .filter(|p| p.node != self.node && drbd::is_diskful(p))
-                .filter(|p| {
-                    let connected = r
-                        .connections
-                        .get(&p.node)
-                        .is_some_and(|c| c.state == "Connected");
-                    let inconsistent = r
-                        .peer_devices
-                        .get(&(p.node.clone(), VOLUME))
-                        .is_some_and(|d| d.peer_disk.as_deref() == Some("Inconsistent"));
-                    !(connected && inconsistent)
-                })
-                .map(|p| p.node.as_str())
-                .collect();
+        let waiting = unready_peers(s, r, &self.node, source.filter(|_| !grown));
         let since = *self
             .init_started
             .entry(name.to_owned())
@@ -1133,23 +1179,41 @@ impl Reconciler {
             );
             return Ok(());
         }
+        if !waiting.is_empty()
+            && let Some(why) = timeout_blocker(s, r, lost)
+        {
+            tracing::warn!(
+                volume = name,
+                ?waiting,
+                why,
+                "not starting without these peers"
+            );
+            return Ok(());
+        }
+        if source.is_some() && (grown || !waiting.is_empty()) {
+            tracing::warn!(
+                volume = name,
+                ?waiting,
+                grown,
+                "restored copies not all identical: this one is the source, the others full-sync"
+            );
+            self.drbd_cmd(&argv::start_as_source(name), DRBD_TIMEOUT)
+                .await?;
+            self.init_started.remove(name);
+            return Ok(());
+        }
         if !waiting.is_empty() {
-            if let Some(why) = timeout_blocker(s, r, lost) {
-                tracing::warn!(
-                    volume = name,
-                    ?waiting,
-                    why,
-                    "not starting without these peers"
-                );
-                return Ok(());
-            }
             tracing::warn!(
                 volume = name,
                 ?waiting,
                 "starting without these peers: they will full-sync"
             );
         }
-        tracing::info!(volume = name, "first data current without a sync");
+        if source.is_some() {
+            tracing::info!(volume = name, "restored copies current without a sync");
+        } else {
+            tracing::info!(volume = name, "first data current without a sync");
+        }
         self.drbd_cmd(&argv::start_without_sync(name), DRBD_TIMEOUT)
             .await?;
         self.init_started.remove(name);

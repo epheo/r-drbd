@@ -612,6 +612,111 @@ async fn restore_every_holder_from_its_copy() {
     assert!(!seen(&x, "lvcreate"));
 }
 
+#[tokio::test]
+async fn restore_starts_without_sync_when_every_peer_restored() {
+    let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    x.expect(
+        vec![
+            "drbdadm".into(),
+            "new-current-uuid".into(),
+            "--clear-bitmap".into(),
+            "pvc-1/0".into(),
+        ],
+        ok(""),
+    );
+    let vol = with_entries(restored(volume(GIB)), vec![peer_entry("n2", true)]);
+    let w = r.pass(&[vol], &[source_snapshot()]).await;
+    assert_eq!(entry_of(&w).restored_from.as_deref(), Some("snap-1"));
+    assert!(!seen(&x, "--force-resync"));
+    assert!(r.rec.init_started.is_empty());
+}
+
+#[tokio::test]
+async fn restore_falls_back_to_a_full_sync_when_a_peer_did_not_restore() {
+    // n2 is connected and Inconsistent, but its entry has no restoredFrom:
+    // it may be empty, so the bitmap is never cleared.
+    let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    r.rec.drbd.init_wait = Duration::from_millis(100);
+    let x = r.x.clone();
+    let vol = with_entries(restored(volume(GIB)), vec![peer_entry("n2", false)]);
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    r.pass(std::slice::from_ref(&vol), &[source_snapshot()])
+        .await;
+    assert!(!seen(&x, "new-current-uuid"));
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    reads_again(&x, &[source_lv(), lv(LV_KIB)]);
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    x.expect(
+        vec![
+            "drbdadm".into(),
+            "new-current-uuid".into(),
+            "--force-resync".into(),
+            "pvc-1/0".into(),
+        ],
+        ok(""),
+    );
+    r.pass(&[vol], &[source_snapshot()]).await;
+    assert!(!seen(&x, "--clear-bitmap"));
+}
+
+#[tokio::test]
+async fn restore_waits_for_its_peers_before_any_uuid_step() {
+    // n2 restored but is not connected yet; then connected but not yet
+    // reporting restoredFrom. Neither moves the UUIDs before init_wait.
+    let mut lines = up("Inconsistent", "DUnknown");
+    lines[1] = "exists connection name:pvc-1 peer-node-id:1 conn-name:n2 connection:Connecting role:Unknown".into();
+    let mut r = Rig::new(&lines, up_host());
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    let vol = with_entries(restored(volume(GIB)), vec![peer_entry("n2", true)]);
+    r.pass(&[vol], &[source_snapshot()]).await;
+    assert!(r.rec.init_started["pvc-1"].is_some());
+
+    r.feed(&[
+        "change connection name:pvc-1 conn-name:n2 connection:Connected",
+        "change peer-device name:pvc-1 conn-name:n2 volume:0 replication:Established peer-disk:Inconsistent",
+    ]);
+    reads_again(&x, &[source_lv(), lv(LV_KIB)]);
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    let vol = with_entries(restored(volume(GIB)), vec![peer_entry("n2", false)]);
+    r.pass(&[vol], &[source_snapshot()]).await;
+    assert!(!seen(&x, "new-current-uuid"));
+}
+
+#[tokio::test]
+async fn larger_restore_syncs_from_the_initial_node() {
+    // Every peer restored and connected, but the LVs grew past the old
+    // metadata, which differs per node: never a clear-bitmap.
+    let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV2_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    x.expect(argv::start_as_source("pvc-1"), ok(""));
+    let vol = with_entries(restored(volume(2 * GIB)), vec![peer_entry("n2", true)]);
+    r.pass(&[vol], &[source_snapshot()]).await;
+    assert!(!seen(&x, "--clear-bitmap"));
+}
+
 /// n2 (not the initial node) with its restored LV up; returns its entry.
 async fn restored_from_on_n2(
     vol: Volume,
@@ -677,6 +782,27 @@ async fn restore_holder_without_its_snapshot_lv_reports_an_error_and_creates_not
     assert_eq!(e.restored_from, None);
     assert!(!seen(&x, "lvcreate") && !seen(&x, "create-md"));
     assert!(r.res_file().is_none());
+}
+
+#[tokio::test]
+async fn initial_node_without_its_restored_copy_never_starts() {
+    // Every peer restored, but this node's LV lacks the tag.
+    let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    r.rec.drbd.init_wait = Duration::ZERO;
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN])]);
+    dry(&x, "");
+    let vol = with_entries(restored(volume(GIB)), vec![peer_entry("n2", true)]);
+    let w = r.pass(&[vol], &[source_snapshot()]).await;
+    let err = entry_of(&w).last_error.unwrap();
+    assert!(
+        err.contains("not proven to come from snapshot snap-1"),
+        "{err}"
+    );
+    assert!(!seen(&x, "new-current-uuid"));
 }
 
 #[tokio::test]
@@ -1514,7 +1640,8 @@ async fn restore_lost_before_initialized_is_restored_again() {
     );
     assert!(!r.rec.rebuilt_seen.contains("pvc-1"));
 
-    // Up and Inconsistent: the restored copy is the source.
+    // Up and Inconsistent beside a restored peer: the copies are the same
+    // snapshot again, nobody syncs.
     let lines = up("Inconsistent", "Inconsistent");
     r.feed(&lines.iter().map(String::as_str).collect::<Vec<_>>());
     *r.host.sectors.lock().unwrap() = NET_SECTORS;
@@ -1522,7 +1649,7 @@ async fn restore_lost_before_initialized_is_restored_again() {
     r.expect_sweep();
     expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
     dry(&x, "");
-    x.expect(argv::start_as_source("pvc-1"), ok(""));
+    x.expect(argv::start_without_sync("pvc-1"), ok(""));
     r.pass(
         &[with_entries(vol, vec![e, peer_entry("n2", true)])],
         &[source_snapshot()],
