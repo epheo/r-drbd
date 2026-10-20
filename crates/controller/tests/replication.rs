@@ -683,6 +683,16 @@ async fn replicated_restore_from_acks() {
         ]
     );
     assert_eq!(a.initial_up_to_date_node.as_deref(), Some("n1"));
+    let restored: BTreeMap<_, _> = r
+        .status
+        .iter()
+        .flat_map(|s| &s.replicas)
+        .map(|e| (e.node.as_str(), e.restored_from.as_deref()))
+        .collect();
+    assert_eq!(
+        restored,
+        BTreeMap::from([("n1", Some("snap")), ("n2", Some("snap")), ("n3", None)])
+    );
     assert_ne!(a.minor, src.spec.assignment.as_ref().unwrap().minor);
     assert!(a.secret.is_some());
     assert!(a.replicas.iter().all(|r| r.port == Some(11001)));
@@ -701,6 +711,68 @@ async fn replicated_restore_from_acks() {
     let c = cond(&r, "Ready").unwrap();
     assert_eq!(c.reason, "UnsupportedRestore");
     assert_eq!(c.message, "snapshot holders 2, replicas 3");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_outlives_an_uninitialized_restore() {
+    let assets = require_envtest!();
+    let (_env, client, _cfg, _ctl) = setup(&assets).await;
+    cluster(&client).await;
+    let auto: Vec<_> = ["n1", "n2", "n3"]
+        .iter()
+        .map(|n| FakeAgent::new(&client, n).spawn_auto())
+        .collect();
+    create_volume(&client, "src", volume_spec(GIB, 2, "fast")).await;
+    volume_where(&client, "src", |v| phase_of(v) == VolumePhase::Ready).await;
+    create_snapshot(&client, "snap", "src").await;
+    snapshot_where(&client, "snap", |s| {
+        support::snap_phase(s) == SnapshotPhase::Ready
+    })
+    .await;
+    for a in auto {
+        a.abort();
+    }
+
+    let mut spec = volume_spec(GIB, 2, "fast");
+    spec.source = Some(VolumeSource {
+        snapshot: "snap".into(),
+    });
+    create_volume(&client, "restored", spec).await;
+    volume_where(&client, "restored", |v| v.spec.assignment.is_some()).await;
+    Api::<model::Snapshot>::all(client.clone())
+        .delete("snap", &DeleteParams::default())
+        .await
+        .expect("delete snapshot");
+    snapshot_where(&client, "snap", |s| {
+        support::snap_phase(s) == SnapshotPhase::Deleting
+    })
+    .await;
+    let agents = ["n1", "n2", "n3"].map(|n| FakeAgent::new(&client, n));
+    for a in &agents[..2] {
+        a.ack("snap", SnapshotPhase::Deleting, true, None).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        support::get_snapshot(&client, "snap").await.is_some(),
+        "released under an uninitialized restore"
+    );
+
+    for a in &agents {
+        a.ready("restored").await;
+    }
+    volume_where(&client, "restored", |v| {
+        v.status
+            .as_ref()
+            .is_some_and(|s| s.initialized_at.is_some())
+    })
+    .await;
+    support::eventually(Duration::from_secs(20), || async {
+        support::get_snapshot(&client, "snap")
+            .await
+            .is_none()
+            .then_some(())
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

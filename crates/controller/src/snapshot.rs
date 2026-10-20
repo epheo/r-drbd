@@ -14,7 +14,7 @@ use model::condition::{self, Condition, FALSE, TRUE, types};
 use model::keys::FINALIZER_SNAPSHOT;
 use model::{Role, Snapshot, SnapshotAck, SnapshotPhase, Volume, VolumePhase, VolumeStatus};
 use serde_json::json;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::store::Stores;
 use crate::volume::{Cond, build_conditions};
@@ -307,7 +307,9 @@ async fn reconcile(
         .map(|r| r.node.clone())
         .collect();
     if s.metadata.deletion_timestamp.is_some() {
-        delete(api, s, current, &diskful).await;
+        let volumes = Stores::sorted(&ctx.stores.volumes);
+        let restoring = restoring_from(&volumes, &name);
+        delete(api, s, current, &diskful, restoring.as_deref()).await;
         return None;
     }
     if !has_finalizer(s, FINALIZER_SNAPSHOT) {
@@ -616,8 +618,35 @@ async fn apply_step(
     }
 }
 
-/// Releases the finalizer once every node that may hold the LV removed it.
-async fn delete(api: &Api<Snapshot>, s: &Snapshot, current: Owned, diskful: &[String]) {
+/// A placed restore from `snapshot` without its first data yet. Its holders
+/// still need their copy: a lost LV is restored again until initializedAt,
+/// and a replica without a copy turns the restore into a full sync.
+pub fn restoring_from(volumes: &[std::sync::Arc<Volume>], snapshot: &str) -> Option<String> {
+    volumes
+        .iter()
+        .find(|v| {
+            v.spec
+                .source
+                .as_ref()
+                .is_some_and(|src| src.snapshot == snapshot)
+                && v.spec.assignment.is_some()
+                && v.metadata.deletion_timestamp.is_none()
+                && v.status
+                    .as_ref()
+                    .is_none_or(|st| st.initialized_at.is_none())
+        })
+        .map(|v| v.name_any())
+}
+
+/// Releases the finalizer once every node that may hold the LV removed it,
+/// and no uninitialized restore reads from it.
+async fn delete(
+    api: &Api<Snapshot>,
+    s: &Snapshot,
+    current: Owned,
+    diskful: &[String],
+    restoring: Option<&str>,
+) {
     if !has_finalizer(s, FINALIZER_SNAPSHOT) {
         return;
     }
@@ -636,7 +665,14 @@ async fn delete(api: &Api<Snapshot>, s: &Snapshot, current: Owned, diskful: &[St
                 | SnapshotPhase::Ready
         );
     let held = holders(acks, if reached_taking { diskful } else { &[] });
-    if deleted_everywhere(acks, &held) {
+    if let Some(v) = restoring {
+        debug!(
+            snapshot = s.name_any(),
+            volume = v,
+            "kept for a restore not initialized yet"
+        );
+    }
+    if restoring.is_none() && deleted_everywhere(acks, &held) {
         info!(
             snapshot = s.name_any(),
             "snapshot removed on every node; releasing"
@@ -950,6 +986,38 @@ mod tests {
             &done,
             &holders(&done, &["n4".to_owned()])
         ));
+    }
+
+    #[test]
+    fn an_uninitialized_placed_restore_holds_its_source() {
+        use std::sync::Arc;
+        let restore = |name: &str, from: &str| {
+            let spec: model::VolumeSpec = serde_json::from_value(json!({
+                "sizeBytes": 1, "tier": "t", "replicas": 2,
+                "source": { "snapshot": from },
+                "assignment": { "replicas": [] },
+            }))
+            .unwrap();
+            Volume::new(name, spec)
+        };
+        let v = restore("v", "snap");
+        assert_eq!(
+            restoring_from(&[Arc::new(v.clone())], "snap").as_deref(),
+            Some("v")
+        );
+        assert_eq!(restoring_from(&[Arc::new(v.clone())], "other"), None);
+        let mut init = v.clone();
+        init.status = Some(VolumeStatus {
+            initialized_at: Some(Time(Timestamp::now())),
+            ..VolumeStatus::default()
+        });
+        let mut unplaced = v.clone();
+        unplaced.spec.assignment = None;
+        let mut deleting = v;
+        deleting.metadata.deletion_timestamp = Some(Time(Timestamp::now()));
+        for x in [init, unplaced, deleting] {
+            assert_eq!(restoring_from(&[Arc::new(x)], "snap"), None);
+        }
     }
 
     #[test]

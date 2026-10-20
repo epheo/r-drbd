@@ -1914,7 +1914,10 @@ fn place(ctx: &Ctx<'_>, placing: &Placing, v: &Volume) -> Placement {
         // Holders are never gated by capacity: each one already holds the
         // restore's blocks and has nowhere else to go.
         if v.spec.replicas >= 2 {
-            // Every replica restores from its own copy of the snapshot.
+            // The agent restores every diskful replica of an uninitialized
+            // restore from its node's snapshot LV, a thin snapshot that only
+            // grows by what the volume later writes. The Snapshot and every
+            // holder's copy stay until this volume is initialized.
             let diskful: Vec<placer::Chosen> = holders
                 .into_iter()
                 .map(|(node, pool)| placer::Chosen { node, pool })
