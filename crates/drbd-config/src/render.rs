@@ -164,7 +164,11 @@ pub fn render(r: &Resource<'_>, features: Features) -> Result<Rendered, RenderEr
     line(1, "}");
 
     let local_diskful = matches!(r.local.disk, Disk::Local(_));
-    if let Some(g) = r.discard_granularity.filter(|_| local_diskful) {
+    if let Some(g) = r
+        .discard_granularity
+        .filter(|_| local_diskful)
+        .and_then(discard_granularity)
+    {
         if features.discard_granularity {
             line(1, "disk {");
             line(2, &format!("rs-discard-granularity {g};"));
@@ -221,6 +225,21 @@ pub fn render(r: &Resource<'_>, features: Features) -> Result<Rendered, RenderEr
         hash,
         dropped,
     })
+}
+
+/// DRBD refuses an rs-discard-granularity over 1 MiB, while a thin chunk
+/// may reach 1 GiB: the largest 4 KiB multiple at most 1 MiB that divides
+/// the chunk, so every discard still covers whole chunks.
+pub fn discard_granularity(chunk: u64) -> Option<u64> {
+    const MAX: u64 = 1 << 20;
+    const STEP: u64 = 4096;
+    if chunk <= MAX {
+        return Some(chunk);
+    }
+    (1..=MAX / STEP)
+        .rev()
+        .map(|k| k * STEP)
+        .find(|&d| chunk.is_multiple_of(d))
 }
 
 fn sha256_hex(s: &str) -> String {

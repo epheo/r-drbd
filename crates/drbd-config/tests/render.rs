@@ -1,4 +1,7 @@
-use drbd_config::{Disk, Features, Host, PEER_DISK, RenderError, Resource, header_hash, render};
+use drbd_config::{
+    Disk, Features, Host, PEER_DISK, RenderError, Resource, discard_granularity, header_hash,
+    render,
+};
 
 const ALL: Features = Features {
     tiebreaker: true,
@@ -192,4 +195,20 @@ fn refuses_what_drbdadm_would_misread() {
     let long = "x".repeat(65);
     r.secret = &long;
     assert_eq!(render(&r, ALL), Err(RenderError::SecretLength));
+}
+
+#[test]
+fn discard_granularity_stays_within_drbd_limit() {
+    const K: u64 = 1024;
+    const M: u64 = K * K;
+    assert_eq!(discard_granularity(64 * K), Some(64 * K));
+    assert_eq!(discard_granularity(M), Some(M));
+    assert_eq!(discard_granularity(2 * M), Some(M));
+    assert_eq!(discard_granularity(1024 * M), Some(M));
+    assert_eq!(discard_granularity(3 * 512 * K), Some(768 * K));
+
+    let mut r = resource();
+    r.discard_granularity = Some(2 * M);
+    let text = render(&r, ALL).unwrap().text;
+    assert!(text.contains("rs-discard-granularity 1048576;"), "{text}");
 }

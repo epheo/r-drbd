@@ -181,7 +181,7 @@ Pick the link of the whole disk (no `-part` suffix); the target (`../../nvme1n1`
 | Field | Meaning |
 |---|---|
 | `totalBytes`, `freeBytes` | Thin pool data size and free space |
-| `chunkBytes` | Thin pool chunk size; DRBD discards are aligned to it |
+| `chunkBytes` | Thin pool chunk size; DRBD resync discards are aligned to it, capped at 1 MiB |
 | `committedBytes` | Sum of the sizes of the volumes with a diskful replica here |
 | `placeableBytes` | Largest new volume placement accepts here now, rounded down to MiB; 0 when the Pool is not Available, its node is not Ready or its agent is down, or it is being deleted |
 | `volumes` | Volumes with a diskful replica here |
