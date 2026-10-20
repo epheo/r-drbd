@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use model::{
@@ -1148,4 +1149,73 @@ fn lv_lost_is_never_double_wrapped() {
     };
     assert_eq!(keep_lost(Some(&healthy), "x".into()), "x");
     assert_eq!(keep_lost(None, "x".into()), "x");
+}
+
+/// When the Lease was renewed over 60 s while a pass waits for the disk
+/// lock, held by the inventory for `hold`, then runs a 60 s step.
+async fn renewals_behind_the_scan(hold: Duration) -> Vec<u64> {
+    use crate::node::{Liveness, Progress, renew_loop};
+    let progress = Progress::default();
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    let scan = lock.clone().lock_owned().await;
+    tokio::spawn(async move {
+        tokio::time::sleep(hold).await;
+        drop(scan);
+    });
+    let x = Arc::new(ScriptedExec::new());
+    let rec = Reconciler::new(NODE, x)
+        .with_disk_lock(lock)
+        .with_progress(progress.clone());
+    // The last await before the lock ended just now.
+    progress.within(Duration::ZERO);
+    let step = progress.clone();
+    let pass = tokio::spawn(async move {
+        let _g = rec.lock_disks().await;
+        step.within(Duration::from_secs(60));
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+    let live = Liveness::new(progress, None);
+    let base = tokio::time::Instant::now();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rec_seen = seen.clone();
+    let hb = tokio::spawn(renew_loop(
+        Duration::from_secs(10),
+        k8s_openapi::jiff::Timestamp::now,
+        move || live.may_renew(),
+        move |_| {
+            rec_seen.lock().unwrap().push(base.elapsed().as_secs());
+            async { Ok(()) }
+        },
+    ));
+    tokio::time::sleep(Duration::from_secs(65)).await;
+    hb.abort();
+    pass.abort();
+    seen.lock().unwrap().clone()
+}
+
+#[tokio::test(start_paused = true)]
+async fn waiting_for_the_disk_lock_keeps_the_lease_within_the_scan_bound() {
+    let hold = crate::inventory::scan::LOCK_HOLD_MAX;
+    assert_eq!(
+        renewals_behind_the_scan(hold).await,
+        [0, 10, 20, 30, 40, 50, 60]
+    );
+    // Past the last await's slack, still waiting: the wait is declared.
+    let progress = crate::node::Progress::default();
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    let scan = lock.clone().lock_owned().await;
+    let rec = Reconciler::new(NODE, Arc::new(ScriptedExec::new()))
+        .with_disk_lock(lock)
+        .with_progress(progress.clone());
+    progress.within(Duration::ZERO);
+    let waiter = tokio::spawn(async move { drop(rec.lock_disks().await) });
+    tokio::time::sleep(hold.saturating_sub(Duration::from_millis(100))).await;
+    assert!(progress.alive());
+    drop(scan);
+    waiter.await.unwrap();
+    // A scan hung past its bound: renewals stop after the bound and slack.
+    assert_eq!(
+        renewals_behind_the_scan(Duration::from_secs(3600)).await,
+        [0, 10, 20]
+    );
 }

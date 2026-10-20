@@ -378,6 +378,8 @@ pub struct Reconciler {
     device_rows: HashMap<String, Vec<DeviceStatus>>,
     /// Shared with the NodeDisks inventory.
     disk_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The loop's deadline, kept while waiting for the disk lock.
+    progress: crate::node::Progress,
     /// Live reads for the restore decisions the watch cache cannot prove.
     live: Arc<dyn LiveVolumes>,
     /// Applies writes during the pass; None returns them all from it.
@@ -424,6 +426,7 @@ impl Reconciler {
             disks_changed: false,
             device_rows: HashMap::new(),
             disk_lock: Arc::default(),
+            progress: crate::node::Progress::default(),
             live: Arc::new(NoLiveVolumes),
             publish: None,
         }
@@ -452,6 +455,19 @@ impl Reconciler {
     pub fn with_live(mut self, live: Arc<dyn LiveVolumes>) -> Self {
         self.live = live;
         self
+    }
+
+    #[must_use]
+    pub fn with_progress(mut self, progress: crate::node::Progress) -> Self {
+        self.progress = progress;
+        self
+    }
+
+    /// The disk lock, the wait declared to the heartbeat: the inventory
+    /// holds it for one bounded step at a time.
+    async fn lock_disks(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.progress.within(crate::inventory::scan::LOCK_HOLD_MAX);
+        self.disk_lock.clone().lock_owned().await
     }
 
     #[must_use]

@@ -248,6 +248,7 @@ fn reconciler(
         .with_drbd(drbd)
         .with_disks(inv.disks.clone())
         .with_disk_lock(inv.lock.clone())
+        .with_progress(exec.progress().clone())
         .with_live(Arc::new(ProgressLive {
             inner: KubeLiveVolumes::new(writer.client.clone()),
             progress: exec.progress().clone(),

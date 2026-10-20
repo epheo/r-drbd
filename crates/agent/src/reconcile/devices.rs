@@ -206,8 +206,7 @@ impl Reconciler {
             self.release(reads, pool, &paths, &t).await
         } else {
             // Retained: look only, never build what is going away.
-            let disk_lock = self.disk_lock.clone();
-            let _held = disk_lock.lock().await;
+            let _held = self.lock_disks().await;
             match self.look(pool, &paths).await {
                 Ok(l) => Outcome {
                     rows: Some(l.rows()),
@@ -245,8 +244,7 @@ impl Reconciler {
         for _ in 0..MAX_STEPS {
             // Each look and its step under the disk lock: the inventory's
             // exclusive open never meets our open or a vgcreate.
-            let disk_lock = self.disk_lock.clone();
-            let _held = disk_lock.lock().await;
+            let _held = self.lock_disks().await;
             // Checks right before every step, in the same pass.
             let look = match self.look(pool, paths).await {
                 Ok(l) => l,
@@ -395,8 +393,7 @@ impl Reconciler {
             .map(|d| d.path.as_str())
             .collect();
         for _ in 0..MAX_STEPS {
-            let disk_lock = self.disk_lock.clone();
-            let _held = disk_lock.lock().await;
+            let _held = self.lock_disks().await;
             let look = match self.look(pool, paths).await {
                 Ok(l) => l,
                 Err(e) => {
