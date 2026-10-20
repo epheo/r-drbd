@@ -320,6 +320,50 @@ async fn failed_probe_keeps_chunk_bytes() {
     assert_eq!(body["status"]["chunkBytes"], 65536);
 }
 
+#[derive(Debug, Default)]
+struct Recorded(std::sync::Mutex<Vec<Vec<String>>>);
+
+#[async_trait::async_trait]
+impl Publish for Recorded {
+    async fn publish(&self, writes: Vec<StatusWrite>) -> Vec<String> {
+        let names = writes.iter().map(|w| w.name().to_owned()).collect();
+        self.0.lock().unwrap().push(names);
+        Vec::new()
+    }
+}
+
+/// Each step's writes go out as the step ends, not after the pass.
+#[tokio::test]
+async fn writes_publish_after_each_step() {
+    let x = Arc::new(ScriptedExec::new());
+    reads(
+        &x,
+        &[
+            lv_row("pvc-1", GIB_KIB, St::Active),
+            lv_row("pvc-2", GIB_KIB, St::Active),
+        ],
+    );
+    let sent = Arc::new(Recorded::default());
+    let vols = [
+        Arc::new(volume("pvc-1", GIB, 1)),
+        Arc::new(volume("pvc-2", GIB, 1)),
+    ];
+    let left = Reconciler::new(NODE, x.clone())
+        .with_publish(sent.clone())
+        .pass(&[pool()], &vols, &[])
+        .await;
+    x.assert_done();
+    assert!(left.is_empty(), "{left:?}");
+    assert_eq!(
+        *sent.0.lock().unwrap(),
+        [
+            vec![POOL.to_owned()],
+            vec!["pvc-1".into()],
+            vec!["pvc-2".into()]
+        ]
+    );
+}
+
 #[tokio::test]
 async fn create() {
     let x = Arc::new(ScriptedExec::new());

@@ -380,6 +380,16 @@ pub struct Reconciler {
     disk_lock: Arc<tokio::sync::Mutex<()>>,
     /// Live reads for the restore decisions the watch cache cannot prove.
     live: Arc<dyn LiveVolumes>,
+    /// Applies writes during the pass; None returns them all from it.
+    publish: Option<Arc<dyn Publish>>,
+}
+
+/// Where a pass sends its writes as each step ends, so statuses trail the
+/// host by one step, not by a whole pass.
+#[async_trait::async_trait]
+pub trait Publish: std::fmt::Debug + Send + Sync {
+    /// Applies `writes`; returns the Pools whose Events did not get through.
+    async fn publish(&self, writes: Vec<StatusWrite>) -> Vec<String>;
 }
 
 impl Reconciler {
@@ -415,6 +425,26 @@ impl Reconciler {
             device_rows: HashMap::new(),
             disk_lock: Arc::default(),
             live: Arc::new(NoLiveVolumes),
+            publish: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_publish(mut self, publish: Arc<dyn Publish>) -> Self {
+        self.publish = Some(publish);
+        self
+    }
+
+    /// Sends the writes so far when a publisher is set.
+    async fn flush(&mut self, writes: &mut Vec<StatusWrite>) {
+        let Some(p) = self.publish.clone() else {
+            return;
+        };
+        if writes.is_empty() {
+            return;
+        }
+        for pool in p.publish(std::mem::take(writes)).await {
+            self.events_unsent(&pool);
         }
     }
 
@@ -464,7 +494,8 @@ impl Reconciler {
     }
 
     /// One pass over the current objects. Returns only writes that change
-    /// something, so an idle node writes nothing.
+    /// something, so an idle node writes nothing; with a publisher, only
+    /// those it has not sent after a step.
     pub async fn pass(
         &mut self,
         pools: &[Arc<Pool>],
@@ -484,6 +515,7 @@ impl Reconciler {
         for pool in &pools {
             writes.extend(self.pool(&mut reads, pool).await);
         }
+        self.flush(&mut writes).await;
         // A bad name never reaches an lvm argv, not even through lvs.
         self.invalid_pools = pools
             .iter()
@@ -501,6 +533,7 @@ impl Reconciler {
         for vol in &vols {
             if let Some(w) = self.volume(&mut reads, &pools, snapshots, vol).await {
                 writes.push(w);
+                self.flush(&mut writes).await;
             }
         }
         self.probe_peers(&vols, &mut writes).await;

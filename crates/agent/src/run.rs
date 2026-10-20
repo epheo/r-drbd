@@ -144,8 +144,9 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
     // awaits, and the heartbeat, which renews only while it is kept.
     let progress = node::Progress::default();
     let rexec = Arc::new(node::ProgressExec::new(exec.clone(), progress.clone()));
-    let liveness = node::Liveness::new(progress, events.is_some().then(|| tracker.clone()));
-    let reconciler = reconciler(&cfg, &rexec, &client, features, &tracker, &inv);
+    let liveness = node::Liveness::new(progress.clone(), events.is_some().then(|| tracker.clone()));
+    let writer = Arc::new(Writer::new(client.clone(), &cfg.node, progress.clone()));
+    let reconciler = reconciler(&cfg, &rexec, &writer, features, &tracker, &inv);
 
     let listener = ::csi::bind_unix(&cfg.csi_endpoint)
         .and_then(tokio::net::UnixListener::from_std)
@@ -170,7 +171,7 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
         liveness,
     ));
     let mut reconcile = tokio::spawn(reconcile_loop(
-        client,
+        writer,
         rexec,
         reconciler,
         stores,
@@ -236,7 +237,7 @@ fn host_name() -> Option<String> {
 fn reconciler(
     cfg: &Config,
     exec: &Arc<node::ProgressExec>,
-    client: &Client,
+    writer: &Arc<Writer>,
     features: Option<drbd_config::Features>,
     tracker: &Arc<Mutex<Tracker>>,
     inv: &Inventory,
@@ -248,9 +249,10 @@ fn reconciler(
         .with_disks(inv.disks.clone())
         .with_disk_lock(inv.lock.clone())
         .with_live(Arc::new(ProgressLive {
-            inner: KubeLiveVolumes::new(client.clone()),
+            inner: KubeLiveVolumes::new(writer.client.clone()),
             progress: exec.progress().clone(),
         }))
+        .with_publish(writer.clone())
 }
 
 /// `drbdsetup events2` from the image (no host prefix) feeding the tracker.
@@ -422,7 +424,7 @@ struct Triggers {
 }
 
 async fn reconcile_loop(
-    client: Client,
+    writer: Arc<Writer>,
     exec: Arc<node::ProgressExec>,
     rec: Reconciler,
     stores: watch::Stores,
@@ -439,9 +441,8 @@ async fn reconcile_loop(
     tracing::info!(node, "caches ready, reconciling");
     let progress = exec.progress().clone();
     let mut work = LoopWork {
-        client,
+        writer,
         exec,
-        progress: progress.clone(),
         rec,
         stores,
         node,
@@ -525,9 +526,8 @@ async fn drive(work: &mut dyn Work, mut s: Schedule) {
 }
 
 struct LoopWork {
-    client: Client,
+    writer: Arc<Writer>,
     exec: Arc<node::ProgressExec>,
-    progress: node::Progress,
     rec: Reconciler,
     stores: watch::Stores,
     node: String,
@@ -551,8 +551,9 @@ impl Work for LoopWork {
         }
         let volumes = stores.volumes.state();
         let snapshots = stores.snapshots.state();
+        self.writer.revive();
         let writes = rec.pass(&pools, &volumes, &snapshots).await;
-        for pool in apply(&self.client, node, &self.progress, writes).await {
+        for pool in self.writer.apply(writes).await {
             rec.events_unsent(&pool);
         }
         let pool_set_changed = self.pool_set.update(&pools, node);
@@ -563,8 +564,9 @@ impl Work for LoopWork {
 
     async fn refresh(&mut self) -> bool {
         let volumes = self.stores.volumes.state();
+        self.writer.revive();
         let writes = self.rec.refresh(&volumes).await;
-        apply(&self.client, &self.node, &self.progress, writes).await;
+        self.writer.apply(writes).await;
         self.rec.take_pass_wanted()
     }
 }
@@ -600,45 +602,91 @@ fn addresses(stores: &watch::Stores) -> BTreeMap<String, std::net::IpAddr> {
         .collect()
 }
 
-/// Applies the writes; returns the Pools whose Events did not get through.
-async fn apply(
-    client: &Client,
-    node: &str,
-    progress: &node::Progress,
-    writes: Vec<crate::reconcile::StatusWrite>,
-) -> Vec<String> {
-    let results = crate::retry::each_with_backoff(
-        &writes,
-        &crate::retry::BACKOFF,
-        crate::retry::retryable,
-        |w| {
-            progress.within(REQUEST_BOUND);
-            w.apply(client, node)
-        },
-    )
-    .await;
-    let mut skipped = 0;
-    let mut unsent = Vec::new();
-    for (w, res) in writes.iter().zip(results) {
-        if matches!(w, crate::reconcile::StatusWrite::Event { .. }) && !matches!(res, Some(Ok(())))
-        {
-            unsent.push(w.name().to_owned());
+/// Status writes of the reconcile loop. Once the API proves unreachable
+/// the rest of the pass or refresh is skipped: against a dead connection
+/// each try still costs a connect or read timeout. Writes are diffs
+/// against the cache, so the next pass rebuilds them.
+struct Writer {
+    client: Client,
+    node: String,
+    progress: node::Progress,
+    dead: std::sync::atomic::AtomicBool,
+}
+
+impl std::fmt::Debug for Writer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Writer")
+            .field("node", &self.node)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Writer {
+    fn new(client: Client, node: &str, progress: node::Progress) -> Self {
+        Self {
+            client,
+            node: node.to_owned(),
+            progress,
+            dead: std::sync::atomic::AtomicBool::new(false),
         }
-        match res {
-            Some(Err(e)) => {
-                tracing::warn!(object = w.name(), error = %e, "status write failed, retried next pass");
+    }
+
+    /// A new pass or refresh tries the API again.
+    fn revive(&self) {
+        self.dead.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Applies the writes; returns the Pools whose Events did not get through.
+    async fn apply(&self, writes: Vec<crate::reconcile::StatusWrite>) -> Vec<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let results = if self.dead.load(Relaxed) {
+            writes.iter().map(|_| None).collect()
+        } else {
+            crate::retry::each_with_backoff(
+                &writes,
+                &crate::retry::BACKOFF,
+                crate::retry::retryable,
+                |w| {
+                    self.progress.within(REQUEST_BOUND);
+                    w.apply(&self.client, &self.node)
+                },
+            )
+            .await
+        };
+        let mut skipped = 0;
+        let mut unsent = Vec::new();
+        for (w, res) in writes.iter().zip(results) {
+            if matches!(w, crate::reconcile::StatusWrite::Event { .. })
+                && !matches!(res, Some(Ok(())))
+            {
+                unsent.push(w.name().to_owned());
             }
-            None => skipped += 1,
-            Some(Ok(())) => {}
+            match res {
+                Some(Err(e)) => {
+                    if crate::retry::retryable(&e) {
+                        self.dead.store(true, Relaxed);
+                    }
+                    tracing::warn!(object = w.name(), error = %e, "status write failed, retried next pass");
+                }
+                None => skipped += 1,
+                Some(Ok(())) => {}
+            }
         }
+        if skipped > 0 {
+            tracing::warn!(
+                skipped,
+                "API unreachable: remaining status writes left to the next pass"
+            );
+        }
+        unsent
     }
-    if skipped > 0 {
-        tracing::warn!(
-            skipped,
-            "API unreachable: remaining status writes left to the next pass"
-        );
+}
+
+#[async_trait::async_trait]
+impl crate::reconcile::Publish for Writer {
+    async fn publish(&self, writes: Vec<crate::reconcile::StatusWrite>) -> Vec<String> {
+        self.apply(writes).await
     }
-    unsent
 }
 
 /// The pass gate closes first, then the shutdown guard runs, before the drain.
