@@ -1254,6 +1254,13 @@ async fn reconcile(
         write(memory, api, v, wanted).await;
         return;
     }
+    let failed = v.status.as_ref().is_some_and(|s| {
+        s.phase == VolumePhase::Failed && s.observed_generation == v.metadata.generation
+    });
+    if failed {
+        // Final until the spec changes: CreateVolume has given up on it.
+        return;
+    }
     match place(ctx, placing, v) {
         Placement::Assign(a) => match write_assignment(api, v, &a).await {
             Outcome::Applied => {
@@ -2002,6 +2009,11 @@ fn assign(placing: &Placing, v: &Volume, diskful: &[placer::Chosen]) -> Placemen
     };
     match alloc::allocate(diskful, tiebreaker.as_deref(), &placing.used, entropy) {
         Ok(a) => Placement::Assign(a),
+        // Exhaustion clears as volumes go: Insufficient, which CSI reports
+        // as ResourceExhausted.
+        Err(e @ (alloc::AllocError::NoMinor | alloc::AllocError::NoPort(_))) => {
+            Placement::Wait(Cond::new(FALSE, reason::INSUFFICIENT, e.to_string()))
+        }
         Err(e) => Placement::Fail(Cond::new(FALSE, reason::ALLOCATION_FAILED, e.to_string())),
     }
 }

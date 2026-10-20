@@ -99,11 +99,11 @@ A volume that was never Ready (a restore larger than its snapshot) stays Provisi
 
 | Phase | Meaning |
 |---|---|
-| Pending | Not placed yet; reason `Insufficient` while no Pool has room, retried when Pools change |
+| Pending | Not placed yet; reason `Insufficient` while no Pool has room or no DRBD minor or port is free, retried when Pools change |
 | Provisioning | Placed; replicas being created or synced for the first time |
 | Ready | Every diskful replica and the tiebreaker present; diskful replicas up to date and connected |
 | Degraded | Usable, but a replica is missing, out of date or on an unreachable node |
-| Failed | Invalid name, no free DRBD minor, port or node id, or a restore that cannot proceed; the `Ready` condition says why |
+| Failed | Invalid name or a restore that cannot proceed; the `Ready` condition says why; final until the spec changes, and CreateVolume deletes it |
 | Deleting | Agents are tearing down |
 
 CSI calls wait for Ready up to 30 s, then return an error; the CSI sidecars retry.

@@ -431,12 +431,14 @@ impl Csi {
     }
 
     /// Deletes a Volume that never got an assignment, so a CO that treats
-    /// RESOURCE_EXHAUSTED as "nothing exists" (csi-provisioner reschedules
-    /// or finishes, and never calls DeleteVolume) leaves no orphan. The
-    /// preconditions keep a Volume assigned in the meantime.
-    /// `expect` is the (uid, generation) that reported Insufficient: a
-    /// Volume recreated or respecified since is a different request and is
-    /// left alone. None takes whatever unassigned Volume is there.
+    /// RESOURCE_EXHAUSTED or a final error as "nothing exists"
+    /// (csi-provisioner reschedules or finishes, and never calls
+    /// DeleteVolume) leaves no orphan. The preconditions keep a Volume
+    /// assigned in the meantime.
+    /// `expect` is the (uid, generation) that reported Insufficient or
+    /// Failed: a Volume recreated or respecified since is a different
+    /// request and is left alone. None takes whatever unassigned Volume is
+    /// there.
     async fn discard_unassigned(&self, name: &str, expect: Option<(String, i64)>) {
         let api = self.volumes();
         let matches = |v: &Volume| {
@@ -642,7 +644,8 @@ impl Csi {
 
     /// Waits for the Volume `uid` to be usable; Failed maps to the CSI code
     /// the CO acts on.
-    /// Insufficient also yields the (uid, generation) it was reported for.
+    /// Insufficient and Failed also yield the (uid, generation) they were
+    /// reported for.
     async fn wait_volume_ready(
         &self,
         name: &str,
@@ -1304,13 +1307,16 @@ fn ready_outcome(name: &str, v: Arc<Volume>, generation: i64, requested: u64) ->
                 reported,
             )))
         }
+        // Final for the CO, which never calls DeleteVolume after it: the
+        // caller discards the unassigned Volume.
         VolumePhase::Failed => {
             let msg = format!(
                 "volume {name} failed: {}",
                 c.map(|c| format!("{}: {}", c.reason, c.message))
                     .unwrap_or_default()
             );
-            Some(Err((Status::failed_precondition(msg), None)))
+            let reported = v.metadata.uid.clone().zip(st.observed_generation);
+            Some(Err((Status::failed_precondition(msg), reported)))
         }
         _ => None,
     }
@@ -1344,6 +1350,27 @@ mod tests {
         assert_eq!(at(VolumePhase::Ready, Some(1024)), None);
         assert_eq!(at(VolumePhase::Ready, None), None);
         assert_eq!(at(VolumePhase::Provisioning, Some(2048)), None);
+    }
+
+    #[test]
+    fn a_failed_volume_is_reported_for_discarding() {
+        let mut v: Volume = serde_json::from_value(serde_json::json!({
+            "apiVersion": "r-drbd.io/v1alpha1",
+            "kind": "Volume",
+            "metadata": { "name": "v", "uid": "u", "generation": 2 },
+            "spec": { "sizeBytes": 2048, "tier": "t" },
+        }))
+        .unwrap();
+        v.status = Some(model::VolumeStatus {
+            phase: VolumePhase::Failed,
+            observed_generation: Some(2),
+            ..model::VolumeStatus::default()
+        });
+        let Some(Err((status, reported))) = ready_outcome("v", Arc::new(v), 2, 2048) else {
+            panic!("not an error");
+        };
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(reported, Some(("u".to_owned(), 2)));
     }
 
     fn params(kv: &[(&str, &str)]) -> HashMap<String, String> {
