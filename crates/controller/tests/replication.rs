@@ -1291,11 +1291,14 @@ async fn evict_blocked_then_tiebreaker_takes_over() {
     );
     assert!(!a.replicas.iter().any(|r| r.role == Role::Tiebreaker));
     assert_eq!(a.replicas.len(), 2);
-    let v = volume_where(&client, "rep", |v| {
-        v.spec.evict.is_empty() && entry_of(v, "n2").is_none() && phase_of(v) == VolumePhase::Ready
+    // A status from the pass before the move can stand a moment longer.
+    volume_where(&client, "rep", |v| {
+        v.spec.evict.is_empty()
+            && entry_of(v, "n2").is_none()
+            && phase_of(v) == VolumePhase::Ready
+            && v.status.as_ref().and_then(|s| s.nodes.as_deref()) == Some("n1,n3")
     })
     .await;
-    assert_eq!(v.status.as_ref().unwrap().nodes.as_deref(), Some("n1,n3"));
     let ev = events_of(&client, "rep", "Evicted").await;
     assert_eq!(ev.len(), 1);
     assert_eq!(
