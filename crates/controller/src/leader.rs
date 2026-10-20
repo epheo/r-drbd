@@ -38,6 +38,18 @@ async fn timed<T>(f: impl Future<Output = Result<T, kube::Error>>) -> Result<T, 
         .map_err(Into::into)
 }
 
+/// A restarted container keeps its pod name. A fresh suffix makes it a
+/// new contender, so it waits out the Lease instead of retaking it while
+/// a write of the dead process may still land.
+pub fn per_process(base: &str) -> String {
+    let suffix = getrandom::u32().unwrap_or_else(|_| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos())
+    });
+    format!("{base}-{suffix:08x}")
+}
+
 /// Expiry as a contender sees it: measured on this process's clock from
 /// the first time it saw the current (holder, renewTime) pair, so clock
 /// skew between nodes cannot shorten a holder's term.
@@ -217,6 +229,13 @@ mod tests {
             )),
             ..LeaseSpec::default()
         }
+    }
+
+    #[test]
+    fn identity_differs_per_process() {
+        let (a, b) = (per_process("pod"), per_process("pod"));
+        assert!(a.starts_with("pod-") && b.starts_with("pod-"));
+        assert_ne!(a, b);
     }
 
     #[test]

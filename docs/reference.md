@@ -209,7 +209,7 @@ Topology key: `r-drbd.io/node`, on local volumes only.
 |---|---|---|
 | `--csi-endpoint` | `CSI_ENDPOINT` | `unix:///csi/csi.sock` |
 | `--namespace` | `POD_NAMESPACE` | `r-drbd-system` |
-| `--identity` (controller) | `POD_NAME` | hostname |
+| `--identity` (controller) | `POD_NAME` | hostname; a random suffix is added per process |
 | `--node` (agent) | `NODE_NAME` | required |
 | `--res-dir` (agent) | `R_DRBD_RES_DIR` | `/var/lib/r-drbd` |
 

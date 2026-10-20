@@ -39,7 +39,8 @@ pub struct Config {
     pub namespace: String,
     /// `unix:///path` or a plain path.
     pub csi_endpoint: String,
-    /// Lease holder identity: the pod name or the hostname.
+    /// Lease holder identity: the pod name or the hostname; `run` makes it
+    /// unique per process.
     pub identity: String,
     /// Bound of the snapshot take round.
     pub take_timeout: Duration,
@@ -164,7 +165,8 @@ fn request_config(mut config: kube::Config) -> kube::Config {
 /// Connects with the in-cluster or kubeconfig credentials and runs until
 /// SIGTERM (Ok, Lease released) or until leadership is lost or a component
 /// fails (Err); the caller exits the process.
-pub async fn run(cfg: Config) -> Result<(), Error> {
+pub async fn run(mut cfg: Config) -> Result<(), Error> {
+    cfg.identity = leader::per_process(&cfg.identity);
     let config = kube::Config::infer().await.map_err(Error::KubeConfig)?;
     Box::pin(run_with_clients(cfg, Clients::new(config)?)).await
 }
