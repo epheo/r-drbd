@@ -275,16 +275,16 @@ fn files_candidate_install_remove() {
         access_mode: model::AccessMode::ReadWriteOnce,
     };
     let r = drbd_config::render(&resource(&inputs).unwrap(), ALL).unwrap();
-    assert!(!f.installed("pvc-1", &r.hash).unwrap());
+    assert!(!f.installed("pvc-1", &r.text).unwrap());
     let c = f.write_candidate("pvc-1", &r.text).unwrap();
     assert_eq!(c, dir.join(".pvc-1.candidate"));
     assert!(!f.exists("pvc-1"));
     f.install("pvc-1").unwrap();
-    assert!(f.installed("pvc-1", &r.hash).unwrap() && !c.exists());
+    assert!(f.installed("pvc-1", &r.text).unwrap() && !c.exists());
     // A hand edit is a change.
     let edited = r.text.replace("11002", "11009");
     std::fs::write(f.path("pvc-1"), edited).unwrap();
-    assert!(!f.installed("pvc-1", &r.hash).unwrap());
+    assert!(!f.installed("pvc-1", &r.text).unwrap());
     f.write_candidate("pvc-1", "x").unwrap();
     f.remove("pvc-1").unwrap();
     f.remove("pvc-1").unwrap();

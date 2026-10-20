@@ -1,6 +1,6 @@
 use drbd_config::{
-    Disk, Features, Host, PEER_DISK, RenderError, Resource, discard_granularity, header_hash,
-    render,
+    Disk, Features, Host, PEER_DISK, RenderError, Resource, discard_granularity, render,
+    same_content,
 };
 
 const ALL: Features = Features {
@@ -105,14 +105,13 @@ fn full_file() {
     let r = render(&resource(), ALL).unwrap();
     let (header, body) = r.text.split_once('\n').unwrap();
     assert_eq!(body, BODY);
-    assert_eq!(header, format!("# r-drbd 0.1.0 sha256:{}", r.hash));
-    assert_eq!(r.hash.len(), 64);
+    assert_eq!(header, "# r-drbd 0.1.0");
     assert_eq!(r.dropped, Vec::<&str>::new());
     assert!(BODY.contains(PEER_DISK));
 }
 
 #[test]
-fn hash_ignores_the_version_and_catches_edits() {
+fn content_ignores_the_version_and_catches_edits() {
     let a = render(&resource(), ALL).unwrap();
     let b = render(
         &Resource {
@@ -122,13 +121,13 @@ fn hash_ignores_the_version_and_catches_edits() {
         ALL,
     )
     .unwrap();
-    assert_eq!(a.hash, b.hash);
     assert_ne!(a.text, b.text);
-    assert_eq!(header_hash(&a.text).as_deref(), Some(a.hash.as_str()));
+    assert!(same_content(&a.text, &b.text));
     let edited = a.text.replace("11001", "11009");
-    assert_eq!(header_hash(&edited), None);
-    assert_eq!(header_hash("resource \"x\" {}\n"), None);
-    assert_eq!(header_hash(""), None);
+    assert!(!same_content(&edited, &a.text));
+    let unheaded = a.text.split_once('\n').unwrap().1;
+    assert!(!same_content(unheaded, &a.text));
+    assert!(!same_content("", &a.text));
 }
 
 #[test]

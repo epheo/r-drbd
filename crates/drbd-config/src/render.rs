@@ -9,9 +9,8 @@ pub const VOLUME: u32 = 0;
 /// (only the local disk is) and its name says so.
 pub const PEER_DISK: &str = "/dev/r-drbd/peer-disk-never-opened";
 
-/// First line of every file: `# r-drbd <version> sha256:<hex of the rest>`.
+/// First line of every file: `# r-drbd <version>`.
 pub const HEADER_PREFIX: &str = "# r-drbd ";
-const HASH_TAG: &str = "sha256:";
 
 /// Optional settings the installed drbd-utils may not know; each one left
 /// out is reported in [`Rendered::dropped`].
@@ -60,8 +59,6 @@ pub struct Resource<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rendered {
     pub text: String,
-    /// Hex sha256 of everything after the header line.
-    pub hash: String,
     /// Settings left out because the tools lack them.
     pub dropped: Vec<&'static str>,
 }
@@ -219,10 +216,8 @@ pub fn render(r: &Resource<'_>, features: Features) -> Result<Rendered, RenderEr
     }
     line(0, "}");
 
-    let hash = sha256_hex(&b);
     Ok(Rendered {
-        text: format!("{HEADER_PREFIX}{} {HASH_TAG}{hash}\n{b}", r.version),
-        hash,
+        text: format!("{HEADER_PREFIX}{}\n{b}", r.version),
         dropped,
     })
 }
@@ -242,22 +237,14 @@ pub fn discard_granularity(chunk: u64) -> Option<u64> {
         .find(|&d| chunk.is_multiple_of(d))
 }
 
-fn sha256_hex(s: &str) -> String {
-    let d = ring::digest::digest(&ring::digest::SHA256, s.as_bytes());
-    d.as_ref().iter().fold(String::new(), |mut acc, b| {
-        let _ = write!(acc, "{b:02x}");
-        acc
-    })
-}
-
-/// The hash a file states in its header, only when the rest of the file
-/// still matches it; a hand-edited file gives None and is rewritten.
-pub fn header_hash(text: &str) -> Option<String> {
-    let (header, body) = text.split_once('\n')?;
-    let stated = header
-        .strip_prefix(HEADER_PREFIX)?
-        .split(' ')
-        .find_map(|t| t.strip_prefix(HASH_TAG))?;
-    let actual = sha256_hex(body);
-    (stated == actual).then_some(actual)
+/// Whether an installed file holds what `rendered` would install: the
+/// whole body, so any hand edit is a change; the version in the header is
+/// not, so an upgrade rewrites nothing.
+pub fn same_content(installed: &str, rendered: &str) -> bool {
+    fn body(t: &str) -> Option<&str> {
+        t.split_once('\n')
+            .filter(|(h, _)| h.starts_with(HEADER_PREFIX))
+            .map(|(_, b)| b)
+    }
+    body(installed).is_some_and(|b| body(rendered) == Some(b))
 }

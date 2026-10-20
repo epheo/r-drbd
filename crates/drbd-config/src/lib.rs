@@ -8,6 +8,6 @@ mod size;
 
 pub use render::{
     Disk, Features, HEADER_PREFIX, Host, PEER_DISK, RenderError, Rendered, Resource, VOLUME,
-    discard_granularity, header_hash, render,
+    discard_granularity, render, same_content,
 };
 pub use size::{gross_bytes, metadata_bytes, usable_bytes};

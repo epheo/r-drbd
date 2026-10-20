@@ -419,11 +419,11 @@ impl ResFiles {
         self.path(res).exists()
     }
 
-    /// Whether the installed file already carries content of `hash`.
-    pub fn installed(&self, res: &str, hash: &str) -> Result<bool, String> {
+    /// Whether the installed file already holds `text`.
+    pub fn installed(&self, res: &str, text: &str) -> Result<bool, String> {
         let path = self.path(res);
         match std::fs::read_to_string(&path) {
-            Ok(text) => Ok(drbd_config::header_hash(&text).as_deref() == Some(hash)),
+            Ok(have) => Ok(drbd_config::same_content(&have, text)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(format!("read {}: {e}", path.display())),
         }

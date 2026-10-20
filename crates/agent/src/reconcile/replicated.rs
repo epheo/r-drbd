@@ -881,7 +881,7 @@ impl Reconciler {
             );
         }
         let files = &self.drbd.files;
-        if files.installed(name, &rendered.hash)? {
+        if files.installed(name, &rendered.text)? {
             return Ok(());
         }
         let candidate = files.write_candidate(name, &rendered.text)?;
@@ -895,11 +895,7 @@ impl Reconciler {
             let _ = std::fs::remove_file(&candidate);
             return Err(format!("drbdadm rejects the new resource file: {e}"));
         }
-        tracing::info!(
-            volume = name,
-            hash = rendered.hash,
-            "installing resource file"
-        );
+        tracing::info!(volume = name, "installing resource file");
         self.drbd.files.install(name)
     }
 

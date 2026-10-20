@@ -501,7 +501,6 @@ dependencies = [
 name = "drbd-config"
 version = "0.1.0"
 dependencies = [
- "ring",
  "thiserror",
 ]
 
