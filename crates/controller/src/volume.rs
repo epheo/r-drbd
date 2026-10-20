@@ -2046,11 +2046,15 @@ fn place(ctx: &Ctx<'_>, placing: &Placing, v: &Volume) -> Placement {
                     .collect::<Vec<_>>()
                     .join(", ")
             };
+            let pin = req
+                .node
+                .map(|n| format!("; one must be on {n}"))
+                .unwrap_or_default();
             Placement::Wait(Cond::new(
                 FALSE,
                 reason::INSUFFICIENT,
                 format!(
-                    "{missing} more replica(s) of tier {} and {} bytes needed; rejected: {list}",
+                    "{missing} more replica(s) of tier {} and {} bytes needed{pin}; rejected: {list}",
                     v.spec.tier, v.spec.size_bytes
                 ),
             ))

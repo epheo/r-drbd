@@ -37,7 +37,6 @@ fn every_reason_in_order() {
     p.tier = "fast".to_string();
     assert_eq!(only_reason(&req, p.clone()), Reason::NotThePinnedPool);
     p.name = "p".to_string();
-    assert_eq!(only_reason(&req, p.clone()), Reason::NotThePinnedNode);
     p.node = "n1".to_string();
     assert_eq!(only_reason(&req, p.clone()), Reason::NoCapacity);
     p.free_bytes = 50 * GIB;
@@ -84,6 +83,43 @@ fn node_pin() {
     assert_eq!(diskful.len(), 1);
     assert_eq!(diskful[0].node, "n2");
     assert_eq!(diskful[0].pool, "b");
+}
+
+#[test]
+fn node_pin_holds_the_first_of_several_replicas() {
+    let mut req = request(2);
+    req.node = Some("n3".to_string());
+    let pools = [
+        pool("a", "n1", 90 * GIB),
+        pool("b", "n2", 50 * GIB),
+        pool("c", "n3", 10 * GIB),
+    ];
+    let nodes: Vec<String> = place(&req, &pools)
+        .unwrap()
+        .into_iter()
+        .map(|c| c.node)
+        .collect();
+    assert_eq!(nodes, ["n3", "n1"]);
+}
+
+#[test]
+fn node_pin_without_room_there_is_insufficient() {
+    let mut req = request(2);
+    req.node = Some("n3".to_string());
+    let pools = [
+        pool("a", "n1", 90 * GIB),
+        pool("b", "n2", 50 * GIB),
+        pool("c", "n3", 0),
+    ];
+    let got = place(&req, &pools).unwrap_err();
+    assert_eq!(got.missing, 1);
+    assert_eq!(reasons(Err(got)), [("c".to_string(), Reason::NoCapacity)]);
+    // No pool at all on the pinned node: the same, nothing to name.
+    let got = place(&req, &pools[..2]).unwrap_err();
+    assert_eq!((got.missing, got.rejected.len()), (1, 0));
+    // n1 could hold the other replica; with no pool at all both are missing.
+    assert_eq!(place(&req, &pools[..1]).unwrap_err().missing, 1);
+    assert_eq!(place(&req, &[]).unwrap_err().missing, 2);
 }
 
 #[test]

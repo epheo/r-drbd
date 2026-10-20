@@ -238,6 +238,32 @@ async fn publish_appends_diskless_and_unpublish_removes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn node_pin_places_one_of_the_replicas() {
+    let assets = require_envtest!();
+    let (_env, client, _cfg, _ctl) = setup(&assets).await;
+    cluster(&client).await;
+    // Equal pools: without the pin n1 would come first.
+    let mut spec = volume_spec(GIB, 2, "fast");
+    spec.node = Some("n2".into());
+    create_volume(&client, "pinned", spec).await;
+    let v = volume_where(&client, "pinned", |v| v.spec.assignment.is_some()).await;
+    let a = v.spec.assignment.as_ref().unwrap();
+    assert_eq!(a.initial_up_to_date_node.as_deref(), Some("n2"));
+    assert_eq!(role_of(&v, "n1"), Some(Role::Diskful));
+    // A pinned node without a pool: Pending, naming the pin.
+    let mut spec = volume_spec(GIB, 2, "fast");
+    spec.node = Some("n3".into());
+    create_volume(&client, "nowhere", spec).await;
+    let v = volume_where(&client, "nowhere", |v| {
+        ready_reason(v).as_deref() == Some("Insufficient")
+    })
+    .await;
+    let message = &cond(&v, types::READY).unwrap().message;
+    assert!(message.contains("one must be on n3"), "{message}");
+    assert!(v.spec.assignment.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_volumes_attach_to_one_node_in_one_pass() {
     let assets = require_envtest!();
     let (_env, client, _cfg, _ctl) = setup(&assets).await;

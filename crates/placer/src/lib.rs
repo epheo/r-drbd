@@ -29,7 +29,9 @@ pub struct Request {
     /// 0 behaves like already satisfied.
     pub replicas: u32,
     pub tier: String,
+    /// Every diskful replica goes to this pool.
     pub pool: Option<String>,
+    /// The first diskful replica goes to this node; the others go anywhere.
     pub node: Option<String>,
     /// The pinned pool already holds this volume's blocks (a restore from
     /// its snapshot): the volume has nowhere else to go, so capacity is not
@@ -67,7 +69,6 @@ pub enum Reason {
     PoolUnavailable,
     WrongTier,
     NotThePinnedPool,
-    NotThePinnedNode,
     NoCapacity,
 }
 
@@ -111,8 +112,9 @@ pub fn fits(pool: &PoolView, size_bytes: u64) -> bool {
 }
 
 /// Diskful placement: filter pools, order by room descending then node
-/// then pool name, pick one pool per node until `replicas` are held.
-/// Never partial.
+/// then pool name, the pinned node first, pick one pool per node until
+/// `replicas` are held. Never partial; with a node pin, Insufficient unless
+/// the first choice is on that node.
 pub fn place(req: &Request, pools: &[PoolView]) -> Result<Vec<Chosen>, Insufficient> {
     let wanted = usize::try_from(req.replicas).unwrap_or(usize::MAX);
     let mut rejected = Vec::new();
@@ -129,9 +131,11 @@ pub fn place(req: &Request, pools: &[PoolView]) -> Result<Vec<Chosen>, Insuffici
     }
     // Room, not freeBytes: committed grows with every placement of a pass,
     // so a burst spreads instead of filling the pool with most unwritten space.
+    let off_pin = |node: &str| req.node.as_deref().is_some_and(|n| n != node);
     survivors.sort_by(|a, b| {
-        room(b)
-            .cmp(&room(a))
+        off_pin(&a.node)
+            .cmp(&off_pin(&b.node))
+            .then_with(|| room(b).cmp(&room(a)))
             .then_with(|| a.node.cmp(&b.node))
             .then_with(|| a.name.cmp(&b.name))
     });
@@ -150,9 +154,15 @@ pub fn place(req: &Request, pools: &[PoolView]) -> Result<Vec<Chosen>, Insuffici
             pool: pool.name.clone(),
         });
     }
-    if diskful.len() < wanted {
+    // Without a pool on the pinned node, that replica is missing whatever
+    // the other nodes offer.
+    let held = match diskful.first() {
+        Some(c) if off_pin(&c.node) => diskful.len().min(wanted - 1),
+        _ => diskful.len(),
+    };
+    if held < wanted {
         return Err(Insufficient {
-            missing: u32::try_from(wanted - diskful.len()).unwrap_or(u32::MAX),
+            missing: u32::try_from(wanted - held).unwrap_or(u32::MAX),
             rejected,
         });
     }
@@ -168,8 +178,6 @@ fn reject(req: &Request, pool: &PoolView) -> Option<Reason> {
         Some(Reason::WrongTier)
     } else if req.pool.as_ref().is_some_and(|p| *p != pool.name) {
         Some(Reason::NotThePinnedPool)
-    } else if req.node.as_ref().is_some_and(|n| *n != pool.node) {
-        Some(Reason::NotThePinnedNode)
     } else if !((req.holds_data && req.pool.is_some()) || fits(pool, req.size_bytes)) {
         Some(Reason::NoCapacity)
     } else {

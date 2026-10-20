@@ -38,7 +38,7 @@ Two PVC annotations override placement:
         r-drbd.io/node: node2
         r-drbd.io/pool: node2-nvme
 
-- `r-drbd.io/node`: one of the diskful replicas goes to this node.
+- `r-drbd.io/node`: one diskful replica goes to this node, the others anywhere; the claim stays Pending while that node has no room.
 - `r-drbd.io/pool`: every diskful replica goes to this Pool; only sensible with `replicas: 1`.
 
 The CSI driver copies the annotations into the Volume (`spec.node`, `spec.pool`) once, at creation.
