@@ -18,7 +18,7 @@ pub mod store;
 pub mod volume;
 pub mod wait;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
@@ -26,7 +26,7 @@ use kube::api::{Patch, PatchParams};
 use kube::{Api, Client, Resource, ResourceExt};
 use model::Assignment;
 use serde::de::DeserializeOwned;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::store::Stores;
 
@@ -261,6 +261,8 @@ pub(crate) struct Memory {
     /// Per Volume uid: the kind of the status apply failure last sent as
     /// an Event; cleared once an apply succeeds.
     pub(crate) status_failed: HashMap<String, String>,
+    /// Duplicate minors and ports already announced, by message.
+    pub(crate) duplicates: BTreeSet<String>,
     /// Per Volume uid: the attached nodes without a replica, and the
     /// message last sent as an Event.
     pub(crate) attach_failed: HashMap<String, (Vec<String>, String)>,
@@ -447,6 +449,7 @@ async fn pass(ctx: &Ctx<'_>, memory: &mut Memory) -> Option<Duration> {
         .filter_map(|s| s.metadata.uid.clone())
         .collect();
     memory.rounds.retain(|uid, _| snapshots.contains(uid));
+    report_duplicates(ctx, memory).await;
     volume::reconcile_all(ctx, memory).await;
     pool::reconcile_all(ctx, memory).await;
     let snapshots = snapshot::reconcile_all(ctx, memory).await;
@@ -456,6 +459,62 @@ async fn pass(ctx: &Ctx<'_>, memory: &mut Memory) -> Option<Duration> {
         .flatten()
         .min()
 }
+
+/// Every stored minor and per-node port held by more than one Volume, with
+/// its holders. Allocation should make this empty.
+pub(crate) fn duplicates(
+    volumes: &[std::sync::Arc<model::Volume>],
+) -> Vec<(String, Vec<std::sync::Arc<model::Volume>>)> {
+    let mut minors: BTreeMap<u32, Vec<_>> = BTreeMap::new();
+    let mut ports: BTreeMap<(&str, u16), Vec<_>> = BTreeMap::new();
+    for v in volumes {
+        let Some(a) = &v.spec.assignment else {
+            continue;
+        };
+        if let Some(m) = a.minor {
+            minors.entry(m).or_default().push(v.clone());
+        }
+        for r in &a.replicas {
+            if let Some(p) = r.port {
+                ports.entry((&r.node, p)).or_default().push(v.clone());
+            }
+        }
+    }
+    let names = |held: &[std::sync::Arc<model::Volume>]| {
+        held.iter()
+            .map(|v| v.name_any())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let minors = minors
+        .into_iter()
+        .filter(|(_, held)| held.len() > 1)
+        .map(|(m, held)| (format!("minor {m} held by {}", names(&held)), held));
+    let ports = ports
+        .into_iter()
+        .filter(|(_, held)| held.len() > 1)
+        .map(|((n, p), held)| (format!("port {p} on {n} held by {}", names(&held)), held));
+    minors.chain(ports).collect()
+}
+
+/// Both values are immutable once stored, so a duplicate is only reported:
+/// an error and one Warning Event per holder, once while it lasts.
+async fn report_duplicates(ctx: &Ctx<'_>, memory: &mut Memory) {
+    let found = duplicates(&ctx.stores.volumes.state());
+    for (message, held) in &found {
+        if memory.duplicates.contains(message) {
+            continue;
+        }
+        error!(message, "duplicate DRBD assignment; not rewritten");
+        for v in held {
+            warning_event(ctx.client, v, DUPLICATE_ASSIGNMENT, message).await;
+        }
+    }
+    memory.duplicates = found.into_iter().map(|(m, _)| m).collect();
+}
+
+/// Warning Event: two Volumes hold the same minor or port.
+pub(crate) const DUPLICATE_ASSIGNMENT: &str = "DuplicateAssignment";
 
 /// Warning Event: the controller's own status apply failed.
 pub(crate) const STATUS_APPLY_FAILED: &str = "StatusApplyFailed";
@@ -619,6 +678,7 @@ mod tests {
         valid_volume_name, watch_config,
     };
     use crate::volume::Outcome;
+    use kube::ResourceExt;
     use model::keys::{MINOR_RANGE, PORT_RANGE};
 
     fn volume(uid: &str, rv: &str, assignment: Option<serde_json::Value>) -> Arc<model::Volume> {
@@ -706,6 +766,36 @@ mod tests {
         // An apply that succeeds forgets it.
         memory.status_failed.remove("a");
         assert!(memory.status_failure("a", invalid));
+    }
+
+    #[test]
+    fn duplicate_minors_and_ports_are_found() {
+        let (minor, port) = (*MINOR_RANGE.start(), *PORT_RANGE.start());
+        let vols = [
+            volume("a", "1", Some(assignment(minor, "n1", port))),
+            volume("b", "1", Some(assignment(minor, "n2", port))),
+            volume("c", "1", Some(assignment(minor + 1, "n1", port))),
+            volume("d", "1", Some(assignment(minor + 2, "n2", port + 1))),
+            volume("e", "1", None),
+        ];
+        let found: Vec<(String, Vec<String>)> = super::duplicates(&vols)
+            .into_iter()
+            .map(|(m, held)| (m, held.iter().map(|v| v.name_any()).collect()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    format!("minor {minor} held by a, b"),
+                    vec!["a".into(), "b".into()]
+                ),
+                (
+                    format!("port {port} on n1 held by a, c"),
+                    vec!["a".into(), "c".into()]
+                ),
+            ]
+        );
+        assert_eq!(super::duplicates(&vols[2..]), vec![]);
     }
 
     #[test]
