@@ -448,10 +448,35 @@ pub(crate) mod scripted {
         }
     }
 
+    /// LVM commands that change metadata may suspend a thin pool; a kill
+    /// then hangs every LV in it, so they must run in `Finish` mode.
+    const LVM_CHANGES: &[&str] = &[
+        "lvcreate",
+        "lvextend",
+        "lvremove",
+        "lvchange",
+        "lvconvert",
+        "vgcreate",
+        "vgextend",
+        "vgreduce",
+        "vgremove",
+        "pvcreate",
+        "pvremove",
+    ];
+
     #[async_trait::async_trait]
     impl Exec for ScriptedExec {
-        async fn run(&self, argv: &[String], _mode: ExecMode) -> Result<Output, ExecError> {
+        async fn run(&self, argv: &[String], mode: ExecMode) -> Result<Output, ExecError> {
             self.seen.lock().unwrap().push(argv.to_vec());
+            let change = argv
+                .first()
+                .is_some_and(|p| LVM_CHANGES.contains(&p.as_str()));
+            if change != matches!(mode, ExecMode::Finish { .. }) {
+                self.unexpected
+                    .lock()
+                    .unwrap()
+                    .push(format!("{argv:?} in mode {mode:?}"));
+            }
             let mut steps = self.steps.lock().unwrap();
             let why = match steps.front() {
                 Some((want, _)) if argv == want.as_slice() => {
@@ -488,6 +513,17 @@ pub(crate) mod scripted {
         );
         // The expected step stays first, so the order check goes on.
         x.run(&super::argv(&["blkid", "/dev/x"]), super::DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        x.assert_done();
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "unexpected commands")]
+    async fn lvm_change_outside_finish_fails() {
+        let x = ScriptedExec::new();
+        x.expect_s(&["lvremove", "vg/lv"], ok(""));
+        x.run(&super::argv(&["lvremove", "vg/lv"]), super::DEFAULT_TIMEOUT)
             .await
             .unwrap();
         x.assert_done();

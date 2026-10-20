@@ -38,6 +38,10 @@ static FREED: Condvar = Condvar::new();
 /// instead of letting them pass as skipped.
 const REQUIRE_ENVTEST: &str = "R_DRBD_REQUIRE_ENVTEST";
 
+pub fn envtest_required() -> bool {
+    std::env::var_os(REQUIRE_ENVTEST).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 /// The envtest binaries, or None with the reason printed.
 pub fn assets() -> Option<PathBuf> {
     let dir = std::env::var_os("KUBEBUILDER_ASSETS")
@@ -55,10 +59,7 @@ pub fn assets() -> Option<PathBuf> {
                 "envtest binary {} missing (set KUBEBUILDER_ASSETS)",
                 dir.join(bin).display()
             );
-            assert!(
-                std::env::var_os(REQUIRE_ENVTEST).is_none_or(|v| v.is_empty() || v == "0"),
-                "{why}; {REQUIRE_ENVTEST} is set"
-            );
+            assert!(!envtest_required(), "{why}; {REQUIRE_ENVTEST} is set");
             eprintln!("SKIPPED: {why}");
             return None;
         }
@@ -169,6 +170,17 @@ impl Drop for Env {
 impl Env {
     /// Starts etcd and kube-apiserver, installs the CRDs and the namespace.
     pub async fn start(assets: &Path) -> Self {
+        // free_port can lose a race with another test for its port; the
+        // losing process exits, and fresh ports almost always win.
+        for _ in 0..3 {
+            if let Some(env) = Self::try_start(assets).await {
+                return env;
+            }
+        }
+        panic!("envtest failed to start three times");
+    }
+
+    async fn try_start(assets: &Path) -> Option<Self> {
         let slot = Slot::take();
         let dir = tempfile::Builder::new()
             .prefix("r-drbd-envtest-")
@@ -246,16 +258,18 @@ impl Env {
             ),
         )
         .expect("kubeconfig");
-        let env = Self {
+        let mut env = Self {
             apiserver,
             etcd,
             dir,
             kubeconfig,
             _slot: slot,
         };
-        env.wait_up().await;
+        if !env.wait_up().await {
+            return None;
+        }
         env.install().await;
-        env
+        Some(env)
     }
 
     async fn kube_config(&self) -> kube::Config {
@@ -291,12 +305,25 @@ impl Env {
             .count()
     }
 
-    async fn wait_up(&self) {
+    /// False when etcd or the apiserver exited, with its log tail printed.
+    async fn wait_up(&mut self) -> bool {
         let client = self.client().await;
         let api: Api<Namespace> = Api::all(client);
         for _ in 0..1200 {
             if api.get_opt("default").await.ok().flatten().is_some() {
-                return;
+                return true;
+            }
+            for (name, err, child) in [
+                ("etcd", "etcd.err", &mut self.etcd),
+                ("kube-apiserver", "apiserver.err", &mut self.apiserver),
+            ] {
+                if let Ok(Some(status)) = child.0.try_wait() {
+                    let log =
+                        std::fs::read_to_string(self.dir.path().join(err)).unwrap_or_default();
+                    let tail: Vec<&str> = log.lines().rev().take(5).collect();
+                    eprintln!("{name} exited ({status}), retrying: {}", tail.join(" | "));
+                    return false;
+                }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

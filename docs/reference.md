@@ -220,7 +220,7 @@ Other environment:
 | `R_DRBD_HOST_NS` | Agent: namespace directory of the host (`/proc/1/ns`) to run host tools in |
 | `RUST_LOG` | Log filter, e.g. `info`, `debug` |
 
-`r-drbd crds` prints the CRDs as a JSON List for `kubectl apply -f -`.
+`r-drbd crds` prints the CRDs as a JSON List for `kubectl apply -f -`; `deploy/base/crds.yaml` holds the same output.
 
 ## Cluster objects
 

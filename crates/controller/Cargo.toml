@@ -7,39 +7,28 @@ description = "r-drbd controller: reconcilers, allocation, CSI controller plugin
 
 [dependencies]
 base64 = "0.22.1"
-csi = { path = "../csi" }
-futures = "0.3.34"
+csi.workspace = true
+futures.workspace = true
 getrandom = "0.3.4"
-k8s-openapi = { version = "0.28.0", features = ["latest"] }
-kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "rustls-tls", "ring", "jsonpatch"] }
-lvm = { path = "../lvm" }
-model = { path = "../model" }
-placer = { path = "../placer" }
-prost-types = "0.14.4"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
-thiserror = "2.0.21"
-tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
-tokio-stream = { version = "0.1.19", features = ["net"] }
-# The csi crate builds tonic without a server transport; the controller needs one for the Unix socket.
-tonic = { version = "0.14.6", default-features = false, features = ["transport"] }
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter", "ansi"], optional = true }
-
-[features]
-# Temporary dev binary until crates/r-drbd wires the controller role.
-dev-bin = ["dep:tracing-subscriber"]
-
-[[bin]]
-name = "controller-dev"
-required-features = ["dev-bin"]
+k8s-openapi.workspace = true
+kube = { workspace = true, features = ["client", "runtime", "rustls-tls", "ring", "jsonpatch"] }
+lvm.workspace = true
+model.workspace = true
+placer.workspace = true
+prost-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+tokio-stream.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-agent = { path = "../agent" }
+agent.workspace = true
 # test-util: paused clock for the Lease deadline test.
-tokio = { version = "1.53.3", features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3.27.0"
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter"] }
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

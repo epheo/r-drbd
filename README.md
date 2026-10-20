@@ -26,9 +26,8 @@ Kubernetes CRDs are the API; one static binary runs as the controller and as a p
 
 ## Quick start
 
-Install the CRDs and the controller and agent:
+Install the CRDs, the controller and the agent:
 
-    podman run --rm ghcr.io/epheo/r-drbd:sha-6765eba crds | kubectl apply -f -
     kubectl apply -k deploy/base
 
 Declare a thin pool on a node (or list blank disks in `devices` and let the agent build it, see docs/pools.md):

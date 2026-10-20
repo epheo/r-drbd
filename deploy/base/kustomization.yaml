@@ -1,16 +1,16 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
+  - crds.yaml
   - 00-namespace-rbac.yaml
   - 10-csidriver.yaml
   - 20-controller.yaml
   - 30-agent.yaml
   - 40-storageclasses.yaml
 # One immutable build for the controller and every agent. A release bumps
-# every place that names this tag together, as deploy/README.md lists:
-# 20-controller.yaml, 30-agent.yaml, newTag here, and the CRD commands in
-# README.md, docs/install.md and docs/openshift.md; a test checks they
-# agree. deploy/dev follows :latest instead.
+# this tag together with 20-controller.yaml and 30-agent.yaml, and
+# regenerates crds.yaml from the same commit; tests check both.
+# deploy/dev follows :latest instead.
 images:
   - name: ghcr.io/epheo/r-drbd
     newTag: sha-6765eba

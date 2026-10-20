@@ -6,7 +6,28 @@ members = ["crates/*"]
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/epheo/r-drbd"
-rust-version = "1.90"
+
+[workspace.dependencies]
+agent = { path = "crates/agent" }
+controller = { path = "crates/controller" }
+csi = { path = "crates/csi" }
+drbd-config = { path = "crates/drbd-config" }
+lvm = { path = "crates/lvm" }
+model = { path = "crates/model" }
+placer = { path = "crates/placer" }
+futures = { version = "0.3.34", default-features = false, features = ["std"] }
+k8s-openapi = { version = "0.28.0", features = ["latest"] }
+kube = { version = "4.2.0", default-features = false }
+prost-types = "0.14.4"
+rustix = { version = "1.1.5", default-features = false, features = ["std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = "1.53.3"
+tokio-stream = { version = "0.1.19", features = ["net"] }
+tonic = { version = "0.14.6", default-features = false }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

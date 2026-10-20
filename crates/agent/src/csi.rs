@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,7 +30,6 @@ use tokio_stream::wrappers::UnixListenerStream;
 
 use crate::Exec;
 use crate::exec::{CmdError, DEFAULT_TIMEOUT, MKFS_TIMEOUT, argv, failure, run_any, run_ok};
-use crate::run::Error;
 use crate::shutdown::OpenGate;
 
 /// publish_context key the controller fills from the Volume status.
@@ -202,39 +201,6 @@ impl VolumeLookup for Store<Volume> {
             .and_then(|r| r.device_path.clone())
             .map_or(Lookup::NoDevice, Lookup::Device)
     }
-}
-
-/// `unix:///run/csi.sock` or a bare path.
-pub fn socket_path(endpoint: &str) -> PathBuf {
-    PathBuf::from(endpoint.strip_prefix("unix://").unwrap_or(endpoint))
-}
-
-/// A leftover socket from a previous run is replaced; any other file at the
-/// path is a configuration error and is never deleted.
-pub fn bind(path: &Path) -> Result<UnixListener, Error> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| Error::io(format!("create {}", dir.display()), e))?;
-    }
-    match std::fs::symlink_metadata(path) {
-        Ok(m) if m.file_type().is_socket() => {
-            std::fs::remove_file(path)
-                .map_err(|e| Error::io(format!("remove {}", path.display()), e))?;
-            tracing::info!(socket = %path.display(), "removed stale CSI socket");
-        }
-        Ok(_) => {
-            return Err(Error::io(
-                format!("CSI endpoint {}", path.display()),
-                std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "exists and is not a socket",
-                ),
-            ));
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(Error::io(format!("stat {}", path.display()), e)),
-    }
-    UnixListener::bind(path).map_err(|e| Error::io(format!("bind {}", path.display()), e))
 }
 
 /// Serves until `stop` resolves; accepted requests still complete.

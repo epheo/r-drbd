@@ -483,26 +483,6 @@ async fn operation_survives_client_cancel() {
     env.x.assert_done();
 }
 
-#[test]
-fn bind_replaces_only_sockets() {
-    let env = Env::new("bind");
-    let file = env.dir.join("not-a-socket");
-    std::fs::write(&file, b"keep").unwrap();
-    assert!(bind(&file).is_err());
-    assert_eq!(std::fs::read(&file).unwrap(), b"keep");
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(async {
-        let sock = env.dir.join("csi.sock");
-        drop(bind(&sock).unwrap());
-        assert!(sock.exists(), "a dropped listener leaves the file behind");
-        drop(bind(&sock).unwrap());
-    });
-}
-
 #[tokio::test]
 async fn publish_mount_readonly_then_unpublish() {
     let env = Env::new("publish-mount");
@@ -759,7 +739,6 @@ async fn info_and_capabilities() {
         .unwrap()
         .into_inner();
     assert_eq!(plugin.name, "r-drbd.io");
-    assert_eq!(socket_path("unix:///a/b.sock"), PathBuf::from("/a/b.sock"));
 }
 
 fn mount_step(env: &Env) {

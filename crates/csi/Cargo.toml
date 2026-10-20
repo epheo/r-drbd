@@ -7,8 +7,8 @@ description = "CSI v1 gRPC types and services generated from the Apache-2.0 csi.
 
 [dependencies]
 prost = "0.14.4"
-prost-types = "0.14.4"
-tonic = { version = "0.14.6", default-features = false, features = ["codegen", "server", "router"] }
+prost-types.workspace = true
+tonic = { workspace = true, features = ["codegen", "server", "router"] }
 tonic-prost = "0.14.6"
 
 [build-dependencies]

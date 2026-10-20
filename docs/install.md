@@ -77,11 +77,7 @@ Host paths it writes:
 
 ## Install the manifests
 
-Install the CRDs, printed by the binary itself; use the tag `deploy/base` pins, so the CRDs match the controller and agents:
-
-    podman run --rm ghcr.io/epheo/r-drbd:sha-6765eba crds | kubectl apply -f -
-
-Install the controller, the agent, RBAC, the CSIDriver and default StorageClasses:
+Install the CRDs, the controller, the agent, RBAC, the CSIDriver and default StorageClasses:
 
     kubectl apply -k deploy/base
 
@@ -169,7 +165,7 @@ Then:
 
 1. Delete every PVC and VolumeSnapshot backed by r-drbd, and wait for the Volumes and Snapshots to go.
 2. Delete the Pools.
-3. `kubectl delete -k deploy/base`, then delete the CRDs.
+3. `kubectl delete -k deploy/base`; it deletes the CRDs too, so it comes last.
 4. The version annotations stay on the Nodes:
 
        kubectl annotate node --all r-drbd.io/drbd-kernel- r-drbd.io/drbd-utils- r-drbd.io/lvm-

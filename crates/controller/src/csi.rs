@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use ::csi::tonic::{self, Request, Response, Status};
 use ::csi::v1::controller_server::{Controller, ControllerServer};
 use ::csi::v1::controller_service_capability::{self, rpc};
 use ::csi::v1::identity_server::{Identity, IdentityServer};
@@ -40,7 +41,6 @@ use model::{
 use serde_json::json;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
-use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use crate::store::Stores;
@@ -224,13 +224,6 @@ pub fn object_name(csi_name: &str) -> String {
     format!("{base}-{hash:016x}")
 }
 
-fn socket_path(endpoint: &str) -> &str {
-    endpoint
-        .strip_prefix("unix://")
-        .or_else(|| endpoint.strip_prefix("unix:"))
-        .unwrap_or(endpoint)
-}
-
 fn kube_status(context: &str, e: &kube::Error) -> Status {
     let msg = format!("{context}: {e}");
     match e {
@@ -276,27 +269,17 @@ fn timestamp(t: k8s_openapi::jiff::Timestamp) -> prost_types::Timestamp {
 /// Serves until the socket fails.
 pub async fn serve(client: Client, stores: Stores, cfg: Config) -> Result<(), Error> {
     stores.wait_ready().await?;
-    let path = socket_path(&cfg.csi_endpoint).to_owned();
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(Error::Io {
-                context: format!("removing stale socket {path}"),
-                source: e,
-            });
-        }
-    }
-    let listener = UnixListener::bind(&path).map_err(|e| Error::Io {
-        context: format!("binding {path}"),
-        source: e,
-    })?;
-    info!(path, "CSI controller plugin listening");
-    let svc = Arc::new(Csi {
-        client,
-        stores,
-        cfg,
-    });
+    let listener = ::csi::bind_unix(&cfg.csi_endpoint)
+        .and_then(UnixListener::from_std)
+        .map_err(|e| Error::Io {
+            context: "CSI socket".to_owned(),
+            source: e,
+        })?;
+    info!(
+        endpoint = cfg.csi_endpoint,
+        "CSI controller plugin listening"
+    );
+    let svc = Arc::new(Csi::new(client, stores, cfg));
     tonic::transport::Server::builder()
         .add_service(IdentityServer::from_arc(svc.clone()))
         .add_service(ControllerServer::from_arc(svc))
@@ -1519,12 +1502,5 @@ mod tests {
             assert_eq!(object_name(&m), m, "mapping is idempotent");
         }
         assert!(object_name(long).starts_with("sanity-controller-create-"));
-    }
-
-    #[test]
-    fn endpoints() {
-        assert_eq!(socket_path("unix:///csi/csi.sock"), "/csi/csi.sock");
-        assert_eq!(socket_path("/tmp/x.sock"), "/tmp/x.sock");
-        assert_eq!(socket_path("unix:/tmp/x.sock"), "/tmp/x.sock");
     }
 }

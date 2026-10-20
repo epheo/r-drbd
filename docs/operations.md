@@ -210,5 +210,5 @@ If an LV that a node already reported disappears (deleted by hand, disk replaced
 
 ## Upgrading r-drbd
 
-Apply the new CRDs, then the new manifests.
+`kubectl apply -k deploy/base` of the new release: it carries the CRDs of that build.
 The agent DaemonSet rolls one node at a time; DRBD devices stay up while an agent restarts.

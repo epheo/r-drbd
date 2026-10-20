@@ -2,7 +2,7 @@
 
 Node-side reconciler of r-drbd, one per node: thin LVM pools, local volumes (replicas 1), replicated volumes (replicas 2 and 3, DRBD), snapshots with the suspend and resume rounds, restore, status reporting, heartbeat Lease, Node annotations, the CSI node plugin.
 
-Entry point: `agent::run(Config)`; `src/bin/agent-dev.rs` (feature `dev-bin`) is a temporary env-driven launcher until crates/r-drbd wires the agent role.
+Entry point: `agent::run(Config)`, called by crates/r-drbd.
 
 Modules:
 - `exec`: tokio process runner behind `Exec` (stdin null, Timeout mode with SIGTERM then SIGKILL).
@@ -28,15 +28,14 @@ Rules:
 Tests:
 - `cargo test -p agent`: unit tests with scripted commands.
 - `tests/host.rs`: real LVM and mounts against a test VG named at run time by `R_DRBD_TEST_VG`, `R_DRBD_TEST_THIN` and `R_DRBD_TEST_DIR`; with `R_DRBD_HOST_NS` set, as in the agent pod, host tools run through host-exec and drbd-utils from the image (LVM tests use LVs rw-l-*; the guest signature test brings up rw-l-d on minor 99989); `tests/host/drbd.rs`: DRBD with resources rw-*, minors 99990 to 99999, ports 11990 to 11999, replicas of one volume as separate resources on loopback addresses; ignored unless `R_DRBD_HOST_TEST=1` and `--ignored`.
-- `tests/csi_client.rs`: CSI client over the Unix socket for the end-to-end demo; ignored unless `CSI_SOCKET` is set.
 
 Dependencies:
 - csi, model, lvm, drbd-config: workspace crates.
 - kube (client, runtime, rustls-tls, ring) and k8s-openapi: API access, reflectors, Lease and Node types.
 - tokio, tokio-stream (net): runtime, processes, Unix socket listener for tonic.
 - futures (std only): stream and future combinators for the watches.
-- tracing: logs; tracing-subscriber only behind `dev-bin`.
+- tracing: logs.
 - serde, serde_json: apply bodies, `drbdsetup status --json`.
 - thiserror, async-trait: errors and the `Exec` trait.
 - rustix (fs): statvfs for NodeGetVolumeStats, the exclusive open of a listed disk.
-- dev only: tonic (channel), hyper-util, tower for the test CSI client; tokio test-util for paused-time tests.
+- dev only: tokio test-util for paused-time tests.

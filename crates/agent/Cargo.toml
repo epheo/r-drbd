@@ -7,35 +7,23 @@ description = "r-drbd node agent: thin LVM, DRBD, status reporting, CSI node plu
 
 [dependencies]
 async-trait = "0.1.92"
-csi = { path = "../csi" }
-drbd-config = { path = "../drbd-config" }
-futures = { version = "0.3.34", default-features = false, features = ["std"] }
-k8s-openapi = { version = "0.28.0", features = ["latest"] }
-kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "rustls-tls", "ring"] }
-lvm = { path = "../lvm" }
-model = { path = "../model" }
-rustix = { version = "1.1.5", default-features = false, features = ["std", "fs", "process", "net", "event"] }
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
-thiserror = "2.0.21"
-tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "net", "signal", "time", "process", "io-util", "sync", "fs"] }
-tokio-stream = { version = "0.1.19", features = ["net"] }
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter", "ansi"], optional = true }
-
-[features]
-# Temporary dev binary until crates/r-drbd wires the agent role.
-dev-bin = ["dep:tracing-subscriber"]
-
-[[bin]]
-name = "agent-dev"
-required-features = ["dev-bin"]
+csi.workspace = true
+drbd-config.workspace = true
+futures.workspace = true
+k8s-openapi.workspace = true
+kube = { workspace = true, features = ["client", "runtime", "rustls-tls", "ring"] }
+lvm.workspace = true
+model.workspace = true
+rustix = { workspace = true, features = ["fs", "process", "net", "event"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "time", "process", "io-util", "sync", "fs"] }
+tokio-stream.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-hyper-util = { version = "0.1.21", features = ["tokio"] }
-tonic = { version = "0.14.6", default-features = false, features = ["channel"] }
-tokio = { version = "1.53.3", features = ["test-util"] }
-tower = { version = "0.5.3", default-features = false, features = ["util"] }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

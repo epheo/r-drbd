@@ -1,6 +1,6 @@
 //! Every place that names the pinned image build must name the same one:
-//! the two pod manifests, the kustomization and the CRD commands in the
-//! docs. A partial bump would deploy one build and print another's CRDs.
+//! the two pod manifests and the kustomization. A partial bump would run
+//! the controller and the agents on different builds.
 
 use std::path::Path;
 
@@ -9,9 +9,6 @@ const IMAGE: &str = "ghcr.io/epheo/r-drbd:";
 /// Files that carry the pin. deploy/dev follows `latest` on purpose and
 /// the workflows produce the tags, so neither is listed.
 const PINNED: &[&str] = &[
-    "README.md",
-    "docs/install.md",
-    "docs/openshift.md",
     "deploy/base/20-controller.yaml",
     "deploy/base/30-agent.yaml",
     "deploy/base/kustomization.yaml",

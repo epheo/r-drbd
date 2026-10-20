@@ -1,0 +1,1369 @@
+{
+  "apiVersion": "v1",
+  "items": [
+    {
+      "apiVersion": "apiextensions.k8s.io/v1",
+      "kind": "CustomResourceDefinition",
+      "metadata": {
+        "name": "pools.r-drbd.io"
+      },
+      "spec": {
+        "group": "r-drbd.io",
+        "names": {
+          "kind": "Pool",
+          "plural": "pools",
+          "singular": "pool"
+        },
+        "scope": "Cluster",
+        "versions": [
+          {
+            "additionalPrinterColumns": [
+              {
+                "jsonPath": ".spec.node",
+                "name": "Node",
+                "type": "string"
+              },
+              {
+                "jsonPath": ".spec.tier",
+                "name": "Tier",
+                "type": "string"
+              },
+              {
+                "jsonPath": ".spec.vg",
+                "name": "VG",
+                "type": "string"
+              },
+              {
+                "jsonPath": ".spec.thinPool",
+                "name": "Thin pool",
+                "type": "string"
+              },
+              {
+                "jsonPath": ".status.freeBytes",
+                "name": "Free",
+                "type": "integer"
+              },
+              {
+                "jsonPath": ".status.committedBytes",
+                "name": "Committed",
+                "type": "integer"
+              },
+              {
+                "jsonPath": ".status.placeableBytes",
+                "name": "Placeable",
+                "type": "integer"
+              },
+              {
+                "jsonPath": ".status.conditions[?(@.type==\"Available\")].status",
+                "name": "Available",
+                "type": "string"
+              },
+              {
+                "jsonPath": ".metadata.creationTimestamp",
+                "name": "Age",
+                "type": "date"
+              }
+            ],
+            "name": "v1alpha1",
+            "schema": {
+              "openAPIV3Schema": {
+                "description": "Auto-generated derived type for PoolSpec via `CustomResource`",
+                "properties": {
+                  "spec": {
+                    "description": "Location fields are immutable: a pool is a fixed place on a fixed node.\nThe capacity policy may change at any time; it only gates new placements.",
+                    "properties": {
+                      "chunkSize": {
+                        "description": "Thin pool chunk size, devices mode only, fixed at creation.\nAbsent: 64Ki, set by the agent.",
+                        "nullable": true,
+                        "x-kubernetes-int-or-string": true,
+                        "x-kubernetes-validations": [
+                          {
+                            "message": "chunkSize must be a power of two from 64Ki to 1Gi",
+                            "rule": "isQuantity(string(self)) && quantity(string(self)).isInteger() && quantity(string(self)).asInteger() in [65536, 131072, 262144, 524288, 1048576, 2097152, 4194304, 8388608, 16777216, 33554432, 67108864, 134217728, 268435456, 536870912, 1073741824]"
+                          }
+                        ]
+                      },
+                      "devices": {
+                        "description": "Blank whole disks the agent builds `vg` and `thinPool` from.\nAbsent: `vg` and `thinPool` already exist on the node.\nby-id paths only: kernel names like sdb change between boots.",
+                        "items": {
+                          "maxLength": 300,
+                          "pattern": "^/dev/disk/by-id/[^/]+$",
+                          "type": "string"
+                        },
+                        "maxItems": 64,
+                        "minItems": 1,
+                        "nullable": true,
+                        "type": "array",
+                        "x-kubernetes-list-type": "set"
+                      },
+                      "node": {
+                        "maxLength": 253,
+                        "minLength": 1,
+                        "type": "string",
+                        "x-kubernetes-validations": [
+                          {
+                            "message": "node is immutable",
+                            "rule": "self == oldSelf"
+                          }
+                        ]
+                      },
+                      "overcommitPercent": {
+                        "default": 100,
+                        "description": "Committed volume sizes may reach this percent of the pool size less\nthe reserve. 100 never promises more than the pool holds.",
+                        "format": "uint32",
+                        "maximum": 1000.0,
+                        "minimum": 100.0,
+                        "type": "integer"
+                      },
+                      "reclaimPolicy": {
+                        "description": "What deleting the Pool does to the VG, devices mode only.\nAbsent: Retain.",
+                        "enum": [
+                          "Retain",
+                          "Delete"
+                        ],
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "reservePercent": {
+                        "default": 5,
+                        "description": "Percent of the pool size that placement never plans to use.",
+                        "format": "uint32",
+                        "maximum": 50.0,
+                        "minimum": 0.0,
+                        "type": "integer"
+                      },
+                      "thinPool": {
+                        "maxLength": 127,
+                        "minLength": 1,
+                        "pattern": "^[A-Za-z0-9+_.][A-Za-z0-9+_.-]{0,126}$",
+                        "type": "string",
+                        "x-kubernetes-validations": [
+                          {
+                            "message": "thinPool is immutable",
+                            "rule": "self == oldSelf"
+                          },
+                          {
+                            "message": "thinPool is not a name",
+                            "rule": "self != '.' && self != '..'"
+                          }
+                        ]
+                      },
+                      "tier": {
+                        "maxLength": 253,
+                        "minLength": 1,
+                        "type": "string",
+                        "x-kubernetes-validations": [
+                          {
+                            "message": "tier is immutable",
+                            "rule": "self == oldSelf"
+                          }
+                        ]
+                      },
+                      "vg": {
+                        "description": "LVM names only (keys::LVM_NAME_PATTERN): anything else would reach\nlvm commands as an option or a path.",
+                        "maxLength": 127,
+                        "minLength": 1,
+                        "pattern": "^[A-Za-z0-9+_.][A-Za-z0-9+_.-]{0,126}$",
+                        "type": "string",
+                        "x-kubernetes-validations": [
+                          {
+                            "message": "vg is immutable",
+                            "rule": "self == oldSelf"
+                          },
+                          {
+                            "message": "vg is not a name",
+                            "rule": "self != '.' && self != '..'"
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "node",
+                      "thinPool",
+                      "tier",
+                      "vg"
+                    ],
+                    "type": "object",
+                    "x-kubernetes-validations": [
+                      {
+                        "message": "devices mode is fixed at creation",
+                        "rule": "has(self.devices) == has(oldSelf.devices)"
+                      },
+                      {
+                        "message": "devices is append only: removing a disk is not supported",
+                        "rule": "!has(self.devices) || !has(oldSelf.devices) || oldSelf.devices.all(d, d in self.devices)"
+                      },
+                      {
+                        "message": "chunkSize needs devices",
+                        "rule": "!has(self.chunkSize) || has(self.devices)"
+                      },
+                      {
+                        "message": "reclaimPolicy needs devices",
+                        "rule": "!has(self.reclaimPolicy) || has(self.devices)"
+                      },
+                      {
+                        "message": "chunkSize is immutable",
+                        "rule": "has(self.chunkSize) == has(oldSelf.chunkSize) && (!has(self.chunkSize) || string(self.chunkSize) == string(oldSelf.chunkSize))"
+                      }
+                    ]
+                  },
+                  "status": {
+                    "description": "Capacity, Available, Released and devices come from the agent; `volumes`, `committedBytes`\nand `placeableBytes` from the controller.",
+                    "nullable": true,
+                    "properties": {
+                      "chunkBytes": {
+                        "description": "Thin pool chunk size; feeds rs-discard-granularity.",
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
+                      },
+                      "committedBytes": {
+                        "description": "Sum of the sizes of the Volumes with a diskful replica here.",
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
+                      },
+                      "conditions": {
+                        "default": [],
+                        "items": {
+                          "description": "Condition contains details for one aspect of the current state of this API Resource.",
+                          "properties": {
+                            "lastTransitionTime": {
+                              "description": "lastTransitionTime is the last time the condition transitioned from one status to another. This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.",
+                              "format": "date-time",
+                              "type": "string"
+                            },
+                            "message": {
+                              "description": "message is a human readable message indicating details about the transition. This may be an empty string.",
+                              "type": "string"
+                            },
+                            "observedGeneration": {
+                              "description": "observedGeneration represents the .metadata.generation that the condition was set based upon. For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date with respect to the current state of the instance.",
+                              "format": "int64",
+                              "type": "integer"
+                            },
+                            "reason": {
+                              "description": "reason contains a programmatic identifier indicating the reason for the condition's last transition. Producers of specific condition types may define expected values and meanings for this field, and whether the values are considered a guaranteed API. The value should be a CamelCase string. This field may not be empty.",
+                              "type": "string"
+                            },
+                            "status": {
+                              "description": "status of the condition, one of True, False, Unknown.",
+                              "type": "string"
+                            },
+                            "type": {
+                              "description": "type of condition in CamelCase or in foo.example.com/CamelCase.",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "lastTransitionTime",
+                            "message",
+                            "reason",
+                            "status",
+                            "type"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array",
+                        "x-kubernetes-list-map-keys": [
+                          "type"
+                        ],
+                        "x-kubernetes-list-type": "map"
+                      },
+                      "devices": {
+                        "description": "One row per `spec.devices` path, from the agent.",
+                        "items": {
+                          "properties": {
+                            "message": {
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "model": {
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "path": {
+                              "type": "string"
+                            },
+                            "serial": {
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "sizeBytes": {
+                              "format": "uint64",
+                              "minimum": 0.0,
+                              "nullable": true,
+                              "type": "integer"
+                            },
+                            "state": {
+                              "description": "What the agent found on one listed device.",
+                              "enum": [
+                                "Missing",
+                                "NotADisk",
+                                "Member",
+                                "Busy",
+                                "NotEmpty",
+                                "Blank"
+                              ],
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "path",
+                            "state"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array",
+                        "x-kubernetes-list-map-keys": [
+                          "path"
+                        ],
+                        "x-kubernetes-list-type": "map"
+                      },
+                      "freeBytes": {
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
+                      },
+                      "observedGeneration": {
+                        "format": "int64",
+                        "nullable": true,
+                        "type": "integer"
+                      },
+                      "placeableBytes": {
+                        "description": "Largest new volume placement accepts here now.",
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
+                      },
+                      "totalBytes": {
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
+                      },
+                      "volumes": {
+                        "default": [],
+                        "description": "Names of Volumes with a diskful replica here; the finalizer waits on it.",
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array",
+                        "x-kubernetes-list-type": "set"
+                      }
+                    },
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "spec"
+                ],
+                "title": "Pool",
+                "type": "object"
+              }
+            },
+            "served": true,
+            "storage": true,
+            "subresources": {
+              "status": {}
+            }
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "apiextensions.k8s.io/v1",
+      "kind": "CustomResourceDefinition",
+      "metadata": {
+        "name": "volumes.r-drbd.io"
+      },
+      "spec": {
+        "group": "r-drbd.io",
+        "names": {
+          "kind": "Volume",
+          "plural": "volumes",
+          "singular": "volume"
+        },
+        "scope": "Cluster",
+        "versions": [
+          {
+            "additionalPrinterColumns": [
+              {
+                "jsonPath": ".spec.sizeBytes",
+                "name": "Size",
+                "type": "integer"
+              },
+              {
+                "jsonPath": ".spec.replicas",
+                "name": "Replicas",
+                "type": "integer"
+              },
+              {
+                "jsonPath": ".spec.tier",
+                "name": "Tier",
+                "type": "string"
+              },
+              {
+                "jsonPath": ".status.phase",
+                "name": "Phase",
+                "type": "string"
+              },
+              {
+                "jsonPath": ".status.nodes",
+                "name": "Nodes",
+                "type": "string"
+              },
+              {
+                "jsonPath": ".metadata.creationTimestamp",
+                "name": "Age",
+                "type": "date"
+              }
+            ],
+            "name": "v1alpha1",
+            "schema": {
+              "openAPIV3Schema": {
+                "description": "Auto-generated derived type for VolumeSpec via `CustomResource`",
+                "properties": {
+                  "spec": {
+                    "properties": {
+                      "accessMode": {
+                        "default": "ReadWriteOnce",
+                        "description": "ReadWriteMany lets more than one node open the device at once (two\nDRBD Primaries, block mode only, replicas 2 or 3); the default allows\none attachment at a time.",
+                        "enum": [
+                          "ReadWriteOnce",
+                          "ReadWriteMany"
+                        ],
+                        "type": "string",
+                        "x-kubernetes-validations": [
+                          {
+                            "message": "accessMode is immutable",
+                            "rule": "self == oldSelf"
+                          }
+                        ]
+                      },
+                      "assignment": {
+                        "description": "Written once by the controller; only diskless entries come and go\nwith attachments.",
+                        "nullable": true,
+                        "properties": {
+                          "initialUpToDateNode": {
+                            "description": "The node that makes the first data current: it starts the volume\nwithout a sync, or, for a restore, is the sync source.",
+                            "maxLength": 253,
+                            "nullable": true,
+                            "type": "string",
+                            "x-kubernetes-validations": [
+                              {
+                                "message": "initialUpToDateNode is immutable",
+                                "rule": "self == oldSelf"
+                              }
+                            ]
+                          },
+                          "minor": {
+                            "description": "DRBD minor, cluster wide unique, same on every node; absent for replicas 1.",
+                            "format": "uint32",
+                            "minimum": 0.0,
+                            "nullable": true,
+                            "type": "integer",
+                            "x-kubernetes-validations": [
+                              {
+                                "message": "minor is immutable",
+                                "rule": "self == oldSelf"
+                              }
+                            ]
+                          },
+                          "replicas": {
+                            "items": {
+                              "properties": {
+                                "node": {
+                                  "maxLength": 253,
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                "nodeId": {
+                                  "description": "DRBD node id, 0 to 31, unique within the volume.",
+                                  "format": "uint8",
+                                  "maximum": 31.0,
+                                  "minimum": 0.0,
+                                  "type": "integer"
+                                },
+                                "pool": {
+                                  "description": "Pool holding the LV; absent for diskless and tiebreaker.",
+                                  "maxLength": 253,
+                                  "nullable": true,
+                                  "type": "string"
+                                },
+                                "port": {
+                                  "description": "DRBD listen port on this node; absent for replicas 1.",
+                                  "format": "uint16",
+                                  "maximum": 65535.0,
+                                  "minimum": 0.0,
+                                  "nullable": true,
+                                  "type": "integer"
+                                },
+                                "role": {
+                                  "enum": [
+                                    "diskful",
+                                    "diskless",
+                                    "tiebreaker"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "node",
+                                "nodeId",
+                                "role"
+                              ],
+                              "type": "object"
+                            },
+                            "maxItems": 32,
+                            "type": "array",
+                            "x-kubernetes-list-map-keys": [
+                              "node"
+                            ],
+                            "x-kubernetes-list-type": "map"
+                          },
+                          "secret": {
+                            "description": "Shared secret, 32 random bytes in Base64; absent for replicas 1.",
+                            "maxLength": 64,
+                            "nullable": true,
+                            "type": "string",
+                            "x-kubernetes-validations": [
+                              {
+                                "message": "secret is immutable",
+                                "rule": "self == oldSelf"
+                              }
+                            ]
+                          }
+                        },
+                        "required": [
+                          "replicas"
+                        ],
+                        "type": "object"
+                      },
+                      "attachments": {
+                        "default": [],
+                        "description": "Nodes that must see the device (ControllerPublish). A node without a\nreplica gets a diskless one appended to the assignment.",
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array",
+                        "x-kubernetes-list-type": "set"
+                      },
+                      "evict": {
+                        "default": [],
+                        "description": "Nodes whose replica must be placed elsewhere (a dead or retired\nnode). The controller honours one node at a time. Every move needs\nno resolve pending, no split brain, no Snapshot round between\nSuspending and Resuming, and the node's agent stale, or fresh with\nthe replica neither attached nor in use. A diskful move also needs\nstatus.initializedAt set, another UpToDate replica with quorum from\na fresh agent, every other reachable diskful replica UpToDate, and\nno pin to the evicted node. A node listed here never receives a\ndiskless entry either. A node leaves the list once it holds no entry\nand no attachment. The replaced node keeps its LV as an orphan.",
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array",
+                        "x-kubernetes-list-type": "set"
+                      },
+                      "node": {
+                        "maxLength": 253,
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "pool": {
+                        "description": "Placement pins, read at placement and by every evict move.",
+                        "maxLength": 253,
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "replicas": {
+                        "default": 1,
+                        "description": "1 is a plain LV with no DRBD; 2 or 3 are DRBD with quorum and, for 2, a tiebreaker.",
+                        "format": "uint32",
+                        "maximum": 3.0,
+                        "minimum": 1.0,
+                        "type": "integer",
+                        "x-kubernetes-validations": [
+                          {
+                            "message": "replicas is immutable",
+                            "rule": "self == oldSelf"
+                          }
+                        ]
+                      },
+                      "resolve": {
+                        "description": "Split-brain resolution: every diskful replica except the\nsurvivor is discarded and resynced from it.",
+                        "nullable": true,
+                        "properties": {
+                          "survivor": {
+                            "description": "Node whose data wins.",
+                            "maxLength": 253,
+                            "minLength": 1,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "survivor"
+                        ],
+                        "type": "object"
+                      },
+                      "sizeBytes": {
+                        "description": "Usable size as the CSI caller sees it; the LV is larger by the DRBD metadata.",
+                        "format": "uint64",
+                        "minimum": 1.0,
+                        "type": "integer",
+                        "x-kubernetes-validations": [
+                          {
+                            "message": "sizeBytes cannot shrink",
+                            "rule": "self >= oldSelf"
+                          }
+                        ]
+                      },
+                      "source": {
+                        "nullable": true,
+                        "properties": {
+                          "snapshot": {
+                            "description": "Name of a Ready Snapshot; the new volume is a writable thin snapshot of it.",
+                            "maxLength": 253,
+                            "minLength": 1,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "snapshot"
+                        ],
+                        "type": "object",
+                        "x-kubernetes-validations": [
+                          {
+                            "message": "source is immutable",
+                            "rule": "self == oldSelf"
+                          }
+                        ]
+                      },
+                      "tier": {
+                        "maxLength": 63,
+                        "minLength": 1,
+                        "type": "string",
+                        "x-kubernetes-validations": [
+                          {
+                            "message": "tier is immutable",
+                            "rule": "self == oldSelf"
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "sizeBytes",
+                      "tier"
+                    ],
+                    "type": "object",
+                    "x-kubernetes-validations": [
+                      {
+                        "message": "assignment cannot be removed",
+                        "rule": "!has(oldSelf.assignment) || has(self.assignment)"
+                      },
+                      {
+                        "message": "ReadWriteMany needs replicas >= 2",
+                        "rule": "self.accessMode != 'ReadWriteMany' || self.replicas >= 2"
+                      }
+                    ]
+                  },
+                  "status": {
+                    "nullable": true,
+                    "properties": {
+                      "attachmentErrors": {
+                        "description": "Nodes in spec.attachments the controller could not give a diskless\nreplica, as of observedGeneration. An entry goes once its node has\na replica or leaves spec.attachments.",
+                        "items": {
+                          "description": "An attached node without a diskless replica, and why.",
+                          "properties": {
+                            "message": {
+                              "maxLength": 1024,
+                              "type": "string"
+                            },
+                            "node": {
+                              "maxLength": 253,
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "reason": {
+                              "enum": [
+                                "NoPort",
+                                "TooManyPeers"
+                              ],
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "message",
+                            "node",
+                            "reason"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array",
+                        "x-kubernetes-list-map-keys": [
+                          "node"
+                        ],
+                        "x-kubernetes-list-type": "map"
+                      },
+                      "conditions": {
+                        "default": [],
+                        "items": {
+                          "description": "Condition contains details for one aspect of the current state of this API Resource.",
+                          "properties": {
+                            "lastTransitionTime": {
+                              "description": "lastTransitionTime is the last time the condition transitioned from one status to another. This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.",
+                              "format": "date-time",
+                              "type": "string"
+                            },
+                            "message": {
+                              "description": "message is a human readable message indicating details about the transition. This may be an empty string.",
+                              "type": "string"
+                            },
+                            "observedGeneration": {
+                              "description": "observedGeneration represents the .metadata.generation that the condition was set based upon. For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date with respect to the current state of the instance.",
+                              "format": "int64",
+                              "type": "integer"
+                            },
+                            "reason": {
+                              "description": "reason contains a programmatic identifier indicating the reason for the condition's last transition. Producers of specific condition types may define expected values and meanings for this field, and whether the values are considered a guaranteed API. The value should be a CamelCase string. This field may not be empty.",
+                              "type": "string"
+                            },
+                            "status": {
+                              "description": "status of the condition, one of True, False, Unknown.",
+                              "type": "string"
+                            },
+                            "type": {
+                              "description": "type of condition in CamelCase or in foo.example.com/CamelCase.",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "lastTransitionTime",
+                            "message",
+                            "reason",
+                            "status",
+                            "type"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array",
+                        "x-kubernetes-list-map-keys": [
+                          "type"
+                        ],
+                        "x-kubernetes-list-type": "map"
+                      },
+                      "fileSystem": {
+                        "description": "File system the node plugin created (or inherited from a snapshot),\nwritten before the first mount. An XFS signature without this\nmarker is adopted, never formatted, unless it still carries the\nmkfs-time label, which proves a format that was cut short.",
+                        "maxLength": 16,
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "initializedAt": {
+                        "description": "Set by the controller the first time the volume is Ready (every\ndiskful replica UpToDate and connected), which is before any consumer\ncould write. From then on a replica created on any node (a lost LV, a\nnode from spec.evict) gets just-created DRBD metadata and a full sync\nfrom its peers; the initial-node start-up never runs again.",
+                        "format": "date-time",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "nodes": {
+                        "description": "Comma separated diskful nodes, for kubectl.",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "observedGeneration": {
+                        "format": "int64",
+                        "nullable": true,
+                        "type": "integer"
+                      },
+                      "phase": {
+                        "default": "Pending",
+                        "enum": [
+                          "Ready",
+                          "Deleting",
+                          "Pending",
+                          "Provisioning",
+                          "Degraded",
+                          "Failed"
+                        ],
+                        "type": "string"
+                      },
+                      "primary": {
+                        "description": "Node where DRBD is Primary, or where the LV is open for replicas 1.",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "replicas": {
+                        "default": [],
+                        "description": "One entry per node, written by that node's agent.",
+                        "items": {
+                          "description": "What one agent sees of its replica. `observed_generation` is the spec\ngeneration the agent last applied; the controller gates resize and\ndelete on it.",
+                          "properties": {
+                            "allocatedBytes": {
+                              "description": "LV size.",
+                              "format": "uint64",
+                              "minimum": 0.0,
+                              "nullable": true,
+                              "type": "integer"
+                            },
+                            "devicePath": {
+                              "description": "/dev/drbd<minor>, or the LV path for replicas 1.",
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "diskState": {
+                              "description": "DRBD disk state (UpToDate, Inconsistent, Diskless, ...); \"UpToDate\" for replicas 1.",
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "inUse": {
+                              "default": false,
+                              "description": "Primary or opened.",
+                              "type": "boolean"
+                            },
+                            "lastError": {
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "node": {
+                              "type": "string"
+                            },
+                            "observedGeneration": {
+                              "format": "int64",
+                              "nullable": true,
+                              "type": "integer"
+                            },
+                            "peers": {
+                              "additionalProperties": {
+                                "type": "string"
+                              },
+                              "description": "Peer node name to connection state.",
+                              "type": "object"
+                            },
+                            "present": {
+                              "default": false,
+                              "description": "LV exists and, for DRBD, the resource is configured.",
+                              "type": "boolean"
+                            },
+                            "quorum": {
+                              "description": "DRBD quorum as this replica sees it; absent for replicas 1.",
+                              "nullable": true,
+                              "type": "boolean"
+                            },
+                            "restoredFrom": {
+                              "description": "The source Snapshot this replica's backing LV was restored from,\nwhile that Snapshot exists. The initial node starts a restore\nwithout a sync only when every diskful replica reports it.",
+                              "maxLength": 253,
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "sizeBytes": {
+                              "description": "Net size of the device as seen on this node.",
+                              "format": "uint64",
+                              "minimum": 0.0,
+                              "nullable": true,
+                              "type": "integer"
+                            },
+                            "syncPercent": {
+                              "description": "Whole percent while SyncTarget.",
+                              "format": "uint32",
+                              "minimum": 0.0,
+                              "nullable": true,
+                              "type": "integer"
+                            },
+                            "unreachablePeers": {
+                              "description": "Peers whose DRBD connection has stayed out of Connected for a while,\nwith what a TCP connect to their DRBD port found.",
+                              "items": {
+                                "description": "One stuck connection seen from the reporting replica.",
+                                "properties": {
+                                  "address": {
+                                    "description": "The peer's DRBD address and port, as probed.",
+                                    "maxLength": 45,
+                                    "type": "string"
+                                  },
+                                  "error": {
+                                    "description": "The OS error of a Failed probe.",
+                                    "maxLength": 256,
+                                    "nullable": true,
+                                    "type": "string"
+                                  },
+                                  "node": {
+                                    "maxLength": 253,
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  "peerRun": {
+                                    "description": "The peer agent run (its Lease acquireTime) the prober saw; a result\ncounts only while that run holds the Lease.",
+                                    "format": "date-time",
+                                    "nullable": true,
+                                    "type": "string"
+                                  },
+                                  "port": {
+                                    "format": "uint16",
+                                    "maximum": 65535.0,
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  },
+                                  "probedAt": {
+                                    "description": "Time is a wrapper around time.Time which supports correct marshaling to YAML and JSON.  Wrappers are provided for many of the factory methods that the time package offers.",
+                                    "format": "date-time",
+                                    "type": "string"
+                                  },
+                                  "result": {
+                                    "description": "What a TCP connect to a peer's DRBD port found.",
+                                    "enum": [
+                                      "Failed",
+                                      "Refused",
+                                      "Filtered",
+                                      "TimedOut",
+                                      "Accepted"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  "since": {
+                                    "description": "When this agent saw the connection leave Connected.",
+                                    "format": "date-time",
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "address",
+                                  "node",
+                                  "port",
+                                  "probedAt",
+                                  "result",
+                                  "since"
+                                ],
+                                "type": "object"
+                              },
+                              "maxItems": 32,
+                              "type": "array",
+                              "x-kubernetes-list-map-keys": [
+                                "node"
+                              ],
+                              "x-kubernetes-list-type": "map"
+                            }
+                          },
+                          "required": [
+                            "node"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array",
+                        "x-kubernetes-list-map-keys": [
+                          "node"
+                        ],
+                        "x-kubernetes-list-type": "map"
+                      },
+                      "usableBytes": {
+                        "description": "Net size every replica currently provides (after a resize, the old size until all grew).",
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
+                      }
+                    },
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "spec"
+                ],
+                "title": "Volume",
+                "type": "object"
+              }
+            },
+            "served": true,
+            "storage": true,
+            "subresources": {
+              "status": {}
+            }
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "apiextensions.k8s.io/v1",
+      "kind": "CustomResourceDefinition",
+      "metadata": {
+        "name": "snapshots.r-drbd.io"
+      },
+      "spec": {
+        "group": "r-drbd.io",
+        "names": {
+          "kind": "Snapshot",
+          "plural": "snapshots",
+          "singular": "snapshot"
+        },
+        "scope": "Cluster",
+        "versions": [
+          {
+            "additionalPrinterColumns": [
+              {
+                "jsonPath": ".spec.volume",
+                "name": "Volume",
+                "type": "string"
+              },
+              {
+                "jsonPath": ".status.phase",
+                "name": "Phase",
+                "type": "string"
+              },
+              {
+                "jsonPath": ".status.sizeBytes",
+                "name": "Size",
+                "type": "integer"
+              },
+              {
+                "jsonPath": ".metadata.creationTimestamp",
+                "name": "Age",
+                "type": "date"
+              }
+            ],
+            "name": "v1alpha1",
+            "schema": {
+              "openAPIV3Schema": {
+                "description": "Auto-generated derived type for SnapshotSpec via `CustomResource`",
+                "properties": {
+                  "spec": {
+                    "properties": {
+                      "volume": {
+                        "maxLength": 253,
+                        "minLength": 1,
+                        "type": "string",
+                        "x-kubernetes-validations": [
+                          {
+                            "message": "volume is immutable",
+                            "rule": "self == oldSelf"
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "volume"
+                    ],
+                    "type": "object"
+                  },
+                  "status": {
+                    "nullable": true,
+                    "properties": {
+                      "acks": {
+                        "default": [],
+                        "description": "One entry per replica of the assignment, diskless ones included,\nwritten by that node's agent.",
+                        "items": {
+                          "description": "The last phase a node completed, and whether it succeeded. `pool` is\nwhere the snapshot LV lives, so restore and delete still find it after\nthe Volume is gone.",
+                          "properties": {
+                            "error": {
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "node": {
+                              "maxLength": 253,
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "ok": {
+                              "default": false,
+                              "type": "boolean"
+                            },
+                            "phase": {
+                              "enum": [
+                                "Suspended",
+                                "Taken",
+                                "Ready",
+                                "Failed",
+                                "Pending",
+                                "Suspending",
+                                "Taking",
+                                "Resuming",
+                                "Deleting"
+                              ],
+                              "type": "string"
+                            },
+                            "pool": {
+                              "maxLength": 253,
+                              "nullable": true,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "node",
+                            "phase"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array",
+                        "x-kubernetes-list-map-keys": [
+                          "node"
+                        ],
+                        "x-kubernetes-list-type": "map"
+                      },
+                      "conditions": {
+                        "default": [],
+                        "items": {
+                          "description": "Condition contains details for one aspect of the current state of this API Resource.",
+                          "properties": {
+                            "lastTransitionTime": {
+                              "description": "lastTransitionTime is the last time the condition transitioned from one status to another. This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.",
+                              "format": "date-time",
+                              "type": "string"
+                            },
+                            "message": {
+                              "description": "message is a human readable message indicating details about the transition. This may be an empty string.",
+                              "type": "string"
+                            },
+                            "observedGeneration": {
+                              "description": "observedGeneration represents the .metadata.generation that the condition was set based upon. For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date with respect to the current state of the instance.",
+                              "format": "int64",
+                              "type": "integer"
+                            },
+                            "reason": {
+                              "description": "reason contains a programmatic identifier indicating the reason for the condition's last transition. Producers of specific condition types may define expected values and meanings for this field, and whether the values are considered a guaranteed API. The value should be a CamelCase string. This field may not be empty.",
+                              "type": "string"
+                            },
+                            "status": {
+                              "description": "status of the condition, one of True, False, Unknown.",
+                              "type": "string"
+                            },
+                            "type": {
+                              "description": "type of condition in CamelCase or in foo.example.com/CamelCase.",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "lastTransitionTime",
+                            "message",
+                            "reason",
+                            "status",
+                            "type"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array",
+                        "x-kubernetes-list-map-keys": [
+                          "type"
+                        ],
+                        "x-kubernetes-list-type": "map"
+                      },
+                      "createdAt": {
+                        "description": "Time is a wrapper around time.Time which supports correct marshaling to YAML and JSON.  Wrappers are provided for many of the factory methods that the time package offers.",
+                        "format": "date-time",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "fileSystem": {
+                        "description": "The volume's fileSystem marker at Taking; a restored volume inherits it.",
+                        "maxLength": 16,
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "lastError": {
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "observedGeneration": {
+                        "format": "int64",
+                        "nullable": true,
+                        "type": "integer"
+                      },
+                      "phase": {
+                        "default": "Pending",
+                        "enum": [
+                          "Suspended",
+                          "Taken",
+                          "Ready",
+                          "Failed",
+                          "Pending",
+                          "Suspending",
+                          "Taking",
+                          "Resuming",
+                          "Deleting"
+                        ],
+                        "type": "string"
+                      },
+                      "phaseSince": {
+                        "description": "When the current phase began; the round bounds (Suspending, Taking)\ncount from it and survive a controller restart.",
+                        "format": "date-time",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "sizeBytes": {
+                        "description": "Volume size at the time of the snapshot; restores start from it.",
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
+                      }
+                    },
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "spec"
+                ],
+                "title": "Snapshot",
+                "type": "object"
+              }
+            },
+            "served": true,
+            "storage": true,
+            "subresources": {
+              "status": {}
+            }
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "apiextensions.k8s.io/v1",
+      "kind": "CustomResourceDefinition",
+      "metadata": {
+        "name": "nodedisks.r-drbd.io"
+      },
+      "spec": {
+        "group": "r-drbd.io",
+        "names": {
+          "kind": "NodeDisks",
+          "plural": "nodedisks",
+          "shortNames": [
+            "nd"
+          ],
+          "singular": "nodedisks"
+        },
+        "scope": "Cluster",
+        "versions": [
+          {
+            "additionalPrinterColumns": [
+              {
+                "jsonPath": ".status.blank",
+                "name": "Blank",
+                "type": "integer"
+              },
+              {
+                "jsonPath": ".metadata.creationTimestamp",
+                "name": "Age",
+                "type": "date"
+              }
+            ],
+            "name": "v1alpha1",
+            "schema": {
+              "openAPIV3Schema": {
+                "description": "Auto-generated derived type for NodeDisksSpec via `CustomResource`",
+                "properties": {
+                  "spec": {
+                    "description": "Empty: the agent of the node writes the status only.",
+                    "type": "object"
+                  },
+                  "status": {
+                    "nullable": true,
+                    "properties": {
+                      "blank": {
+                        "description": "Disks in state Blank; a printer column cannot count.",
+                        "format": "uint32",
+                        "minimum": 0.0,
+                        "type": "integer"
+                      },
+                      "disks": {
+                        "default": [],
+                        "items": {
+                          "description": "One whole disk of the node.",
+                          "properties": {
+                            "links": {
+                              "default": [],
+                              "description": "Every by-id link of the disk.",
+                              "items": {
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "message": {
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "model": {
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "name": {
+                              "description": "Kernel name; it may change at the next boot.",
+                              "type": "string"
+                            },
+                            "path": {
+                              "description": "The path a Pool lists: the `wwn-` by-id link, else the bus one;\n`/dev/<name>` when the disk has no by-id link.",
+                              "type": "string"
+                            },
+                            "pool": {
+                              "description": "The Pool whose VG holds the disk, for `Member`.",
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "serial": {
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "sizeBytes": {
+                              "format": "uint64",
+                              "minimum": 0.0,
+                              "nullable": true,
+                              "type": "integer"
+                            },
+                            "state": {
+                              "description": "What the agent found on one listed device.",
+                              "enum": [
+                                "Missing",
+                                "NotADisk",
+                                "Member",
+                                "Busy",
+                                "NotEmpty",
+                                "Blank"
+                              ],
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "name",
+                            "path",
+                            "state"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array",
+                        "x-kubernetes-list-map-keys": [
+                          "path"
+                        ],
+                        "x-kubernetes-list-type": "map"
+                      },
+                      "message": {
+                        "description": "Set when the list is incomplete: rows capped, or the scan ran out\nof time before every disk was checked.",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "watch": {
+                        "description": "How the agent learns of disk changes.",
+                        "enum": [
+                          "uevent",
+                          "poll"
+                        ],
+                        "nullable": true,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "blank"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "spec"
+                ],
+                "title": "NodeDisks",
+                "type": "object"
+              }
+            },
+            "served": true,
+            "storage": true,
+            "subresources": {
+              "status": {}
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "kind": "List"
+}

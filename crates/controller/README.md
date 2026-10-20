@@ -14,7 +14,6 @@ One leader, one reflector per kind, one reconcile loop that walks every object i
 - `volume`: placement (replicated restore from the snapshot holders), assignment write (no fileSystem seed on restores), diskless entries converged to `spec.attachments`, status aggregation (Ready, Degraded, QuorumLost, SplitBrain, NodeUnreachable), `spec.resolve`, deletion.
 - `snapshot`: the snapshot round state machine and deletion.
 - `csi`: CSI Identity and Controller services on the sidecars' Unix socket.
-- `bin/controller-dev`: temporary entry point (feature `dev-bin`) until crates/r-drbd wires the role.
 
 ## Volume status: notes for consumers
 
@@ -31,12 +30,11 @@ One leader, one reflector per kind, one reconcile loop that walks every object i
 - `model`: the CRD types this controller reconciles.
 - `placer`: placement and tiebreaker rules, kept pure in their own crate.
 - `lvm`: LV names and the checks LVM makes on them, so a bad snapshot or volume name fails at admission.
-- `csi`: generated CSI v1 service traits and messages.
+- `csi`: generated CSI v1 service traits and messages, tonic and the socket bind.
 - `kube` (client, runtime, rustls-tls, ring): API access, watchers and reflectors without openssl or aws-lc.
 - `k8s-openapi`: core types (Node, Lease, PVC) and metav1 time.
 - `tokio`: the async runtime; signal for SIGTERM, net for the Unix socket.
 - `tokio-stream` (net): turns the Unix listener into the stream tonic serves.
-- `tonic` (transport): the gRPC server; the csi crate builds tonic without one.
 - `prost-types`: the Timestamp in CSI snapshot responses.
 - `futures`: stream combinators over the watchers.
 - `serde`, `serde_json`: patch bodies built as JSON so server-side apply claims only controller fields.
@@ -44,7 +42,6 @@ One leader, one reflector per kind, one reconcile loop that walks every object i
 - `tracing`: structured logs.
 - `getrandom`: the DRBD shared secret, straight from the OS.
 - `base64`: encoding of the shared secret.
-- `tracing-subscriber` (optional, `dev-bin` only): log output of the dev binary.
 
 Dev-dependencies: `tempfile` for envtest directories, `tracing-subscriber` for test logs.
 
