@@ -587,6 +587,7 @@ async fn restore_case(h: &Host, factor: u64, max_received: u64) {
     let snaps = [Arc::new(snap)];
     let pools = [pool(&h.node)];
     let mut g = group(h, size, &[A, B], &[], Some("rw-snap"));
+    let mut proven = [false, false];
     let mut done = false;
     for _ in 0..120 {
         // Each member sees the other's entry, as Volume status shows it.
@@ -600,6 +601,10 @@ async fn restore_case(h: &Host, factor: u64, max_received: u64) {
                 .map(|(n, e)| (n.as_str(), e.clone()))
                 .collect();
             g[i].pass_seeing_snapshots(&pools, &others, &snaps).await;
+            proven[i] |= g[i]
+                .entry
+                .as_ref()
+                .is_some_and(|e| e.restored_from.as_deref() == Some("rw-snap"));
         }
         done = {
             let t = h.tracker.lock().unwrap();
@@ -616,10 +621,8 @@ async fn restore_case(h: &Host, factor: u64, max_received: u64) {
         "{:?}",
         g.iter().map(Member::error).collect::<Vec<_>>()
     );
-    for m in &g {
-        let e = m.entry.as_ref().unwrap();
-        assert_eq!(e.restored_from.as_deref(), Some("rw-snap"), "{}", m.res);
-    }
+    // Reported while at the snapshot's size, so before any growth.
+    assert_eq!(proven, [true, true], "both members proved their copy");
     let tags = l.tags(VG).await.unwrap();
     for lv in ["rw-a", "rw-b"] {
         assert!(
