@@ -36,7 +36,7 @@ const NEW: &str = storage::NEW_TAG;
 const OWN: &str = "r-drbd.md.uid-1.0";
 const SNAP_UID: &str = "snap-uid-1";
 /// The restore's proof that an LV came from snap-1.
-const FROM: &str = "r-drbd.from.snap-uid-1";
+const FROM: &str = "r-drbd.from.uid-1.snap-uid-1";
 const ALL: Features = Features {
     tiebreaker: true,
     discard_granularity: true,
@@ -855,17 +855,12 @@ async fn restored_from_is_reported_from_the_tag_only_while_the_snapshot_exists()
 
 #[tokio::test]
 async fn restore_holder_without_its_snapshot_lv_reports_an_error_and_creates_nothing() {
-    let mut r = Rig::on("n2", &[], FakeHost::default());
+    // The initial node: nobody else could hold the data.
+    let mut r = Rig::new(&[], FakeHost::default());
     let x = r.x.clone();
     reads(&x, &[]);
     expect_lvs(&x, &[]);
-    let w = r
-        .pass_pools(
-            &[pool_on("n2")],
-            &[restored(volume(GIB))],
-            &[source_snapshot()],
-        )
-        .await;
+    let w = r.pass(&[restored(volume(GIB))], &[source_snapshot()]).await;
     let e = entry_of(&w);
     let err = e.last_error.unwrap();
     assert!(
@@ -878,23 +873,169 @@ async fn restore_holder_without_its_snapshot_lv_reports_an_error_and_creates_not
 }
 
 #[tokio::test]
-async fn initial_node_without_its_restored_copy_never_starts() {
-    // Every peer restored, but this node's LV lacks the tag.
+async fn restore_peer_without_its_copy_starts_empty_and_full_syncs() {
+    // n2's pool lacks the snapshot LV: an empty LV, no proof tag.
+    let mut r = Rig::on("n2", &[], FakeHost::default());
+    let x = r.x.clone();
+    reads(&x, &[]);
+    expect_create(&x, &[]);
+    r.expect_check();
+    expect_lv_tags(&x, &[("pvc-1", &[NEW])]);
+    expect_md_as(&x, "r-drbd.md.uid-1.1", &[NEW]);
+    up_plan(&x);
+    let w = r
+        .pass_pools(
+            &[pool_on("n2")],
+            &[restored(volume(GIB))],
+            &[source_snapshot()],
+        )
+        .await;
+    let e = entry_of(&w);
+    assert_eq!(
+        (e.last_error.clone(), e.restored_from.clone()),
+        (None, None)
+    );
+    assert!(!seen(&x, "--snapshot"));
+
+    // The initial node sees n2 without restoredFrom: it is the sync source.
     let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
     r.rec.drbd.init_wait = Duration::ZERO;
     let x = r.x.clone();
     reads(&x, &[source_lv(), lv(LV_KIB)]);
     r.expect_check();
     r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    x.expect(argv::start_as_source("pvc-1"), ok(""));
+    let n2 = ReplicaStatus {
+        node: "n2".into(),
+        ..e
+    };
+    let vol = with_entries(restored(volume(GIB)), vec![n2]);
+    r.pass(&[vol], &[source_snapshot()]).await;
+    assert!(!seen(&x, "--clear-bitmap"));
+}
+
+#[tokio::test]
+async fn stale_lv_with_another_volumes_from_tag_is_made_new_and_not_a_copy() {
+    // Left on n2 by a deleted Volume of the same name, restored from the
+    // same snapshot: its tags name another Volume uid.
+    const OLD_MD: &str = "r-drbd.md.uid-0.1";
+    const OLD_FROM: &str = "r-drbd.from.uid-0.snap-uid-1";
+    const N2: &str = "r-drbd.md.uid-1.1";
+    let mut r = Rig::on("n2", &[], FakeHost::default());
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    expect_lv_tags(&x, &[("pvc-1", &[OLD_MD, OLD_FROM])]);
+    expect_change(&x, "pvc-1", &[NEW], &[OLD_MD, OLD_FROM]);
+    expect_md_as(&x, N2, &[NEW]);
+    up_plan(&x);
+    let w = r
+        .pass_pools(
+            &[pool_on("n2")],
+            &[restored(volume(GIB))],
+            &[source_snapshot()],
+        )
+        .await;
+    let e = entry_of(&w);
+    assert_eq!((e.last_error, e.restored_from), (None, None));
+    // Without its report, the initial node force-resyncs: see
+    // restore_falls_back_to_a_full_sync_when_a_peer_did_not_restore.
+}
+
+#[tokio::test]
+async fn restore_peer_larger_than_its_snapshot_reports_no_restored_from() {
+    const N2: &str = "r-drbd.md.uid-1.1";
+    let mut lines = up("Inconsistent", "Inconsistent");
+    lines[1] = "exists connection name:pvc-1 peer-node-id:0 conn-name:n1 connection:Connected role:Secondary".into();
+    lines[4] = "exists peer-device name:pvc-1 peer-node-id:0 conn-name:n1 volume:0 replication:Established peer-disk:Inconsistent".into();
+    let mut r = Rig::on("n2", &lines, up_host());
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV2_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[N2, FROM])]);
+    dry(&x, "");
+    let w = r
+        .pass_pools(
+            &[pool_on("n2")],
+            &[restored(volume(GIB))],
+            &[source_snapshot()],
+        )
+        .await;
+    assert_eq!(entry_of(&w).restored_from, None);
+}
+
+#[tokio::test]
+async fn initial_node_with_an_orphan_lv_refuses_until_the_claim_is_deleted() {
+    // An LV of a deleted Volume of the same name: another md tag, no from
+    // tag of this Volume. Made new, but never started as the restore.
+    const OLD_MD: &str = "r-drbd.md.uid-0.0";
+    let mut r = Rig::new(&[], FakeHost::default());
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    expect_lv_tags(&x, &[("pvc-1", &[OLD_MD])]);
+    expect_change(&x, "pvc-1", &[NEW], &[OLD_MD]);
+    expect_md(&x, &[NEW]);
+    up_plan(&x);
+    let vol = with_entries(restored(volume(GIB)), vec![peer_entry("n2", true)]);
+    let w = r
+        .pass(std::slice::from_ref(&vol), &[source_snapshot()])
+        .await;
+    assert_eq!(entry_of(&w).restored_from, None);
+
+    r.feed(
+        &up("Inconsistent", "Inconsistent")
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    *r.host.sectors.lock().unwrap() = NET_SECTORS;
+    r.rec.drbd.init_wait = Duration::ZERO;
+    reads_again(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_sweep();
     expect_lv_tags(&x, &[("pvc-1", &[OWN])]);
     dry(&x, "");
+    let w = r
+        .pass(std::slice::from_ref(&vol), &[source_snapshot()])
+        .await;
+    assert_eq!(
+        entry_of(&w).last_error.as_deref(),
+        Some(
+            "LV vg1/pvc-1 is not this restore's copy of snapshot snap-1; delete the claim and restore again"
+        )
+    );
+    assert!(!seen(&x, "new-current-uuid"));
+
+    // Deleting the claim removes the LV, so the Snapshot guard lets go.
+    reads_again(&x, &[source_lv(), lv(LV_KIB)]);
+    x.expect(argv::down("pvc-1"), ok("")).expect(
+        argv::status("pvc-1"),
+        code(10, "", "pvc-1: No such resource"),
+    );
+    expect_lvs(&x, &[source_lv(), lv(LV_KIB)]);
+    x.expect(lvm::cmd::remove(VG, "pvc-1"), ok(""));
+    expect_lvs(&x, &[source_lv()]);
+    let w = r.pass(&[deleting(vol)], &[source_snapshot()]).await;
+    let e = entry_of(&w);
+    assert!(!e.present && e.last_error.is_none(), "{e:?}");
+}
+
+#[tokio::test]
+async fn a_failed_proof_read_fails_the_pass_and_starts_nothing() {
+    let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    r.rec.drbd.init_wait = Duration::ZERO;
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    x.expect(lvm::cmd::lv_tags(VG), code(5, "", "lvs failed"));
     let vol = with_entries(restored(volume(GIB)), vec![peer_entry("n2", true)]);
     let w = r.pass(&[vol], &[source_snapshot()]).await;
-    let err = entry_of(&w).last_error.unwrap();
-    assert!(
-        err.contains("not proven to come from snapshot snap-1"),
-        "{err}"
-    );
+    let e = entry_of(&w);
+    assert!(e.last_error.unwrap().contains("lvs failed"));
     assert!(!seen(&x, "new-current-uuid"));
 }
 
@@ -1391,8 +1532,8 @@ async fn node_leaving_the_assignment_keeps_its_data() {
     x.expect(argv::down("pvc-1"), ok(""))
         .expect(argv::status("pvc-1"), code(10, "", ""));
     // The bytes stay, the proof of ownership goes.
-    expect_lv_tags(&x, &[("pvc-1", &[OWN, "other"])]);
-    expect_change(&x, "pvc-1", &[], &[OWN]);
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM, "other"])]);
+    expect_change(&x, "pvc-1", &[], &[OWN, FROM]);
     let w = r.pass(&[with_entries(v, vec![reported()])], &[]).await;
     assert!(
         w.iter()

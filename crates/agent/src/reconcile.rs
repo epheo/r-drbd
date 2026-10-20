@@ -824,7 +824,8 @@ impl Reconciler {
                     .uid
                     .as_deref()
                     .ok_or_else(|| format!("source snapshot {snapshot} has no uid"))?;
-                Some(storage::from_tag(uid))
+                let vol_uid = vol.metadata.uid.as_deref().ok_or("Volume has no uid")?;
+                Some(storage::from_tag(vol_uid, uid))
             } else {
                 None
             };
@@ -1011,9 +1012,7 @@ impl Reconciler {
             .await?
             .into_iter()
             .filter(|t| {
-                crate::drbd::is_md_tag(t)
-                    || t == storage::NEW_TAG
-                    || t.starts_with(storage::FROM_TAG_PREFIX)
+                crate::drbd::is_md_tag(t) || t == storage::NEW_TAG || storage::is_from_tag(t)
             })
             .collect();
         tracing::info!(lv, origin, vg = place.vg, "taking snapshot");

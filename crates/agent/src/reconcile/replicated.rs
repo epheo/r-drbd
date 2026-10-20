@@ -118,6 +118,35 @@ struct Backing {
     restored: bool,
 }
 
+/// This replica's LV as a copy of a restore's source snapshot.
+struct Copy {
+    /// vg/lv, for messages.
+    lv: String,
+    /// Carries the from tag of this Volume and that Snapshot.
+    tagged: bool,
+    /// Has the size of the snapshot LV in the same lvs report: its metadata
+    /// sits where the source's did, so its data area holds nothing but the
+    /// snapshot's.
+    at_size: bool,
+}
+
+fn snapshot_lv_name(snap: &Snapshot) -> String {
+    lvm::names::snapshot_lv(&snap.spec.volume, &snap.name_any())
+}
+
+/// A peer whose pool lacks its snapshot LV starts empty and syncs in full
+/// from the initial node; the initial node has nothing to sync from, so
+/// its restore error stands.
+fn copy_missing(s: &Step<'_>, source: Option<&Snapshot>, rows: &[LvRow], place: &Place) -> bool {
+    !s.initial_node()
+        && source.is_some_and(|snap| {
+            matches!(
+                find_in_pool(rows, &snapshot_lv_name(snap), &place.thin),
+                Ok(None)
+            )
+        })
+}
+
 /// A dry-run plan that came back after its adjust succeeded.
 #[derive(Debug, Clone)]
 pub(super) struct Repeat {
@@ -422,7 +451,7 @@ impl Reconciler {
         let del: Vec<&str> = tags
             .iter()
             .map(String::as_str)
-            .filter(|t| drbd::is_md_tag(t))
+            .filter(|t| drbd::is_md_tag(t) || storage::is_from_tag(t))
             .collect();
         if del.is_empty() {
             return Ok(());
@@ -715,9 +744,18 @@ impl Reconciler {
         let name = s.vol.name_any();
         let diskful = s.mine.role == Role::Diskful;
         let mut complete = true;
+        let source = s
+            .vol
+            .spec
+            .source
+            .as_ref()
+            .and_then(|src| snapshots.iter().find(|x| x.name_any() == src.snapshot))
+            .map(AsRef::as_ref);
         let backing = if diskful {
             let place = self.place(pools, s.mine.pool.as_deref())?;
-            let b = self.ensure_drbd_lv(reads, snapshots, s, &place).await?;
+            let b = self
+                .ensure_drbd_lv(reads, snapshots, source, s, &place)
+                .await?;
             *rebuilt = b.rebuilt;
             if b.restored {
                 self.rebuilt_seen.remove(&name);
@@ -747,11 +785,8 @@ impl Reconciler {
             self.sweep_slots(s, &name, &b.row.path).await;
         }
 
-        let restored = match &backing {
-            Some((b, _, place)) => {
-                self.restored_from(reads, snapshots, s, place, &b.row.name)
-                    .await?
-            }
+        let copy = match &backing {
+            Some((b, _, place)) => self.restore_copy(reads, source, s, place, &b.row).await?,
             None => None,
         };
         if let Some((b, _, place)) = &backing
@@ -769,7 +804,11 @@ impl Reconciler {
             }
             return Err(e);
         }
-        facts.restored_from.clone_from(&restored);
+        facts.restored_from = copy
+            .as_ref()
+            .filter(|c| c.tagged && c.at_size)
+            .and(s.vol.spec.source.as_ref())
+            .map(|src| src.snapshot.clone());
 
         if let Some(r) = s.res
             && r.suspended_by_user()
@@ -808,15 +847,7 @@ impl Reconciler {
 
         if diskful {
             let lost = *rebuilt || s.prev_lost() || self.rebuilt_seen.contains(&name);
-            let at_snapshot_size = match &backing {
-                Some((b, _, place)) if restored.is_some() => {
-                    self.at_snapshot_size(reads, snapshots, s, place, &b.row)
-                        .await
-                }
-                _ => false,
-            };
-            self.first_data(s, &name, lost, restored.is_some(), at_snapshot_size)
-                .await?;
+            self.first_data(s, &name, lost, copy.as_ref()).await?;
         }
         Ok(complete)
     }
@@ -881,6 +912,7 @@ impl Reconciler {
         &self,
         reads: &mut Reads,
         snapshots: &[Arc<Snapshot>],
+        source: Option<&Snapshot>,
         s: &Step<'_>,
         place: &Place,
     ) -> Result<Backing, String> {
@@ -892,7 +924,15 @@ impl Reconciler {
         let extent = reads.vg(&self.lvm, vg).await?.extent_bytes;
         let desired = storage::desired_bytes(gross_bytes(vol), extent);
         let rebuilt = row.is_none() && lost_after_report(prev);
-        let restore = row.is_none() && vol.spec.source.is_some() && !s.initialized();
+        let mut restore = row.is_none() && s.restoring();
+        if restore && copy_missing(s, source, &rows, place) {
+            tracing::warn!(
+                lv,
+                vg,
+                "snapshot copy missing here: empty LV, full sync from the initial node"
+            );
+            restore = false;
+        }
         if row.is_none() {
             let created = if restore {
                 if rebuilt {
@@ -927,7 +967,7 @@ impl Reconciler {
         if created {
             reads.created.insert(format!("{vg}/{lv}"));
         }
-        let restoring = vol.spec.source.is_some() && !s.initialized();
+        let restoring = s.restoring();
         let may_grow = s.may_grow(created);
         let r = row.ok_or_else(|| format!("LV {vg}/{lv} missing after create"))?;
         let mut changed = false;
@@ -977,65 +1017,44 @@ impl Reconciler {
         })
     }
 
-    /// The source Snapshot's name while the volume is not initialized, this
-    /// replica's LV carries the from tag and that Snapshot still exists with
-    /// the uid in the tag. Read from LVM each pass, never remembered.
-    async fn restored_from(
+    /// What this replica's LV is to a restore not yet initialized, None for
+    /// any other volume. Read from LVM each pass, never remembered; a read
+    /// error fails the pass, so no first-data decision rests on it.
+    async fn restore_copy(
         &self,
         reads: &mut Reads,
-        snapshots: &[Arc<Snapshot>],
-        s: &Step<'_>,
-        place: &Place,
-        lv: &str,
-    ) -> Result<Option<String>, String> {
-        let Some(src) = &s.vol.spec.source else {
-            return Ok(None);
-        };
-        if s.initialized() {
-            return Ok(None);
-        }
-        let Some(uid) = snapshots
-            .iter()
-            .find(|x| x.name_any() == src.snapshot)
-            .and_then(|x| x.metadata.uid.as_deref())
-        else {
-            return Ok(None);
-        };
-        let tag = storage::from_tag(uid);
-        let tags = reads.tags(&self.lvm, &place.vg, lv).await?;
-        Ok(tags.contains(&tag).then(|| src.snapshot.clone()))
-    }
-
-    /// This replica's LV has the size of its source snapshot LV in the same
-    /// lvs report: its metadata sits where the source's did, so its data
-    /// area holds nothing but the snapshot's. False when either row is
-    /// missing.
-    async fn at_snapshot_size(
-        &self,
-        reads: &mut Reads,
-        snapshots: &[Arc<Snapshot>],
+        source: Option<&Snapshot>,
         s: &Step<'_>,
         place: &Place,
         row: &LvRow,
-    ) -> bool {
-        let Some(src) = &s.vol.spec.source else {
-            return false;
+    ) -> Result<Option<Copy>, String> {
+        if !s.restoring() {
+            return Ok(None);
+        }
+        let mut copy = Copy {
+            lv: format!("{}/{}", place.vg, row.name),
+            tagged: false,
+            at_size: false,
         };
-        let Some(snap) = snapshots.iter().find(|x| x.name_any() == src.snapshot) else {
-            return false;
+        let Some(snap) = source else {
+            return Ok(Some(copy));
         };
-        let source = lvm::names::snapshot_lv(&snap.spec.volume, &src.snapshot);
-        let Ok(rows) = reads.lvs(&self.lvm, &place.vg).await else {
-            return false;
+        let (Some(vol_uid), Some(snap_uid)) =
+            (s.vol.metadata.uid.as_deref(), snap.metadata.uid.as_deref())
+        else {
+            return Ok(Some(copy));
         };
-        let size = |name: &str| {
-            find_in_pool(&rows, name, &place.thin)
-                .ok()
-                .flatten()
-                .map(|r| r.size_bytes)
-        };
-        let (mine, theirs) = (size(&row.name), size(&source));
-        mine.is_some() && mine == theirs
+        let tag = storage::from_tag(vol_uid, snap_uid);
+        copy.tagged = reads
+            .tags(&self.lvm, &place.vg, &row.name)
+            .await?
+            .contains(&tag);
+        let rows = reads.lvs(&self.lvm, &place.vg).await?;
+        let size =
+            |name: &str| find_in_pool(&rows, name, &place.thin).map(|r| r.map(|r| r.size_bytes));
+        let (mine, theirs) = (size(&row.name)?, size(&snapshot_lv_name(snap))?);
+        copy.at_size = mine.is_some() && mine == theirs;
+        Ok(Some(copy))
     }
 
     /// Ownership comes from the LV's tags only:
@@ -1090,7 +1109,7 @@ impl Reconciler {
             let del: Vec<&str> = tags
                 .iter()
                 .map(String::as_str)
-                .filter(|t| drbd::is_md_tag(t))
+                .filter(|t| drbd::is_md_tag(t) || storage::is_from_tag(t))
                 .collect();
             let r = self
                 .lvm
@@ -1134,8 +1153,8 @@ impl Reconciler {
     /// empty disk would declare it in sync. Without that on every peer it
     /// starts after `init_wait` as the sync source. So it does when this
     /// node's LV is not `at_snapshot_size`: metadata of another size leaves
-    /// old metadata in the data area. A node that cannot prove its own copy
-    /// (`restored` false) never starts a restore.
+    /// old metadata in the data area. A node whose LV is not this restore's
+    /// copy never starts it.
     ///
     /// `lost`: this replica was rebuilt. A rebuilt replica may still take
     /// the all-connected path (nobody holds data then), never the timeout
@@ -1146,8 +1165,7 @@ impl Reconciler {
         s: &Step<'_>,
         name: &str,
         lost: bool,
-        restored: bool,
-        at_snapshot_size: bool,
+        copy: Option<&Copy>,
     ) -> Result<(), String> {
         if s.initialized() || !s.initial_node() {
             self.init_started.remove(name);
@@ -1179,12 +1197,16 @@ impl Reconciler {
         }
         let source = s.vol.spec.source.as_ref().map(|x| x.snapshot.as_str());
         if let Some(snap) = source
-            && !restored
+            && !copy.is_some_and(|c| c.tagged)
         {
+            // Not this restore's data: starting would publish it as the
+            // restore.
+            let lv = copy.map_or("this node's LV", |c| c.lv.as_str());
             return Err(format!(
-                "this node's copy is not proven to come from snapshot {snap}: the restore does not start"
+                "LV {lv} is not this restore's copy of snapshot {snap}; delete the claim and restore again"
             ));
         }
+        let at_snapshot_size = copy.is_some_and(|c| c.at_size);
         let waiting = unready_peers(s, r, &self.node, source.filter(|_| at_snapshot_size));
         let since = *self
             .init_started
@@ -1391,7 +1413,7 @@ impl Reconciler {
         let name = s.vol.name_any();
         // A restore grows from its snapshot's size: the new area holds each
         // node's old metadata, which differs, so it syncs.
-        let synced = s.vol.spec.source.is_some() && !s.initialized();
+        let synced = s.restoring();
         tracing::info!(volume = name, from = current, synced, "growing DRBD device");
         let argv = if synced {
             argv::resize_synced(&name)
@@ -1662,6 +1684,11 @@ impl Step<'_> {
             .is_some_and(is_lost)
     }
 
+    /// A restore that has not made its first data yet.
+    fn restoring(&self) -> bool {
+        self.vol.spec.source.is_some() && !self.initialized()
+    }
+
     fn initialized(&self) -> bool {
         self.vol
             .status
@@ -1680,7 +1707,7 @@ impl Step<'_> {
             .res
             .and_then(|r| r.devices.get(&VOLUME))
             .and_then(|d| d.disk.as_deref());
-        if self.vol.spec.source.is_some() && !self.initialized() {
+        if self.restoring() {
             return holds_data(disk);
         }
         created || holds_data(disk) || disk == Some("Inconsistent")
