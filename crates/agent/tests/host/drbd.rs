@@ -537,11 +537,12 @@ async fn drbd_no_start_without_quorum() {
     delete(&h, a).await;
 }
 
-/// A restored volume: the initial node's restored data becomes current and
-/// the empty peer full-syncs from it.
+/// A replicated restore: each member restores from the snapshot LV and the
+/// initial node clears the bitmap, so nothing but metadata crosses the
+/// network and the copies verify equal.
 #[tokio::test]
 #[ignore = "needs root, DRBD 9 and the test VG"]
-async fn drbd_restore_source_full_syncs() {
+async fn drbd_restore_uses_every_copy() {
     if !enabled() {
         return;
     }
@@ -567,8 +568,10 @@ async fn drbd_restore_source_full_syncs() {
             volume: "rw-src".into(),
         },
     );
+    snap.metadata.uid = Some("uid-rw-snap".into());
     snap.status = Some(SnapshotStatus {
         phase: SnapshotPhase::Ready,
+        size_bytes: Some(size),
         ..SnapshotStatus::default()
     });
     let snaps = [Arc::new(snap)];
@@ -576,8 +579,17 @@ async fn drbd_restore_source_full_syncs() {
     let mut g = group(&h, size, &[A, B], &[], Some("rw-snap"));
     let mut done = false;
     for _ in 0..120 {
-        for m in &mut g {
-            m.pass(&pools, &snaps).await;
+        // Each member sees the other's entry, as Volume status shows it.
+        for i in 0..g.len() {
+            let others: Vec<(String, ReplicaStatus)> = (0..g.len())
+                .filter(|j| *j != i)
+                .filter_map(|j| Some((format!("m{j}"), g[j].entry.clone()?)))
+                .collect();
+            let others: Vec<(&str, ReplicaStatus)> = others
+                .iter()
+                .map(|(n, e)| (n.as_str(), e.clone()))
+                .collect();
+            g[i].pass_seeing_snapshots(&pools, &others, &snaps).await;
         }
         done = {
             let t = h.tracker.lock().unwrap();
@@ -594,12 +606,51 @@ async fn drbd_restore_source_full_syncs() {
         "{:?}",
         g.iter().map(Member::error).collect::<Vec<_>>()
     );
+    for m in &g {
+        let e = m.entry.as_ref().unwrap();
+        assert_eq!(e.restored_from.as_deref(), Some("rw-snap"), "{}", m.res);
+    }
+    let tags = l.tags(VG).await.unwrap();
+    for lv in ["rw-a", "rw-b"] {
+        assert!(
+            tags[lv].iter().any(|t| t == "r-drbd.from.uid-rw-snap"),
+            "{lv}: {:?}",
+            tags[lv]
+        );
+        let origin = sh(&["lvs", "--noheadings", "-o", "origin", &format!("{VG}/{lv}")]).await;
+        assert_eq!(origin.stdout.trim(), "rw-src+rw-snap", "{lv}");
+    }
     let (received, _) = traffic("rw-b").await;
     println!(
         "restore peer received {received} KiB of a {} KiB volume",
         size / 1024
     );
-    assert!(received * 1024 >= size, "full sync");
+    assert!(received * 1024 < 8 * MIB, "no sync: {received} KiB");
+
+    // Online verify compares every block; the resource files carry no
+    // verify-alg, so it is set on the live connections for this check.
+    for (res, peer) in [("rw-a", "1"), ("rw-b", "0")] {
+        let out = sh(&["drbdsetup", "net-options", res, peer, "--verify-alg=sha256"]).await;
+        assert_eq!(out.exit_code, Some(0), "{out:?}");
+    }
+    let out = sh(&["drbdadm", "verify", "rw-a"]).await;
+    assert_eq!(out.exit_code, Some(0), "{out:?}");
+    let mut verified = None;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let out = sh(&["drbdsetup", "status", "--json", "--statistics", "rw-a"]).await;
+        let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+        let p = &v[0]["connections"][0]["peer_devices"][0];
+        let state = p["replication-state"].as_str().unwrap_or_default();
+        if !state.starts_with("Verify") {
+            verified = Some((p["out-of-sync"].as_u64(), out.stdout));
+            break;
+        }
+    }
+    let (oos, status) = verified.expect("verify did not end within 60 s");
+    println!("after verify: {status}");
+    assert_eq!(oos, Some(0), "out of sync after verify");
+
     // Direct reads: udev probed the new LVs through the page cache before
     // DRBD wrote under it.
     let head = |lv: &'static str| async move {
@@ -613,7 +664,7 @@ async fn drbd_restore_source_full_syncs() {
     };
     let (source, copy) = (head("rw-a").await, head("rw-b").await);
     println!(
-        "first 4 MiB: snapshot {} restored {} peer {}",
+        "first 4 MiB: snapshot {} initial {} peer {}",
         marker.stdout.trim(),
         source.trim(),
         copy.trim()
@@ -966,6 +1017,15 @@ impl Member {
         pools: &[Arc<Pool>],
         others: &[(&str, ReplicaStatus)],
     ) -> Vec<StatusWrite> {
+        self.pass_seeing_snapshots(pools, others, &[]).await
+    }
+
+    async fn pass_seeing_snapshots(
+        &mut self,
+        pools: &[Arc<Pool>],
+        others: &[(&str, ReplicaStatus)],
+        snaps: &[Arc<Snapshot>],
+    ) -> Vec<StatusWrite> {
         let mut v = self.current();
         let st = v.status.get_or_insert_with(Default::default);
         for (name, e) in others {
@@ -973,7 +1033,7 @@ impl Member {
             (*name).clone_into(&mut e.node);
             st.replicas.push(e);
         }
-        let w = self.rec.pass(pools, &[Arc::new(v)], &[]).await;
+        let w = self.rec.pass(pools, &[Arc::new(v)], snaps).await;
         for x in &w {
             if let StatusWrite::Volume { name, entry } = x
                 && name == self.res
