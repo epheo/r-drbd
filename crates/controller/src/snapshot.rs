@@ -626,14 +626,11 @@ async fn apply_step(
 pub fn restoring_from(volumes: &[std::sync::Arc<Volume>]) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for v in volumes {
-        let Some(src) = &v.spec.source else { continue };
-        let waiting = v.spec.assignment.is_some()
-            && v.metadata.deletion_timestamp.is_none()
-            && v.status
-                .as_ref()
-                .is_none_or(|st| st.initialized_at.is_none());
-        if waiting {
-            out.entry(src.snapshot.clone())
+        let Some(snapshot) = v.restoring() else {
+            continue;
+        };
+        if v.spec.assignment.is_some() && v.metadata.deletion_timestamp.is_none() {
+            out.entry(snapshot.to_owned())
                 .or_insert_with(|| v.name_any());
         }
     }

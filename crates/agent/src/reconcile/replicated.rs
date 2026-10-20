@@ -1121,12 +1121,7 @@ impl Reconciler {
         let fresh = b.created || has(&tags, storage::NEW_TAG);
         if !fresh {
             let tagged = tags.iter().any(|t| drbd::is_md_tag(t));
-            let initialized = s
-                .vol
-                .status
-                .as_ref()
-                .is_some_and(|st| st.initialized_at.is_some());
-            let departed = initialized && s.prev.is_none();
+            let departed = s.initialized() && s.prev.is_none();
             if !tagged && !departed {
                 return Err(NOT_OURS.to_owned());
             }
@@ -1713,7 +1708,7 @@ impl Step<'_> {
 
     /// A restore that has not made its first data yet.
     fn restoring(&self) -> bool {
-        self.vol.spec.source.is_some() && !self.initialized()
+        self.vol.restoring().is_some()
     }
 
     fn initialized(&self) -> bool {

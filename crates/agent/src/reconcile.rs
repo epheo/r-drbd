@@ -631,15 +631,8 @@ impl Reconciler {
     /// `vol` restores from `snapshot` on this node and has not made its first
     /// data yet: until then a lost LV is restored again from this copy.
     fn restores_here_from(&self, vol: &Volume, snapshot: &str) -> bool {
-        vol.spec
-            .source
-            .as_ref()
-            .is_some_and(|s| s.snapshot == snapshot)
+        vol.restoring() == Some(snapshot)
             && vol.metadata.deletion_timestamp.is_none()
-            && vol
-                .status
-                .as_ref()
-                .is_none_or(|st| st.initialized_at.is_none())
             && self.local_replica(vol).is_some()
     }
 

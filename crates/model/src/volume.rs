@@ -182,6 +182,20 @@ pub enum VolumePhase {
     Deleting,
 }
 
+impl Volume {
+    /// The snapshot this volume restores from while it has not made its
+    /// first data (no initializedAt). Until then every diskful replica
+    /// restores from its own copy, and the Snapshot must stay.
+    pub fn restoring(&self) -> Option<&str> {
+        let src = self.spec.source.as_ref()?;
+        let initialized = self
+            .status
+            .as_ref()
+            .is_some_and(|st| st.initialized_at.is_some());
+        (!initialized).then_some(src.snapshot.as_str())
+    }
+}
+
 #[derive(KubeSchema, Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct VolumeStatus {
