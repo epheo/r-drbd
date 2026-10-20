@@ -1109,11 +1109,13 @@ impl Controller for Csi {
                 snap.spec.volume
             )));
         }
-        // A failed attempt is not reused: replace it, one new attempt per call.
+        // A failed attempt is not reused: replace it, one new attempt per
+        // call. So is one in a phase this version does not know: no round
+        // ever ends it.
         if snap
             .status
             .as_ref()
-            .is_some_and(|s| s.phase == SnapshotPhase::Failed)
+            .is_some_and(|s| matches!(s.phase, SnapshotPhase::Failed | SnapshotPhase::Unknown))
         {
             info!(snapshot = name, "replacing the failed snapshot");
             match self
@@ -1134,10 +1136,12 @@ impl Controller for Csi {
             let st = snap.status.as_ref()?;
             match st.phase {
                 SnapshotPhase::Ready => Some(Ok(snap.clone())),
-                SnapshotPhase::Failed => Some(Err(Status::internal(format!(
-                    "snapshot {name} failed: {}",
-                    st.last_error.as_deref().unwrap_or("unknown error")
-                )))),
+                SnapshotPhase::Failed | SnapshotPhase::Unknown => {
+                    Some(Err(Status::internal(format!(
+                        "snapshot {name} failed: {}",
+                        st.last_error.as_deref().unwrap_or("unknown error")
+                    ))))
+                }
                 _ => None,
             }
         })

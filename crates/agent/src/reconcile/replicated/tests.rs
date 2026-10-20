@@ -2785,3 +2785,35 @@ async fn a_peer_with_a_stale_lease_is_not_probed() {
     rig.pass(std::slice::from_ref(&vol), &[]).await;
     assert_eq!(rig.host.probes.load(Ordering::Relaxed), 0);
 }
+
+/// A Snapshot an older version left in a phase this one removed: no round.
+/// IO it held suspended is resumed, nothing is taken, nothing written.
+#[tokio::test]
+async fn a_snapshot_in_an_unknown_phase_is_no_round() {
+    let old: Snapshot = serde_json::from_value(serde_json::json!({
+        "apiVersion": "r-drbd.io/v1alpha1", "kind": "Snapshot",
+        "metadata": { "name": "snap-1" },
+        "spec": { "volume": "pvc-1" },
+        "status": {
+            "phase": "Resuming",
+            "acks": [
+                { "node": NODE, "phase": "Taken", "pool": POOL, "ok": true },
+                { "node": "n2", "phase": "Suspended", "ok": true }
+            ]
+        }
+    }))
+    .unwrap();
+    assert_eq!(old.status.as_ref().unwrap().phase, SnapshotPhase::Unknown);
+    let mut sus = healthy();
+    sus[0] = "exists resource name:pvc-1 role:Secondary suspended:user".into();
+    let mut r = Rig::new(&sus, up_host());
+    reads(&r.x, &[lv(LV_KIB)]);
+    r.x.expect(argv::resume_io("pvc-1"), ok(""));
+    r.expect_check();
+    r.expect_sweep();
+    dry(&r.x, "");
+    let w = r.pass(&[volume(GIB)], &[old]).await;
+    assert_eq!(acks(&w), vec![]);
+    assert!(!seen(&r.x, "--snapshot"));
+    assert_eq!(r.rec.next_deadline(), None);
+}

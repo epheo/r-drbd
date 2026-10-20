@@ -48,6 +48,12 @@ pub enum SnapshotPhase {
     Failed,
     /// Agents remove the snapshot LVs.
     Deleting,
+    /// Any other value: one an older or newer version wrote, still stored.
+    /// It decodes so one object never stops a watch; no round runs on it
+    /// and it is never written back.
+    #[serde(other, skip_serializing)]
+    #[schemars(skip)]
+    Unknown,
 }
 
 #[derive(KubeSchema, Serialize, Deserialize, Clone, Debug, Default, PartialEq)]

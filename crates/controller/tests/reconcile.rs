@@ -1196,3 +1196,92 @@ async fn a_transition_from_a_stale_copy_is_rejected() {
         SnapshotPhase::Taking
     );
 }
+
+/// The Snapshot CRD with the phase values an older version knew, or the
+/// current one again.
+async fn snapshot_crd(client: &Client, legacy: bool) {
+    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+    let api: Api<CustomResourceDefinition> = Api::all(client.clone());
+    let live = api.get("snapshots.r-drbd.io").await.expect("crd");
+    let mut crd = serde_json::to_value(<Snapshot as kube::CustomResourceExt>::crd()).unwrap();
+    crd["metadata"]["resourceVersion"] = json!(live.metadata.resource_version);
+    if legacy {
+        let status = &mut crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]
+            ["properties"];
+        let old = ["Suspended", "Taken", "Resuming"].map(|v| json!(v));
+        status["phase"]["enum"]
+            .as_array_mut()
+            .expect("phase enum")
+            .extend(old.clone());
+        status["acks"]["items"]["properties"]["phase"]["enum"]
+            .as_array_mut()
+            .expect("ack phase enum")
+            .extend(old);
+    }
+    let crd: CustomResourceDefinition = serde_json::from_value(crd).unwrap();
+    api.replace(
+        "snapshots.r-drbd.io",
+        &kube::api::PostParams::default(),
+        &crd,
+    )
+    .await
+    .expect("replace crd");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+}
+
+/// A Snapshot written by an older version, in a phase this one removed,
+/// decodes: the stores sync, volumes are still provisioned, no round runs
+/// on it and its delete still completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_snapshot_in_a_removed_phase_never_stops_the_controller() {
+    let assets = require_envtest!();
+    support::init_tracing();
+    let env = Env::start(&assets).await;
+    let client = env.client().await;
+    snapshot_crd(&client, true).await;
+    create_snapshot(&client, "old", "vol").await;
+    let ack = |node: &str, phase: &str, pool: Option<&str>| json!({ "node": node, "phase": phase, "ok": true, "pool": pool });
+    Api::<Snapshot>::all(client.clone())
+        .patch_status(
+            "old",
+            &PatchParams::default(),
+            &Patch::Merge(json!({ "status": {
+                "phase": "Resuming",
+                "sizeBytes": GIB,
+                "acks": [
+                    ack("n1", "Resuming", Some("p1")),
+                    ack("n2", "Suspended", None),
+                    ack("n3", "Taken", None),
+                ],
+            }})),
+        )
+        .await
+        .expect("old status");
+    snapshot_crd(&client, false).await;
+
+    let _ctl = support::spawn(env.clients().await, support::config(&env, "ctl"));
+    node(&client, "n1", true).await;
+    pool(&client, "p1", "n1", "fast", 100 * GIB).await;
+    let agent = FakeAgent::new(&client, "n1");
+    let mut spec = volume_spec(GIB, 1, "fast");
+    spec.node = Some("n1".into());
+    create_volume(&client, "vol", spec).await;
+    volume_where(&client, "vol", |v| v.spec.assignment.is_some()).await;
+    agent.ready("vol").await;
+    volume_where(&client, "vol", |v| phase_of(v) == VolumePhase::Ready).await;
+
+    let s = get_snapshot(&client, "old").await.unwrap();
+    assert_eq!(snap_phase(&s), SnapshotPhase::Unknown, "left as it is");
+    Api::<Snapshot>::all(client.clone())
+        .delete("old", &DeleteParams::default())
+        .await
+        .expect("delete snapshot");
+    snapshot_where(&client, "old", |s| snap_phase(s) == SnapshotPhase::Deleting).await;
+    agent
+        .ack("old", SnapshotPhase::Deleting, true, Some("p1"))
+        .await;
+    support::eventually(Duration::from_secs(20), || async {
+        get_snapshot(&client, "old").await.is_none().then_some(())
+    })
+    .await;
+}

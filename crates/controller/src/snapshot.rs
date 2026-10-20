@@ -357,6 +357,7 @@ fn phase_reason(p: SnapshotPhase) -> &'static str {
         SnapshotPhase::Ready => "Ready",
         SnapshotPhase::Failed => "Failed",
         SnapshotPhase::Deleting => "Deleting",
+        SnapshotPhase::Unknown => "Unknown",
     }
 }
 
@@ -456,7 +457,12 @@ async fn reconcile(
         set_finalizer(api, s, FINALIZER_SNAPSHOT, true).await;
         return None;
     }
-    if matches!(current.phase, SnapshotPhase::Ready | SnapshotPhase::Failed) {
+    // Unknown: a phase another version wrote. Left as it is, like Failed:
+    // rewriting it could fail a newer version's good snapshot.
+    if matches!(
+        current.phase,
+        SnapshotPhase::Ready | SnapshotPhase::Failed | SnapshotPhase::Unknown
+    ) {
         return None;
     }
     if !valid_name(&name) {
@@ -1112,6 +1118,28 @@ mod tests {
             let acks = [ack("n1", P::Taking, true), ack("n2", P::Taking, true), late];
             failed_with(&Case::new(P::Taking, &acks).next(), "n3: boom");
         }
+    }
+
+    #[test]
+    fn unknown_phases_run_no_round_and_never_count() {
+        // A Snapshot in a phase another version wrote: no step at all.
+        let old = |n: &str| ack(n, P::Unknown, true);
+        let c = Case::new(P::Unknown, &[old("n1"), old("n2"), old("n3")]);
+        assert_eq!(c.next(), Step::Stay);
+        // An ack in an unknown phase counts toward nothing, even ok.
+        let c = Case::new(P::Suspending, &[old("n1"), old("n2"), old("n3")]);
+        assert_eq!(c.next(), Step::Stay);
+        let mut c = Case::new(
+            P::Taking,
+            &[
+                ack("n1", P::Taking, true),
+                ack("n2", P::Taking, true),
+                old("n3"),
+            ],
+        );
+        assert_eq!(c.next(), Step::Stay);
+        c.phase_for = model::snapshot::TAKE_BOUND;
+        failed_with(&c.next(), "within");
     }
 
     #[test]

@@ -1859,7 +1859,8 @@ fn ready_snapshot<'a>(
     let status = snap.status.clone().unwrap_or_default();
     match status.phase {
         SnapshotPhase::Ready => Ok((snap, status.size_bytes.unwrap_or(0))),
-        SnapshotPhase::Failed => Err(Placement::Fail(Cond::new(
+        // Unknown: written by another version; no round ever ends it.
+        SnapshotPhase::Failed | SnapshotPhase::Unknown => Err(Placement::Fail(Cond::new(
             FALSE,
             reason::SNAPSHOT_FAILED,
             format!(
@@ -3217,6 +3218,27 @@ mod tests {
                 ("n1".to_owned(), "p1".to_owned()),
                 ("n2".to_owned(), "p2".to_owned())
             ]
+        );
+    }
+
+    #[test]
+    fn holders_of_a_snapshot_an_older_version_made_ready() {
+        // Its acks carry a phase this version removed; the copies are there.
+        let mut snap = Snapshot::new("s", model::SnapshotSpec { volume: "v".into() });
+        snap.status = Some(model::SnapshotStatus {
+            phase: SnapshotPhase::Ready,
+            acks: vec![model::SnapshotAck {
+                node: "n1".into(),
+                phase: SnapshotPhase::Unknown,
+                pool: Some("p1".into()),
+                ok: true,
+                error: None,
+            }],
+            ..model::SnapshotStatus::default()
+        });
+        assert_eq!(
+            snapshot_holders(&snap),
+            [("n1".to_owned(), "p1".to_owned())]
         );
     }
 
