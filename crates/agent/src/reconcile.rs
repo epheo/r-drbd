@@ -1084,9 +1084,7 @@ impl Reconciler {
                                 let place = place.ok()?;
                                 lvm::names::check_new_lv(&place.vg, &lv).err()
                             });
-                        let res = self
-                            .suspend_step(v, &status.acks, prev.as_ref(), refused)
-                            .await?;
+                        let res = self.suspend_step(v, prev.as_ref(), refused).await?;
                         ack(&self.node, SnapshotPhase::Suspending, pool_name, res)
                     } else {
                         replica?;
@@ -1111,34 +1109,11 @@ impl Reconciler {
     async fn suspend_step(
         &mut self,
         vol: &Volume,
-        acks: &[SnapshotAck],
         prev: Option<&SnapshotAck>,
         refused: Option<String>,
     ) -> Option<Result<(), String>> {
         let volume = &vol.name_any();
         let Some(p) = prev.filter(|a| a.phase == SnapshotPhase::Suspending) else {
-            // Primaries first: a replica suspended before its Primary could
-            // miss a write the Primary's copy holds.
-            if !self.tracked(volume).is_some_and(|r| r.is_primary()) {
-                let first: Vec<String> = self
-                    .other_primaries(vol)
-                    .into_iter()
-                    .filter(|n| {
-                        !acks.iter().any(|a| {
-                            a.node == *n
-                                && a.ok
-                                && matches!(
-                                    a.phase,
-                                    SnapshotPhase::Suspending | SnapshotPhase::Taking
-                                )
-                        })
-                    })
-                    .collect();
-                if !first.is_empty() {
-                    tracing::debug!(volume, ?first, "suspend waits for the Primary");
-                    return None;
-                }
-            }
             return Some(match refused {
                 Some(e) => Err(e),
                 None => match vol.spec.assignment.as_ref().and_then(|a| a.minor) {

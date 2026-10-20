@@ -48,6 +48,9 @@ pub struct DrbdEnv {
     pub init_wait: Duration,
     /// First wait before a plan that came back is adjusted again.
     pub repeat_backoff: Duration,
+    /// Whether a snapshot's holder copies are proven identical, which
+    /// alone allows a restore without a sync.
+    pub copies_identical: fn(&Snapshot) -> bool,
     /// How long a suspended Primary waits for its writes in flight to
     /// land before it acks; well inside the suspend bound.
     pub drain_wait: Duration,
@@ -72,6 +75,7 @@ impl DrbdEnv {
             // milliseconds, and drbdsetup status decides after anyway.
             down_wait: Duration::from_secs(5),
             drain_wait: Duration::from_secs(10),
+            copies_identical,
             // A resync finishing on a fresh small volume takes seconds;
             // a longer one leaves the adjust to the next pass.
             adjust_retry: vec![Duration::from_secs(1), Duration::from_secs(3)],
@@ -105,13 +109,13 @@ pub(super) fn snapshot_round_active(snapshots: &[Arc<Snapshot>], volume: &str) -
         .any(|s| s.spec.volume == volume && in_round(s))
 }
 
-/// The copies of `snap` are the same bytes: every holder acked Taking ok
-/// in this version's round. An older version suspended with a block
-/// device freeze, which left the Primary's copy newer than its peers'.
-fn copies_identical(snap: &Snapshot) -> bool {
-    let acks = snap.status.as_ref().map_or(&[][..], |st| &st.acks);
-    let mut holders = acks.iter().filter(|a| a.pool.is_some()).peekable();
-    holders.peek().is_some() && holders.all(|a| a.phase == SnapshotPhase::Taking && a.ok)
+/// The holder copies of `snap` hold the same bytes. Never assumed: a page
+/// rewritten during writeback reaches each disk in another version, so
+/// only matching content digests can prove it, and none exist yet. Until
+/// then every replicated restore starts from the initial node's copy and
+/// the others sync in full from it.
+fn copies_identical(_snap: &Snapshot) -> bool {
+    false
 }
 
 /// Disk states that hold data a just-created replica must not override.
@@ -854,7 +858,7 @@ impl Reconciler {
 
         if diskful {
             let lost = *rebuilt || s.prev_lost() || self.rebuilt_seen.contains(&name);
-            let identical = source.is_some_and(copies_identical);
+            let identical = source.is_some_and(self.drbd.copies_identical);
             self.first_data(s, &name, lost, copy.as_ref(), identical)
                 .await?;
         }
@@ -1034,7 +1038,7 @@ impl Reconciler {
         desired: u64,
     ) -> (Result<(), String>, bool) {
         let vg = place.vg.as_str();
-        let created = if s.initial_node() || source.is_some_and(copies_identical) {
+        let created = if s.initial_node() || source.is_some_and(self.drbd.copies_identical) {
             self.create_lv(rows, source, place, s.vol, lv, desired)
                 .await
         } else {
@@ -1835,8 +1839,7 @@ impl Reconciler {
     }
 
     /// A Primary acks its suspend only once nothing it wrote is still on
-    /// its way to its disk or a peer: the Secondaries suspend after that
-    /// ack, so they then hold every write the Primary's copy holds.
+    /// its way to its disk or a peer.
     async fn drained(&self, volume: &str) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + self.drbd.drain_wait;
         loop {
@@ -1851,26 +1854,6 @@ impl Reconciler {
             }
             tokio::time::sleep(POLL).await;
         }
-    }
-
-    /// The other replicas of `vol` that are Primary: from this node's view
-    /// of a connected peer, else from the peer's last status entry.
-    pub(super) fn other_primaries(&self, vol: &Volume) -> Vec<String> {
-        let r = self.tracked(&vol.name_any());
-        let entries = vol.status.as_ref().map_or(&[][..], |st| &st.replicas);
-        vol.spec
-            .assignment
-            .iter()
-            .flat_map(|a| &a.replicas)
-            .filter(|x| x.node != self.node)
-            .filter(
-                |x| match r.as_ref().and_then(|r| r.connections.get(&x.node)) {
-                    Some(c) if c.state == "Connected" => c.peer_role.as_deref() == Some("Primary"),
-                    _ => entries.iter().any(|e| e.node == x.node && e.in_use),
-                },
-            )
-            .map(|x| x.node.clone())
-            .collect()
     }
 
     /// Status of the replicated volumes events2 touched since the last call,

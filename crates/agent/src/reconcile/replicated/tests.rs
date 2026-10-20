@@ -386,6 +386,12 @@ fn old_source_snapshot() -> Snapshot {
     s
 }
 
+/// What digests will prove one day. The tests of the proof that a
+/// restore without a sync rests on assume it; no snapshot is proven today.
+fn proven(_: &Snapshot) -> bool {
+    true
+}
+
 /// A peer's entry; `restored` sets restoredFrom to the source.
 fn peer_entry(node: &str, restored: bool) -> ReplicaStatus {
     ReplicaStatus {
@@ -660,6 +666,7 @@ async fn restore_every_holder_from_its_copy() {
     // tag survives the metadata tag swap.
     for (node, own) in [("n1", OWN), ("n2", "r-drbd.md.uid-1.1")] {
         let mut r = Rig::on(node, &[], FakeHost::default());
+        r.rec.drbd.copies_identical = proven;
         let x = r.x.clone();
         reads(&x, &[source_lv()]);
         expect_restore(&x);
@@ -685,6 +692,7 @@ async fn restore_every_holder_from_its_copy() {
     }
     // The tiebreaker reads no LVM and creates nothing.
     let mut r = Rig::on("n3", &[], FakeHost::default());
+    r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     r.expect_check();
     up_plan(&x);
@@ -697,6 +705,7 @@ async fn restore_every_holder_from_its_copy() {
 #[tokio::test]
 async fn restore_starts_without_sync_when_every_peer_restored() {
     let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     reads(&x, &[source_lv(), lv(LV_KIB)]);
     r.expect_check();
@@ -724,6 +733,7 @@ async fn restore_falls_back_to_a_full_sync_when_a_peer_did_not_restore() {
     // n2 is connected and Inconsistent, but its entry has no restoredFrom:
     // it may be empty, so the bitmap is never cleared.
     let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    r.rec.drbd.copies_identical = proven;
     r.rec.drbd.init_wait = Duration::from_millis(100);
     let x = r.x.clone();
     let vol = with_entries(restored(volume(GIB)), vec![peer_entry("n2", false)]);
@@ -760,6 +770,7 @@ async fn restore_waits_for_its_peers_before_any_uuid_step() {
     let mut lines = up("Inconsistent", "DUnknown");
     lines[1] = "exists connection name:pvc-1 peer-node-id:1 conn-name:n2 connection:Connecting role:Unknown".into();
     let mut r = Rig::new(&lines, up_host());
+    r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     reads(&x, &[source_lv(), lv(LV_KIB)]);
     r.expect_check();
@@ -794,6 +805,7 @@ fn restored_peer(kib: u64) -> ReplicaStatus {
 async fn larger_restore_starts_at_the_snapshot_size_then_grows() {
     let resize_synced: Vec<String> = ["drbdadm", "resize", "pvc-1/0"].map(str::to_owned).to_vec();
     let mut r = Rig::new(&[], FakeHost::default());
+    r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     let vol = |peer_kib| with_entries(restored(volume(2 * GIB)), vec![restored_peer(peer_kib)]);
     // At the snapshot's size: no size on the lvcreate, no lvextend.
@@ -1033,6 +1045,7 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
     let empty = || lvm::cmd::create_thin(VG, THIN, "pvc-1", LV_KIB * 1024, &[NEW]);
     // No Snapshot object.
     let mut r = Rig::on("n2", &[], FakeHost::default());
+    r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     reads(&x, &[source_lv()]);
     expect_create(&x, &[source_lv()]);
@@ -1049,6 +1062,7 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
         error: None,
     }];
     let mut r = Rig::on("n2", &[], FakeHost::default());
+    r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     reads(&x, &[source_lv()]);
     expect_create(&x, &[source_lv()]);
@@ -1057,6 +1071,7 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
 
     // The restore lvcreate fails.
     let mut r = Rig::on("n2", &[], FakeHost::default());
+    r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     reads(&x, &[source_lv()]);
     x.expect(
@@ -1070,6 +1085,7 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
 
     // A full pool fails the empty LV too: an error entry.
     let mut r = Rig::on("n2", &[], FakeHost::default());
+    r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     reads(&x, &[]);
     x.expect(empty(), code(5, "", "insufficient free space"));
@@ -1080,38 +1096,40 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
     assert!(!seen(&x, "drbdadm"));
 }
 
-/// Copies an older version took may differ: one copy, the initial node's,
-/// and the other replicas full-sync from it, even when they say otherwise.
+/// No holder copies are proven identical yet, whichever version took
+/// them: one copy, the initial node's, and the other replicas sync in full
+/// from it, even when they claim a copy. Never a start without a sync.
 #[tokio::test]
-async fn a_snapshot_an_older_version_took_restores_by_sync() {
-    let mut r = Rig::on("n2", &[], FakeHost::default());
-    let x = r.x.clone();
-    reads(&x, &[source_lv()]);
-    expect_create(&x, &[source_lv()]);
-    let e = n2_restore_pass(&mut r, &[old_source_snapshot()]).await;
-    assert_eq!((e.last_error, e.restored_from), (None, None));
-    assert!(
-        !seen(&x, "--snapshot")
-            && !x
-                .seen
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|c| c.contains(&"pvc-0+snap-1".to_owned()))
-    );
+async fn every_replicated_restore_syncs_from_one_copy() {
+    for snap in [source_snapshot(), old_source_snapshot()] {
+        let mut r = Rig::on("n2", &[], FakeHost::default());
+        let x = r.x.clone();
+        reads(&x, &[source_lv()]);
+        expect_create(&x, &[source_lv()]);
+        let e = n2_restore_pass(&mut r, std::slice::from_ref(&snap)).await;
+        assert_eq!((e.last_error, e.restored_from), (None, None));
+        let used_copy = x
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains(&"pvc-0+snap-1".to_owned()));
+        assert!(!used_copy, "the peer never restores its copy");
 
-    // The initial node: the source at once, no proof awaited, no clear.
-    let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
-    let x = r.x.clone();
-    reads(&x, &[source_lv(), lv(LV_KIB)]);
-    r.expect_check();
-    r.expect_sweep();
-    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
-    dry(&x, "");
-    x.expect(argv::start_as_source("pvc-1"), ok(""));
-    let vol = with_entries(restored(volume(GIB)), vec![peer_entry("n2", true)]);
-    r.pass(&[vol], &[old_source_snapshot()]).await;
-    assert!(!seen(&x, "--clear-bitmap"));
+        // The initial node: the source at once, no proof awaited.
+        let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+        let x = r.x.clone();
+        reads(&x, &[source_lv(), lv(LV_KIB)]);
+        r.expect_check();
+        r.expect_sweep();
+        expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+        dry(&x, "");
+        x.expect(argv::start_as_source("pvc-1"), ok(""));
+        let vol = with_entries(restored(volume(GIB)), vec![peer_entry("n2", true)]);
+        r.pass(&[vol], &[snap]).await;
+        assert!(!seen(&x, "--clear-bitmap"));
+        assert_eq!(r.live.reads.load(Ordering::Relaxed), 0, "no proof read");
+    }
 }
 
 #[tokio::test]
@@ -1299,6 +1317,7 @@ async fn initial_node_clears_the_bitmap_only_on_the_live_proof() {
     let cached = with_entries(restored(volume(GIB)), vec![peer_entry("n2", true)]);
     // The cache shows n2's proof, the API server no longer does.
     let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    r.rec.drbd.copies_identical = proven;
     r.rec.drbd.init_wait = Duration::ZERO;
     let x = r.x.clone();
     *r.live.scripted.lock().unwrap() = Some(Ok(with_entries(
@@ -1317,6 +1336,7 @@ async fn initial_node_clears_the_bitmap_only_on_the_live_proof() {
 
     // A failed live read: no uuid step of either kind.
     let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    r.rec.drbd.copies_identical = proven;
     r.rec.drbd.init_wait = Duration::ZERO;
     let x = r.x.clone();
     *r.live.scripted.lock().unwrap() = Some(Err("unreachable".into()));
@@ -1332,6 +1352,7 @@ async fn initial_node_clears_the_bitmap_only_on_the_live_proof() {
 
     // Live and cache agree on the proof: the bitmap is cleared.
     let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     reads(&x, &[source_lv(), lv(LV_KIB)]);
     r.expect_check();
@@ -2406,39 +2427,6 @@ fn stats(lower: Option<u64>, peers: &[(&str, u64, u64)]) -> String {
     serde_json::json!([{ "name": "pvc-1", "devices": [device], "connections": conns }]).to_string()
 }
 
-/// A Secondary suspends only once every Primary of the volume acked its
-/// own suspend: suspended first, it could miss a write the Primary holds.
-#[tokio::test]
-async fn a_secondary_suspends_after_the_primary() {
-    let mut lines = healthy();
-    lines[1] = "exists connection name:pvc-1 peer-node-id:1 conn-name:n2 connection:Connected role:Primary".into();
-    let mut r = Rig::new(&lines, up_host());
-    reads(&r.x, &[lv(LV_KIB)]);
-    r.expect_check();
-    r.expect_sweep();
-    dry(&r.x, "");
-    let w = r
-        .pass(&[volume(GIB)], &[snapshot(SnapshotPhase::Suspending)])
-        .await;
-    assert_eq!(acks(&w), vec![]);
-    assert!(!seen(&r.x, "suspend-io"));
-
-    let primary = SnapshotAck {
-        node: "n2".into(),
-        phase: SnapshotPhase::Suspending,
-        pool: Some("pool-n2".into()),
-        ok: true,
-        error: None,
-    };
-    let mut snap = snapshot(SnapshotPhase::Suspending);
-    snap.status.as_mut().unwrap().acks = vec![primary];
-    reads_again(&r.x, &[lv(LV_KIB)]);
-    dry(&r.x, "");
-    r.x.expect(argv::suspend_io(50000), ok(""));
-    let w = r.pass(&[volume(GIB)], &[snap]).await;
-    assert_eq!(acks(&w), vec![round_ack(SnapshotPhase::Suspending, true)]);
-}
-
 /// A Primary acks only once its writes left: nothing pending on its disk,
 /// nothing pending or unacked toward a peer.
 #[tokio::test]
@@ -2611,6 +2599,7 @@ async fn nothing_before_the_initial_dump() {
 #[tokio::test]
 async fn restore_lost_before_initialized_is_restored_again() {
     let mut r = Rig::new(&[], FakeHost::default());
+    r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     reads(&x, &[source_lv()]);
     expect_restore(&x);
