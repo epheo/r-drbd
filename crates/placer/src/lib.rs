@@ -1,8 +1,8 @@
 //! Placement of volume replicas and the choice of the quorum tiebreaker.
 //!
 //! Pure crate, deliberately small: distinct nodes, tier or pool or node
-//! filter, capacity from the pool's own policy (see `room`), most free
-//! space first, deterministic ties.
+//! filter, capacity from the pool's own policy (see `room`), most room
+//! first, deterministic ties.
 
 #![forbid(unsafe_code)]
 
@@ -110,8 +110,8 @@ pub fn fits(pool: &PoolView, size_bytes: u64) -> bool {
     pool.total_bytes > 0 && size_bytes <= room(pool)
 }
 
-/// Diskful placement: filter pools, order by free bytes descending then
-/// node then pool name, pick one pool per node until `replicas` are held.
+/// Diskful placement: filter pools, order by room descending then node
+/// then pool name, pick one pool per node until `replicas` are held.
 /// Never partial.
 pub fn place(req: &Request, pools: &[PoolView]) -> Result<Vec<Chosen>, Insufficient> {
     let wanted = usize::try_from(req.replicas).unwrap_or(usize::MAX);
@@ -127,9 +127,11 @@ pub fn place(req: &Request, pools: &[PoolView]) -> Result<Vec<Chosen>, Insuffici
             None => survivors.push(pool),
         }
     }
+    // Room, not freeBytes: committed grows with every placement of a pass,
+    // so a burst spreads instead of filling the pool with most unwritten space.
     survivors.sort_by(|a, b| {
-        b.free_bytes
-            .cmp(&a.free_bytes)
+        room(b)
+            .cmp(&room(a))
             .then_with(|| a.node.cmp(&b.node))
             .then_with(|| a.name.cmp(&b.name))
     });

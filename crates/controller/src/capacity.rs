@@ -41,7 +41,7 @@ pub fn largest(
     node: Option<&str>,
 ) -> u64 {
     // Only a local volume lives on the pod's node. A replicated one is
-    // placed by free space anywhere and any node attaches it diskless, so
+    // placed by room anywhere and any node attaches it diskless, so
     // every node sees the cluster-wide answer.
     let node = node.filter(|_| replicas == 1);
     let views: Vec<PoolView> = pools.iter().map(|p| view(p, ready_nodes)).collect();
