@@ -1756,8 +1756,8 @@ impl Reconciler {
             .filter_map(|s| {
                 let status = s.status.as_ref()?;
                 let prev = status.acks.iter().find(|a| a.node == self.node);
-                // A copy taken stays good: every other take ended before
-                // this deadline. Failing it could strip a Ready holder.
+                // Its part is done (a copy, or a freeze held past every
+                // take window); failing it could strip a Ready holder.
                 if prev.is_some_and(|a| a.phase == SnapshotPhase::Taking && a.ok) {
                     return None;
                 }

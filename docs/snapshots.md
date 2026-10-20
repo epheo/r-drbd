@@ -41,7 +41,7 @@ A replica whose agent is down holds every snapshot of its volume; evict or detac
 Then:
 
 1. Every replica suspends IO, diskless and tiebreaker included, within 30 s.
-2. Every diskful node creates a thin snapshot of its LV, within 2 minutes.
+2. Every diskful node creates a thin snapshot of its LV, and every other replica confirms its IO is still suspended, within 2 minutes.
 3. The snapshot is Ready, or Failed with the reason; every replica resumes IO on its own when it sees the round end.
 
 All copies are taken at the same point in the write stream, so the snapshot is crash consistent on every node.

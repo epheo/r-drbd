@@ -1012,9 +1012,11 @@ async fn snapshot_suspend_bound_and_mid_round_attach() {
     cluster(&client).await;
     let agents = ["n1", "n2", "n3"].map(|n| FakeAgent::new(&client, n));
     ready_rep(&client, &agents).await;
-    let [a1, a2, _] = &agents;
+    let [a1, a2, a3] = &agents;
+    let a4 = FakeAgent::new(&client, "n4");
 
-    // n4 attached during Taking never suspended and may write: the round fails.
+    // n4 attached during Taking never suspended and may write: its agent
+    // says so instead of confirming a freeze, and the round fails.
     create_snapshot(&client, "s-attach", "rep").await;
     snap_in(&client, "s-attach", SnapshotPhase::Suspending).await;
     for a in &agents {
@@ -1028,9 +1030,17 @@ async fn snapshot_suspend_bound_and_mid_round_attach() {
         .await;
     a2.ack("s-attach", SnapshotPhase::Taking, true, Some("p2"))
         .await;
+    a3.ack("s-attach", SnapshotPhase::Taking, true, None).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        support::snap_phase(&support::get_snapshot(&client, "s-attach").await.unwrap()),
+        SnapshotPhase::Taking,
+        "waits for n4"
+    );
+    a4.ack("s-attach", SnapshotPhase::Taking, false, None).await;
     let s = snap_in(&client, "s-attach", SnapshotPhase::Failed).await;
     let e = s.status.unwrap().last_error.unwrap();
-    assert!(e.contains("never suspended on n4"), "{e}");
+    assert!(e.contains("fake failure on n4"), "{e}");
     patch_spec(&client, "rep", json!({ "attachments": [] })).await;
     volume_where(&client, "rep", |v| role_of(v, "n4").is_none()).await;
     // Rounds start only on a spec every replica applied.
@@ -1095,6 +1105,7 @@ async fn snapshot_round_waits_for_every_agent() {
     snap_in(&client, "s1", SnapshotPhase::Taking).await;
     a1.ack("s1", SnapshotPhase::Taking, true, Some("p1")).await;
     a2.ack("s1", SnapshotPhase::Taking, true, Some("p2")).await;
+    agents[2].ack("s1", SnapshotPhase::Taking, true, None).await;
     snap_in(&client, "s1", SnapshotPhase::Ready).await;
 }
 
@@ -1474,6 +1485,7 @@ async fn evict_waits_for_the_snapshot_round() {
     let v = get_volume(&client, "rep").await.unwrap();
     assert_eq!(role_of(&v, "n4"), None, "moved during Taking");
     a2.ack("s1", SnapshotPhase::Taking, true, Some("p2")).await;
+    agents[2].ack("s1", SnapshotPhase::Taking, true, None).await;
     snap_in(&client, "s1", SnapshotPhase::Ready).await;
     // The round is over: the move goes ahead.
     let v = volume_where(&client, "rep", |v| role_of(v, "n2").is_none()).await;

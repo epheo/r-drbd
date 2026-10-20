@@ -1057,15 +1057,17 @@ impl Reconciler {
                         };
                         ack(&self.node, SnapshotPhase::Taking, pool_name, res)
                     }
-                    // Diskless or tiebreaker: no copy, but its IO must
-                    // stay frozen until every copy is taken.
+                    // Diskless or tiebreaker: no copy; its ack says its IO
+                    // is still suspended, and Ready waits for it.
                     (None, Some(v)) => {
                         self.my_replica(v)?;
-                        if self.suspended(&snap.spec.volume) {
-                            return None;
-                        }
-                        let e = "IO is not suspended here: resumed, or restarted, mid round";
-                        ack(&self.node, SnapshotPhase::Taking, pool_name, Err(e.into()))
+                        let res = if self.suspended(&snap.spec.volume) {
+                            Ok(())
+                        } else {
+                            Err("IO is not suspended here: resumed, or restarted, mid round"
+                                .to_owned())
+                        };
+                        ack(&self.node, SnapshotPhase::Taking, pool_name, res)
                     }
                     (None, None) => return None,
                 },

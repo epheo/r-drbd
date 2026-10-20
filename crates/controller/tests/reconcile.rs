@@ -605,6 +605,13 @@ async fn snapshot_replicated_rounds() {
     agents[1]
         .ack("rs", SnapshotPhase::Taking, true, Some("p2"))
         .await;
+    // The copies alone are not enough: the tiebreaker confirms its freeze.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        snap_phase(&get_snapshot(&client, "rs").await.unwrap()),
+        SnapshotPhase::Taking
+    );
+    agents[2].ack("rs", SnapshotPhase::Taking, true, None).await;
     // Ready at once: every agent resumes on its own when the round ends.
     let s = snapshot_where(&client, "rs", |s| snap_phase(s) == SnapshotPhase::Ready).await;
     let st = s.status.unwrap();
@@ -975,8 +982,8 @@ async fn controller_owns_no_agent_fields() {
         a.ack("snap", SnapshotPhase::Suspending, true, None).await;
     }
     snapshot_where(&client, "snap", |s| snap_phase(s) == SnapshotPhase::Taking).await;
-    for (a, p) in agents.iter().zip(["p1", "p2"]) {
-        a.ack("snap", SnapshotPhase::Taking, true, Some(p)).await;
+    for (a, p) in agents.iter().zip([Some("p1"), Some("p2"), None]) {
+        a.ack("snap", SnapshotPhase::Taking, true, p).await;
     }
     snapshot_where(&client, "snap", |s| snap_phase(s) == SnapshotPhase::Ready).await;
     support::eventually(Duration::from_secs(20), || async {

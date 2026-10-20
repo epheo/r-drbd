@@ -215,38 +215,31 @@ fn suspending(r: &Round<'_>) -> Step {
     }
 }
 
-/// Every diskful replica takes. Replicated: a listed replica without a
-/// suspend for this round (attached mid round, or its ack replaced by a
-/// failure) may be writing, so the round fails.
+/// Every listed replica acks Taking: a diskful one with its copy, the
+/// others with IO still suspended at ack time. A node that acked Taking
+/// resumes only once the phase leaves Taking or at RESUME_AFTER, past
+/// every take window, so no write lands between two copies.
 fn taking(r: &Round<'_>) -> Step {
     use SnapshotPhase as P;
-    let in_round = |a: &SnapshotAck| matches!(a.phase, P::Suspending | P::Taking);
-    let asked = if r.replicated {
-        r.nodes(None)
-    } else {
-        r.nodes(Some(Role::Diskful))
-    };
+    let asked: Vec<&model::AssignedReplica> = r
+        .assignment
+        .replicas
+        .iter()
+        .filter(|x| r.replicated || x.role == Role::Diskful)
+        .collect();
     let errors: Vec<String> = asked
         .iter()
-        .filter_map(|n| r.ack(n).filter(|a| in_round(a) && !a.ok))
+        .filter_map(|x| r.ack(&x.node))
+        .filter(|a| matches!(a.phase, P::Suspending | P::Taking) && !a.ok)
         .map(|a| format!("{}: {}", a.node, a.error.as_deref().unwrap_or("failed")))
         .collect();
     if !errors.is_empty() {
         return failed(format!("Taking failed on {}", errors.join("; ")));
     }
-    if r.replicated {
-        let unsuspended: Vec<&str> = asked
-            .iter()
-            .filter(|n| r.ack(n).is_none_or(|a| !in_round(a)))
-            .copied()
-            .collect();
-        if !unsuspended.is_empty() {
-            return failed(format!("IO never suspended on {}", unsuspended.join(", ")));
-        }
-    }
-    let taken = r.nodes(Some(Role::Diskful)).iter().all(|n| {
-        r.ack(n)
-            .is_some_and(|a| a.phase == P::Taking && a.ok && a.pool.is_some())
+    let taken = asked.iter().all(|x| {
+        r.ack(&x.node).is_some_and(|a| {
+            a.phase == P::Taking && a.ok && (x.role != Role::Diskful || a.pool.is_some())
+        })
     });
     if taken {
         return go(P::Ready, None);
@@ -1072,64 +1065,66 @@ mod tests {
         assert!(!e.contains("n1"), "{e}");
     }
 
+    /// A diskless or tiebreaker Taking ack: IO still suspended there.
+    fn frozen(node: &str) -> SnapshotAck {
+        let mut a = ack(node, P::Taking, true);
+        a.pool = None;
+        a
+    }
+
     #[test]
-    fn taking_needs_every_diskful_copy() {
+    fn taking_needs_every_listed_replica() {
         let sus = |n: &str| ack(n, P::Suspending, true);
         let c = Case::new(P::Taking, &[sus("n1"), sus("n2"), sus("n3")]);
         assert_eq!(c.next(), Step::Stay);
         let mut no_pool = ack("n2", P::Taking, true);
         no_pool.pool = None;
-        let c = Case::new(P::Taking, &[ack("n1", P::Taking, true), no_pool, sus("n3")]);
-        assert_eq!(c.next(), Step::Stay);
-        let done = [
+        let c = Case::new(
+            P::Taking,
+            &[ack("n1", P::Taking, true), no_pool, frozen("n3")],
+        );
+        assert_eq!(c.next(), Step::Stay, "a diskful ack without its copy");
+        let copies = [
             ack("n1", P::Taking, true),
             ack("n2", P::Taking, true),
             sus("n3"),
         ];
+        assert_eq!(
+            Case::new(P::Taking, &copies).next(),
+            Step::Stay,
+            "the tiebreaker has not confirmed its freeze"
+        );
+        let done = [
+            ack("n1", P::Taking, true),
+            ack("n2", P::Taking, true),
+            frozen("n3"),
+        ];
         assert_eq!(Case::new(P::Taking, &done).next(), go(P::Ready, None));
-        // All taken after the bound: each agent took within its own window.
+        // All acked after the bound: each agent acked within its own window.
         let mut c = Case::new(P::Taking, &done);
         c.phase_for = model::snapshot::TAKE_BOUND * 2;
         assert_eq!(c.next(), go(P::Ready, None));
-        let mut c = Case::new(
-            P::Taking,
-            &[ack("n1", P::Taking, true), sus("n2"), sus("n3")],
-        );
+        // An attachment added mid round must confirm a freeze it never had.
+        let mut c = Case::new(P::Taking, &done);
+        c.assignment = assignment(&[("n4", Role::Diskless)]);
+        assert_eq!(c.next(), Step::Stay);
         c.phase_for = model::snapshot::TAKE_BOUND;
         failed_with(&c.next(), "within 120 s");
         let bad = [
             ack("n1", P::Taking, true),
             ack("n2", P::Taking, false),
-            sus("n3"),
+            frozen("n3"),
         ];
         failed_with(&Case::new(P::Taking, &bad).next(), "n2: boom");
     }
 
     #[test]
     fn taking_fails_on_a_replica_not_suspended() {
-        let sus = |n: &str| ack(n, P::Suspending, true);
-        let done = [
-            ack("n1", P::Taking, true),
-            ack("n2", P::Taking, true),
-            sus("n3"),
-        ];
-        // Attached mid round: never suspended, may be writing.
-        let mut c = Case::new(P::Taking, &done);
-        c.assignment = assignment(&[("n4", Role::Diskless)]);
-        failed_with(&c.next(), "never suspended on n4");
         // Resumed on its own deadline, or found IO live again.
-        let resumed = [
-            ack("n1", P::Taking, true),
-            ack("n2", P::Taking, true),
-            ack("n3", P::Taking, false),
-        ];
-        failed_with(&Case::new(P::Taking, &resumed).next(), "n3: boom");
-        let resumed = [
-            ack("n1", P::Taking, true),
-            ack("n2", P::Taking, true),
-            ack("n3", P::Suspending, false),
-        ];
-        failed_with(&Case::new(P::Taking, &resumed).next(), "n3: boom");
+        for late in [ack("n3", P::Taking, false), ack("n3", P::Suspending, false)] {
+            let acks = [ack("n1", P::Taking, true), ack("n2", P::Taking, true), late];
+            failed_with(&Case::new(P::Taking, &acks).next(), "n3: boom");
+        }
     }
 
     #[test]

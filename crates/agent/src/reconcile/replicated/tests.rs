@@ -2277,7 +2277,24 @@ async fn diskless_replica_keeps_its_freeze_through_taking() {
     let mut r = Rig::on("n3", &lines("user"), FakeHost::default());
     r.expect_check();
     let w = r.pass(&[volume(GIB)], std::slice::from_ref(&taking)).await;
+    let frozen = SnapshotAck {
+        node: "n3".into(),
+        phase: SnapshotPhase::Taking,
+        pool: None,
+        ok: true,
+        error: None,
+    };
+    assert_eq!(
+        acks(&w),
+        vec![frozen.clone()],
+        "still suspended at ack time"
+    );
+    // Acked: kept frozen while the phase stays Taking, nothing rewritten.
+    let mut held = taking.clone();
+    held.status.as_mut().unwrap().acks = vec![frozen];
+    let w = r.pass(&[volume(GIB)], &[held]).await;
     assert_eq!(acks(&w), vec![]);
+    assert!(!seen(&r.x, "resume-io"));
     // Rebooted mid round: IO is live again, the round must fail.
     let mut r = Rig::on("n3", &lines("no"), FakeHost::default());
     r.expect_check();

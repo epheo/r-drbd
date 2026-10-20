@@ -955,7 +955,8 @@ impl FakeAgent {
                     let pool = mine.and_then(|a| a.pool.clone());
                     self.ack(&name, status.phase, true, pool.as_deref()).await;
                 }
-                SnapshotPhase::Taking if my_pool.is_some() => {
+                // Diskless and tiebreaker ack with IO still suspended.
+                SnapshotPhase::Taking if member => {
                     self.ack(&name, status.phase, true, my_pool.as_deref())
                         .await;
                 }
