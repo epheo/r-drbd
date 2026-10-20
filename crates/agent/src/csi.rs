@@ -595,8 +595,8 @@ impl Inner {
     }
 
     /// File system type and label, `None` only for a device blkid calls
-    /// empty (exit 2). A partition table or any signature blkid cannot name
-    /// is FailedPrecondition: mkfs there would destroy data.
+    /// empty (exit 2) that also reads. A partition table or any signature
+    /// blkid cannot name is FailedPrecondition: mkfs there would destroy data.
     async fn fs_probe(&self, dev: &str) -> Result<Option<Probe>, Status> {
         let cmd = argv(&[
             "blkid", "-p", "-s", "TYPE", "-s", "PTTYPE", "-s", "LABEL", "-o", "export", dev,
@@ -624,9 +624,28 @@ impl Inner {
                         out.stdout.trim().replace('\n', " ")
                     ))
                 }),
-            Some(2) => Ok(None),
+            Some(2) => self.readable(dev).await.map(|()| None),
             _ => Err(internal(&failure(&cmd, &out))),
         }
+    }
+
+    /// blkid exits 2 also when it could not open or read the device (DRBD
+    /// without quorum, a Primary elsewhere): only a direct read of the first
+    /// block tells an empty device from an unreadable one.
+    async fn readable(&self, dev: &str) -> Result<(), Status> {
+        let cmd = argv(&[
+            "dd",
+            &format!("if={dev}"),
+            "of=/dev/null",
+            "bs=4096",
+            "count=1",
+            "iflag=direct",
+            "status=none",
+        ]);
+        run_ok(self.exec(), &cmd, DEFAULT_TIMEOUT)
+            .await
+            .map(|_| ())
+            .map_err(|e| Status::unavailable(format!("{dev} is not readable: {e}")))
     }
 
     async fn stage(&self, req: NodeStageVolumeRequest) -> Result<(), Status> {
@@ -704,7 +723,7 @@ impl Inner {
                 } else {
                     tracing::info!(volume, dev, "formatting xfs");
                 }
-                self.mkfs_xfs(&dev).await?;
+                self.mkfs_xfs(&dev, found.is_some()).await?;
                 self.mark(volume, fs).await?;
             }
             FsAction::Adopt => {
@@ -732,14 +751,17 @@ impl Inner {
 
     /// The label marks the format unfinished until it is cleared; a stage
     /// that stops in between formats again, losing nothing (the fs is empty).
-    async fn mkfs_xfs(&self, dev: &str) -> Result<(), Status> {
-        run_ok(
-            self.exec(),
-            &argv(&["mkfs.xfs", "-q", "-f", "-K", "-L", MKFS_LABEL, dev]),
-            MKFS_TIMEOUT,
-        )
-        .await
-        .map_err(|e| internal(&e))?;
+    /// `-f` only over that unfinished format: without it mkfs.xfs refuses a
+    /// device that holds a file system, the last guard of a blank device.
+    async fn mkfs_xfs(&self, dev: &str, unfinished: bool) -> Result<(), Status> {
+        let mut cmd = argv(&["mkfs.xfs", "-q"]);
+        if unfinished {
+            cmd.push("-f".to_owned());
+        }
+        cmd.extend(argv(&["-K", "-L", MKFS_LABEL, dev]));
+        run_ok(self.exec(), &cmd, MKFS_TIMEOUT)
+            .await
+            .map_err(|e| internal(&e))?;
         self.run(&argv(&["xfs_admin", "-L", "--", dev]))
             .await
             .map(|_| ())
