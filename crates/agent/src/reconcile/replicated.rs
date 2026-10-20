@@ -160,6 +160,13 @@ enum Resize {
 /// Why the initial node must not start without its missing peers, if
 /// anything.
 fn timeout_blocker(s: &Step<'_>, r: &Resource, lost: bool) -> Option<&'static str> {
+    if s.restoring() {
+        // Only the initial node ever makes a restore's data, and first_data
+        // gets here only with its proven copy of the snapshot, restored
+        // again after a loss too: whatever a peer was shown before
+        // initializedAt is that snapshot, and quorum protects nothing.
+        return None;
+    }
     // Statuses only report a disk state DRBD reached; UpToDate, Consistent
     // or Outdated anywhere means data was made already.
     let seen_data = s

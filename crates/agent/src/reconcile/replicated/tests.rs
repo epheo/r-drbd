@@ -1000,6 +1000,65 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
 }
 
 #[tokio::test]
+async fn degraded_restore_starts_without_quorum() {
+    // The peer and the tiebreaker away: no quorum, yet the initial node's
+    // copy is the snapshot's, so after the wait it is the sync source.
+    let mut r = Rig::new(&waiting_lines(false), up_host());
+    r.rec.drbd.init_wait = Duration::ZERO;
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    x.expect(argv::start_as_source("pvc-1"), ok(""));
+    r.pass(&[restored(volume(GIB))], &[source_snapshot()]).await;
+    assert!(!seen(&x, "--clear-bitmap"));
+}
+
+#[tokio::test]
+async fn initial_node_lost_during_the_grow_starts_as_source() {
+    // n1 lost its LV while the grown area synced; n2 is Inconsistent at the
+    // grown size. n1 restores its copy again and, the loss still on record,
+    // takes the timeout path as the sync source.
+    let mut r = Rig::new(&up("Diskless", "Inconsistent"), up_host());
+    r.rec.drbd.init_wait = Duration::ZERO;
+    let x = r.x.clone();
+    let n1 = ReplicaStatus {
+        allocated_bytes: Some(LV2_KIB * 1024),
+        ..reported()
+    };
+    let n2 = ReplicaStatus {
+        allocated_bytes: Some(LV2_KIB * 1024),
+        restored_from: None,
+        ..peer_entry("n2", false)
+    };
+    let vol = |me: ReplicaStatus| with_entries(restored(volume(2 * GIB)), vec![me, n2.clone()]);
+    reads(&x, &[source_lv()]);
+    expect_restore(&x);
+    r.expect_check();
+    expect_lv_tags(&x, &[("pvc-1", &[NEW, FROM])]);
+    expect_md(&x, &[NEW]);
+    dry(&x, PLAN);
+    x.expect(argv::adjust("pvc-1"), code(10, "", "attach failed"));
+    let w = r.pass(&[vol(n1)], &[source_snapshot()]).await;
+    let e = entry_of(&w);
+    assert!(
+        e.last_error.as_deref().unwrap().starts_with(LV_LOST),
+        "{e:?}"
+    );
+
+    r.feed(&["change device name:pvc-1 volume:0 disk:Inconsistent"]);
+    reads_again(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    x.expect(argv::start_as_source("pvc-1"), ok(""));
+    r.pass(&[vol(e)], &[source_snapshot()]).await;
+    assert!(!seen(&x, "--clear-bitmap"));
+}
+
+#[tokio::test]
 async fn a_stale_peer_entry_never_clears_the_bitmap() {
     // restoredFrom without a present entry and a device: written before
     // the LV it speaks of.
