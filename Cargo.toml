@@ -6,7 +6,6 @@ members = ["crates/*"]
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/epheo/r-drbd"
-rust-version = "1.90"
 
 [workspace.dependencies]
 agent = { path = "crates/agent" }

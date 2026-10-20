@@ -1,4 +1,5 @@
 [toolchain]
-channel = "stable"
+# The one toolchain pin: the Containerfile image and CI follow it.
+channel = "1.99.0"
 profile = "minimal"
 components = ["rustfmt", "clippy"]

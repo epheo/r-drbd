@@ -1,7 +1,7 @@
 # Static binaries on scratch. The agent runs drbd-utils from this image, so
 # hosts need only the DRBD kernel module; lvm, mkfs and mount still run from
 # the host mount namespace.
-FROM docker.io/library/rust:1.99-alpine AS build
+FROM docker.io/library/rust:1.99.0-alpine AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY . .
