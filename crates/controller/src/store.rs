@@ -26,7 +26,7 @@ pub struct Stores {
     pub volumes: Store<Volume>,
     pub snapshots: Store<Snapshot>,
     pub nodes: Store<Node>,
-    /// Leases of the product namespace; agent heartbeats among them.
+    /// Agent heartbeat Leases of the product namespace, by label.
     pub leases: Store<Lease>,
     /// Per agent Lease name: when this process last saw its renewTime
     /// change. Staleness is judged on this clock, as leader.rs does, so
@@ -251,8 +251,8 @@ async fn drive_leases(
 ) -> Error {
     type Seen = HashMap<String, (Option<MicroTime>, Instant)>;
     type Listed = Vec<(String, Option<MicroTime>)>;
-    let prefix = model::keys::agent_lease_name("");
-    let stream = watcher(api, watcher::Config::default())
+    let selector = format!("{}=true", model::keys::AGENT_LEASE_LABEL);
+    let stream = watcher(api, watcher::Config::default().labels(&selector))
         .default_backoff()
         .modify(|o: &mut Lease| o.managed_fields_mut().clear())
         .reflect(writer);
@@ -274,11 +274,8 @@ async fn drive_leases(
                 false
             }
             Ok(watcher::Event::InitApply(l)) => {
-                let name = l.name_any();
-                if let Some((_, listed)) = relist.as_mut()
-                    && name.starts_with(&prefix)
-                {
-                    listed.push((name, renew_of(&l)));
+                if let Some((_, listed)) = relist.as_mut() {
+                    listed.push((l.name_any(), renew_of(&l)));
                 }
                 false
             }
@@ -302,9 +299,6 @@ async fn drive_leases(
             }
             Ok(watcher::Event::Apply(l)) => {
                 let name = l.name_any();
-                if !name.starts_with(&prefix) {
-                    continue;
-                }
                 let renew = renew_of(&l);
                 match seen.get(&name) {
                     Some((r, _)) if *r == renew => false,
