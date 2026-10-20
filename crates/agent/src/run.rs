@@ -623,6 +623,9 @@ mod tests {
             !set.update(std::slice::from_ref(&a), "n1"),
             "other node removed"
         );
+        let came = with(&other, |p| p.spec.node = "n1".into());
+        assert!(set.update(&[a.clone(), came], "n1"), "moved to this node");
+        assert!(set.update(std::slice::from_ref(&a), "n1"), "moved away");
 
         let status = with(&a, |p| {
             p.status = Some(model::PoolStatus {
