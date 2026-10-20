@@ -9,7 +9,7 @@ The image holds static binaries on scratch: r-drbd and drbd-utils. With R_DRBD_H
 ## Image version
 
 `base` pins one build: `ghcr.io/epheo/r-drbd:sha-<short commit>` with `imagePullPolicy: IfNotPresent` on the controller and the agent.
-The tag is set once, by the `images:` entry in `base/kustomization.yaml`.
+The tag is written in the two pod manifests, so a plain `kubectl apply -f` deploys the same build as `kubectl apply -k`; the `images:` entry in `base/kustomization.yaml` carries it for overlays.
 Every agent then runs the same build, and a restarted pod starts from the node's copy even while the registry is unreachable.
 
 `dev` follows `:latest` with `imagePullPolicy: Always`: each restart takes the newest main build.
@@ -19,6 +19,7 @@ Use it for development only: agents can end up on different builds, and an agent
     kubectl apply -k deploy/dev     # latest
 
 Each build on main is tagged `sha-<short commit>`, each release `v<version>`.
-A release bumps `newTag` in `base/kustomization.yaml` and the tag in the CRD command of docs/install.md together.
+A release bumps every place that names the tag together: `base/20-controller.yaml`, `base/30-agent.yaml`, `newTag` in `base/kustomization.yaml`, and the CRD commands in README.md, docs/install.md and docs/openshift.md.
+A workspace test fails when those places disagree.
 Changing the tag changes the pod spec, so `kubectl apply -k` rolls both.
 Keep `Always` with a tag that can move; `IfNotPresent` only with a `sha-` tag or a digest.

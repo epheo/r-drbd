@@ -88,7 +88,7 @@ pub enum Error {
     },
     #[error("CSI server: {0}")]
     Transport(#[from] tonic::transport::Error),
-    #[error("kube config: {0}")]
+    #[error("kube config")]
     KubeConfig(#[source] kube::config::InferConfigError),
     #[error("lost the leader Lease {0}")]
     LostLease(String),
