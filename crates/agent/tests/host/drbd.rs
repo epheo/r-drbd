@@ -539,18 +539,28 @@ async fn drbd_no_start_without_quorum() {
 
 /// A replicated restore: each member restores from the snapshot LV and the
 /// initial node clears the bitmap, so nothing but metadata crosses the
-/// network and the copies verify equal.
+/// network and the copies verify equal. Restored to twice the size, the
+/// grown area syncs, mostly as discards.
 #[tokio::test]
 #[ignore = "needs root, DRBD 9 and the test VG"]
 async fn drbd_restore_uses_every_copy() {
     if !enabled() {
         return;
     }
-    drbd_clean(EVERY).await;
     let h = start().await;
-    let size = 256 * MIB;
+    restore_case(&h, 1, 8 * MIB).await;
+    restore_case(&h, 2, 64 * MIB).await;
+}
+
+/// Restores a 256 MiB snapshot to `factor` times its size; the peer may
+/// receive at most `max_received` bytes.
+async fn restore_case(h: &Host, factor: u64, max_received: u64) {
+    drbd_clean(EVERY).await;
+    let source_size = 256 * MIB;
+    let size = factor * source_size;
+    println!("restore of {source_size} bytes to {size}");
     let l = lvm();
-    let gross = drbd_config::gross_bytes(size, model::keys::PEER_SLOTS);
+    let gross = drbd_config::gross_bytes(source_size, model::keys::PEER_SLOTS);
     let bytes = agent::storage::desired_bytes(gross, EXTENT);
     l.create(VG, super::THIN, "rw-src", bytes, &[])
         .await
@@ -571,12 +581,12 @@ async fn drbd_restore_uses_every_copy() {
     snap.metadata.uid = Some("uid-rw-snap".into());
     snap.status = Some(SnapshotStatus {
         phase: SnapshotPhase::Ready,
-        size_bytes: Some(size),
+        size_bytes: Some(source_size),
         ..SnapshotStatus::default()
     });
     let snaps = [Arc::new(snap)];
     let pools = [pool(&h.node)];
-    let mut g = group(&h, size, &[A, B], &[], Some("rw-snap"));
+    let mut g = group(h, size, &[A, B], &[], Some("rw-snap"));
     let mut done = false;
     for _ in 0..120 {
         // Each member sees the other's entry, as Volume status shows it.
@@ -595,7 +605,7 @@ async fn drbd_restore_uses_every_copy() {
             let t = h.tracker.lock().unwrap();
             disk(&t, "rw-b").as_deref() == Some("UpToDate")
                 && disk(&t, "rw-a").as_deref() == Some("UpToDate")
-        };
+        } && g.iter().all(|m| sectors(m.minor) * 512 >= size);
         if done {
             break;
         }
@@ -625,7 +635,10 @@ async fn drbd_restore_uses_every_copy() {
         "restore peer received {received} KiB of a {} KiB volume",
         size / 1024
     );
-    assert!(received * 1024 < 8 * MIB, "no sync: {received} KiB");
+    assert!(
+        received * 1024 < max_received,
+        "at most {max_received} bytes: {received} KiB"
+    );
 
     // Online verify compares every block; the resource files carry no
     // verify-alg, so it is set on the live connections for this check.
@@ -675,7 +688,7 @@ async fn drbd_restore_uses_every_copy() {
     );
     assert_eq!(copy, marker.stdout, "the peer holds the restored data");
     for m in &mut g {
-        delete(&h, m).await;
+        delete(h, m).await;
     }
     drbd_clean(&["rw-src"]).await;
 }
