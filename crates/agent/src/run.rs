@@ -470,6 +470,10 @@ trait Work: Send {
     async fn pass(&mut self);
     /// A status refresh of what events2 touched; true when a pass is wanted.
     async fn refresh(&mut self) -> bool;
+    /// When a pass must run even with nothing changed: a resume deadline.
+    fn next_deadline(&self) -> Option<tokio::time::Instant> {
+        None
+    }
 }
 
 struct Schedule {
@@ -493,6 +497,7 @@ async fn drive(work: &mut dyn Work, mut s: Schedule) {
         }
         // Fixed per pass so a stream of refreshes cannot push the resync out.
         let resync = tokio::time::Instant::now() + watch::RESYNC;
+        let resync = work.next_deadline().map_or(resync, |d| d.min(resync));
         loop {
             if open {
                 s.progress.until(resync + watch::COALESCE);
@@ -540,6 +545,10 @@ struct LoopWork {
 
 #[async_trait::async_trait]
 impl Work for LoopWork {
+    fn next_deadline(&self) -> Option<tokio::time::Instant> {
+        self.rec.next_deadline()
+    }
+
     async fn pass(&mut self) {
         let (rec, stores, node) = (&mut self.rec, &self.stores, &self.node);
         rec.set_addresses(addresses(stores));

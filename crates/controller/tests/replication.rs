@@ -1012,66 +1012,82 @@ async fn snapshot_suspend_bound_and_mid_round_attach() {
     cluster(&client).await;
     let agents = ["n1", "n2", "n3"].map(|n| FakeAgent::new(&client, n));
     ready_rep(&client, &agents).await;
-    let [a1, a2, a3] = &agents;
+    let [a1, a2, _] = &agents;
 
-    // n4 attached during Taking never suspended and is not waited for.
-    create_snapshot(&client, "s-ok", "rep").await;
-    snap_in(&client, "s-ok", SnapshotPhase::Suspending).await;
+    // n4 attached during Taking never suspended and may write: the round fails.
+    create_snapshot(&client, "s-attach", "rep").await;
+    snap_in(&client, "s-attach", SnapshotPhase::Suspending).await;
     for a in &agents {
-        a.ack("s-ok", SnapshotPhase::Suspending, true, None).await;
+        a.ack("s-attach", SnapshotPhase::Suspending, true, None)
+            .await;
     }
-    snap_in(&client, "s-ok", SnapshotPhase::Taking).await;
+    snap_in(&client, "s-attach", SnapshotPhase::Taking).await;
     patch_spec(&client, "rep", json!({ "attachments": ["n4"] })).await;
     volume_where(&client, "rep", |v| role_of(v, "n4") == Some(Role::Diskless)).await;
-    a1.ack("s-ok", SnapshotPhase::Taking, true, Some("p1"))
+    a1.ack("s-attach", SnapshotPhase::Taking, true, Some("p1"))
         .await;
-    a2.ack("s-ok", SnapshotPhase::Taking, true, Some("p2"))
+    a2.ack("s-attach", SnapshotPhase::Taking, true, Some("p2"))
         .await;
-    snap_in(&client, "s-ok", SnapshotPhase::Resuming).await;
-    a1.ack("s-ok", SnapshotPhase::Resuming, true, Some("p1"))
-        .await;
-    a2.ack("s-ok", SnapshotPhase::Resuming, true, Some("p2"))
-        .await;
-    a3.ack("s-ok", SnapshotPhase::Resuming, true, None).await;
-    snap_in(&client, "s-ok", SnapshotPhase::Ready).await;
+    let s = snap_in(&client, "s-attach", SnapshotPhase::Failed).await;
+    let e = s.status.unwrap().last_error.unwrap();
+    assert!(e.contains("never suspended on n4"), "{e}");
     patch_spec(&client, "rep", json!({ "attachments": [] })).await;
     volume_where(&client, "rep", |v| role_of(v, "n4").is_none()).await;
+    // Rounds start only on a spec every replica applied.
+    for a in &agents {
+        a.ready("rep").await;
+    }
 
-    // n3 never acks Suspending: past the bound IO resumes on the others,
-    // then the snapshot fails naming n3.
+    // n3 never acks Suspending: past the bound the round fails naming n3;
+    // the agents resume on their own.
     create_snapshot(&client, "s-bad", "rep").await;
     snap_in(&client, "s-bad", SnapshotPhase::Suspending).await;
     let started = tokio::time::Instant::now();
     a1.ack("s-bad", SnapshotPhase::Suspending, true, None).await;
     a2.ack("s-bad", SnapshotPhase::Suspending, true, None).await;
-    let s = snap_in(&client, "s-bad", SnapshotPhase::Resuming).await;
+    let s = snap_in(&client, "s-bad", SnapshotPhase::Failed).await;
     assert!(started.elapsed() < Duration::from_secs(10));
     let e = s.status.unwrap().last_error.unwrap();
     assert!(e.contains("n3") && !e.contains("n1"), "{e}");
-    // Only the nodes that suspended must resume.
-    a1.ack("s-bad", SnapshotPhase::Resuming, true, None).await;
-    a2.ack("s-bad", SnapshotPhase::Resuming, true, None).await;
-    let s = snap_in(&client, "s-bad", SnapshotPhase::Failed).await;
-    assert!(s.status.unwrap().last_error.unwrap().contains("n3"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn snapshot_round_skips_unreachable_members() {
+async fn snapshot_round_waits_for_every_agent() {
     let assets = require_envtest!();
     let (_env, client, _cfg, _ctl) = setup_with(&assets, |c| c.lease_stale = SHORT_STALE).await;
     cluster(&client).await;
     let agents = ["n1", "n2", "n3"].map(|n| FakeAgent::new(&client, n));
     let a4 = FakeAgent::new(&client, "n4");
     ready_rep(&client, &agents).await;
-    let [a1, a2, a3] = &agents;
+    let [a1, a2, _] = &agents;
     patch_spec(&client, "rep", json!({ "attachments": ["n4"] })).await;
     volume_where(&client, "rep", |v| role_of(v, "n4") == Some(Role::Diskless)).await;
     a4.ready("rep").await;
     support::agent_lease(&client, "n4", Duration::ZERO, true).await;
     tokio::time::sleep(SHORT_STALE + Duration::from_secs(1)).await;
 
-    // The dead diskless n4 is left out of the round.
+    // n4 could be writing and would never suspend: the round waits.
     create_snapshot(&client, "s1", "rep").await;
+    let s = snapshot_where(&client, "s1", |s| {
+        s.status
+            .as_ref()
+            .and_then(|st| st.last_error.as_deref())
+            .is_some_and(|e| e.contains("agent not reachable on n4"))
+    })
+    .await;
+    assert_eq!(support::snap_phase(&s), SnapshotPhase::Pending);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        support::snap_phase(&support::get_snapshot(&client, "s1").await.unwrap()),
+        SnapshotPhase::Pending
+    );
+
+    // n4 no longer listed: the round starts and every listed replica acks.
+    patch_spec(&client, "rep", json!({ "attachments": [] })).await;
+    volume_where(&client, "rep", |v| role_of(v, "n4").is_none()).await;
+    for a in &agents {
+        a.ready("rep").await;
+    }
     snap_in(&client, "s1", SnapshotPhase::Suspending).await;
     for a in &agents {
         a.ack("s1", SnapshotPhase::Suspending, true, None).await;
@@ -1079,39 +1095,7 @@ async fn snapshot_round_skips_unreachable_members() {
     snap_in(&client, "s1", SnapshotPhase::Taking).await;
     a1.ack("s1", SnapshotPhase::Taking, true, Some("p1")).await;
     a2.ack("s1", SnapshotPhase::Taking, true, Some("p2")).await;
-    snap_in(&client, "s1", SnapshotPhase::Resuming).await;
-    a1.ack("s1", SnapshotPhase::Resuming, true, Some("p1"))
-        .await;
-    a2.ack("s1", SnapshotPhase::Resuming, true, Some("p2"))
-        .await;
-    a3.ack("s1", SnapshotPhase::Resuming, true, None).await;
     snap_in(&client, "s1", SnapshotPhase::Ready).await;
-
-    // The Primary is on the dead node: the round does not start.
-    let mut e = healthy("n4", &["n1", "n2"], None);
-    e.disk_state = Some("Diskless".into());
-    e.in_use = true;
-    a4.report("rep", e).await;
-    // status.primary leaves the unreachable n4 out; the round still sees it.
-    let v = volume_where(&client, "rep", |v| {
-        entry_of(v, "n4").is_some_and(|e| e.in_use)
-    })
-    .await;
-    assert_eq!(v.status.unwrap().primary, None);
-    create_snapshot(&client, "s2", "rep").await;
-    let s = snapshot_where(&client, "s2", |s| {
-        s.status
-            .as_ref()
-            .and_then(|st| st.last_error.as_deref())
-            .is_some_and(|e| e.contains("primary n4"))
-    })
-    .await;
-    assert_eq!(support::snap_phase(&s), SnapshotPhase::Pending);
-    // Failover: n1 is in use now; n4's stale entry no longer holds the round.
-    let mut p1 = healthy("n1", &["n2"], None);
-    p1.in_use = true;
-    a1.report("rep", p1).await;
-    snap_in(&client, "s2", SnapshotPhase::Suspending).await;
 }
 
 async fn events_of(client: &Client, volume: &str, reason: &str) -> Vec<Event> {
@@ -1470,7 +1454,7 @@ async fn evict_waits_for_the_snapshot_round() {
             .is_some_and(|s| s.initialized_at.is_some())
     })
     .await;
-    let [a1, a2, a3] = &agents;
+    let [a1, a2, _] = &agents;
 
     // A node joining mid-round would ack Taking with a blank LV.
     create_snapshot(&client, "s1", "rep").await;
@@ -1486,15 +1470,10 @@ async fn evict_waits_for_the_snapshot_round() {
     }
     snap_in(&client, "s1", SnapshotPhase::Taking).await;
     a1.ack("s1", SnapshotPhase::Taking, true, Some("p1")).await;
-    a2.ack("s1", SnapshotPhase::Taking, true, Some("p2")).await;
-    snap_in(&client, "s1", SnapshotPhase::Resuming).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let v = get_volume(&client, "rep").await.unwrap();
-    assert_eq!(role_of(&v, "n4"), None, "moved during Resuming");
-    a1.ack("s1", SnapshotPhase::Resuming, true, Some("p1"))
-        .await;
-    a2.ack("s1", SnapshotPhase::Resuming, true, Some("p2"))
-        .await;
-    a3.ack("s1", SnapshotPhase::Resuming, true, None).await;
+    assert_eq!(role_of(&v, "n4"), None, "moved during Taking");
+    a2.ack("s1", SnapshotPhase::Taking, true, Some("p2")).await;
     snap_in(&client, "s1", SnapshotPhase::Ready).await;
     // The round is over: the move goes ahead.
     let v = volume_where(&client, "rep", |v| role_of(v, "n2").is_none()).await;

@@ -859,19 +859,18 @@ async fn drbd_replicated_lifecycle() {
     for phase in [
         SnapshotPhase::Suspending,
         SnapshotPhase::Taking,
-        SnapshotPhase::Resuming,
+        SnapshotPhase::Ready,
         SnapshotPhase::Deleting,
     ] {
         let w = a.pass(&pools, &[snap(phase)]).await;
-        let ack = w
-            .iter()
-            .find_map(|w| match w {
-                StatusWrite::Snapshot { ack, .. } => Some(ack.clone()),
-                _ => None,
-            })
-            .unwrap();
+        let ack = w.iter().find_map(|w| match w {
+            StatusWrite::Snapshot { ack, .. } => Some(ack.clone()),
+            _ => None,
+        });
         println!("{phase:?}: {ack:?}");
-        assert!(ack.ok, "{ack:?}");
+        // Ready: the agent resumes on its own and has nothing to report.
+        assert_eq!(ack.is_none(), phase == SnapshotPhase::Ready, "{ack:?}");
+        assert!(ack.is_none_or(|a| a.ok));
         let suspended = matches!(phase, SnapshotPhase::Suspending | SnapshotPhase::Taking);
         wait(&h.tracker, "suspend state", |t| {
             t.resource("rw-a")

@@ -65,7 +65,7 @@ pub struct VolumeSpec {
     /// Nodes whose replica must be placed elsewhere (a dead or retired
     /// node). The controller makes one move per pass, for the first node
     /// by name that can act. Every move needs no resolve pending, no split
-    /// brain, no Snapshot round between Suspending and Resuming, and the
+    /// brain, no Snapshot in Suspending or Taking, and the
     /// replica neither attached nor in use, unless the node's Node object is
     /// gone. A diskful move also needs replicas above 1, status.initializedAt
     /// set unless the node is not the initial one, another UpToDate replica

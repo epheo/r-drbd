@@ -555,7 +555,7 @@
                       },
                       "evict": {
                         "default": [],
-                        "description": "Nodes whose replica must be placed elsewhere (a dead or retired\nnode). The controller makes one move per pass, for the first node\nby name that can act. Every move needs no resolve pending, no split\nbrain, no Snapshot round between Suspending and Resuming, and the\nreplica neither attached nor in use, unless the node's Node object is\ngone. A diskful move also needs replicas above 1, status.initializedAt\nset unless the node is not the initial one, another UpToDate replica\nwith quorum from a fresh agent, every other reachable diskful replica\nUpToDate, and no pin to the evicted node. A node listed here never receives a\ndiskless entry either. A node leaves the list once it holds no entry\nand no attachment. The replaced node keeps its LV as an orphan.",
+                        "description": "Nodes whose replica must be placed elsewhere (a dead or retired\nnode). The controller makes one move per pass, for the first node\nby name that can act. Every move needs no resolve pending, no split\nbrain, no Snapshot in Suspending or Taking, and the\nreplica neither attached nor in use, unless the node's Node object is\ngone. A diskful move also needs replicas above 1, status.initializedAt\nset unless the node is not the initial one, another UpToDate replica\nwith quorum from a fresh agent, every other reachable diskful replica\nUpToDate, and no pin to the evicted node. A node listed here never receives a\ndiskless entry either. A node leaves the list once it holds no entry\nand no attachment. The replaced node keeps its LV as an orphan.",
                         "items": {
                           "type": "string"
                         },
@@ -1062,14 +1062,11 @@
                             },
                             "phase": {
                               "enum": [
-                                "Suspended",
-                                "Taken",
                                 "Ready",
                                 "Failed",
                                 "Pending",
                                 "Suspending",
                                 "Taking",
-                                "Resuming",
                                 "Deleting"
                               ],
                               "type": "string"
@@ -1163,20 +1160,17 @@
                       "phase": {
                         "default": "Pending",
                         "enum": [
-                          "Suspended",
-                          "Taken",
                           "Ready",
                           "Failed",
                           "Pending",
                           "Suspending",
                           "Taking",
-                          "Resuming",
                           "Deleting"
                         ],
                         "type": "string"
                       },
                       "phaseSince": {
-                        "description": "When the current phase began; the round bounds (Suspending, Taking)\ncount from it and survive a controller restart.",
+                        "description": "When the current phase began; the round bounds (Suspending, Taking)\ncount from it and survive a controller restart. Agents never read\nit: a wall clock of another node is no input to their deadlines.",
                         "format": "date-time",
                         "nullable": true,
                         "type": "string"

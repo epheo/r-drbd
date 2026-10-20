@@ -605,23 +605,14 @@ async fn snapshot_replicated_rounds() {
     agents[1]
         .ack("rs", SnapshotPhase::Taking, true, Some("p2"))
         .await;
-    let s = snapshot_where(&client, "rs", |s| snap_phase(s) == SnapshotPhase::Resuming).await;
-    assert!(s.status.unwrap().created_at.is_some());
-    agents[0]
-        .ack("rs", SnapshotPhase::Resuming, true, Some("p1"))
-        .await;
-    agents[1]
-        .ack("rs", SnapshotPhase::Resuming, true, Some("p2"))
-        .await;
-    agents[2]
-        .ack("rs", SnapshotPhase::Resuming, true, None)
-        .await;
+    // Ready at once: every agent resumes on its own when the round ends.
     let s = snapshot_where(&client, "rs", |s| snap_phase(s) == SnapshotPhase::Ready).await;
     let st = s.status.unwrap();
+    assert!(st.created_at.is_some());
     assert_eq!(st.size_bytes, Some(GIB));
     assert!(st.last_error.is_none());
 
-    // A failed suspend resumes IO first, then fails.
+    // A failed suspend fails the round.
     create_snapshot(&client, "rs-bad", "rep").await;
     snapshot_where(&client, "rs-bad", |s| {
         snap_phase(s) == SnapshotPhase::Suspending
@@ -634,7 +625,7 @@ async fn snapshot_replicated_rounds() {
         .ack("rs-bad", SnapshotPhase::Suspending, false, None)
         .await;
     let s = snapshot_where(&client, "rs-bad", |s| {
-        snap_phase(s) == SnapshotPhase::Resuming
+        snap_phase(s) == SnapshotPhase::Failed
     })
     .await;
     assert!(
@@ -644,19 +635,57 @@ async fn snapshot_replicated_rounds() {
             .unwrap()
             .contains("fake failure on n2")
     );
-    agents[0]
-        .ack("rs-bad", SnapshotPhase::Resuming, true, None)
-        .await;
-    agents[1]
-        .ack("rs-bad", SnapshotPhase::Resuming, true, None)
-        .await;
-    agents[2]
-        .ack("rs-bad", SnapshotPhase::Resuming, true, None)
-        .await;
-    snapshot_where(&client, "rs-bad", |s| {
-        snap_phase(s) == SnapshotPhase::Failed
-    })
-    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_snapshots_of_one_volume_never_overlap() {
+    let assets = require_envtest!();
+    let (_env, client, _ctl) = setup(&assets, |_| {}).await;
+    for n in ["n1", "n2", "n3"] {
+        node(&client, n, true).await;
+    }
+    pool(&client, "p1", "n1", "fast", 100 * GIB).await;
+    pool(&client, "p2", "n2", "fast", 100 * GIB).await;
+    let _agents = ["n1", "n2", "n3"].map(|n| FakeAgent::new(&client, n).spawn_auto());
+    create_volume(&client, "rep", volume_spec(GIB, 2, "fast")).await;
+    volume_where(&client, "rep", |v| phase_of(v) == VolumePhase::Ready).await;
+    let names = ["sa", "sb", "sc"];
+    for n in names {
+        create_snapshot(&client, n, "rep").await;
+    }
+    let api: Api<Snapshot> = Api::all(client.clone());
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut held = false;
+    loop {
+        let all = api
+            .list(&kube::api::ListParams::default())
+            .await
+            .expect("list");
+        let running: Vec<String> = all
+            .items
+            .iter()
+            .filter(|s| controller::volume::round_running(s))
+            .map(kube::ResourceExt::name_any)
+            .collect();
+        assert!(running.len() <= 1, "rounds overlap: {running:?}");
+        held |= all.items.iter().any(|s| {
+            s.status
+                .as_ref()
+                .and_then(|st| st.last_error.as_deref())
+                .is_some_and(|e| e.contains("of the same volume is in its round"))
+        });
+        if all.items.len() == names.len()
+            && all
+                .items
+                .iter()
+                .all(|s| snap_phase(s) == SnapshotPhase::Ready)
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "not all Ready");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(held, "no snapshot was ever held for another");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -941,20 +970,13 @@ async fn controller_owns_no_agent_fields() {
         snap_phase(s) == SnapshotPhase::Suspending
     })
     .await;
-    // The tiebreaker suspends and resumes too.
+    // The tiebreaker suspends too.
     for a in &agents {
         a.ack("snap", SnapshotPhase::Suspending, true, None).await;
     }
     snapshot_where(&client, "snap", |s| snap_phase(s) == SnapshotPhase::Taking).await;
     for (a, p) in agents.iter().zip(["p1", "p2"]) {
         a.ack("snap", SnapshotPhase::Taking, true, Some(p)).await;
-    }
-    snapshot_where(&client, "snap", |s| {
-        snap_phase(s) == SnapshotPhase::Resuming
-    })
-    .await;
-    for (a, p) in agents.iter().zip([Some("p1"), Some("p2"), None]) {
-        a.ack("snap", SnapshotPhase::Resuming, true, p).await;
     }
     snapshot_where(&client, "snap", |s| snap_phase(s) == SnapshotPhase::Ready).await;
     support::eventually(Duration::from_secs(20), || async {

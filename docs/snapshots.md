@@ -27,24 +27,38 @@ Install the external-snapshotter CRDs and snapshot controller first.
 
 The CSI driver creates a Snapshot object; `kubectl get snapshots` shows its volume, phase and size.
 
-A snapshot waits until the volume is Ready with every diskful replica UpToDate.
-Then, for a replicated volume:
+A replicated restore starts without a sync, so every copy of one snapshot must hold the same bytes.
+A snapshot of a replicated volume therefore waits in Pending, saying why in `lastError`, until:
 
-1. Every replica suspends IO.
-2. Every diskful node creates a thin snapshot of its LV.
-3. Every replica resumes IO.
+- the volume is Ready, at its requested size, with no resize in flight;
+- every replica's agent is reachable;
+- every diskful replica is UpToDate, and every diskful or attached replica is connected to every diskful replica;
+- every diskful replica applied the current spec;
+- no other snapshot of the same volume is suspending or taking.
+
+A replica whose agent is down holds every snapshot of its volume; evict or detach it to take one.
+
+Then:
+
+1. Every replica suspends IO, diskless and tiebreaker included, within 30 s.
+2. Every diskful node creates a thin snapshot of its LV, within 2 minutes.
+3. The snapshot is Ready, or Failed with the reason; every replica resumes IO on its own when it sees the round end.
 
 All copies are taken at the same point in the write stream, so the snapshot is crash consistent on every node.
-IO is frozen for the duration of step 2.
-A local volume skips the suspend and resume steps.
+A local volume skips the suspend: it waits only for the volume to be Ready and for no other snapshot of it to run.
 
-Bounds:
+Each node keeps its own deadlines, on its own clock:
 
-- Suspending must finish within 30 s.
-- Taking must finish within 2 minutes.
-- Past a bound, IO is resumed and the snapshot ends Failed with the reason.
+- it takes its copy only within 2 minutes of its own suspend, and never after an agent restart or a reboot;
+- it resumes IO 4 minutes after its own suspend, even when the controller or the API server is gone; the snapshot then fails unless every copy was already taken.
+
+So IO stays frozen about 4 minutes at most, and no node resumes before every copy of a Ready snapshot is taken.
+A node that is no longer suspended when it should be (a reboot, a resume on its deadline) fails the snapshot.
+A replica attached during the round never suspended, so it fails the snapshot too.
+While a round runs, no replica grows.
 
 A failed take is a failure: the Snapshot never turns Ready without a backing LV on every node.
+A snapshot of a volume that is being deleted, or that stays missing for 30 s, fails.
 
 ## Restoring
 

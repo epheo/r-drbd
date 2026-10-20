@@ -1374,23 +1374,17 @@ async fn attach_report(
     Cond::new(TRUE, reason::ATTACHMENT_FAILED, message)
 }
 
-/// A snapshot round runs from Suspending to Resuming. Pending is not one:
+/// A snapshot round runs in Suspending and Taking. Pending is not one:
 /// it waits for a Ready volume, which may need the very move it would block.
 pub fn round_running(s: &Snapshot) -> bool {
     matches!(
         s.status.as_ref().map(|st| st.phase),
-        Some(
-            SnapshotPhase::Suspending
-                | SnapshotPhase::Suspended
-                | SnapshotPhase::Taking
-                | SnapshotPhase::Taken
-                | SnapshotPhase::Resuming
-        )
+        Some(SnapshotPhase::Suspending | SnapshotPhase::Taking)
     )
 }
 
 /// The first Snapshot of `volume` by name whose round runs.
-fn snapshot_in_progress(stores: &Stores, volume: &str) -> Option<String> {
+pub(crate) fn snapshot_in_progress(stores: &Stores, volume: &str) -> Option<String> {
     Stores::sorted(&stores.snapshots)
         .iter()
         .filter(|s| s.spec.volume == volume)
@@ -3124,10 +3118,7 @@ mod tests {
         for (phase, running) in [
             (SnapshotPhase::Pending, false),
             (SnapshotPhase::Suspending, true),
-            (SnapshotPhase::Suspended, true),
             (SnapshotPhase::Taking, true),
-            (SnapshotPhase::Taken, true),
-            (SnapshotPhase::Resuming, true),
             (SnapshotPhase::Ready, false),
             (SnapshotPhase::Failed, false),
             (SnapshotPhase::Deleting, false),
@@ -3200,7 +3191,7 @@ mod tests {
     fn holders_from_acks() {
         let ack = |node: &str, ok: bool, pool: Option<&str>| model::SnapshotAck {
             node: node.into(),
-            phase: SnapshotPhase::Resuming,
+            phase: SnapshotPhase::Taking,
             pool: pool.map(str::to_owned),
             ok,
             error: None,

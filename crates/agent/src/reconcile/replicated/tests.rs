@@ -480,6 +480,15 @@ fn expect_md(x: &ScriptedExec, del: &[&str]) {
     expect_md_as(x, OWN, del);
 }
 
+fn times(x: &ScriptedExec, word: &str) -> usize {
+    x.seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|a| a.iter().any(|w| w == word))
+        .count()
+}
+
 fn seen(x: &ScriptedExec, word: &str) -> bool {
     x.seen
         .lock()
@@ -2024,19 +2033,28 @@ async fn only_the_lowest_node_id_resizes() {
     assert!(!seen(&x, "resize"));
 }
 
-#[tokio::test]
-async fn snapshot_rounds() {
-    let ack = |phase, ok| SnapshotAck {
+fn round_ack(phase: SnapshotPhase, ok: bool) -> SnapshotAck {
+    SnapshotAck {
         node: NODE.into(),
         phase,
         pool: Some(POOL.into()),
         ok,
         error: None,
-    };
-    let mut sus = healthy();
-    sus[0] = "exists resource name:pvc-1 role:Secondary suspended:user".into();
+    }
+}
 
-    let mut r = Rig::new(&healthy(), up_host());
+/// The Snapshot in `phase` with this node's last ack.
+fn acked(phase: SnapshotPhase, mine: SnapshotAck) -> Snapshot {
+    let mut s = snapshot(phase);
+    s.status.as_mut().unwrap().acks = vec![mine];
+    s
+}
+
+const SUSPENDED: &str = "change resource name:pvc-1 role:Secondary suspended:user";
+const RESUMED: &str = "change resource name:pvc-1 role:Secondary suspended:no";
+
+/// A pass in Suspending that suspends IO; the tracker then shows it.
+async fn suspend_pass(r: &mut Rig) {
     reads(&r.x, &[lv(LV_KIB)]);
     r.expect_check();
     r.expect_sweep();
@@ -2045,53 +2063,231 @@ async fn snapshot_rounds() {
     let w = r
         .pass(&[volume(GIB)], &[snapshot(SnapshotPhase::Suspending)])
         .await;
-    assert_eq!(acks(&w), vec![ack(SnapshotPhase::Suspending, true)]);
+    assert_eq!(acks(&w), vec![round_ack(SnapshotPhase::Suspending, true)]);
+    r.feed(&[SUSPENDED]);
+}
 
-    // Suspended for the round: no adjust at all, no second suspend.
-    let mut r = Rig::new(&sus, up_host());
-    reads(&r.x, &[lv(LV_KIB)]);
-    r.expect_check();
-    r.expect_sweep();
-    let w = r
-        .pass(&[volume(GIB)], &[snapshot(SnapshotPhase::Suspending)])
-        .await;
-    assert_eq!(acks(&w), vec![ack(SnapshotPhase::Suspending, true)]);
-    assert!(!seen(&r.x, "--dry-run"));
-
-    let mut r = Rig::new(&sus, up_host());
-    reads(&r.x, &[lv(LV_KIB)]);
-    r.expect_check();
-    r.expect_sweep();
-    expect_lv_tags(&r.x, &[("pvc-1", &[OWN])]);
-    r.x.expect(lvm::cmd::snapshot(VG, "pvc-1", "pvc-1+snap-1"), ok(""));
-    expect_change(&r.x, "pvc-1+snap-1", &[], &[OWN]);
+fn expect_take(x: &ScriptedExec) {
+    expect_lv_tags(x, &[("pvc-1", &[OWN])]);
+    x.expect(lvm::cmd::snapshot(VG, "pvc-1", "pvc-1+snap-1"), ok(""));
+    expect_change(x, "pvc-1+snap-1", &[], &[OWN]);
     expect_lvs(
-        &r.x,
+        x,
         &[lv(LV_KIB), lv_row("pvc-1+snap-1", LV_KIB, St::Inactive)],
     );
-    let w = r
-        .pass(&[volume(GIB)], &[snapshot(SnapshotPhase::Taking)])
-        .await;
-    assert_eq!(acks(&w), vec![ack(SnapshotPhase::Taking, true)]);
+}
 
-    let mut r = Rig::new(&sus, up_host());
-    reads(&r.x, &[lv(LV_KIB)]);
-    r.expect_check();
-    r.expect_sweep();
-    r.x.expect(argv::resume_io("pvc-1"), ok(""));
-    let w = r
-        .pass(&[volume(GIB)], &[snapshot(SnapshotPhase::Resuming)])
-        .await;
-    assert_eq!(acks(&w), vec![ack(SnapshotPhase::Resuming, true)]);
+#[tokio::test]
+async fn snapshot_rounds() {
+    let mut r = Rig::new(&healthy(), up_host());
+    suspend_pass(&mut r).await;
 
-    // A suspend no round accounts for (snapshot gone mid-round) is resumed.
-    let mut r = Rig::new(&sus, up_host());
-    reads(&r.x, &[lv(LV_KIB)]);
-    r.expect_check();
-    r.expect_sweep();
+    // Acked: no second suspend, no adjust under the frozen IO, no write.
+    reads_again(&r.x, &[lv(LV_KIB)]);
+    let sus = round_ack(SnapshotPhase::Suspending, true);
+    let w = r
+        .pass(
+            &[volume(GIB)],
+            &[acked(SnapshotPhase::Suspending, sus.clone())],
+        )
+        .await;
+    assert_eq!(acks(&w), vec![]);
+    assert_eq!(times(&r.x, "--dry-run"), 1, "only before the suspend");
+
+    reads_again(&r.x, &[lv(LV_KIB)]);
+    expect_take(&r.x);
+    let w = r
+        .pass(&[volume(GIB)], &[acked(SnapshotPhase::Taking, sus)])
+        .await;
+    assert_eq!(acks(&w), vec![round_ack(SnapshotPhase::Taking, true)]);
+
+    // Over: resumed with no word from the controller but the phase.
+    reads_again(&r.x, &[lv(LV_KIB)]);
     r.x.expect(argv::resume_io("pvc-1"), ok(""));
     dry(&r.x, "");
+    let done = round_ack(SnapshotPhase::Taking, true);
+    let w = r
+        .pass(&[volume(GIB)], &[acked(SnapshotPhase::Ready, done)])
+        .await;
+    assert_eq!(acks(&w), vec![]);
+    assert_eq!(r.rec.next_deadline(), None);
+
+    // A suspend no round accounts for (snapshot gone mid-round) is resumed.
+    let mut sus = healthy();
+    sus[0] = "exists resource name:pvc-1 role:Secondary suspended:user".into();
+    let mut r = Rig::new(&sus, up_host());
+    reads(&r.x, &[lv(LV_KIB)]);
+    r.x.expect(argv::resume_io("pvc-1"), ok(""));
+    r.expect_check();
+    r.expect_sweep();
+    dry(&r.x, "");
     r.pass(&[volume(GIB)], &[]).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn take_refused_past_the_window() {
+    let mut r = Rig::new(&healthy(), up_host());
+    suspend_pass(&mut r).await;
+    tokio::time::advance(model::snapshot::TAKE_WINDOW).await;
+    reads_again(&r.x, &[lv(LV_KIB)]);
+    let sus = round_ack(SnapshotPhase::Suspending, true);
+    let w = r
+        .pass(&[volume(GIB)], &[acked(SnapshotPhase::Taking, sus)])
+        .await;
+    let a = &acks(&w)[0];
+    assert_eq!(
+        a.error.as_deref(),
+        Some("IO not suspended by this agent within the last 120 s")
+    );
+    assert!(!seen(&r.x, "--snapshot"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn resume_on_the_local_deadline_without_a_controller() {
+    let mut r = Rig::new(&healthy(), up_host());
+    let start = tokio::time::Instant::now();
+    suspend_pass(&mut r).await;
+    let deadline = start + model::snapshot::RESUME_AFTER;
+    assert!(r.rec.next_deadline().is_some_and(|d| d >= deadline));
+    let sus = round_ack(SnapshotPhase::Suspending, true);
+    let stuck = [acked(SnapshotPhase::Suspending, sus)];
+
+    tokio::time::advance(model::snapshot::RESUME_AFTER.saturating_sub(Duration::from_secs(1)))
+        .await;
+    reads_again(&r.x, &[lv(LV_KIB)]);
+    assert_eq!(acks(&r.pass(&[volume(GIB)], &stuck).await), vec![]);
+    assert!(!seen(&r.x, "resume-io"));
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    reads_again(&r.x, &[lv(LV_KIB)]);
+    r.x.expect(argv::resume_io("pvc-1"), ok(""));
+    let w = r.pass(&[volume(GIB)], &stuck).await;
+    let a = &acks(&w)[0];
+    assert_eq!((a.phase, a.ok), (SnapshotPhase::Suspending, false));
+    assert_eq!(
+        a.error.as_deref(),
+        Some("IO resumed here 240 s after its suspend")
+    );
+    assert_eq!(r.rec.next_deadline(), None);
+
+    // Still Suspending in the cache: never a second suspend this round.
+    r.feed(&[RESUMED]);
+    reads_again(&r.x, &[lv(LV_KIB)]);
+    dry(&r.x, "");
+    let failed = acked(SnapshotPhase::Suspending, a.clone());
+    let w = r.pass(&[volume(GIB)], &[failed]).await;
+    assert_eq!(acks(&w), vec![]);
+    assert_eq!(times(&r.x, "suspend-io"), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_restart_forgets_the_suspend_and_never_takes() {
+    let mut sus = healthy();
+    sus[0] = "exists resource name:pvc-1 role:Secondary suspended:user".into();
+    let mut r = Rig::new(&sus, up_host());
+    reads(&r.x, &[lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    let before = round_ack(SnapshotPhase::Suspending, true);
+    let taking = [acked(SnapshotPhase::Taking, before)];
+    let w = r.pass(&[volume(GIB)], &taking).await;
+    let a = &acks(&w)[0];
+    assert!(
+        !a.ok
+            && a.error
+                .as_deref()
+                .unwrap()
+                .contains("not suspended by this agent")
+    );
+    assert!(!seen(&r.x, "--snapshot"));
+    // Resumed in time all the same, counted from the first sight.
+    tokio::time::advance(model::snapshot::RESUME_AFTER).await;
+    reads_again(&r.x, &[lv(LV_KIB)]);
+    r.x.expect(argv::resume_io("pvc-1"), ok(""));
+    r.pass(&[volume(GIB)], &taking).await;
+}
+
+#[tokio::test]
+async fn a_copy_that_may_differ_is_refused() {
+    let sus = round_ack(SnapshotPhase::Suspending, true);
+    let taking = [acked(SnapshotPhase::Taking, sus)];
+    // Cut from the diskful peer, both still UpToDate.
+    let mut r = Rig::new(&healthy(), up_host());
+    suspend_pass(&mut r).await;
+    r.feed(&["change connection name:pvc-1 conn-name:n2 connection:Connecting"]);
+    reads_again(&r.x, &[lv(LV_KIB)]);
+    let w = r.pass(&[volume(GIB)], &taking).await;
+    assert_eq!(
+        acks(&w)[0].error.as_deref(),
+        Some("peer n2 is Connecting, disk UpToDate")
+    );
+    // Mid resize: the LV grew, the DRBD device did not.
+    let mut r = Rig::new(&healthy(), up_host());
+    suspend_pass(&mut r).await;
+    reads_again(&r.x, &[lv(LV_KIB)]);
+    let w = r.pass(&[volume(2 * GIB)], &taking).await;
+    let e = acks(&w)[0].error.clone().unwrap();
+    assert!(e.contains("a resize is in flight"), "{e}");
+    assert!(!seen(&r.x, "--snapshot"));
+}
+
+#[tokio::test]
+async fn nothing_grows_during_a_round() {
+    let round = [snapshot(SnapshotPhase::Suspending)];
+    let mut r = Rig::new(&healthy(), up_host());
+    reads(&r.x, &[lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    dry(&r.x, "");
+    r.x.expect(argv::suspend_io("pvc-1"), ok(""));
+    let w = r.pass(&[grown(2 * GIB, 4, Some(LV_KIB))], &round).await;
+    assert_eq!(entry_of(&w).observed_generation, Some(3));
+    assert!(!seen(&r.x, "lvextend"));
+    // Grown everywhere already: the DRBD resize waits too.
+    let mut r = Rig::new(&healthy(), up_host());
+    reads(&r.x, &[lv(LV2_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    dry(&r.x, "");
+    r.x.expect(argv::suspend_io("pvc-1"), ok(""));
+    let w = r.pass(&[grown(2 * GIB, 4, Some(LV2_KIB))], &round).await;
+    assert_eq!(entry_of(&w).observed_generation, Some(3));
+    assert!(!seen(&r.x, "resize"));
+}
+
+#[tokio::test]
+async fn diskless_replica_keeps_its_freeze_through_taking() {
+    let lines = |suspended: &str| {
+        vec![
+            format!("exists resource name:pvc-1 role:Primary suspended:{suspended}"),
+            "exists connection name:pvc-1 peer-node-id:0 conn-name:n1 connection:Connected".into(),
+            "exists connection name:pvc-1 peer-node-id:1 conn-name:n2 connection:Connected".into(),
+            "exists device name:pvc-1 volume:0 minor:50000 disk:Diskless client:yes quorum:yes"
+                .into(),
+        ]
+    };
+    let mine = SnapshotAck {
+        node: "n3".into(),
+        phase: SnapshotPhase::Suspending,
+        pool: None,
+        ok: true,
+        error: None,
+    };
+    let taking = acked(SnapshotPhase::Taking, mine);
+    let mut r = Rig::on("n3", &lines("user"), FakeHost::default());
+    r.expect_check();
+    let w = r.pass(&[volume(GIB)], std::slice::from_ref(&taking)).await;
+    assert_eq!(acks(&w), vec![]);
+    // Rebooted mid round: IO is live again, the round must fail.
+    let mut r = Rig::on("n3", &lines("no"), FakeHost::default());
+    r.expect_check();
+    dry(&r.x, "");
+    let w = r.pass(&[volume(GIB)], &[taking]).await;
+    let a = &acks(&w)[0];
+    assert_eq!(
+        (a.node.as_str(), a.phase, a.ok),
+        ("n3", SnapshotPhase::Taking, false)
+    );
 }
 
 #[tokio::test]

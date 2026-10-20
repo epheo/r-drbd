@@ -316,6 +316,18 @@ enum Origin {
     Drbd(Option<String>),
 }
 
+/// A user IO suspend of one volume, as this agent run knows it.
+#[derive(Debug, Clone, Copy)]
+struct Freeze {
+    /// On this agent's monotonic clock, never a wall clock: the deadlines
+    /// must hold whatever the other nodes' clocks say.
+    since: tokio::time::Instant,
+    /// This run suspended it for the current round. A suspend found after
+    /// a restart started at an unknown time: it is resumed in time, never
+    /// taken from.
+    mine: bool,
+}
+
 /// Where an LV of this node lives.
 #[derive(Debug, Clone)]
 struct Place {
@@ -384,6 +396,9 @@ pub struct Reconciler {
     live: Arc<dyn LiveVolumes>,
     /// Applies writes during the pass; None returns them all from it.
     publish: Option<Arc<dyn Publish>>,
+    /// Per volume, the IO suspend this agent keeps. Memory only: a restart
+    /// forgets it, which only forbids takes until the next round.
+    freezes: HashMap<String, Freeze>,
 }
 
 /// Where a pass sends its writes as each step ends, so statuses trail the
@@ -429,6 +444,7 @@ impl Reconciler {
             progress: crate::node::Progress::default(),
             live: Arc::new(NoLiveVolumes),
             publish: None,
+            freezes: HashMap::new(),
         }
     }
 
@@ -546,17 +562,33 @@ impl Reconciler {
 
         let mut vols: Vec<&Volume> = volumes.iter().map(AsRef::as_ref).collect();
         vols.sort_by_key(|v| v.name_any());
-        for vol in &vols {
-            if let Some(w) = self.volume(&mut reads, &pools, snapshots, vol).await {
-                writes.push(w);
-                self.flush(&mut writes).await;
-            }
-        }
-        self.probe_peers(&vols, &mut writes).await;
-
         let mut snaps: Vec<&Snapshot> = snapshots.iter().map(AsRef::as_ref).collect();
         snaps.sort_by_key(|s| s.name_any());
+        let round_of =
+            |vol: &Volume, s: &Snapshot| s.spec.volume == vol.name_any() && replicated::in_round(s);
+        for vol in &vols {
+            writes.extend(self.freeze(vol, &snaps).await);
+            if let Some(w) = self.volume(&mut reads, &pools, snapshots, vol).await {
+                writes.push(w);
+            }
+            self.flush(&mut writes).await;
+            // Right after its volume: a frozen volume never waits for the
+            // others, and the take window never runs out on their account.
+            for snap in snaps.iter().filter(|s| round_of(vol, s)) {
+                if let Some(w) = self.snapshot(&mut reads, &pools, &vols, snap).await {
+                    writes.push(w);
+                    self.flush(&mut writes).await;
+                }
+            }
+        }
+        self.freezes
+            .retain(|name, _| vols.iter().any(|v| v.name_any() == *name));
+        self.probe_peers(&vols, &mut writes).await;
+
         for snap in &snaps {
+            if vols.iter().any(|v| round_of(v, snap)) {
+                continue;
+            }
             if let Some(w) = self.snapshot(&mut reads, &pools, &vols, snap).await {
                 writes.push(w);
             }
@@ -968,7 +1000,7 @@ impl Reconciler {
     }
 
     async fn snapshot(
-        &self,
+        &mut self,
         reads: &mut Reads,
         pools: &[&Pool],
         vols: &[&Volume],
@@ -1006,44 +1038,62 @@ impl Reconciler {
             ack(&self.node, SnapshotPhase::Deleting, pool_name, res)
         } else {
             match status.phase {
-                SnapshotPhase::Taking => {
-                    replica?;
-                    let origin = lvm::names::volume_lv(&snap.spec.volume);
-                    let res = match self.place(pools, pool_name.as_deref()) {
-                        Ok(place) => {
-                            let origin_kind = match replicated {
-                                Some(_) => {
-                                    Origin::Drbd(self.snapshot_blocker(reads, &place, &origin))
-                                }
-                                None => Origin::Local,
-                            };
-                            self.take_snapshot(reads, &place, &origin, &lv, origin_kind)
-                                .await
+                SnapshotPhase::Taking => match (replica, replicated) {
+                    (Some(_), _) => {
+                        let vol = vol?;
+                        let origin = lvm::names::volume_lv(&snap.spec.volume);
+                        let res = match self.place(pools, pool_name.as_deref()) {
+                            Ok(place) => {
+                                let origin_kind = match replicated {
+                                    Some(_) => Origin::Drbd(
+                                        self.snapshot_blocker(reads, &place, &origin, vol).await,
+                                    ),
+                                    None => Origin::Local,
+                                };
+                                self.take_snapshot(reads, &place, &origin, &lv, origin_kind)
+                                    .await
+                            }
+                            Err(e) => Err(e),
+                        };
+                        ack(&self.node, SnapshotPhase::Taking, pool_name, res)
+                    }
+                    // Diskless or tiebreaker: no copy, but its IO must
+                    // stay frozen until every copy is taken.
+                    (None, Some(v)) => {
+                        self.my_replica(v)?;
+                        if self.suspended(&snap.spec.volume) {
+                            return None;
                         }
-                        Err(e) => Err(e),
-                    };
-                    ack(&self.node, SnapshotPhase::Taking, pool_name, res)
-                }
-                p @ (SnapshotPhase::Suspending | SnapshotPhase::Resuming) => {
+                        let e = "IO is not suspended here: resumed, or restarted, mid round";
+                        ack(&self.node, SnapshotPhase::Taking, pool_name, Err(e.into()))
+                    }
+                    (None, None) => return None,
+                },
+                SnapshotPhase::Suspending => {
                     if let Some(v) = replicated {
                         self.my_replica(v)?;
                         // Backstop to the controller's admission check: an
                         // LV name LVM refuses here would fail in Taking,
                         // with IO already suspended on every replica.
-                        let refused = (p == SnapshotPhase::Suspending && replica.is_some())
+                        let refused = replica
+                            .is_some()
                             .then(|| self.place(pools, pool_name.as_deref()))
                             .and_then(|place| {
                                 let place = place.ok()?;
                                 lvm::names::check_new_lv(&place.vg, &lv).err()
                             });
-                        let res = match refused {
-                            Some(e) => Err(e),
-                            None => self.suspend_resume(&snap.spec.volume, p).await,
-                        };
-                        ack(&self.node, p, pool_name, res)
+                        let res = self
+                            .suspend_step(&snap.spec.volume, prev.as_ref(), refused)
+                            .await?;
+                        ack(&self.node, SnapshotPhase::Suspending, pool_name, res)
                     } else {
                         replica?;
-                        ack(&self.node, p, pool_name, Err(NO_DRBD_LOCAL.to_owned()))
+                        ack(
+                            &self.node,
+                            SnapshotPhase::Suspending,
+                            pool_name,
+                            Err(NO_DRBD_LOCAL.to_owned()),
+                        )
                     }
                 }
                 _ => return None,
@@ -1053,6 +1103,31 @@ impl Reconciler {
             tracing::warn!(snapshot = name, error = %e, "snapshot step failed");
         }
         (prev.as_ref() != Some(&ack)).then_some(StatusWrite::Snapshot { name, ack })
+    }
+
+    /// Suspending on a replicated volume; None leaves the ack as it is.
+    async fn suspend_step(
+        &mut self,
+        volume: &str,
+        prev: Option<&SnapshotAck>,
+        refused: Option<String>,
+    ) -> Option<Result<(), String>> {
+        let Some(p) = prev.filter(|a| a.phase == SnapshotPhase::Suspending) else {
+            return Some(match refused {
+                Some(e) => Err(e),
+                None => self.suspend(volume).await,
+            });
+        };
+        // Never a second suspend in one round: its take window would start
+        // after the ack the controller already counted.
+        if !p.ok {
+            return None;
+        }
+        Some(if self.suspended(volume) {
+            Ok(())
+        } else {
+            Err("IO is no longer suspended here".to_owned())
+        })
     }
 
     async fn take_snapshot(
@@ -1108,22 +1183,77 @@ impl Reconciler {
     }
 
     /// Why a replicated origin must not be snapshotted now: a copy of an LV
-    /// made this pass, or of a disk that is not UpToDate, is no data at all.
-    fn snapshot_blocker(&self, reads: &Reads, place: &Place, origin: &str) -> Option<String> {
+    /// made this pass, of a disk that is not UpToDate, or that may differ
+    /// from the other copies of the round, is no data at all.
+    async fn snapshot_blocker(
+        &self,
+        reads: &Reads,
+        place: &Place,
+        origin: &str,
+        vol: &Volume,
+    ) -> Option<String> {
         if reads.created.contains(&format!("{}/{origin}", place.vg)) {
             return Some(format!(
                 "volume LV {}/{origin} was created this pass: nothing to snapshot yet",
                 place.vg
             ));
         }
-        let disk = self
-            .tracked(origin)
+        let res = self.tracked(origin);
+        let disk = res
+            .as_ref()
             .and_then(|r| r.devices.get(&crate::drbd::VOLUME).cloned())
             .and_then(|d| d.disk);
-        (disk.as_deref() != Some(DISK_UP_TO_DATE)).then(|| {
-            format!(
+        if disk.as_deref() != Some(DISK_UP_TO_DATE) {
+            return Some(format!(
                 "local DRBD disk is {}, not UpToDate",
                 disk.as_deref().unwrap_or("not attached")
+            ));
+        }
+        let (Some(res), Some(a)) = (res, vol.spec.assignment.as_ref()) else {
+            return Some("not assigned or not up".to_owned());
+        };
+        // A Secondary cut from the Primary may still say UpToDate.
+        for p in a
+            .replicas
+            .iter()
+            .filter(|p| p.role == Role::Diskful && p.node != self.node)
+        {
+            let conn = res.connections.get(&p.node).map(|c| c.state.as_str());
+            let peer_disk = res
+                .peer_devices
+                .get(&(p.node.clone(), crate::drbd::VOLUME))
+                .and_then(|d| d.peer_disk.as_deref());
+            if conn != Some("Connected") || peer_disk != Some(DISK_UP_TO_DATE) {
+                return Some(format!(
+                    "peer {} is {}, disk {}",
+                    p.node,
+                    conn.unwrap_or("unknown"),
+                    peer_disk.unwrap_or("unknown")
+                ));
+            }
+        }
+        // Between lvextend and the DRBD resize, the metadata sits mid LV.
+        if let Some(minor) = a.minor {
+            let bytes = match self.sectors(minor).await {
+                Ok(n) => n * 512,
+                Err(e) => return Some(format!("size of the DRBD device: {e}")),
+            };
+            if bytes < vol.spec.size_bytes {
+                return Some(format!(
+                    "DRBD device has {bytes} bytes, below the volume's {}: a resize is in flight",
+                    vol.spec.size_bytes
+                ));
+            }
+        }
+        let window = model::snapshot::TAKE_WINDOW;
+        let fresh = self
+            .freezes
+            .get(origin)
+            .is_some_and(|f| f.mine && f.since.elapsed() < window);
+        (!fresh || !res.suspended_by_user()).then(|| {
+            format!(
+                "IO not suspended by this agent within the last {} s",
+                window.as_secs()
             )
         })
     }

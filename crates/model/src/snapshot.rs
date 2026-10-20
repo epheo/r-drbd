@@ -1,8 +1,11 @@
 //! Snapshot: a thin snapshot of a Volume on every diskful node.
 //!
 //! The controller drives the rounds through `status.phase`; each agent acts
-//! on the phase for its node and records an ack. Suspending and Resuming
-//! only exist for DRBD volumes; a replicas 1 volume goes straight to Taking.
+//! on the phase for its node and records an ack. Suspending only exists for
+//! DRBD volumes; a replicas 1 volume goes straight to Taking. Each agent
+//! resumes IO on its own once the round is over or its own deadline passed.
+
+use std::time::Duration;
 
 use kube::{CustomResource, KubeSchema};
 use schemars::JsonSchema;
@@ -33,17 +36,14 @@ pub struct SnapshotSpec {
 
 #[derive(JsonSchema, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SnapshotPhase {
-    /// Waiting for the volume to be Ready with every diskful replica UpToDate.
+    /// Waiting for the volume to be Ready, in sync and connected everywhere,
+    /// every agent reachable, and no other round on the volume.
     #[default]
     Pending,
-    /// Agents suspend DRBD IO.
+    /// Every replica suspends DRBD IO; SUSPEND_BOUND.
     Suspending,
-    Suspended,
-    /// Agents create the thin snapshot LV; 2 minute bound.
+    /// Diskful replicas create the thin snapshot LV; TAKE_BOUND.
     Taking,
-    Taken,
-    /// Agents resume IO.
-    Resuming,
     Ready,
     Failed,
     /// Agents remove the snapshot LVs.
@@ -68,7 +68,8 @@ pub struct SnapshotStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<Time>,
     /// When the current phase began; the round bounds (Suspending, Taking)
-    /// count from it and survive a controller restart.
+    /// count from it and survive a controller restart. Agents never read
+    /// it: a wall clock of another node is no input to their deadlines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase_since: Option<Time>,
     /// One entry per replica of the assignment, diskless ones included,
@@ -81,6 +82,25 @@ pub struct SnapshotStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
 }
+
+// Each agent measures its own suspend on its own monotonic clock. The
+// suspends of one round lie within SUSPEND_BOUND of each other plus skew,
+// and each take comes at most TAKE_WINDOW after its node's suspend, so
+// RESUME_AFTER > TAKE_WINDOW + SUSPEND_BOUND + CLOCK_MARGIN keeps every
+// node frozen until every take of the round is done.
+
+/// Controller: Suspending fails unless every replica acked within this of
+/// phaseSince.
+pub const SUSPEND_BOUND: Duration = Duration::from_secs(30);
+/// Controller: Taking fails unless every diskful replica took within this
+/// of phaseSince.
+pub const TAKE_BOUND: Duration = Duration::from_secs(120);
+/// Agent: takes only while its own suspend for the round is younger.
+pub const TAKE_WINDOW: Duration = Duration::from_secs(120);
+/// Agent: resumes once its own suspend is this old, whatever the round.
+pub const RESUME_AFTER: Duration = Duration::from_secs(240);
+/// Clock skew between controller runs that read one phaseSince.
+pub const CLOCK_MARGIN: Duration = Duration::from_secs(30);
 
 /// The last phase a node completed, and whether it succeeded. `pool` is
 /// where the snapshot LV lives, so restore and delete still find it after

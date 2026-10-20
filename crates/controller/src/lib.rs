@@ -44,7 +44,8 @@ pub struct Config {
     pub identity: String,
     /// Bound of the snapshot take round.
     pub take_timeout: Duration,
-    /// Bound of the snapshot suspend round: IO stays frozen meanwhile.
+    /// Bound of the snapshot suspend round. Never above
+    /// model::snapshot::SUSPEND_BOUND: the agents' resume deadline assumes it.
     pub suspend_timeout: Duration,
     /// Bound of every CSI wait on store state.
     pub ready_timeout: Duration,
@@ -64,8 +65,8 @@ impl Config {
             namespace: namespace.into(),
             csi_endpoint: csi_endpoint.into(),
             identity: identity.into(),
-            take_timeout: Duration::from_secs(120),
-            suspend_timeout: Duration::from_secs(30),
+            take_timeout: model::snapshot::TAKE_BOUND,
+            suspend_timeout: model::snapshot::SUSPEND_BOUND,
             ready_timeout: Duration::from_secs(30),
             lease_stale: store::LEASE_STALE,
             peer_clear_grace: volume::PEER_CLEAR_GRACE,
@@ -249,9 +250,6 @@ pub(crate) struct Memory {
     /// Volume uids whose spec.resolve has seen SplitBrain True; only those
     /// get the field cleared once resynced.
     pub(crate) resolving: HashSet<String>,
-    /// Per Snapshot uid: the reachable replicas listed when Suspending
-    /// started; its acks are awaited from those.
-    pub(crate) rounds: HashMap<String, Vec<String>>,
     /// initializedAt as last written, per Volume uid, so an apply built
     /// from a store copy that lags behind that write cannot drop it.
     pub(crate) initialized: HashMap<String, k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>,
@@ -441,14 +439,6 @@ async fn pass(ctx: &Ctx<'_>, memory: &mut Memory) -> Option<Duration> {
         .retain(|uid, _| seen.contains_key(uid));
     memory.probes.retain(|uid, _| seen.contains_key(uid));
     memory.probe_wait.retain(|uid| seen.contains_key(uid));
-    let snapshots: HashSet<String> = ctx
-        .stores
-        .snapshots
-        .state()
-        .iter()
-        .filter_map(|s| s.metadata.uid.clone())
-        .collect();
-    memory.rounds.retain(|uid, _| snapshots.contains(uid));
     report_duplicates(ctx, memory).await;
     volume::reconcile_all(ctx, memory).await;
     pool::reconcile_all(ctx, memory).await;
