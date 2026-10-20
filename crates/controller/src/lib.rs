@@ -657,6 +657,42 @@ pub(crate) fn error_kind(e: &kube::Error) -> String {
     }
 }
 
+/// `apply_status` that lands only on the object version it was computed
+/// from. Returns false when it did not land; a conflict means the store
+/// lagged, and the next pass, woken by the newer version, decides again.
+pub async fn apply_status_at<K>(
+    api: &Api<K>,
+    name: &str,
+    resource_version: Option<&str>,
+    status: serde_json::Value,
+) -> bool
+where
+    K: Resource<DynamicType = ()> + Clone + DeserializeOwned + std::fmt::Debug,
+{
+    let patch = serde_json::json!({
+        "apiVersion": K::api_version(&()),
+        "kind": K::kind(&()),
+        "metadata": { "name": name, "resourceVersion": resource_version },
+        "status": status,
+    });
+    let pp = PatchParams::apply(model::keys::CONTROLLER_FIELD_MANAGER).force();
+    match api.patch_status(name, &pp, &Patch::Apply(&patch)).await {
+        Ok(_) => {
+            debug!(kind = %K::kind(&()), name, "status applied");
+            true
+        }
+        Err(kube::Error::Api(s)) if s.is_conflict() => {
+            debug!(kind = %K::kind(&()), name, "status computed from a stale copy; retrying next pass");
+            false
+        }
+        Err(kube::Error::Api(s)) if s.is_not_found() => false,
+        Err(e) => {
+            warn!(kind = %K::kind(&()), name, error = %e, "status apply failed");
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

@@ -21,7 +21,7 @@ use tracing::{debug, info};
 
 use crate::store::Stores;
 use crate::volume::{Cond, build_conditions};
-use crate::{Ctx, Memory, apply_status, has_finalizer, set_finalizer, valid_name};
+use crate::{Ctx, Memory, apply_status_at, has_finalizer, set_finalizer, valid_name};
 
 /// How long a Pending Snapshot waits for a Volume missing from the store.
 pub const VOLUME_GRACE: Duration = crate::RESYNC;
@@ -372,7 +372,10 @@ async fn write(api: &Api<Snapshot>, s: &Snapshot, mut wanted: Owned) {
     if Owned::current(s) == wanted {
         return;
     }
-    apply_status(api, &s.name_any(), wanted.json()).await;
+    // Computed from `s`: a store copy that lags must never move the phase
+    // backwards, e.g. a started round back to Pending.
+    let rv = s.metadata.resource_version.as_deref();
+    apply_status_at(api, &s.name_any(), rv, wanted.json()).await;
 }
 
 /// Returns the time left until the earliest bound, if any.
@@ -591,9 +594,8 @@ async fn step(
     let mut step = next(&round);
     if current.phase == SnapshotPhase::Pending && matches!(step, Step::Go { .. }) {
         match live_round(api, s).await {
-            Ok(Live::Free) => {}
-            Ok(Live::Started) => return None,
-            Ok(Live::Busy(other)) => {
+            Ok(None) => {}
+            Ok(Some(other)) => {
                 step = Step::Hold(format!(
                     "snapshot {other} of the same volume is in its round"
                 ));
@@ -604,32 +606,17 @@ async fn step(
     apply_step(ctx, api, s, v, current, phase_for, step).await
 }
 
-enum Live {
-    Free,
-    /// This Snapshot already left Pending; the store lags.
-    Started,
-    Busy(String),
-}
-
-/// The store may not show a round this controller started a moment ago:
-/// two rounds of one volume at once would let one resume IO under the
-/// other's take. A list from the API server cannot lag behind our writes.
-async fn live_round(api: &Api<Snapshot>, s: &Snapshot) -> Result<Live, kube::Error> {
+/// Another Snapshot of the volume in its round, as the API server has it.
+/// The store may not show a round this controller started a moment ago,
+/// and two rounds at once would let one resume IO under the other's take.
+async fn live_round(api: &Api<Snapshot>, s: &Snapshot) -> Result<Option<String>, kube::Error> {
     let all = api.list(&ListParams::default()).await?;
-    let mut busy = None;
-    for x in &all.items {
-        if x.metadata.uid == s.metadata.uid {
-            if x.status
-                .as_ref()
-                .is_some_and(|st| st.phase != SnapshotPhase::Pending)
-            {
-                return Ok(Live::Started);
-            }
-        } else if x.spec.volume == s.spec.volume && crate::volume::round_running(x) {
-            busy.get_or_insert_with(|| x.name_any());
-        }
-    }
-    Ok(busy.map_or(Live::Free, Live::Busy))
+    Ok(all
+        .items
+        .iter()
+        .filter(|x| x.metadata.uid != s.metadata.uid && x.spec.volume == s.spec.volume)
+        .find(|x| crate::volume::round_running(x))
+        .map(ResourceExt::name_any))
 }
 
 /// The bound of a phase, if it has one.

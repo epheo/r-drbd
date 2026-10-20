@@ -1168,3 +1168,31 @@ async fn pool_delete_policy_waits_for_released() {
     })
     .await;
 }
+
+/// A phase computed from a copy the store had before some other write
+/// never lands: a lagging store cannot move a round backwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transition_from_a_stale_copy_is_rejected() {
+    let assets = require_envtest!();
+    support::init_tracing();
+    let env = Env::start(&assets).await;
+    let client = env.client().await;
+    let api: Api<Snapshot> = Api::all(client.clone());
+    create_snapshot(&client, "s", "vol").await;
+    let stale = get_snapshot(&client, "s").await.unwrap();
+    FakeAgent::new(&client, "n1")
+        .ack("s", SnapshotPhase::Suspending, true, None)
+        .await;
+    let phase = |p: SnapshotPhase| json!({ "phase": p, "conditions": [] });
+    let rv = stale.metadata.resource_version.as_deref();
+    assert!(!controller::apply_status_at(&api, "s", rv, phase(SnapshotPhase::Taking)).await);
+    let now = get_snapshot(&client, "s").await.unwrap();
+    assert_eq!(snap_phase(&now), SnapshotPhase::Pending);
+    assert_eq!(now.status.unwrap().acks.len(), 1, "the ack stays");
+    let rv = now.metadata.resource_version.as_deref();
+    assert!(controller::apply_status_at(&api, "s", rv, phase(SnapshotPhase::Taking)).await);
+    assert_eq!(
+        snap_phase(&get_snapshot(&client, "s").await.unwrap()),
+        SnapshotPhase::Taking
+    );
+}
