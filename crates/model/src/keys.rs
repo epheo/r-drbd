@@ -43,8 +43,29 @@ pub const FS_FIELD_MANAGER: &str = "r-drbd-fs";
 /// The agent writes it as a replica's lastError; the controller matches on it with starts_with.
 pub const LV_LOST: &str = "LV missing after it was reported present; not recreated so the loss stays visible, delete the Volume to start over";
 /// Per-node field manager so server-side apply keeps each agent's entries apart.
+/// The API caps a manager at 128 bytes and node names reach 253: a long name
+/// keeps its first 96 bytes plus a hash of the whole, so names that differ
+/// only past byte 96 stay apart. A name that fits is used as is, so the
+/// managers of existing entries never change.
 pub fn agent_field_manager(node: &str) -> String {
-    format!("r-drbd-agent-{node}")
+    const PREFIX: &str = "r-drbd-agent-";
+    const MAX: usize = 128;
+    const KEEP: usize = 96;
+    if PREFIX.len() + node.len() <= MAX {
+        return format!("{PREFIX}{node}");
+    }
+    let mut cut = KEEP;
+    while !node.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{PREFIX}{}-{:016x}", &node[..cut], fnv1a(node.as_bytes()))
+}
+
+/// FNV-1a 64: fixed forever, since a manager name must not change between builds.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 /// DRBD listen ports, one per replica on each node. Outside the kubelet
@@ -86,4 +107,28 @@ pub const DEVICE_PATTERN: &str = "^/dev/disk/by-id/[^/]+$";
 /// Pool recreated after a cluster rebuild finds its VG again.
 pub fn pool_vg_tag(pool: &str) -> String {
     format!("r-drbd.pool.{pool}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn field_manager_fits_the_api_limit() {
+        assert_eq!(agent_field_manager("n1"), "r-drbd-agent-n1");
+        let fits = "a".repeat(115);
+        assert_eq!(agent_field_manager(&fits), format!("r-drbd-agent-{fits}"));
+
+        let long = "a".repeat(253);
+        let m = agent_field_manager(&long);
+        assert!(m.len() <= 128, "{}", m.len());
+        assert!(m.starts_with(&format!("r-drbd-agent-{}-", "a".repeat(96))));
+        assert_eq!(m, agent_field_manager(&long), "stable");
+        let other = format!("{}b", "a".repeat(252));
+        assert_ne!(m, agent_field_manager(&other), "differs past the cut");
+        assert_eq!(
+            agent_field_manager(&"a".repeat(116)).len(),
+            13 + 96 + 1 + 16
+        );
+    }
 }

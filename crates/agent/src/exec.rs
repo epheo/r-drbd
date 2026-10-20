@@ -680,7 +680,6 @@ mod tests {
         assert!(late.exists(), "still completed after the error");
         assert!(!termed.exists(), "no signal after the wait");
 
-
         // The same under Timeout is killed with the caller.
         let gone = dir.join("gone");
         let script = format!("sleep 0.5; touch {}", gone.display());
