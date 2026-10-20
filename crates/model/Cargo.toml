@@ -6,11 +6,11 @@ license.workspace = true
 description = "r-drbd.io v1alpha1 CRD types: Pool, Volume, Snapshot, NodeDisks"
 
 [dependencies]
-k8s-openapi = { version = "0.28.0", features = ["latest", "schemars"] }
-kube = { version = "4.2.0", default-features = false, features = ["derive"] }
+k8s-openapi = { workspace = true, features = ["schemars"] }
+kube = { workspace = true, features = ["derive"] }
 schemars = "1.2.3"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true
