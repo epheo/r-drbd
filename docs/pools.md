@@ -193,7 +193,7 @@ Pick the link of the whole disk (no `-part` suffix); the target (`../../nvme1n1`
 | Reason | Status | Meaning |
 |---|---|---|
 | `ThinPoolReady` | True | The thin pool is usable |
-| `ThinPoolUnavailable` | False | The VG or thin pool is missing or unreadable; the message holds the LVM error |
+| `ThinPoolUnavailable` | False | The VG or thin pool is missing or unreadable, or LVM flags its health, or its metadata is over 80 percent used; the message says which. In the last two cases capacity stays reported and existing volumes keep running, but no new volume is placed there |
 | `ZeroingDisabled` | False | Zeroing is off and turning it on failed |
 | `InvalidName` | False | `vg` or `thinPool` is not a valid LVM name |
 | `DeviceNotEmpty` | False | Devices mode: a path holds a signature or partitions |
