@@ -30,12 +30,11 @@ One leader, one reflector per kind, one reconcile loop that walks every object i
 - `model`: the CRD types this controller reconciles.
 - `placer`: placement and tiebreaker rules, kept pure in their own crate.
 - `lvm`: LV names and the checks LVM makes on them, so a bad snapshot or volume name fails at admission.
-- `csi`: generated CSI v1 service traits and messages.
+- `csi`: generated CSI v1 service traits and messages, tonic and the socket bind.
 - `kube` (client, runtime, rustls-tls, ring): API access, watchers and reflectors without openssl or aws-lc.
 - `k8s-openapi`: core types (Node, Lease, PVC) and metav1 time.
 - `tokio`: the async runtime; signal for SIGTERM, net for the Unix socket.
 - `tokio-stream` (net): turns the Unix listener into the stream tonic serves.
-- `tonic` (transport): the gRPC server; the csi crate builds tonic without one.
 - `prost-types`: the Timestamp in CSI snapshot responses.
 - `futures`: stream combinators over the watchers.
 - `serde`, `serde_json`: patch bodies built as JSON so server-side apply claims only controller fields.

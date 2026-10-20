@@ -124,8 +124,9 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
         .with_disk_lock(inv.lock.clone())
         .with_live(Arc::new(KubeLiveVolumes::new(client.clone())));
 
-    let socket = csi::socket_path(&cfg.csi_endpoint);
-    let listener = csi::bind(&socket)?;
+    let listener = ::csi::bind_unix(&cfg.csi_endpoint)
+        .and_then(tokio::net::UnixListener::from_std)
+        .map_err(|e| Error::io("CSI socket", e))?;
     let node_service = csi::NodeService::new(
         cfg.node.clone(),
         exec.clone(),
