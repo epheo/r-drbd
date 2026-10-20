@@ -41,7 +41,8 @@ Two PVC annotations override placement:
 - `r-drbd.io/node`: one of the diskful replicas goes to this node.
 - `r-drbd.io/pool`: every diskful replica goes to this Pool; only sensible with `replicas: 1`.
 
-Pins are read once, when the volume is placed.
+The CSI driver copies the annotations into the Volume (`spec.node`, `spec.pool`) once, at creation.
+Placement reads them, and so does every `spec.evict` move: a replica pinned to the evicted node does not move.
 The default manifests run csi-provisioner with `--extra-create-metadata`, which pins need.
 
 ## Volume modes
@@ -88,7 +89,8 @@ Each agent grows its LV, then DRBD grows once all replicas are larger, then XFS 
 Expansion works online.
 Shrinking is refused.
 
-`status.usableBytes` keeps the old size until every replica reports the new one.
+`status.usableBytes` keeps the old size until every diskful replica on a reachable node reports the new one.
+Meanwhile the Volume stays Ready, with `Ready` reason `Resizing`.
 
 ## Lifecycle
 
@@ -96,14 +98,12 @@ Shrinking is refused.
 
 | Phase | Meaning |
 |---|---|
-| Pending | Not placed yet |
+| Pending | Not placed yet; reason `Insufficient` while no Pool has room, retried when Pools change |
 | Provisioning | Placed; replicas being created or synced for the first time |
-| Ready | Every replica present, up to date and connected |
+| Ready | Every diskful replica and the tiebreaker present; diskful replicas up to date and connected |
 | Degraded | Usable, but a replica is missing, out of date or on an unreachable node |
-| Failed | Cannot be placed or restored as asked; the `Ready` condition says why |
+| Failed | Invalid name, no free DRBD minor, port or node id, or a restore that cannot proceed; the `Ready` condition says why |
 | Deleting | Agents are tearing down |
-
-A Failed volume for lack of capacity is retried when Pools change.
 
 CSI calls wait for Ready up to 30 s, then return an error; the CSI sidecars retry.
 

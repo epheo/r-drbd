@@ -17,7 +17,7 @@ Useful Volume status fields:
 | `phase` | Pending, Provisioning, Ready, Degraded, Failed, Deleting |
 | `primary` | Node where the device is open |
 | `nodes` | Diskful nodes |
-| `usableBytes` | Size every replica provides |
+| `usableBytes` | Smallest size the diskful replicas on reachable nodes provide |
 | `replicas[]` | One entry per node, written by its agent |
 | `replicas[].diskState` | DRBD disk state: UpToDate, Inconsistent, Outdated, Diskless, ... |
 | `replicas[].syncPercent` | Progress while resyncing |
@@ -30,13 +30,14 @@ Conditions:
 
 | Type | True means |
 |---|---|
-| `Ready` | Every replica present, UpToDate and connected |
+| `Ready` | Every diskful replica and the tiebreaker present; diskful replicas UpToDate and connected |
 | `Degraded` | Usable, but not every replica is healthy; the reason and message name the node |
 | `QuorumLost` | A replica in use has no quorum; IO there is suspended until quorum returns |
 | `SplitBrain` | Two replicas diverged; the message names them |
 | `PeerUnreachable` | A DRBD connection between two running nodes does not come up; the message names both nodes, the address and the likely cause |
 
-Degraded reasons: `ReplicaMissing`, `ReplicaNotUpToDate`, `ReplicaDisconnected`, `NodeUnreachable`, `Resizing`.
+Degraded reasons: `ReplicaMissing`, `ReplicaNotUpToDate`, `ReplicaDisconnected`, `NodeUnreachable`.
+A resize in progress keeps `Ready` True with reason `Resizing`.
 
 Logs:
 
@@ -105,13 +106,19 @@ The controller then:
 3. Re-adds a tiebreaker if needed.
 4. Removes the node from `spec.evict`.
 
-It refuses to move a replica while it would risk data:
+It refuses any move while:
 
-- The volume was never Ready.
 - A split brain is pending or being resolved.
-- A snapshot is in progress.
-- No other diskful replica is UpToDate with quorum, or a previous rebuild is still running.
+- A snapshot is suspending, taking or resuming.
 - The evicted node's agent is alive and its replica is in use or attached.
+
+A diskful replica is also refused while:
+
+- `status.initializedAt` is not set: the volume was never Ready, or its status was lost.
+- No other diskful replica is UpToDate with quorum, or a previous rebuild is still running.
+- The Volume is pinned to that node (`spec.node`, or `spec.pool` on that node).
+
+A tiebreaker holds no data: it moves to another free node, or is dropped when there is none.
 
 While blocked, it emits an `EvictionBlocked` Event and keeps trying.
 On success, it emits `Evicted`.

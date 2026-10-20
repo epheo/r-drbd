@@ -25,6 +25,7 @@ Group `r-drbd.io/v1alpha1`, cluster scoped.
 | `status.volumes` | []string | Volumes with a diskful replica here |
 | `status.devices[]` | object | Devices mode, per listed path: `path`, `state`, `sizeBytes`, `model`, `serial`, `message` |
 | `status.conditions` | []Condition | `Available`; `Released` under `reclaimPolicy: Delete` once deleted |
+| `status.observedGeneration` | integer | Spec generation the agent last applied |
 
 Device `state`: `Member`, `Blank`, `NotEmpty`, `Busy`, `NotADisk`, `Missing` (see [Pools](pools.md#what-the-agent-checks)).
 
@@ -59,11 +60,12 @@ Status:
 |---|---|
 | `phase` | Pending, Provisioning, Ready, Degraded, Failed, Deleting |
 | `conditions` | `Ready`, `Degraded`, `QuorumLost`, `SplitBrain`, `PeerUnreachable` |
-| `usableBytes` | Size every replica provides |
+| `usableBytes` | Smallest size the diskful replicas on reachable nodes provide |
 | `primary` | Node where the device is open |
 | `nodes` | Comma separated diskful nodes |
 | `initializedAt` | First time the volume was Ready |
 | `fileSystem` | File system the node plugin created or inherited |
+| `observedGeneration` | Spec generation the controller last wrote status for |
 | `replicas[]` | `node`, `present`, `diskState`, `syncPercent`, `peers`, `inUse`, `quorum`, `devicePath`, `allocatedBytes`, `sizeBytes`, `observedGeneration`, `lastError`, `unreachablePeers` |
 | `replicas[].unreachablePeers[]` | Stuck DRBD connections from this node: `node`, `address`, `port`, `since`, `result` (Refused, Filtered, TimedOut, Accepted, Failed), `probedAt`, `error`, `peerRun` (the peer agent run probed) |
 
@@ -88,6 +90,8 @@ A snapshot over the limit ends Failed before any IO is suspended.
 | `status.phaseSince` | When the current phase began |
 | `status.acks[]` | Per node: `node`, `phase`, `pool`, `ok`, `error` |
 | `status.lastError` | Why it failed |
+| `status.conditions` | `Ready` |
+| `status.observedGeneration` | Spec generation the controller last wrote status for |
 
 Finalizer `r-drbd.io/snapshot` holds deletion until every snapshot LV is removed.
 
@@ -138,7 +142,8 @@ Volume `Ready`:
 | Reason | Meaning |
 |---|---|
 | `AllReplicasUpToDate` | Ready |
-| `Placing`, `Waiting`, `Provisioning` | Not ready yet |
+| `Resizing` | Ready, still growing: `usableBytes` is below `sizeBytes` |
+| `Placing`, `Waiting` | Not ready yet |
 | `Insufficient` | No Pool of the tier has room on enough nodes |
 | `AllocationFailed` | No free DRBD minor, port or node id |
 | `InvalidName` | The Volume name is not a valid LV name |
@@ -147,13 +152,14 @@ Volume `Ready`:
 | `UnsupportedRestore` | Replica count differs from the snapshot's node count |
 | `RestoreNodeConflict` | Pins point away from the snapshot |
 | `InvalidSurvivor` | `spec.resolve.survivor` holds no diskful replica |
+| `ResolveWithoutSplitBrain` | `spec.resolve` is set but there is no split brain; the status of `Ready` is kept; remove `spec.resolve` |
 | `Deleting` | Being removed |
 
-Volume `Degraded`: `ReplicaMissing`, `ReplicaNotUpToDate`, `ReplicaDisconnected`, `NodeUnreachable`, `Resizing`.
+Volume `Degraded`: `ReplicaMissing`, `ReplicaNotUpToDate`, `ReplicaDisconnected`, `NodeUnreachable`; False: `AllReplicasUpToDate`, or `Provisioning` before the first Ready.
 
 Volume `QuorumLost`: `NoQuorum`, `Quorate`.
 
-Volume `SplitBrain`: `SplitBrain`, `NoSplitBrain`, `ResolveWithoutSplitBrain`.
+Volume `SplitBrain`: `SplitBrain`, `NoSplitBrain`.
 
 Volume `PeerUnreachable`:
 
@@ -164,6 +170,8 @@ Volume `PeerUnreachable`:
 | `Timeout` | The probe got no answer: packets dropped |
 | `NotListening` | The probe was refused: nothing listens at that address and port, or a firewall answers with a TCP reset |
 | `Unknown` | The port answers but DRBD does not connect, or the probe failed |
+
+Snapshot `Ready`: True with reason `Ready`; False with the phase as reason (`Pending`, `Suspending`, `Taking`, ..., `Failed`, `Deleting`) and `lastError` as message.
 
 Pool `Available`: `ThinPoolReady`, `ThinPoolUnavailable`, `ZeroingDisabled`, `InvalidName`, `LvmUnsupported` (host LVM older than 2.03.03); devices mode also `DeviceNotEmpty`, `DeviceBusy`, `DeviceMissing`, `NotADisk`, `VolumeGroupNotOwned`, `Building` (a build step failed, named in the message; a failed growth step keeps the Pool Available and puts the error in the message).
 
