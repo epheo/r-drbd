@@ -273,7 +273,9 @@ async fn two_volumes_attach_to_one_node_in_one_pass() {
         .map(|n| FakeAgent::new(&client, n).spawn_auto())
         .collect();
     // Attached from the start: both get placed, then both get their
-    // diskless n4 entry, typically in the same pass.
+    // diskless n4 entry, typically in the same pass. A pool of the tier
+    // too small for them keeps the spreading tiebreakers off n4.
+    pool(&client, "p4", "n4", "fast", GIB / 2).await;
     for name in ["va", "vb"] {
         let mut spec = volume_spec(GIB, 2, "fast");
         spec.attachments = vec!["n4".into()];
@@ -695,6 +697,8 @@ async fn replicated_restore_from_acks() {
     let assets = require_envtest!();
     let (_env, client, _cfg, _ctl) = setup(&assets).await;
     cluster(&client).await;
+    // No agent runs on n4: it is no tiebreaker candidate.
+    support::delete_agent_lease(&client, "n4").await;
     let _agents: Vec<_> = ["n1", "n2", "n3"]
         .iter()
         .map(|n| FakeAgent::new(&client, n).spawn_auto())
@@ -767,6 +771,8 @@ async fn snapshot_outlives_an_uninitialized_restore() {
     let assets = require_envtest!();
     let (_env, client, _cfg, _ctl) = setup(&assets).await;
     cluster(&client).await;
+    // No agent runs on n4: it is no tiebreaker candidate.
+    support::delete_agent_lease(&client, "n4").await;
     let auto: Vec<_> = ["n1", "n2", "n3"]
         .iter()
         .map(|n| FakeAgent::new(&client, n).spawn_auto())
@@ -829,6 +835,8 @@ async fn larger_restore_is_ready_only_at_the_full_size() {
     let assets = require_envtest!();
     let (_env, client, _cfg, _ctl) = setup(&assets).await;
     cluster(&client).await;
+    // No agent runs on n4: it is no tiebreaker candidate.
+    support::delete_agent_lease(&client, "n4").await;
     let auto: Vec<_> = ["n1", "n2", "n3"]
         .iter()
         .map(|n| FakeAgent::new(&client, n).spawn_auto())

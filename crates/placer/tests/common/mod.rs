@@ -16,7 +16,6 @@ pub(crate) fn pool(name: &str, node: &str, free: u64) -> PoolView {
         committed_bytes: 0,
         overcommit_percent: 100,
         reserve_percent: 5,
-        volume_count: 0,
     }
 }
 

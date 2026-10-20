@@ -18,7 +18,6 @@ pub struct PoolView {
     pub free_bytes: u64,
     /// Sum of the sizes of volumes already placed in this pool.
     pub committed_bytes: u64,
-    pub volume_count: u32,
     pub overcommit_percent: u32,
     pub reserve_percent: u32,
 }
@@ -189,22 +188,21 @@ fn reject(req: &Request, pool: &PoolView) -> Option<Reason> {
 }
 
 /// Tiebreaker node for an even diskful count: a live node that holds no
-/// replica, preferring nodes with no pool of this tier (such as a control plane node),
-/// then the node with the fewest volumes, then by name.
+/// replica, preferring nodes with no pool of this tier (such as a control
+/// plane node), then the node with the lowest `load`, then by name.
 pub fn tiebreaker(
     diskful_nodes: &[String],
     live_nodes: &[String],
     pools: &[PoolView],
     tier: &str,
+    load: &dyn Fn(&str) -> usize,
 ) -> Option<String> {
     live_nodes
         .iter()
         .filter(|n| !diskful_nodes.contains(n))
         .min_by_key(|n| {
-            let mine = pools.iter().filter(|p| &p.node == *n);
-            let has_tier = mine.clone().any(|p| p.tier == tier);
-            let volumes: u64 = mine.map(|p| u64::from(p.volume_count)).sum();
-            (has_tier, volumes, n.as_str())
+            let has_tier = pools.iter().any(|p| &p.node == *n && p.tier == tier);
+            (has_tier, load(n), n.as_str())
         })
         .cloned()
 }

@@ -37,6 +37,11 @@ impl Used {
         MINOR_RANGE.into_iter().find(|m| !self.minors.contains(m))
     }
 
+    /// DRBD resources on `node`, every role counted: a tiebreaker's load.
+    pub fn resources_on(&self, node: &str) -> usize {
+        self.ports.get(node).map_or(0, BTreeSet::len)
+    }
+
     pub fn lowest_free_port(&self, node: &str) -> Option<u16> {
         let taken = self.ports.get(node);
         PORT_RANGE

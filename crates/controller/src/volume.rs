@@ -1004,7 +1004,6 @@ impl Placing {
             .find(|p| p.node == node && p.name == pool)
         {
             view.committed_bytes = view.committed_bytes.saturating_add(size);
-            view.volume_count = view.volume_count.saturating_add(1);
         }
     }
 
@@ -1977,7 +1976,13 @@ fn restore_holders(
 fn assign(placing: &Placing, v: &Volume, diskful: &[placer::Chosen]) -> Placement {
     let nodes: Vec<String> = diskful.iter().map(|c| c.node.clone()).collect();
     let tiebreaker = if nodes.len() >= 2 && nodes.len().is_multiple_of(2) {
-        let t = placer::tiebreaker(&nodes, &placing.live_nodes, &placing.views, &v.spec.tier);
+        let t = placer::tiebreaker(
+            &nodes,
+            &placing.live_nodes,
+            &placing.views,
+            &v.spec.tier,
+            &|n| placing.used.resources_on(n),
+        );
         if t.is_none() {
             warn!(volume = v.name_any(), "no node for the quorum tiebreaker");
         }
@@ -3254,7 +3259,6 @@ mod tests {
             total_bytes: 100 * G,
             free_bytes: 0,
             committed_bytes: 90 * G,
-            volume_count: 1,
             overcommit_percent: 100,
             reserve_percent: 0,
         };

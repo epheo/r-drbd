@@ -53,7 +53,6 @@ pub(crate) fn view(p: &Pool, usage: &Usage, live_nodes: &[String]) -> placer::Po
         total_bytes: status.and_then(|s| s.total_bytes).unwrap_or(0),
         free_bytes: status.and_then(|s| s.free_bytes).unwrap_or(0),
         committed_bytes: held.map_or(0, |h| h.iter().map(|(_, size)| size).sum()),
-        volume_count: held.map_or(0, |h| u32::try_from(h.len()).unwrap_or(u32::MAX)),
         overcommit_percent: p.spec.overcommit_percent,
         reserve_percent: p.spec.reserve_percent,
         name,

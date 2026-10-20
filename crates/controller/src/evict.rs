@@ -206,7 +206,9 @@ fn add_tiebreaker(i: &Input<'_>, next: &mut Assignment, retired: u8) -> Option<S
         .filter(|n| !next.replicas.iter().any(|r| &r.node == *n))
         .cloned()
         .collect();
-    let node = placer::tiebreaker(&diskful, &live, i.views, &i.spec.tier)?;
+    let node = placer::tiebreaker(&diskful, &live, i.views, &i.spec.tier, &|n| {
+        i.used.resources_on(n)
+    })?;
     let node_id = free_node_id(next, retired)?;
     let port = i.used.lowest_free_port(&node)?;
     next.replicas.push(AssignedReplica {

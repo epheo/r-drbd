@@ -39,7 +39,6 @@ fn view(node: &str, free: u64) -> placer::PoolView {
         committed_bytes: 0,
         overcommit_percent: 100,
         reserve_percent: 5,
-        volume_count: 0,
     }
 }
 
