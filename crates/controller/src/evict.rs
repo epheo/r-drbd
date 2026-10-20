@@ -5,10 +5,9 @@
 
 use std::collections::BTreeSet;
 
-use model::keys::NODE_ID_MAX;
 use model::{AssignedReplica, Assignment, ReplicaStatus, Role, VolumeSpec};
 
-use crate::alloc::Used;
+use crate::alloc::{Used, next_node_id};
 
 /// What the pass knows besides the Volume itself.
 pub struct Input<'a> {
@@ -82,13 +81,6 @@ fn up_to_date(e: &ReplicaStatus) -> bool {
         && e.disk_state
             .as_deref()
             .is_some_and(|d| d.eq_ignore_ascii_case("UpToDate"))
-}
-
-/// The lowest DRBD node id no entry of `a` uses, never `retired`: within
-/// one move the peers still know the evicted node under its id until they
-/// forget-peer it. A later allocation may reuse it once it departed.
-pub fn free_node_id(a: &Assignment, retired: u8) -> Option<u8> {
-    (0..=NODE_ID_MAX).find(|id| *id != retired && !a.replicas.iter().any(|r| r.node_id == *id))
 }
 
 /// A status entry of a node outside the assignment: its agent has not torn
@@ -195,7 +187,7 @@ fn diskful_precondition(i: &Input<'_>, node: &str) -> Option<String> {
 
 /// A tiebreaker for `next` when it has none and two diskful replicas:
 /// a live node with no entry, not being evicted.
-fn add_tiebreaker(i: &Input<'_>, next: &mut Assignment, retired: u8) -> Option<String> {
+fn add_tiebreaker(i: &Input<'_>, next: &mut Assignment) -> Option<String> {
     let diskful: Vec<String> = next
         .replicas
         .iter()
@@ -219,7 +211,7 @@ fn add_tiebreaker(i: &Input<'_>, next: &mut Assignment, retired: u8) -> Option<S
     let node = placer::tiebreaker(&diskful, &live, i.views, &i.spec.tier, &|n| {
         i.used.resources_on(n)
     })?;
-    let node_id = free_node_id(next, retired)?;
+    let node_id = next_node_id(i.assignment, next)?;
     let port = i.used.lowest_free_port(&node)?;
     next.replicas.push(AssignedReplica {
         node: node.clone(),
@@ -292,7 +284,7 @@ fn move_diskful(i: &Input<'_>, gone: &AssignedReplica) -> Step {
         r.role = Role::Diskful;
         r.pool = Some(chosen.pool.clone());
     } else {
-        let Some(node_id) = free_node_id(i.assignment, gone.node_id) else {
+        let Some(node_id) = next_node_id(i.assignment, &next) else {
             return blocked(node, "no free DRBD node id");
         };
         let port = match i.assignment.minor {
@@ -310,7 +302,7 @@ fn move_diskful(i: &Input<'_>, gone: &AssignedReplica) -> Step {
             role: Role::Diskful,
         });
     }
-    let tiebreaker = add_tiebreaker(i, &mut next, gone.node_id);
+    let tiebreaker = add_tiebreaker(i, &mut next);
     let mut event = format!("replica of {} moved from {node} to {}", i.name, chosen.node);
     if let Some(t) = tiebreaker {
         event = format!("{event}; tiebreaker on {t}");
@@ -327,7 +319,7 @@ fn move_tiebreaker(i: &Input<'_>, gone: &AssignedReplica) -> Step {
     let node = gone.node.as_str();
     let mut next = i.assignment.clone();
     next.replicas.retain(|r| r.node != node);
-    let event = match add_tiebreaker(i, &mut next, gone.node_id) {
+    let event = match add_tiebreaker(i, &mut next) {
         Some(t) => format!("tiebreaker of {} moved from {node} to {t}", i.name),
         None => format!(
             "tiebreaker of {} removed from {node}; no node for a new one",

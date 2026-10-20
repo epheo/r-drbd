@@ -737,9 +737,9 @@ pub fn resolve_action(split_brain: bool, seen_split: bool, done: bool) -> Resolv
 }
 
 /// Diskless entries converged to the attachments: a diskless entry whose
-/// node is no longer attached goes first, so its node id is free again;
-/// then an attached node without a replica gets one (lowest free node id
-/// in the volume, lowest free port on that node). A node in spec.evict
+/// node is no longer attached goes; then an attached node without a
+/// replica gets one (alloc::next_node_id, so never an id this write
+/// frees; lowest free port on that node). A node in spec.evict
 /// never gets a new one, but keeps the one it has while attached: that is
 /// a running workload. Diskful and tiebreaker entries never change. A node
 /// that cannot get a replica is reported and never holds back another.
@@ -759,8 +759,7 @@ pub fn converge_attachments(
         if evict.contains(node) || out.replicas.iter().any(|r| r.node == *node) {
             continue;
         }
-        let node_id = (0..=model::keys::NODE_ID_MAX)
-            .find(|id| !out.replicas.iter().any(|r| r.node_id == *id));
+        let node_id = alloc::next_node_id(a, &out);
         let port = used.lowest_free_port(node);
         let (node_id, port) = match (node_id, port) {
             (Some(id), Some(port)) => (id, port),
@@ -3056,13 +3055,13 @@ mod tests {
         let att = ["n4".to_owned(), "n5".to_owned(), "n6".to_owned()];
         let (next, failed) = converge_attachments(&a, &att, &[], &used);
         let next = next.unwrap();
-        // n9 is detached: gone, and its node id 3 goes to n4.
+        // n9 is detached: gone, and its node id 3 waits for a later write.
         let ids: Vec<(&str, u8)> = next
             .replicas
             .iter()
             .map(|r| (r.node.as_str(), r.node_id))
             .collect();
-        assert_eq!(ids, [("n1", 0), ("n2", 1), ("n3", 2), ("n4", 3), ("n6", 4)]);
+        assert_eq!(ids, [("n1", 0), ("n2", 1), ("n3", 2), ("n4", 4), ("n6", 5)]);
         assert_eq!(failed.len(), 1);
         assert_eq!(
             (failed[0].node.as_str(), failed[0].reason),
@@ -3074,7 +3073,8 @@ mod tests {
             failed[0].message
         );
 
-        // At the node id limit, a detached entry's id is what the add gets.
+        // At the node id limit, a detached entry's id goes to the add one
+        // write later.
         let mut crowded = two_with_tb();
         crowded.replicas = (0..=model::keys::NODE_ID_MAX)
             .map(|id| AssignedReplica {
@@ -3090,6 +3090,9 @@ mod tests {
             })
             .collect();
         let (next, failed) = converge_attachments(&crowded, &["n5".into()], &[], &Used::default());
+        assert_eq!(failed[0].reason, AttachmentErrorReason::TooManyPeers);
+        let (next, failed) =
+            converge_attachments(&next.unwrap(), &["n5".into()], &[], &Used::default());
         assert!(failed.is_empty(), "{failed:?}");
         let added = next.unwrap();
         assert!(
@@ -3110,7 +3113,7 @@ mod tests {
         );
         let (next, failed) =
             converge_attachments(&crowded, &["n5".into(), "n6".into()], &[], &Used::default());
-        assert_eq!(failed.len(), 1, "m8 detached frees one id: {failed:?}");
+        assert_eq!(failed.len(), 2, "m8's id waits a write: {failed:?}");
         assert!(next.unwrap().replicas.iter().all(|r| r.node != "m8"));
     }
 

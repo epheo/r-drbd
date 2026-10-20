@@ -1,5 +1,6 @@
 use super::*;
 use model::Resolve;
+use model::keys::NODE_ID_MAX;
 
 const G: u64 = 1 << 30;
 
@@ -391,19 +392,20 @@ fn departing_nodes_are_no_target() {
 #[test]
 fn node_ids_never_reuse_the_evicted_one() {
     let a = two();
-    assert_eq!(free_node_id(&a, 0), Some(3));
+    assert_eq!(next_node_id(&a, &a), Some(3));
     let mut gap = two();
     gap.replicas.retain(|r| r.node != "n1");
-    // Id 0 is free in the assignment but was n1's.
-    assert_eq!(free_node_id(&gap, 0), Some(3));
-    assert_eq!(free_node_id(&gap, 5), Some(0));
+    // Id 0 is free after the write but was n1's before it.
+    assert_eq!(next_node_id(&a, &gap), Some(3));
+    // A later write may take it.
+    assert_eq!(next_node_id(&gap, &gap), Some(0));
     let full = Assignment {
         replicas: (0..=NODE_ID_MAX)
             .map(|id| rep(&format!("x{id}"), id, 11000, Role::Diskless))
             .collect(),
         ..two()
     };
-    assert_eq!(free_node_id(&full, 0), None);
+    assert_eq!(next_node_id(&full, &gap), None);
 }
 
 #[test]

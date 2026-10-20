@@ -82,6 +82,20 @@ pub enum AllocError {
     Empty,
 }
 
+/// The lowest DRBD node id neither `before` nor `after` uses. An id freed
+/// by the write from `before` to `after` waits for a later write: peers
+/// still know the departing node under it until they forget it.
+pub fn next_node_id(before: &Assignment, after: &Assignment) -> Option<u8> {
+    let used = |id: u8| {
+        before
+            .replicas
+            .iter()
+            .chain(&after.replicas)
+            .any(|r| r.node_id == id)
+    };
+    (0..=NODE_ID_MAX).find(|id| !used(*id))
+}
+
 /// Builds the assignment for freshly placed replicas. One diskful replica
 /// is a plain LV: no DRBD fields at all. Otherwise node ids go 0.. in
 /// placement order, the tiebreaker last; each replica gets the lowest free
