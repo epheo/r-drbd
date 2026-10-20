@@ -7,7 +7,7 @@ const LVS: &str = r#"  {
               "lv": [
                   {"lv_name":"pvc-1", "lv_path":"/dev/vg1/pvc-1", "lv_size":"1073741824", "segtype":"thin", "pool_lv":"thin", "lv_active_locally":"1", "lv_device_open":"1", "zero":"1", "data_percent":"0.00", "chunk_size":"0"},
                   {"lv_name":"pvc-1+s", "lv_path":"/dev/vg1/pvc-1+s", "lv_size":"1073741824", "segtype":"thin", "pool_lv":"thin", "lv_active_locally":"0", "lv_device_open":"-1", "zero":"1", "data_percent":"", "chunk_size":"0"},
-                  {"lv_name":"thin", "lv_path":"", "lv_size":"268435456000", "segtype":"thin-pool", "pool_lv":"", "lv_active_locally":"1", "lv_device_open":"1", "zero":"0", "data_percent":"25.50", "chunk_size":"65536"}
+                  {"lv_name":"thin", "lv_path":"", "lv_size":"268435456000", "segtype":"thin-pool", "pool_lv":"", "lv_active_locally":"1", "lv_device_open":"1", "zero":"0", "data_percent":"25.50", "chunk_size":"65536", "metadata_percent":"81.20", "lv_health_status":"out_of_data"}
               ]
           }
       ]
@@ -52,6 +52,8 @@ fn lvs_rows() {
             zeroing: true,
             data_used: rows[0].data_used,
             chunk_bytes: 0,
+            metadata_used: None,
+            health: String::new(),
         }
     );
     let snap = &rows[1];
@@ -59,6 +61,10 @@ fn lvs_rows() {
     let pool = &rows[2];
     assert!(pool.thin_pool && !pool.zeroing && pool.pool.is_none());
     assert_eq!(pool.chunk_bytes, 65_536);
+    let meta = pool.metadata_used.unwrap();
+    assert!(meta.above(81) && !meta.above(82));
+    assert_eq!(meta.to_string(), "81.20");
+    assert_eq!(pool.health, "out_of_data");
     // 250 GiB at 25.50 percent used.
     assert_eq!(report::thin_free_bytes(pool), Some(199_984_414_720));
     assert_eq!(report::thin_free_bytes(snap), None);

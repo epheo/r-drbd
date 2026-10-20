@@ -576,7 +576,9 @@ impl Reconciler {
         };
         let generation = pool.metadata.generation;
         let (status, reason, message) = match &probed {
-            Ok(_) => (
+            // Capacity and chunk stay in the write: existing volumes go on.
+            Ok((_, Some(sick))) => (condition::FALSE, REASON_UNAVAILABLE, sick.clone()),
+            Ok((_, None)) => (
                 condition::TRUE,
                 REASON_READY,
                 built
@@ -586,9 +588,9 @@ impl Reconciler {
             ),
             Err((reason, e)) => (condition::FALSE, *reason, e.clone()),
         };
-        let capacity = probed.map_err(|(_, e)| e);
-        if let Err(e) = &capacity {
-            tracing::warn!(pool = pool.name_any(), error = %e, "pool unavailable");
+        let capacity = probed.map(|(c, _)| c).map_err(|(_, e)| e);
+        if status == condition::FALSE {
+            tracing::warn!(pool = pool.name_any(), error = %message, "pool unavailable");
         }
         let current = pool.status.clone().unwrap_or_default();
         let now = model::time::now();
@@ -650,7 +652,8 @@ impl Reconciler {
         writes
     }
 
-    /// Capacity of a usable thin pool. Pool zeroing is switched on first:
+    /// Capacity of a usable thin pool, with why it should take no new
+    /// volumes if it is unhealthy. Pool zeroing is switched on first:
     /// without it a new thin LV can expose blocks of deleted ones.
     /// The VG read here serves every volume of the pass.
     async fn probe_pool(
@@ -658,7 +661,7 @@ impl Reconciler {
         reads: &mut Reads,
         vg: &str,
         thin: &str,
-    ) -> Result<PoolCapacity, (&'static str, String)> {
+    ) -> Result<(PoolCapacity, Option<String>), (&'static str, String)> {
         let unavailable = |e: String| (REASON_UNAVAILABLE, e);
         let mut lvs = reads.lvs(&self.lvm, vg).await.map_err(unavailable)?;
         if lvs
@@ -672,7 +675,8 @@ impl Reconciler {
             lvs = reads.lvs(&self.lvm, vg).await.map_err(unavailable)?;
         }
         reads.vg(&self.lvm, vg).await.map_err(unavailable)?;
-        storage::pool_capacity(&lvs, thin).map_err(unavailable)
+        let capacity = storage::pool_capacity(&lvs, thin).map_err(unavailable)?;
+        Ok((capacity, storage::pool_health(&lvs, thin)))
     }
 
     fn my_replica<'a>(&self, vol: &'a Volume) -> Option<&'a AssignedReplica> {

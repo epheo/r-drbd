@@ -22,6 +22,10 @@ pub struct Lv {
     /// Used share of a thin pool's data; `None` while the pool is inactive.
     pub data_used: Option<Percent>,
     pub chunk_bytes: u64,
+    /// Used share of a thin pool's metadata; `None` while inactive.
+    pub metadata_used: Option<Percent>,
+    /// Empty when healthy, else LVM's word for it (failed, out_of_data, ...).
+    pub health: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +90,23 @@ impl Percent {
     fn whole(self) -> u64 {
         100 * 10u64.pow(self.scale)
     }
+
+    /// Strictly above `percent`.
+    pub fn above(self, percent: u64) -> bool {
+        self.digits > percent.saturating_mul(10u64.pow(self.scale))
+    }
+}
+
+impl std::fmt::Display for Percent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let unit = 10u64.pow(self.scale);
+        let (int, frac) = (self.digits / unit, self.digits % unit);
+        if self.scale == 0 {
+            write!(f, "{int}")
+        } else {
+            write!(f, "{int}.{frac:0width$}", width = self.scale as usize)
+        }
+    }
 }
 
 /// Free bytes of a thin pool: its size times the unused share of its data,
@@ -148,6 +169,10 @@ struct RawLv {
     zero: String,
     data_percent: String,
     chunk_size: String,
+    #[serde(default)]
+    metadata_percent: String,
+    #[serde(default)]
+    lv_health_status: String,
 }
 
 #[derive(Deserialize)]
@@ -253,13 +278,14 @@ pub fn parse_lvs(json: &str) -> Result<Vec<Lv>, ReportError> {
                 report: R,
                 object: &r.lv_name,
             };
-            let data_used = match r.data_percent.as_str() {
-                "" => None,
-                v => Some(
-                    Percent::parse(v)
-                        .ok_or_else(|| c.err("data_percent", v, "not a percentage"))?,
-                ),
+            let percent = |field, v: &str| match v {
+                "" => Ok(None),
+                v => Percent::parse(v)
+                    .map(Some)
+                    .ok_or_else(|| c.err(field, v, "not a percentage")),
             };
+            let data_used = percent("data_percent", &r.data_percent)?;
+            let metadata_used = percent("metadata_percent", &r.metadata_percent)?;
             Ok(Lv {
                 size_bytes: c.bytes("lv_size", &r.lv_size)?,
                 chunk_bytes: c.bytes("chunk_size", &r.chunk_size)?,
@@ -267,6 +293,8 @@ pub fn parse_lvs(json: &str) -> Result<Vec<Lv>, ReportError> {
                 open: c.flag("lv_device_open", &r.lv_device_open)?,
                 zeroing: c.flag("zero", &r.zero)?,
                 data_used,
+                metadata_used,
+                health: r.lv_health_status,
                 thin_pool: r.segtype == "thin-pool",
                 pool: Some(r.pool_lv).filter(|p| !p.is_empty()),
                 path: r.lv_path,

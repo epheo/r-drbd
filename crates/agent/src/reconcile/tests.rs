@@ -299,6 +299,49 @@ async fn pool_unchanged_writes_nothing() {
     x.assert_done();
 }
 
+/// A thin pool LVM flags, or with its metadata nearly full, takes no new
+/// volumes; its capacity and chunk stay in the write.
+#[tokio::test]
+async fn unhealthy_thin_pool_is_unavailable_with_its_capacity() {
+    for (extra, why) in [
+        (
+            r#""metadata_percent":"85.00""#,
+            "metadata 85.00 percent used, over 80",
+        ),
+        (r#""lv_health_status":"out_of_data""#, "health: out_of_data"),
+    ] {
+        let x = Arc::new(ScriptedExec::new());
+        let row = pool_row().replace(
+            r#""chunk_size":"65536""#,
+            &format!(r#""chunk_size":"65536", {extra}"#),
+        );
+        x.expect(lvm::cmd::lvs(VG), ok(&json("lv", &[row])));
+        expect_vgs(&x);
+        let w = Reconciler::new(NODE, x.clone())
+            .pass(&[pool()], &[], &[])
+            .await;
+        x.assert_done();
+        let body = w[0].body();
+        let cond = &body["status"]["conditions"][0];
+        assert_eq!(cond["status"], "False", "{why}");
+        assert_eq!(cond["reason"], REASON_UNAVAILABLE);
+        assert!(cond["message"].as_str().unwrap().ends_with(why), "{cond}");
+        assert_eq!(body["status"]["totalBytes"], POOL_BYTES);
+        assert_eq!(body["status"]["chunkBytes"], 65536);
+    }
+    let x = Arc::new(ScriptedExec::new());
+    let row = pool_row().replace(
+        r#""chunk_size":"65536""#,
+        r#""chunk_size":"65536", "metadata_percent":"80.00""#,
+    );
+    x.expect(lvm::cmd::lvs(VG), ok(&json("lv", &[row])));
+    expect_vgs(&x);
+    let w = Reconciler::new(NODE, x.clone())
+        .pass(&[pool()], &[], &[])
+        .await;
+    assert_eq!(w[0].body()["status"]["conditions"][0]["status"], "True");
+}
+
 /// A failed probe keeps the chunk the Pool was created with.
 #[tokio::test]
 async fn failed_probe_keeps_chunk_bytes() {
