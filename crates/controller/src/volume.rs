@@ -1844,11 +1844,8 @@ pub fn snapshot_holders(snap: &Snapshot) -> Vec<(String, String)> {
     holders
 }
 
-/// The Snapshot a restore reads and its size, once Ready.
-fn ready_snapshot<'a>(
-    snap: Option<&'a Snapshot>,
-    wanted: &str,
-) -> Result<(&'a Snapshot, u64), Placement> {
+/// The Snapshot a restore reads, once Ready.
+fn ready_snapshot<'a>(snap: Option<&'a Snapshot>, wanted: &str) -> Result<&'a Snapshot, Placement> {
     let Some(snap) = snap else {
         return Err(Placement::Wait(Cond::new(
             FALSE,
@@ -1858,7 +1855,7 @@ fn ready_snapshot<'a>(
     };
     let status = snap.status.clone().unwrap_or_default();
     match status.phase {
-        SnapshotPhase::Ready => Ok((snap, status.size_bytes.unwrap_or(0))),
+        SnapshotPhase::Ready => Ok(snap),
         // Unknown: written by another version; no round ever ends it.
         SnapshotPhase::Failed | SnapshotPhase::Unknown => Err(Placement::Fail(Cond::new(
             FALSE,
@@ -1878,9 +1875,7 @@ fn ready_snapshot<'a>(
 
 /// The restore's diskful replicas: the snapshot's holders, one for a local
 /// volume (the first usable one on the pinned node, if any), all of them
-/// for a replicated one. Each must be usable, and its pool must promise the
-/// growth beyond the snapshot: the shared blocks are already there, the
-/// growth is new data.
+/// for a replicated one. Each must be usable and fit the volume's full size.
 /// A holder whose Node object is gone took its copy with it.
 fn restore_holders(
     v: &Volume,
@@ -1889,9 +1884,8 @@ fn restore_holders(
     views: &[placer::PoolView],
     exists: &dyn Fn(&str) -> bool,
 ) -> Result<Vec<placer::Chosen>, Placement> {
-    let (snap, snap_size) = ready_snapshot(snap, wanted)?;
+    let snap = ready_snapshot(snap, wanted)?;
     let mut holders = snapshot_holders(snap);
-    holders.retain(|(n, _)| exists(n));
     holders.retain(|(n, _)| exists(n));
     if holders.is_empty() {
         return Err(Placement::Fail(Cond::new(
@@ -1948,16 +1942,17 @@ fn restore_holders(
             ),
         )));
     }
-    let growth = v.spec.size_bytes.saturating_sub(snap_size);
+    // Every replica at full size, like a new volume: only the initial
+    // node keeps its copy's shared blocks, the others fill in full.
     for h in &holders {
-        let promise = view(h).map_or(0, placer::promise);
-        if growth > promise {
+        if !view(h).is_some_and(|p| placer::fits(p, v.spec.size_bytes)) {
+            let room = view(h).map_or(0, placer::room);
             return Err(Placement::Wait(Cond::new(
                 FALSE,
                 reason::INSUFFICIENT,
                 format!(
-                    "pool {}/{}: growth of {growth} bytes beyond snapshot {wanted} exceeds the {promise} bytes its capacity policy still allows",
-                    h.0, h.1
+                    "pool {}/{}: room {room} bytes, a replica of {} bytes needed",
+                    h.0, h.1, v.spec.size_bytes
                 ),
             )));
         }
@@ -3283,8 +3278,8 @@ mod tests {
             live: true,
             available: true,
             total_bytes: 100 * G,
-            free_bytes: 0,
-            committed_bytes: 90 * G,
+            free_bytes: 100 * G,
+            committed_bytes: 80 * G,
             overcommit_percent: 100,
             reserve_percent: 0,
         };
@@ -3305,7 +3300,6 @@ mod tests {
         let got = |views: &[placer::PoolView]| {
             holders_of(restore_holders(&v, Some(&snap), "s", views, &|_| true))
         };
-        // Full pools: a restore at the snapshot size grows nothing.
         assert_eq!(got(&views), Ok(vec!["n1".into(), "n2".into()]));
         views[0].live = false;
         let why = got(&views).unwrap_err();
@@ -3332,8 +3326,9 @@ mod tests {
     }
 
     #[test]
-    fn restore_growth_is_charged_against_each_holder() {
-        // Each pool promises 10 GiB more; the snapshot holds 10 GiB.
+    fn restore_is_charged_at_full_size_on_each_holder() {
+        // Each pool has 20 GiB of room; the snapshot holds 10 GiB, which
+        // buys nothing: every replica but one fills in full.
         let (v, snap, mut views) = restore_case(2, 20 * G);
         let got = |views: &[placer::PoolView]| {
             holders_of(restore_holders(&v, Some(&snap), "s", views, &|_| true))
@@ -3341,7 +3336,35 @@ mod tests {
         assert!(got(&views).is_ok());
         views[1].committed_bytes += 1;
         let why = got(&views).unwrap_err();
-        assert!(why.starts_with("pool n2/p2: growth of"), "{why}");
+        assert!(why.starts_with("pool n2/p2: room"), "{why}");
+        // A restore at the snapshot's size needs its full size too.
+        let (v, snap, mut views) = restore_case(1, 10 * G);
+        views[0].committed_bytes = 95 * G;
+        views.truncate(1);
+        let why = holders_of(restore_holders(&v, Some(&snap), "s", &views, &|_| true)).unwrap_err();
+        assert!(
+            why.contains("a replica of 10737418240 bytes needed"),
+            "{why}"
+        );
+        // Placed, it counts at full size like any volume.
+        let mut placed = v.clone();
+        placed.spec.assignment = Some(Assignment {
+            replicas: vec![AssignedReplica {
+                node: "n1".into(),
+                pool: Some("p1".into()),
+                node_id: 0,
+                port: None,
+                role: Role::Diskful,
+            }],
+            minor: None,
+            secret: None,
+            initial_up_to_date_node: None,
+        });
+        let usage = crate::pool::usage(&[std::sync::Arc::new(placed)], &Memory::default());
+        assert_eq!(
+            usage[&("n1".to_owned(), "p1".to_owned())],
+            [("r".to_owned(), 10 * G)]
+        );
     }
 
     #[test]

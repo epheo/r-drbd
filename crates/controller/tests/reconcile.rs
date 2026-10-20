@@ -447,6 +447,7 @@ async fn snapshot_lv_name_too_long_fails_before_any_round() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn snapshot_local_and_restore() {
     let assets = require_envtest!();
     let (_env, client, _ctl) = setup(&assets, |_| {}).await;
@@ -479,17 +480,30 @@ async fn snapshot_local_and_restore() {
     let s = snapshot_where(&client, "snap1", |s| snap_phase(s) == SnapshotPhase::Ready).await;
     assert!(s.status.unwrap().created_at.is_some());
 
-    // Restore lands where the snapshot lives, not on the emptier n2, even
-    // with p1 too full for a new volume: it holds the data already.
+    // A restore is charged at full size: p1 too full for a new volume
+    // holds it Pending, never on the emptier n2 that lacks the snapshot.
     support::pool_capacity(&client, "p1", "n1", 100 * GIB, 0).await;
     let mut spec = volume_spec(GIB, 1, "fast");
     spec.source = Some(VolumeSource {
         snapshot: "snap1".into(),
     });
     create_volume(&client, "restored", spec).await;
+    let r = volume_where(&client, "restored", |v| {
+        ready_reason(v).as_deref() == Some("Insufficient")
+    })
+    .await;
+    assert!(r.spec.assignment.is_none());
+    support::pool_capacity(&client, "p1", "n1", 100 * GIB, 50 * GIB).await;
     let r = volume_where(&client, "restored", |v| v.spec.assignment.is_some()).await;
     let rep = &r.spec.assignment.unwrap().replicas[0];
     assert_eq!((rep.node.as_str(), rep.pool.as_deref()), ("n1", Some("p1")));
+    // Counted at full size, like the source.
+    support::eventually(Duration::from_secs(20), || async {
+        get_pool(&client, "p1")
+            .await
+            .filter(|p| p.status.as_ref().and_then(|s| s.committed_bytes) == Some(2 * GIB))
+    })
+    .await;
     // No seeded marker: the agent's adopt path gives the restored XFS a new
     // UUID and writes the marker itself.
     tokio::time::sleep(Duration::from_secs(1)).await;

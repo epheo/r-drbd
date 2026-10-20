@@ -238,9 +238,8 @@ Set `overcommitPercent` above 100 only if you watch `freeBytes` and can grow the
 Snapshots still use space beyond `committed`; keep watching `freeBytes` when you take them.
 Lowering the policy below what is committed leaves existing volumes alone; the Pool just takes no new ones.
 
-Restores: a replica that restores from a snapshot copy in this Pool is never refused for capacity.
-It already holds the data and can go nowhere else; it still counts in `committed` afterwards.
-Any other new replica, empty and filled by a full sync, is gated like a new volume.
+Restores: every replica of a restore is gated and counted at the volume's full size, like a new volume.
+Only one replica keeps the blocks it shares with its snapshot copy; the others fill in full.
 
 Resizes: only the growth is checked, against `promise` of every Pool holding a diskful replica.
 A resize writes no data, so `free` does not matter.

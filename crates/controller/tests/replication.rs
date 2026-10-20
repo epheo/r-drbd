@@ -712,14 +712,21 @@ async fn replicated_restore_from_acks() {
     })
     .await;
 
-    // Both holders too full for a new volume: each holds the data already.
-    support::pool_capacity(&client, "p1", "n1", 100 * GIB, 0).await;
+    // One holder too full for a new volume: every replica is charged at
+    // full size, so the restore waits.
     support::pool_capacity(&client, "p2", "n2", 100 * GIB, 0).await;
     let mut spec = volume_spec(GIB, 2, "fast");
     spec.source = Some(VolumeSource {
         snapshot: "snap".into(),
     });
     create_volume(&client, "restored", spec.clone()).await;
+    let r = volume_where(&client, "restored", |v| {
+        cond(v, "Ready").is_some_and(|c| c.reason == "Insufficient")
+    })
+    .await;
+    assert!(r.spec.assignment.is_none());
+    assert!(cond(&r, "Ready").unwrap().message.contains("pool n2/p2"));
+    support::pool_capacity(&client, "p2", "n2", 100 * GIB, 100 * GIB).await;
     let r = volume_where(&client, "restored", |v| phase_of(v) == VolumePhase::Ready).await;
     let a = r.spec.assignment.as_ref().unwrap();
     let got: Vec<_> = a

@@ -97,7 +97,7 @@ Rules:
   The first replica must hold its copy: without it the restore does not start.
 - The requested size may be larger than the snapshot; it may not be smaller.
 - Pins that point away from the snapshot's nodes or Pools fail the restore with reason `RestoreNodeConflict`.
-- Placement charges only the growth beyond the snapshot: each holding Pool's capacity policy must still allow it, or the restore stays Pending, reason `Insufficient`.
+- Placement charges every replica at the volume's full size: a holding Pool without that room keeps the restore Pending, reason `Insufficient`.
   The claim must also fit the scheduler's capacity check (see [Scheduling](volumes.md#scheduling)).
 
 The restored volume keeps the source's file system; it is never formatted again.

@@ -75,7 +75,7 @@ A node without such a Pool has none, so it is not chosen for a local claim.
 For `replicas` 2 or 3, every node sees the same number, the largest volume placement can spread over that many nodes, since any node can attach it.
 Only local claims are kept off nodes without a Pool.
 A claim no Pool can hold stays Pending; the pod's events carry the scheduler's message, `node(s) did not have enough free storage`.
-A restore claim must fit the current capacity too: the scheduler checks every claim, while placement charges a restore only for its growth beyond the snapshot, so a restore on a nearly full Pool can stay Pending although placement would accept it.
+A restore claim must fit the current capacity too: the scheduler checks every claim, and placement charges every replica of a restore at its full size in the Pools that hold the snapshot.
 A pinned local claim (`r-drbd.io/pool`, `r-drbd.io/node`) lands on the pinned node whatever capacity says; if the scheduler picks another node, the PV node affinity then sends the pod to the pinned node.
 If capacity changes between two refreshes, CreateVolume refuses the node and the scheduler picks again.
 
