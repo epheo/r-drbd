@@ -84,13 +84,13 @@ A snapshot over the limit ends Failed before any IO is suspended.
 | Field | Notes |
 |---|---|
 | `spec.volume` | Source Volume; immutable |
-| `status.phase` | Pending, Suspending, Suspended, Taking, Taken, Resuming, Ready, Failed, Deleting |
+| `status.phase` | Pending, Suspending, Taking, Ready, Failed, Deleting |
 | `status.sizeBytes` | Volume size at snapshot time |
 | `status.fileSystem` | Inherited by restores |
 | `status.createdAt` | When the snapshot was taken |
 | `status.phaseSince` | When the current phase began |
 | `status.acks[]` | Per node: `node`, `phase`, `pool`, `ok`, `error` |
-| `status.lastError` | Why it failed |
+| `status.lastError` | Why it waits in Pending, or why it failed |
 | `status.conditions` | `Ready` |
 | `status.observedGeneration` | Spec generation the controller last wrote status for |
 

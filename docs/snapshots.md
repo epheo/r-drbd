@@ -27,24 +27,41 @@ Install the external-snapshotter CRDs and snapshot controller first.
 
 The CSI driver creates a Snapshot object; `kubectl get snapshots` shows its volume, phase and size.
 
-A snapshot waits until the volume is Ready with every diskful replica UpToDate.
-Then, for a replicated volume:
+A snapshot of a replicated volume waits in Pending, saying why in `lastError`, until:
 
-1. Every replica suspends IO.
-2. Every diskful node creates a thin snapshot of its LV.
-3. Every replica resumes IO.
+- the volume is Ready, at its requested size, with no resize in flight;
+- every replica's agent is reachable;
+- every diskful replica is UpToDate, and every diskful or attached replica is connected to every diskful replica;
+- every diskful replica applied the current spec;
+- no other snapshot of the same volume is suspending or taking.
+- at most one replica is Primary: no snapshot runs during a two-Primary live migration.
 
-All copies are taken at the same point in the write stream, so the snapshot is crash consistent on every node.
-IO is frozen for the duration of step 2.
-A local volume skips the suspend and resume steps.
+A replica whose agent is down holds every snapshot of its volume; evict or detach it to take one.
 
-Bounds:
+Then:
 
-- Suspending must finish within 30 s.
-- Taking must finish within 2 minutes.
-- Past a bound, IO is resumed and the snapshot ends Failed with the reason.
+1. Every replica suspends IO, diskless and tiebreaker included, within 30 s; the Primary acks once none of its writes is still on its way to a disk or a peer.
+2. Every diskful node creates a thin snapshot of its LV, and every other replica confirms its IO is still suspended, within 2 minutes.
+3. The snapshot is Ready, or Failed with the reason; every replica resumes IO on its own when it sees the round end.
+
+Each node's copy is crash-consistent.
+The copies of one snapshot can still differ: a page rewritten while it is written out can reach each node's disk in another version.
+Snapshots are crash-consistent: no file system is frozen or flushed first, so data still in a page cache is not in the snapshot, as after a power loss.
+For application consistency, quiesce the application (for example with a pre-snapshot hook) before taking the VolumeSnapshot.
+A local volume skips the suspend: it waits only for the volume to be Ready and for no other snapshot of it to run.
+
+Each node keeps its own deadlines, on its own clock:
+
+- it takes its copy only within 2 minutes of its own suspend, and never after an agent restart or a reboot;
+- it resumes IO 4 minutes after its own suspend, even when the controller or the API server is gone; the snapshot then fails unless every copy was already taken.
+
+So IO stays frozen about 4 minutes at most.
+A node that is no longer suspended when it should be (a reboot, a resume on its deadline) fails the snapshot.
+A replica attached during the round never suspended, so it fails the snapshot too.
+While a round runs, volume expansion is refused (the call is retried) and no replica grows.
 
 A failed take is a failure: the Snapshot never turns Ready without a backing LV on every node.
+A snapshot of a volume that is being deleted, or that stays missing for 30 s, fails.
 
 ## Restoring
 
@@ -65,25 +82,22 @@ Create a PVC with the snapshot as its data source:
         requests:
           storage: 1Gi
 
-The new volume is a writable thin snapshot of the snapshot LV, so a restore is instant and shares blocks.
 It always lands in the Pools that hold the snapshot.
 
 Rules:
 
-- A local restore (`replicas: 1`) uses one of the nodes holding the snapshot, preferring one whose agent is alive.
+- A local restore (`replicas: 1`) uses one of the nodes holding the snapshot, preferring one whose agent is alive; the new volume is a writable thin snapshot of the snapshot LV, so it is instant and shares blocks.
 - A replicated restore needs `replicas` equal to the number of nodes holding the snapshot.
-  Every node holding the snapshot restores it from its own copy, so the restore is instant, shares blocks on every node and needs no sync.
-  The copies are identical because the snapshot was taken with IO suspended on every replica.
+  The first node restores its copy, a thin snapshot; every other replica starts empty and is copied in full from it.
+  The volume is Ready, and its claim usable, once that sync ends.
 - A holder whose node is down, whose agent is stale or whose Pool is not Available keeps the restore Pending, reason `Insufficient`, naming it.
-- A replicated restore larger than its snapshot starts at the snapshot's size with identical copies, then grows online.
-  The new area syncs between the replicas; zero blocks travel as discards, so it costs little network and no thin pool space.
-  During that sync the other replica is Inconsistent on the new area only, and the volume is not Ready yet.
+- A replicated restore larger than its snapshot starts at the snapshot's size, then grows online; the new area syncs, zero blocks as discards.
   The claim is usable once the volume is Ready at the requested size.
-- A replica that cannot restore from its own copy, for any reason (the Snapshot, its snapshot LV or the lvcreate), starts empty and is copied in full from the first one; a full thin pool stays an error.
+- A full thin pool for an empty replica stays an error.
   The first replica must hold its copy: without it the restore does not start.
 - The requested size may be larger than the snapshot; it may not be smaller.
 - Pins that point away from the snapshot's nodes or Pools fail the restore with reason `RestoreNodeConflict`.
-- Placement charges only the growth beyond the snapshot: each holding Pool's capacity policy must still allow it, or the restore stays Pending, reason `Insufficient`.
+- Placement charges every replica at the volume's full size: a holding Pool without that room keeps the restore Pending, reason `Insufficient`.
   The claim must also fit the scheduler's capacity check (see [Scheduling](volumes.md#scheduling)).
 
 The restored volume keeps the source's file system; it is never formatted again.

@@ -363,8 +363,33 @@ fn source_snapshot() -> Snapshot {
     let mut s = snapshot(SnapshotPhase::Ready);
     s.spec.volume = "pvc-0".into();
     s.metadata.uid = Some(SNAP_UID.into());
-    s.status.as_mut().unwrap().size_bytes = Some(GIB);
+    let st = s.status.as_mut().unwrap();
+    st.size_bytes = Some(GIB);
+    st.acks = ["n1", "n2"]
+        .map(|n| SnapshotAck {
+            node: n.into(),
+            phase: SnapshotPhase::Taking,
+            pool: Some(format!("pool-{n}")),
+            ok: true,
+            error: None,
+        })
+        .to_vec();
     s
+}
+
+/// The source as an older version made it Ready: acks in a removed phase.
+fn old_source_snapshot() -> Snapshot {
+    let mut s = source_snapshot();
+    for a in &mut s.status.as_mut().unwrap().acks {
+        a.phase = SnapshotPhase::Unknown;
+    }
+    s
+}
+
+/// What digests will prove one day. The tests of the proof that a
+/// restore without a sync rests on assume it; no snapshot is proven today.
+fn proven(_: &Snapshot) -> bool {
+    true
 }
 
 /// A peer's entry; `restored` sets restoredFrom to the source.
@@ -478,6 +503,15 @@ fn expect_md_as(x: &ScriptedExec, own: &str, del: &[&str]) {
 
 fn expect_md(x: &ScriptedExec, del: &[&str]) {
     expect_md_as(x, OWN, del);
+}
+
+fn times(x: &ScriptedExec, word: &str) -> usize {
+    x.seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|a| a.iter().any(|w| w == word))
+        .count()
 }
 
 fn seen(x: &ScriptedExec, word: &str) -> bool {
@@ -632,6 +666,7 @@ async fn restore_every_holder_from_its_copy() {
     // tag survives the metadata tag swap.
     for (node, own) in [("n1", OWN), ("n2", "r-drbd.md.uid-1.1")] {
         let mut r = Rig::on(node, &[], FakeHost::default());
+        r.rec.drbd.copies_identical = proven;
         let x = r.x.clone();
         reads(&x, &[source_lv()]);
         expect_restore(&x);
@@ -657,6 +692,7 @@ async fn restore_every_holder_from_its_copy() {
     }
     // The tiebreaker reads no LVM and creates nothing.
     let mut r = Rig::on("n3", &[], FakeHost::default());
+    r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     r.expect_check();
     up_plan(&x);
@@ -669,6 +705,7 @@ async fn restore_every_holder_from_its_copy() {
 #[tokio::test]
 async fn restore_starts_without_sync_when_every_peer_restored() {
     let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     reads(&x, &[source_lv(), lv(LV_KIB)]);
     r.expect_check();
@@ -696,6 +733,7 @@ async fn restore_falls_back_to_a_full_sync_when_a_peer_did_not_restore() {
     // n2 is connected and Inconsistent, but its entry has no restoredFrom:
     // it may be empty, so the bitmap is never cleared.
     let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    r.rec.drbd.copies_identical = proven;
     r.rec.drbd.init_wait = Duration::from_millis(100);
     let x = r.x.clone();
     let vol = with_entries(restored(volume(GIB)), vec![peer_entry("n2", false)]);
@@ -732,6 +770,7 @@ async fn restore_waits_for_its_peers_before_any_uuid_step() {
     let mut lines = up("Inconsistent", "DUnknown");
     lines[1] = "exists connection name:pvc-1 peer-node-id:1 conn-name:n2 connection:Connecting role:Unknown".into();
     let mut r = Rig::new(&lines, up_host());
+    r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     reads(&x, &[source_lv(), lv(LV_KIB)]);
     r.expect_check();
@@ -766,6 +805,7 @@ fn restored_peer(kib: u64) -> ReplicaStatus {
 async fn larger_restore_starts_at_the_snapshot_size_then_grows() {
     let resize_synced: Vec<String> = ["drbdadm", "resize", "pvc-1/0"].map(str::to_owned).to_vec();
     let mut r = Rig::new(&[], FakeHost::default());
+    r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     let vol = |peer_kib| with_entries(restored(volume(2 * GIB)), vec![restored_peer(peer_kib)]);
     // At the snapshot's size: no size on the lvcreate, no lvextend.
@@ -1005,6 +1045,7 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
     let empty = || lvm::cmd::create_thin(VG, THIN, "pvc-1", LV_KIB * 1024, &[NEW]);
     // No Snapshot object.
     let mut r = Rig::on("n2", &[], FakeHost::default());
+    r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     reads(&x, &[source_lv()]);
     expect_create(&x, &[source_lv()]);
@@ -1021,6 +1062,7 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
         error: None,
     }];
     let mut r = Rig::on("n2", &[], FakeHost::default());
+    r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     reads(&x, &[source_lv()]);
     expect_create(&x, &[source_lv()]);
@@ -1029,6 +1071,7 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
 
     // The restore lvcreate fails.
     let mut r = Rig::on("n2", &[], FakeHost::default());
+    r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     reads(&x, &[source_lv()]);
     x.expect(
@@ -1042,6 +1085,7 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
 
     // A full pool fails the empty LV too: an error entry.
     let mut r = Rig::on("n2", &[], FakeHost::default());
+    r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     reads(&x, &[]);
     x.expect(empty(), code(5, "", "insufficient free space"));
@@ -1050,6 +1094,42 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
     let err = e.last_error.unwrap();
     assert!(err.contains("the empty LV failed too"), "{err}");
     assert!(!seen(&x, "drbdadm"));
+}
+
+/// No holder copies are proven identical yet, whichever version took
+/// them: one copy, the initial node's, and the other replicas sync in full
+/// from it, even when they claim a copy. Never a start without a sync.
+#[tokio::test]
+async fn every_replicated_restore_syncs_from_one_copy() {
+    for snap in [source_snapshot(), old_source_snapshot()] {
+        let mut r = Rig::on("n2", &[], FakeHost::default());
+        let x = r.x.clone();
+        reads(&x, &[source_lv()]);
+        expect_create(&x, &[source_lv()]);
+        let e = n2_restore_pass(&mut r, std::slice::from_ref(&snap)).await;
+        assert_eq!((e.last_error, e.restored_from), (None, None));
+        let used_copy = x
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains(&"pvc-0+snap-1".to_owned()));
+        assert!(!used_copy, "the peer never restores its copy");
+
+        // The initial node: the source at once, no proof awaited.
+        let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+        let x = r.x.clone();
+        reads(&x, &[source_lv(), lv(LV_KIB)]);
+        r.expect_check();
+        r.expect_sweep();
+        expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+        dry(&x, "");
+        x.expect(argv::start_as_source("pvc-1"), ok(""));
+        let vol = with_entries(restored(volume(GIB)), vec![peer_entry("n2", true)]);
+        r.pass(&[vol], &[snap]).await;
+        assert!(!seen(&x, "--clear-bitmap"));
+        assert_eq!(r.live.reads.load(Ordering::Relaxed), 0, "no proof read");
+    }
 }
 
 #[tokio::test]
@@ -1237,6 +1317,7 @@ async fn initial_node_clears_the_bitmap_only_on_the_live_proof() {
     let cached = with_entries(restored(volume(GIB)), vec![peer_entry("n2", true)]);
     // The cache shows n2's proof, the API server no longer does.
     let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    r.rec.drbd.copies_identical = proven;
     r.rec.drbd.init_wait = Duration::ZERO;
     let x = r.x.clone();
     *r.live.scripted.lock().unwrap() = Some(Ok(with_entries(
@@ -1255,6 +1336,7 @@ async fn initial_node_clears_the_bitmap_only_on_the_live_proof() {
 
     // A failed live read: no uuid step of either kind.
     let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    r.rec.drbd.copies_identical = proven;
     r.rec.drbd.init_wait = Duration::ZERO;
     let x = r.x.clone();
     *r.live.scripted.lock().unwrap() = Some(Err("unreachable".into()));
@@ -1270,6 +1352,7 @@ async fn initial_node_clears_the_bitmap_only_on_the_live_proof() {
 
     // Live and cache agree on the proof: the bitmap is cleared.
     let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     reads(&x, &[source_lv(), lv(LV_KIB)]);
     r.expect_check();
@@ -2024,74 +2107,278 @@ async fn only_the_lowest_node_id_resizes() {
     assert!(!seen(&x, "resize"));
 }
 
-#[tokio::test]
-async fn snapshot_rounds() {
-    let ack = |phase, ok| SnapshotAck {
+fn round_ack(phase: SnapshotPhase, ok: bool) -> SnapshotAck {
+    SnapshotAck {
         node: NODE.into(),
         phase,
         pool: Some(POOL.into()),
         ok,
         error: None,
-    };
+    }
+}
+
+/// The Snapshot in `phase` with this node's last ack.
+fn acked(phase: SnapshotPhase, mine: SnapshotAck) -> Snapshot {
+    let mut s = snapshot(phase);
+    s.status.as_mut().unwrap().acks = vec![mine];
+    s
+}
+
+const SUSPENDED: &str = "change resource name:pvc-1 role:Secondary suspended:user";
+const RESUMED: &str = "change resource name:pvc-1 role:Secondary suspended:no";
+
+/// A pass in Suspending that suspends IO; the tracker then shows it.
+async fn suspend_pass(r: &mut Rig) {
+    reads(&r.x, &[lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    dry(&r.x, "");
+    r.x.expect(argv::suspend_io(50000), ok(""));
+    let w = r
+        .pass(&[volume(GIB)], &[snapshot(SnapshotPhase::Suspending)])
+        .await;
+    assert_eq!(acks(&w), vec![round_ack(SnapshotPhase::Suspending, true)]);
+    r.feed(&[SUSPENDED]);
+}
+
+fn expect_take(x: &ScriptedExec) {
+    expect_lv_tags(x, &[("pvc-1", &[OWN])]);
+    x.expect(lvm::cmd::snapshot(VG, "pvc-1", "pvc-1+snap-1"), ok(""));
+    expect_change(x, "pvc-1+snap-1", &[], &[OWN]);
+    expect_lvs(
+        x,
+        &[lv(LV_KIB), lv_row("pvc-1+snap-1", LV_KIB, St::Inactive)],
+    );
+}
+
+#[tokio::test]
+async fn snapshot_rounds() {
+    let mut r = Rig::new(&healthy(), up_host());
+    suspend_pass(&mut r).await;
+
+    // Acked: no second suspend, no adjust under the frozen IO, no write.
+    reads_again(&r.x, &[lv(LV_KIB)]);
+    let sus = round_ack(SnapshotPhase::Suspending, true);
+    let w = r
+        .pass(
+            &[volume(GIB)],
+            &[acked(SnapshotPhase::Suspending, sus.clone())],
+        )
+        .await;
+    assert_eq!(acks(&w), vec![]);
+    assert_eq!(times(&r.x, "--dry-run"), 1, "only before the suspend");
+
+    reads_again(&r.x, &[lv(LV_KIB)]);
+    expect_take(&r.x);
+    let w = r
+        .pass(&[volume(GIB)], &[acked(SnapshotPhase::Taking, sus)])
+        .await;
+    assert_eq!(acks(&w), vec![round_ack(SnapshotPhase::Taking, true)]);
+
+    // Over: resumed with no word from the controller but the phase.
+    reads_again(&r.x, &[lv(LV_KIB)]);
+    r.x.expect(argv::resume_io("pvc-1"), ok(""));
+    dry(&r.x, "");
+    let done = round_ack(SnapshotPhase::Taking, true);
+    let w = r
+        .pass(&[volume(GIB)], &[acked(SnapshotPhase::Ready, done)])
+        .await;
+    assert_eq!(acks(&w), vec![]);
+    assert_eq!(r.rec.next_deadline(), None);
+
+    // A suspend no round accounts for (snapshot gone mid-round) is resumed.
     let mut sus = healthy();
     sus[0] = "exists resource name:pvc-1 role:Secondary suspended:user".into();
+    let mut r = Rig::new(&sus, up_host());
+    reads(&r.x, &[lv(LV_KIB)]);
+    r.x.expect(argv::resume_io("pvc-1"), ok(""));
+    r.expect_check();
+    r.expect_sweep();
+    dry(&r.x, "");
+    r.pass(&[volume(GIB)], &[]).await;
+}
 
+#[tokio::test(start_paused = true)]
+async fn take_refused_past_the_window() {
+    let mut r = Rig::new(&healthy(), up_host());
+    suspend_pass(&mut r).await;
+    tokio::time::advance(model::snapshot::TAKE_WINDOW).await;
+    reads_again(&r.x, &[lv(LV_KIB)]);
+    let sus = round_ack(SnapshotPhase::Suspending, true);
+    let w = r
+        .pass(&[volume(GIB)], &[acked(SnapshotPhase::Taking, sus)])
+        .await;
+    let a = &acks(&w)[0];
+    assert_eq!(
+        a.error.as_deref(),
+        Some("IO not suspended by this agent within the last 120 s")
+    );
+    assert!(!seen(&r.x, "--snapshot"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn resume_on_the_local_deadline_without_a_controller() {
+    let mut r = Rig::new(&healthy(), up_host());
+    let start = tokio::time::Instant::now();
+    suspend_pass(&mut r).await;
+    let deadline = start + model::snapshot::RESUME_AFTER;
+    assert!(r.rec.next_deadline().is_some_and(|d| d >= deadline));
+    let sus = round_ack(SnapshotPhase::Suspending, true);
+    let stuck = [acked(SnapshotPhase::Suspending, sus)];
+
+    tokio::time::advance(model::snapshot::RESUME_AFTER.saturating_sub(Duration::from_secs(1)))
+        .await;
+    reads_again(&r.x, &[lv(LV_KIB)]);
+    assert_eq!(acks(&r.pass(&[volume(GIB)], &stuck).await), vec![]);
+    assert!(!seen(&r.x, "resume-io"));
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    reads_again(&r.x, &[lv(LV_KIB)]);
+    r.x.expect(argv::resume_io("pvc-1"), ok(""));
+    let w = r.pass(&[volume(GIB)], &stuck).await;
+    let a = &acks(&w)[0];
+    assert_eq!((a.phase, a.ok), (SnapshotPhase::Suspending, false));
+    assert_eq!(
+        a.error.as_deref(),
+        Some("IO resumed here 240 s after its suspend")
+    );
+    assert_eq!(r.rec.next_deadline(), None);
+
+    // Still Suspending in the cache: never a second suspend this round.
+    r.feed(&[RESUMED]);
+    reads_again(&r.x, &[lv(LV_KIB)]);
+    dry(&r.x, "");
+    let failed = acked(SnapshotPhase::Suspending, a.clone());
+    let w = r.pass(&[volume(GIB)], &[failed]).await;
+    assert_eq!(acks(&w), vec![]);
+    assert_eq!(times(&r.x, "suspend-io"), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_restart_forgets_the_suspend_and_never_takes() {
+    let mut sus = healthy();
+    sus[0] = "exists resource name:pvc-1 role:Secondary suspended:user".into();
+    let mut r = Rig::new(&sus, up_host());
+    reads(&r.x, &[lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    let before = round_ack(SnapshotPhase::Suspending, true);
+    let taking = [acked(SnapshotPhase::Taking, before)];
+    let w = r.pass(&[volume(GIB)], &taking).await;
+    let a = &acks(&w)[0];
+    assert!(
+        !a.ok
+            && a.error
+                .as_deref()
+                .unwrap()
+                .contains("not suspended by this agent")
+    );
+    assert!(!seen(&r.x, "--snapshot"));
+    // Resumed in time all the same, counted from the first sight.
+    tokio::time::advance(model::snapshot::RESUME_AFTER).await;
+    reads_again(&r.x, &[lv(LV_KIB)]);
+    r.x.expect(argv::resume_io("pvc-1"), ok(""));
+    r.pass(&[volume(GIB)], &taking).await;
+}
+
+#[tokio::test]
+async fn a_copy_that_may_differ_is_refused() {
+    let sus = round_ack(SnapshotPhase::Suspending, true);
+    let taking = [acked(SnapshotPhase::Taking, sus)];
+    // Cut from the diskful peer, both still UpToDate.
+    let mut r = Rig::new(&healthy(), up_host());
+    suspend_pass(&mut r).await;
+    r.feed(&["change connection name:pvc-1 conn-name:n2 connection:Connecting"]);
+    reads_again(&r.x, &[lv(LV_KIB)]);
+    let w = r.pass(&[volume(GIB)], &taking).await;
+    assert_eq!(
+        acks(&w)[0].error.as_deref(),
+        Some("peer n2 is Connecting, disk UpToDate")
+    );
+    // Mid resize: the LV grew, the DRBD device did not.
+    let mut r = Rig::new(&healthy(), up_host());
+    suspend_pass(&mut r).await;
+    reads_again(&r.x, &[lv(LV_KIB)]);
+    let w = r.pass(&[volume(2 * GIB)], &taking).await;
+    let e = acks(&w)[0].error.clone().unwrap();
+    assert!(e.contains("a resize is in flight"), "{e}");
+    assert!(!seen(&r.x, "--snapshot"));
+}
+
+#[tokio::test]
+async fn nothing_grows_during_a_round() {
+    let round = [snapshot(SnapshotPhase::Suspending)];
     let mut r = Rig::new(&healthy(), up_host());
     reads(&r.x, &[lv(LV_KIB)]);
     r.expect_check();
     r.expect_sweep();
     dry(&r.x, "");
-    r.x.expect(argv::suspend_io("pvc-1"), ok(""));
-    let w = r
-        .pass(&[volume(GIB)], &[snapshot(SnapshotPhase::Suspending)])
-        .await;
-    assert_eq!(acks(&w), vec![ack(SnapshotPhase::Suspending, true)]);
-
-    // Suspended for the round: no adjust at all, no second suspend.
-    let mut r = Rig::new(&sus, up_host());
-    reads(&r.x, &[lv(LV_KIB)]);
+    r.x.expect(argv::suspend_io(50000), ok(""));
+    let w = r.pass(&[grown(2 * GIB, 4, Some(LV_KIB))], &round).await;
+    assert_eq!(entry_of(&w).observed_generation, Some(3));
+    assert!(!seen(&r.x, "lvextend"));
+    // Grown everywhere already: the DRBD resize waits too.
+    let mut r = Rig::new(&healthy(), up_host());
+    reads(&r.x, &[lv(LV2_KIB)]);
     r.expect_check();
     r.expect_sweep();
-    let w = r
-        .pass(&[volume(GIB)], &[snapshot(SnapshotPhase::Suspending)])
-        .await;
-    assert_eq!(acks(&w), vec![ack(SnapshotPhase::Suspending, true)]);
-    assert!(!seen(&r.x, "--dry-run"));
-
-    let mut r = Rig::new(&sus, up_host());
-    reads(&r.x, &[lv(LV_KIB)]);
-    r.expect_check();
-    r.expect_sweep();
-    expect_lv_tags(&r.x, &[("pvc-1", &[OWN])]);
-    r.x.expect(lvm::cmd::snapshot(VG, "pvc-1", "pvc-1+snap-1"), ok(""));
-    expect_change(&r.x, "pvc-1+snap-1", &[], &[OWN]);
-    expect_lvs(
-        &r.x,
-        &[lv(LV_KIB), lv_row("pvc-1+snap-1", LV_KIB, St::Inactive)],
-    );
-    let w = r
-        .pass(&[volume(GIB)], &[snapshot(SnapshotPhase::Taking)])
-        .await;
-    assert_eq!(acks(&w), vec![ack(SnapshotPhase::Taking, true)]);
-
-    let mut r = Rig::new(&sus, up_host());
-    reads(&r.x, &[lv(LV_KIB)]);
-    r.expect_check();
-    r.expect_sweep();
-    r.x.expect(argv::resume_io("pvc-1"), ok(""));
-    let w = r
-        .pass(&[volume(GIB)], &[snapshot(SnapshotPhase::Resuming)])
-        .await;
-    assert_eq!(acks(&w), vec![ack(SnapshotPhase::Resuming, true)]);
-
-    // A suspend no round accounts for (snapshot gone mid-round) is resumed.
-    let mut r = Rig::new(&sus, up_host());
-    reads(&r.x, &[lv(LV_KIB)]);
-    r.expect_check();
-    r.expect_sweep();
-    r.x.expect(argv::resume_io("pvc-1"), ok(""));
     dry(&r.x, "");
-    r.pass(&[volume(GIB)], &[]).await;
+    r.x.expect(argv::suspend_io(50000), ok(""));
+    let w = r.pass(&[grown(2 * GIB, 4, Some(LV2_KIB))], &round).await;
+    assert_eq!(entry_of(&w).observed_generation, Some(3));
+    assert!(!seen(&r.x, "resize"));
+}
+
+#[tokio::test]
+async fn diskless_replica_keeps_its_freeze_through_taking() {
+    let lines = |suspended: &str| {
+        vec![
+            format!("exists resource name:pvc-1 role:Primary suspended:{suspended}"),
+            "exists connection name:pvc-1 peer-node-id:0 conn-name:n1 connection:Connected".into(),
+            "exists connection name:pvc-1 peer-node-id:1 conn-name:n2 connection:Connected".into(),
+            "exists device name:pvc-1 volume:0 minor:50000 disk:Diskless client:yes quorum:yes"
+                .into(),
+        ]
+    };
+    let mine = SnapshotAck {
+        node: "n3".into(),
+        phase: SnapshotPhase::Suspending,
+        pool: None,
+        ok: true,
+        error: None,
+    };
+    let taking = acked(SnapshotPhase::Taking, mine);
+    let mut r = Rig::on("n3", &lines("user"), FakeHost::default());
+    r.expect_check();
+    let w = r.pass(&[volume(GIB)], std::slice::from_ref(&taking)).await;
+    let frozen = SnapshotAck {
+        node: "n3".into(),
+        phase: SnapshotPhase::Taking,
+        pool: None,
+        ok: true,
+        error: None,
+    };
+    assert_eq!(
+        acks(&w),
+        vec![frozen.clone()],
+        "still suspended at ack time"
+    );
+    // Acked: kept frozen while the phase stays Taking, nothing rewritten.
+    let mut held = taking.clone();
+    held.status.as_mut().unwrap().acks = vec![frozen];
+    let w = r.pass(&[volume(GIB)], &[held]).await;
+    assert_eq!(acks(&w), vec![]);
+    assert!(!seen(&r.x, "resume-io"));
+    // Rebooted mid round: IO is live again, the round must fail.
+    let mut r = Rig::on("n3", &lines("no"), FakeHost::default());
+    r.expect_check();
+    dry(&r.x, "");
+    let w = r.pass(&[volume(GIB)], &[taking]).await;
+    let a = &acks(&w)[0];
+    assert_eq!(
+        (a.node.as_str(), a.phase, a.ok),
+        ("n3", SnapshotPhase::Taking, false)
+    );
 }
 
 #[tokio::test]
@@ -2109,12 +2396,82 @@ async fn diskless_replica_suspends_and_acks_without_pool() {
     );
     r.expect_check();
     dry(&r.x, "");
-    r.x.expect(argv::suspend_io("pvc-1"), ok(""));
+    r.x.expect(argv::suspend_io(50000), ok(""));
+    // A diskless Primary has no disk counter; its peers drained.
+    r.x.expect(
+        argv::status_stats_json("pvc-1"),
+        ok(&stats(None, &[("n1", 0, 0), ("n2", 0, 0)])),
+    );
     let w = r
         .pass(&[volume(GIB)], &[snapshot(SnapshotPhase::Suspending)])
         .await;
     let a = acks(&w);
     assert_eq!((a[0].ok, a[0].pool.as_deref()), (true, None));
+}
+
+/// `drbdsetup status --json --statistics` of pvc-1: the disk's
+/// lower-pending, then (peer, pending, unacked) per connection.
+fn stats(lower: Option<u64>, peers: &[(&str, u64, u64)]) -> String {
+    let device = lower.map_or(
+        serde_json::json!({ "volume": 0 }),
+        |l| serde_json::json!({ "volume": 0, "lower-pending": l, "upper-pending": 7 }),
+    );
+    let conns: Vec<_> = peers
+        .iter()
+        .map(|(n, p, u)| {
+            serde_json::json!({ "name": n, "peer_devices": [
+                { "volume": 0, "pending": p, "unacked": u }
+            ]})
+        })
+        .collect();
+    serde_json::json!([{ "name": "pvc-1", "devices": [device], "connections": conns }]).to_string()
+}
+
+/// A Primary acks only once its writes left: nothing pending on its disk,
+/// nothing pending or unacked toward a peer.
+#[tokio::test]
+async fn a_primary_acks_only_once_drained() {
+    let mut lines = healthy();
+    lines[0] = "exists resource name:pvc-1 role:Primary suspended:no".into();
+    let mut r = Rig::new(&lines, up_host());
+    r.rec.drbd.drain_wait = Duration::ZERO;
+    reads(&r.x, &[lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    dry(&r.x, "");
+    r.x.expect(argv::suspend_io(50000), ok(""));
+    r.x.expect(
+        argv::status_stats_json("pvc-1"),
+        ok(&stats(Some(0), &[("n2", 0, 3), ("n3", 0, 0)])),
+    );
+    let w = r
+        .pass(&[volume(GIB)], &[snapshot(SnapshotPhase::Suspending)])
+        .await;
+    let a = &acks(&w)[0];
+    assert!(!a.ok);
+    assert_eq!(
+        a.error.as_deref(),
+        Some("writes still in flight after the suspend: unacked 3 to n2")
+    );
+
+    let mut r = Rig::new(&lines, up_host());
+    reads(&r.x, &[lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    dry(&r.x, "");
+    r.x.expect(argv::suspend_io(50000), ok(""));
+    r.x.expect(
+        argv::status_stats_json("pvc-1"),
+        ok(&stats(Some(1), &[("n2", 0, 0), ("n3", 0, 0)])),
+    );
+    r.x.expect(
+        argv::status_stats_json("pvc-1"),
+        ok(&stats(Some(0), &[("n2", 0, 0), ("n3", 0, 0)])),
+    );
+    let w = r
+        .pass(&[volume(GIB)], &[snapshot(SnapshotPhase::Suspending)])
+        .await;
+    assert_eq!(acks(&w), vec![round_ack(SnapshotPhase::Suspending, true)]);
 }
 
 fn resolving(survivor: &str, split: bool) -> Volume {
@@ -2242,6 +2599,7 @@ async fn nothing_before_the_initial_dump() {
 #[tokio::test]
 async fn restore_lost_before_initialized_is_restored_again() {
     let mut r = Rig::new(&[], FakeHost::default());
+    r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     reads(&x, &[source_lv()]);
     expect_restore(&x);
@@ -2571,4 +2929,36 @@ async fn a_peer_with_a_stale_lease_is_not_probed() {
     dry(&x, "");
     rig.pass(std::slice::from_ref(&vol), &[]).await;
     assert_eq!(rig.host.probes.load(Ordering::Relaxed), 0);
+}
+
+/// A Snapshot an older version left in a phase this one removed: no round.
+/// IO it held suspended is resumed, nothing is taken, nothing written.
+#[tokio::test]
+async fn a_snapshot_in_an_unknown_phase_is_no_round() {
+    let old: Snapshot = serde_json::from_value(serde_json::json!({
+        "apiVersion": "r-drbd.io/v1alpha1", "kind": "Snapshot",
+        "metadata": { "name": "snap-1" },
+        "spec": { "volume": "pvc-1" },
+        "status": {
+            "phase": "Resuming",
+            "acks": [
+                { "node": NODE, "phase": "Taken", "pool": POOL, "ok": true },
+                { "node": "n2", "phase": "Suspended", "ok": true }
+            ]
+        }
+    }))
+    .unwrap();
+    assert_eq!(old.status.as_ref().unwrap().phase, SnapshotPhase::Unknown);
+    let mut sus = healthy();
+    sus[0] = "exists resource name:pvc-1 role:Secondary suspended:user".into();
+    let mut r = Rig::new(&sus, up_host());
+    reads(&r.x, &[lv(LV_KIB)]);
+    r.x.expect(argv::resume_io("pvc-1"), ok(""));
+    r.expect_check();
+    r.expect_sweep();
+    dry(&r.x, "");
+    let w = r.pass(&[volume(GIB)], &[old]).await;
+    assert_eq!(acks(&w), vec![]);
+    assert!(!seen(&r.x, "--snapshot"));
+    assert_eq!(r.rec.next_deadline(), None);
 }

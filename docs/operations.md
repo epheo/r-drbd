@@ -113,7 +113,7 @@ The controller then:
 It refuses any move while:
 
 - A split brain is pending or being resolved.
-- A snapshot is suspending, taking or resuming.
+- A snapshot is suspending or taking.
 - The evicted node is attached, or its replica is in use as last reported, unless its Node object is deleted: a stale agent alone does not prove the workload stopped.
 
 A diskful replica is also refused while:

@@ -48,6 +48,12 @@ pub struct DrbdEnv {
     pub init_wait: Duration,
     /// First wait before a plan that came back is adjusted again.
     pub repeat_backoff: Duration,
+    /// Whether a snapshot's holder copies are proven identical, which
+    /// alone allows a restore without a sync.
+    pub copies_identical: fn(&Snapshot) -> bool,
+    /// How long a suspended Primary waits for its writes in flight to
+    /// land before it acks; well inside the suspend bound.
+    pub drain_wait: Duration,
     /// This host's kernel node name, for its own `on` section: drbdadm
     /// finds its host by uname, which may differ from the Kubernetes
     /// node name. None uses the node name.
@@ -68,6 +74,8 @@ impl DrbdEnv {
             // Down is a local state change; events2 reports it within
             // milliseconds, and drbdsetup status decides after anyway.
             down_wait: Duration::from_secs(5),
+            drain_wait: Duration::from_secs(10),
+            copies_identical,
             // A resync finishing on a fresh small volume takes seconds;
             // a longer one leaves the adjust to the next pass.
             adjust_retry: vec![Duration::from_secs(1), Duration::from_secs(3)],
@@ -87,22 +95,27 @@ fn gross_bytes(vol: &Volume) -> u64 {
     drbd_config::gross_bytes(vol.spec.size_bytes, model::keys::PEER_SLOTS)
 }
 
-/// Phases during which a user suspend of the volume is expected.
-fn snapshot_round_active(snapshots: &[Arc<Snapshot>], volume: &str) -> bool {
-    snapshots.iter().any(|s| {
-        s.spec.volume == volume
-            && s.metadata.deletion_timestamp.is_none()
-            && s.status.as_ref().is_some_and(|st| {
-                matches!(
-                    st.phase,
-                    SnapshotPhase::Suspending
-                        | SnapshotPhase::Suspended
-                        | SnapshotPhase::Taking
-                        | SnapshotPhase::Taken
-                        | SnapshotPhase::Resuming
-                )
-            })
-    })
+/// A Snapshot whose round may hold IO of its volume suspended.
+pub(super) fn in_round(s: &Snapshot) -> bool {
+    s.metadata.deletion_timestamp.is_none()
+        && s.status
+            .as_ref()
+            .is_some_and(|st| matches!(st.phase, SnapshotPhase::Suspending | SnapshotPhase::Taking))
+}
+
+pub(super) fn snapshot_round_active(snapshots: &[Arc<Snapshot>], volume: &str) -> bool {
+    snapshots
+        .iter()
+        .any(|s| s.spec.volume == volume && in_round(s))
+}
+
+/// The holder copies of `snap` hold the same bytes. Never assumed: a page
+/// rewritten during writeback reaches each disk in another version, so
+/// only matching content digests can prove it, and none exist yet. Until
+/// then every replicated restore starts from the initial node's copy and
+/// the others sync in full from it.
+fn copies_identical(_snap: &Snapshot) -> bool {
+    false
 }
 
 /// Disk states that hold data a just-created replica must not override.
@@ -329,6 +342,7 @@ impl Reconciler {
                     minor: 0,
                     res: res.as_ref(),
                     prev: prev.as_ref(),
+                    round: snapshot_round_active(snapshots, &name),
                 };
                 self.drbd_up(reads, pools, snapshots, step).await
             }
@@ -547,7 +561,7 @@ impl Reconciler {
         }
     }
 
-    async fn sectors(&self, minor: u32) -> std::io::Result<u64> {
+    pub(super) async fn sectors(&self, minor: u32) -> std::io::Result<u64> {
         let host = self.drbd.host.clone();
         tokio::task::spawn_blocking(move || host.device_sectors(minor))
             .await
@@ -818,17 +832,6 @@ impl Reconciler {
             .and(s.vol.spec.source.as_ref())
             .map(|src| src.snapshot.clone());
 
-        if let Some(r) = s.res
-            && r.suspended_by_user()
-            && !snapshot_round_active(snapshots, &name)
-        {
-            tracing::info!(
-                volume = name,
-                "IO suspended without a snapshot round: resuming"
-            );
-            self.drbd_cmd(&argv::resume_io(&name), DRBD_TIMEOUT).await?;
-        }
-
         let mut resolved = false;
         if diskful && let (Some(rv), Some(r)) = (&s.vol.spec.resolve, s.res) {
             resolved = self.resolve(s, rv, r).await?;
@@ -855,7 +858,9 @@ impl Reconciler {
 
         if diskful {
             let lost = *rebuilt || s.prev_lost() || self.rebuilt_seen.contains(&name);
-            self.first_data(s, &name, lost, copy.as_ref()).await?;
+            let identical = source.is_some_and(self.drbd.copies_identical);
+            self.first_data(s, &name, lost, copy.as_ref(), identical)
+                .await?;
         }
         Ok(complete)
     }
@@ -968,7 +973,8 @@ impl Reconciler {
         }
         let restoring = s.restoring();
         let r = row.ok_or_else(|| format!("LV {vg}/{lv} missing after create"))?;
-        let may_grow = s.may_grow(created) || s.regrows(rebuilt && created, r.size_bytes);
+        let may_grow =
+            !s.round && (s.may_grow(created) || s.regrows(rebuilt && created, r.size_bytes));
         let mut changed = false;
         if !r.active {
             changed = true;
@@ -979,7 +985,9 @@ impl Reconciler {
         }
         let mut grown = true;
         if r.size_bytes < desired && !may_grow {
-            if restoring {
+            if s.round {
+                tracing::info!(lv, "backing LV grows after the snapshot round");
+            } else if restoring {
                 tracing::info!(lv, "restored LV grows once its disk holds data");
             } else {
                 tracing::info!(lv, "backing LV grows once the DRBD disk is attached");
@@ -1030,7 +1038,13 @@ impl Reconciler {
         desired: u64,
     ) -> (Result<(), String>, bool) {
         let vg = place.vg.as_str();
-        match self.create_lv(rows, source, place, s.vol, lv, desired).await {
+        let created = if s.initial_node() || source.is_some_and(self.drbd.copies_identical) {
+            self.create_lv(rows, source, place, s.vol, lv, desired)
+                .await
+        } else {
+            Err("the snapshot's copies may differ: only the initial node's is used".to_owned())
+        };
+        match created {
             Err(e) if !s.initial_node() => {
                 tracing::warn!(
                     lv,
@@ -1263,6 +1277,7 @@ impl Reconciler {
         name: &str,
         lost: bool,
         copy: Option<&Copy>,
+        identical: bool,
     ) -> Result<(), String> {
         if s.initialized() || !s.initial_node() {
             self.init_started.remove(name);
@@ -1304,7 +1319,8 @@ impl Reconciler {
             ));
         }
         let at_snapshot_size = copy.is_some_and(|c| c.at_size);
-        let proving = source.filter(|_| at_snapshot_size);
+        // Copies that may differ prove nothing: the peers sync from here.
+        let proving = source.filter(|_| at_snapshot_size && identical);
         let cached = s.vol.status.as_ref().map_or(&[][..], |st| &st.replicas);
         let mut waiting = unready_peers(s, r, &self.node, proving, cached);
         if proving.is_some() && waiting.is_empty() {
@@ -1337,13 +1353,8 @@ impl Reconciler {
             );
             return Ok(());
         }
-        if source.is_some() && (!at_snapshot_size || !waiting.is_empty()) {
-            tracing::warn!(
-                volume = name,
-                ?waiting,
-                at_snapshot_size,
-                "restored copies not all identical: this one is the source, the others full-sync"
-            );
+        if source.is_some() && (!identical || !at_snapshot_size || !waiting.is_empty()) {
+            log_source_start(name, &waiting, at_snapshot_size);
             self.drbd_cmd(&argv::start_as_source(name), DRBD_TIMEOUT)
                 .await?;
             self.init_started.remove(name);
@@ -1486,6 +1497,9 @@ impl Reconciler {
             * 512;
         if current >= s.vol.spec.size_bytes {
             return Ok(Resize::NotNeeded);
+        }
+        if s.round {
+            return Ok(Resize::Waiting);
         }
         let diskful = || s.a.replicas.iter().filter(|x| x.role == Role::Diskful);
         if diskful().map(|x| x.node_id).min() != Some(s.mine.node_id) {
@@ -1704,28 +1718,136 @@ impl Reconciler {
         drbd::json_sync_percent(&out.stdout)
     }
 
-    pub(super) async fn suspend_resume(
-        &self,
-        volume: &str,
-        phase: SnapshotPhase,
-    ) -> Result<(), String> {
+    /// User IO suspend is on for the volume now.
+    pub(super) fn suspended(&self, volume: &str) -> bool {
+        self.tracked(volume).is_some_and(|r| r.suspended_by_user())
+    }
+
+    /// Ends a user IO suspend nobody needs: no round of the volume runs, or
+    /// this agent's own deadline passed, whatever the controller says. A
+    /// round still running then gets a failed ack, best effort; safety does
+    /// not rest on it, since every take ends before the deadline.
+    pub(super) async fn freeze(&mut self, vol: &Volume, snaps: &[&Snapshot]) -> Vec<StatusWrite> {
+        let name = vol.name_any();
+        if vol.spec.replicas < 2 || !self.drbd_available() {
+            return Vec::new();
+        }
+        // Leaving or deleted: down resumes first.
+        let staying = vol.metadata.deletion_timestamp.is_none() && self.my_replica(vol).is_some();
+        if !staying || !self.suspended(&name) {
+            self.freezes.remove(&name);
+            return Vec::new();
+        }
+        let now = tokio::time::Instant::now();
+        let since = self
+            .freezes
+            .entry(name.clone())
+            .or_insert(super::Freeze {
+                since: now,
+                mine: false,
+            })
+            .since;
+        let rounds: Vec<&Snapshot> = snaps
+            .iter()
+            .copied()
+            .filter(|s| s.spec.volume == name && in_round(s))
+            .collect();
+        let after = model::snapshot::RESUME_AFTER;
+        if !rounds.is_empty() && now.duration_since(since) < after {
+            return Vec::new();
+        }
+        if rounds.is_empty() {
+            tracing::info!(
+                volume = name,
+                "IO suspended without a snapshot round: resuming"
+            );
+        } else {
+            tracing::warn!(
+                volume = name,
+                "snapshot round still running at this node's deadline: resuming"
+            );
+        }
+        if let Err(e) = self.drbd_cmd(&argv::resume_io(&name), DRBD_TIMEOUT).await {
+            tracing::warn!(volume = name, error = %e, "resume-io failed");
+            return Vec::new();
+        }
+        self.freezes.remove(&name);
+        let error = format!("IO resumed here {} s after its suspend", after.as_secs());
+        rounds
+            .into_iter()
+            .filter_map(|s| {
+                let status = s.status.as_ref()?;
+                let prev = status.acks.iter().find(|a| a.node == self.node);
+                // Its part is done (a copy, or a freeze held past every
+                // take window); failing it could strip a Ready holder.
+                if prev.is_some_and(|a| a.phase == SnapshotPhase::Taking && a.ok) {
+                    return None;
+                }
+                let ack = super::ack(
+                    &self.node,
+                    status.phase,
+                    prev.and_then(|a| a.pool.clone()),
+                    Err(error.clone()),
+                );
+                (prev != Some(&ack)).then(|| StatusWrite::Snapshot {
+                    name: s.name_any(),
+                    ack,
+                })
+            })
+            .collect()
+    }
+
+    /// The next resume deadline still ahead, for the reconcile loop's timer.
+    pub fn next_deadline(&self) -> Option<tokio::time::Instant> {
+        let now = tokio::time::Instant::now();
+        self.freezes
+            .values()
+            .map(|f| f.since + model::snapshot::RESUME_AFTER)
+            .filter(|d| *d > now)
+            .min()
+    }
+
+    /// Suspends IO for a round; the take window and the resume deadline
+    /// count from here, on this agent's clock.
+    pub(super) async fn suspend(&mut self, volume: &str, minor: u32) -> Result<(), String> {
         let r = self
             .tracked(volume)
             .ok_or_else(|| format!("DRBD resource {volume} is not up"))?;
-        match phase {
-            SnapshotPhase::Suspending if !r.suspended_by_user() => {
-                tracing::info!(volume, "suspending IO for a snapshot");
-                self.drbd_cmd(&argv::suspend_io(volume), DRBD_TIMEOUT)
-                    .await
-                    .map(|_| ())
+        if !r.suspended_by_user() {
+            tracing::info!(volume, "suspending IO for a snapshot");
+            self.drbd_cmd(&argv::suspend_io(minor), DRBD_TIMEOUT)
+                .await?;
+        }
+        // Set after the suspend and before the ack: the window then never
+        // starts before the IO froze, nor after the controller saw the ack.
+        self.freezes.insert(
+            volume.to_owned(),
+            super::Freeze {
+                since: tokio::time::Instant::now(),
+                mine: true,
+            },
+        );
+        if r.is_primary() {
+            self.drained(volume).await?;
+        }
+        Ok(())
+    }
+
+    /// A Primary acks its suspend only once nothing it wrote is still on
+    /// its way to its disk or a peer.
+    async fn drained(&self, volume: &str) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + self.drbd.drain_wait;
+        loop {
+            let out = self
+                .drbd_cmd(&argv::status_stats_json(volume), DRBD_TIMEOUT)
+                .await?;
+            let Some(busy) = drbd::json_in_flight(&out) else {
+                return Ok(());
+            };
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!("writes still in flight after the suspend: {busy}"));
             }
-            SnapshotPhase::Resuming if r.suspended_by_user() => {
-                tracing::info!(volume, "resuming IO after a snapshot");
-                self.drbd_cmd(&argv::resume_io(volume), DRBD_TIMEOUT)
-                    .await
-                    .map(|_| ())
-            }
-            _ => Ok(()),
+            tokio::time::sleep(POLL).await;
         }
     }
 
@@ -1779,6 +1901,9 @@ struct Step<'a> {
     minor: u32,
     res: Option<&'a Resource>,
     prev: Option<&'a ReplicaStatus>,
+    /// A snapshot round of this volume runs: no growth, the copies of one
+    /// round must have their metadata at the same place.
+    round: bool,
 }
 
 impl Step<'_> {
@@ -1853,3 +1978,19 @@ impl Step<'_> {
 
 #[cfg(test)]
 mod tests;
+
+/// Until digests prove copies, every restore starts as the sync source;
+/// only a lost peer or a size mismatch deserves a warning.
+fn log_source_start(name: &str, waiting: &[&str], at_snapshot_size: bool) {
+    let why = "source here, others full-sync";
+    if at_snapshot_size && waiting.is_empty() {
+        tracing::info!(volume = name, "copies unproven: {why}");
+    } else {
+        tracing::warn!(
+            volume = name,
+            ?waiting,
+            at_snapshot_size,
+            "copies not all usable: {why}"
+        );
+    }
+}

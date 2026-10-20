@@ -18,7 +18,7 @@ pub struct Input<'a> {
     /// status.initializedAt is set.
     pub initialized: bool,
     pub split_brain: bool,
-    /// A Snapshot of this volume from Suspending to Resuming: a node that
+    /// A Snapshot of this volume in Suspending or Taking: a node that
     /// joins now would ack Taking with a blank LV.
     pub snapshot_in_progress: Option<&'a str>,
     /// The node's agent Lease is fresh.

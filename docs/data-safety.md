@@ -48,9 +48,8 @@ These are the guarantees.
 
 - Writes are synchronous (DRBD protocol C): acknowledged only once every connected replica has them.
 - A new volume skips the first sync only when all its replicas are new and connected; a replica that joins later is copied in full.
-- A replicated restore skips the first sync only when every replica restored the same snapshot from its own copy, at the snapshot's size.
-  The proof is on disk and in status: each backing LV is tagged with the snapshot it came from at creation, the first node's LV has the size of its snapshot LV, each replica reports that snapshot in `restoredFrom`, and the Snapshot reached Ready only after every holder took its copy with IO suspended.
-  Without that proof on every replica, one replica is the source and the others are copied in full.
+- A replicated restore always syncs: the first replica restores its copy of the snapshot and is the source; the others are copied in full.
+  The copies a snapshot keeps on each node can differ, so none is assumed equal to another.
 - A restore larger than its snapshot grows after that first step; the grown area always syncs, because it holds each node's former DRBD metadata.
   The volume is Ready, and its claim usable, only once it has its full size and every replica is in sync.
 - Quorum is a majority: a replica that loses quorum suspends IO instead of diverging.

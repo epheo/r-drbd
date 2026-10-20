@@ -447,6 +447,7 @@ async fn snapshot_lv_name_too_long_fails_before_any_round() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn snapshot_local_and_restore() {
     let assets = require_envtest!();
     let (_env, client, _ctl) = setup(&assets, |_| {}).await;
@@ -479,17 +480,30 @@ async fn snapshot_local_and_restore() {
     let s = snapshot_where(&client, "snap1", |s| snap_phase(s) == SnapshotPhase::Ready).await;
     assert!(s.status.unwrap().created_at.is_some());
 
-    // Restore lands where the snapshot lives, not on the emptier n2, even
-    // with p1 too full for a new volume: it holds the data already.
+    // A restore is charged at full size: p1 too full for a new volume
+    // holds it Pending, never on the emptier n2 that lacks the snapshot.
     support::pool_capacity(&client, "p1", "n1", 100 * GIB, 0).await;
     let mut spec = volume_spec(GIB, 1, "fast");
     spec.source = Some(VolumeSource {
         snapshot: "snap1".into(),
     });
     create_volume(&client, "restored", spec).await;
+    let r = volume_where(&client, "restored", |v| {
+        ready_reason(v).as_deref() == Some("Insufficient")
+    })
+    .await;
+    assert!(r.spec.assignment.is_none());
+    support::pool_capacity(&client, "p1", "n1", 100 * GIB, 50 * GIB).await;
     let r = volume_where(&client, "restored", |v| v.spec.assignment.is_some()).await;
     let rep = &r.spec.assignment.unwrap().replicas[0];
     assert_eq!((rep.node.as_str(), rep.pool.as_deref()), ("n1", Some("p1")));
+    // Counted at full size, like the source.
+    support::eventually(Duration::from_secs(20), || async {
+        get_pool(&client, "p1")
+            .await
+            .filter(|p| p.status.as_ref().and_then(|s| s.committed_bytes) == Some(2 * GIB))
+    })
+    .await;
     // No seeded marker: the agent's adopt path gives the restored XFS a new
     // UUID and writes the marker itself.
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -605,23 +619,21 @@ async fn snapshot_replicated_rounds() {
     agents[1]
         .ack("rs", SnapshotPhase::Taking, true, Some("p2"))
         .await;
-    let s = snapshot_where(&client, "rs", |s| snap_phase(s) == SnapshotPhase::Resuming).await;
-    assert!(s.status.unwrap().created_at.is_some());
-    agents[0]
-        .ack("rs", SnapshotPhase::Resuming, true, Some("p1"))
-        .await;
-    agents[1]
-        .ack("rs", SnapshotPhase::Resuming, true, Some("p2"))
-        .await;
-    agents[2]
-        .ack("rs", SnapshotPhase::Resuming, true, None)
-        .await;
+    // The copies alone are not enough: the tiebreaker confirms its freeze.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        snap_phase(&get_snapshot(&client, "rs").await.unwrap()),
+        SnapshotPhase::Taking
+    );
+    agents[2].ack("rs", SnapshotPhase::Taking, true, None).await;
+    // Ready at once: every agent resumes on its own when the round ends.
     let s = snapshot_where(&client, "rs", |s| snap_phase(s) == SnapshotPhase::Ready).await;
     let st = s.status.unwrap();
+    assert!(st.created_at.is_some());
     assert_eq!(st.size_bytes, Some(GIB));
     assert!(st.last_error.is_none());
 
-    // A failed suspend resumes IO first, then fails.
+    // A failed suspend fails the round.
     create_snapshot(&client, "rs-bad", "rep").await;
     snapshot_where(&client, "rs-bad", |s| {
         snap_phase(s) == SnapshotPhase::Suspending
@@ -634,7 +646,7 @@ async fn snapshot_replicated_rounds() {
         .ack("rs-bad", SnapshotPhase::Suspending, false, None)
         .await;
     let s = snapshot_where(&client, "rs-bad", |s| {
-        snap_phase(s) == SnapshotPhase::Resuming
+        snap_phase(s) == SnapshotPhase::Failed
     })
     .await;
     assert!(
@@ -644,19 +656,57 @@ async fn snapshot_replicated_rounds() {
             .unwrap()
             .contains("fake failure on n2")
     );
-    agents[0]
-        .ack("rs-bad", SnapshotPhase::Resuming, true, None)
-        .await;
-    agents[1]
-        .ack("rs-bad", SnapshotPhase::Resuming, true, None)
-        .await;
-    agents[2]
-        .ack("rs-bad", SnapshotPhase::Resuming, true, None)
-        .await;
-    snapshot_where(&client, "rs-bad", |s| {
-        snap_phase(s) == SnapshotPhase::Failed
-    })
-    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_snapshots_of_one_volume_never_overlap() {
+    let assets = require_envtest!();
+    let (_env, client, _ctl) = setup(&assets, |_| {}).await;
+    for n in ["n1", "n2", "n3"] {
+        node(&client, n, true).await;
+    }
+    pool(&client, "p1", "n1", "fast", 100 * GIB).await;
+    pool(&client, "p2", "n2", "fast", 100 * GIB).await;
+    let _agents = ["n1", "n2", "n3"].map(|n| FakeAgent::new(&client, n).spawn_auto());
+    create_volume(&client, "rep", volume_spec(GIB, 2, "fast")).await;
+    volume_where(&client, "rep", |v| phase_of(v) == VolumePhase::Ready).await;
+    let names = ["sa", "sb", "sc"];
+    for n in names {
+        create_snapshot(&client, n, "rep").await;
+    }
+    let api: Api<Snapshot> = Api::all(client.clone());
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut held = false;
+    loop {
+        let all = api
+            .list(&kube::api::ListParams::default())
+            .await
+            .expect("list");
+        let running: Vec<String> = all
+            .items
+            .iter()
+            .filter(|s| controller::volume::round_running(s))
+            .map(kube::ResourceExt::name_any)
+            .collect();
+        assert!(running.len() <= 1, "rounds overlap: {running:?}");
+        held |= all.items.iter().any(|s| {
+            s.status
+                .as_ref()
+                .and_then(|st| st.last_error.as_deref())
+                .is_some_and(|e| e.contains("of the same volume is in its round"))
+        });
+        if all.items.len() == names.len()
+            && all
+                .items
+                .iter()
+                .all(|s| snap_phase(s) == SnapshotPhase::Ready)
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "not all Ready");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(held, "no snapshot was ever held for another");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -941,20 +991,13 @@ async fn controller_owns_no_agent_fields() {
         snap_phase(s) == SnapshotPhase::Suspending
     })
     .await;
-    // The tiebreaker suspends and resumes too.
+    // The tiebreaker suspends too.
     for a in &agents {
         a.ack("snap", SnapshotPhase::Suspending, true, None).await;
     }
     snapshot_where(&client, "snap", |s| snap_phase(s) == SnapshotPhase::Taking).await;
-    for (a, p) in agents.iter().zip(["p1", "p2"]) {
-        a.ack("snap", SnapshotPhase::Taking, true, Some(p)).await;
-    }
-    snapshot_where(&client, "snap", |s| {
-        snap_phase(s) == SnapshotPhase::Resuming
-    })
-    .await;
     for (a, p) in agents.iter().zip([Some("p1"), Some("p2"), None]) {
-        a.ack("snap", SnapshotPhase::Resuming, true, p).await;
+        a.ack("snap", SnapshotPhase::Taking, true, p).await;
     }
     snapshot_where(&client, "snap", |s| snap_phase(s) == SnapshotPhase::Ready).await;
     support::eventually(Duration::from_secs(20), || async {
@@ -1136,6 +1179,123 @@ async fn pool_delete_policy_waits_for_released() {
         .expect("released true");
     support::eventually(Duration::from_secs(20), || async {
         get_pool(&client, "del").await.is_none().then_some(())
+    })
+    .await;
+}
+
+/// A phase computed from a copy the store had before some other write
+/// never lands: a lagging store cannot move a round backwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transition_from_a_stale_copy_is_rejected() {
+    let assets = require_envtest!();
+    support::init_tracing();
+    let env = Env::start(&assets).await;
+    let client = env.client().await;
+    let api: Api<Snapshot> = Api::all(client.clone());
+    create_snapshot(&client, "s", "vol").await;
+    let stale = get_snapshot(&client, "s").await.unwrap();
+    FakeAgent::new(&client, "n1")
+        .ack("s", SnapshotPhase::Suspending, true, None)
+        .await;
+    let phase = |p: SnapshotPhase| json!({ "phase": p, "conditions": [] });
+    let rv = stale.metadata.resource_version.as_deref();
+    assert!(!controller::apply_status_at(&api, "s", rv, phase(SnapshotPhase::Taking)).await);
+    let now = get_snapshot(&client, "s").await.unwrap();
+    assert_eq!(snap_phase(&now), SnapshotPhase::Pending);
+    assert_eq!(now.status.unwrap().acks.len(), 1, "the ack stays");
+    let rv = now.metadata.resource_version.as_deref();
+    assert!(controller::apply_status_at(&api, "s", rv, phase(SnapshotPhase::Taking)).await);
+    assert_eq!(
+        snap_phase(&get_snapshot(&client, "s").await.unwrap()),
+        SnapshotPhase::Taking
+    );
+}
+
+/// The Snapshot CRD with the phase values an older version knew, or the
+/// current one again.
+async fn snapshot_crd(client: &Client, legacy: bool) {
+    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+    let api: Api<CustomResourceDefinition> = Api::all(client.clone());
+    let live = api.get("snapshots.r-drbd.io").await.expect("crd");
+    let mut crd = serde_json::to_value(<Snapshot as kube::CustomResourceExt>::crd()).unwrap();
+    crd["metadata"]["resourceVersion"] = json!(live.metadata.resource_version);
+    if legacy {
+        let status = &mut crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]
+            ["properties"];
+        let old = ["Suspended", "Taken", "Resuming"].map(|v| json!(v));
+        status["phase"]["enum"]
+            .as_array_mut()
+            .expect("phase enum")
+            .extend(old.clone());
+        status["acks"]["items"]["properties"]["phase"]["enum"]
+            .as_array_mut()
+            .expect("ack phase enum")
+            .extend(old);
+    }
+    let crd: CustomResourceDefinition = serde_json::from_value(crd).unwrap();
+    api.replace(
+        "snapshots.r-drbd.io",
+        &kube::api::PostParams::default(),
+        &crd,
+    )
+    .await
+    .expect("replace crd");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+}
+
+/// A Snapshot written by an older version, in a phase this one removed,
+/// decodes: the stores sync, volumes are still provisioned, no round runs
+/// on it and its delete still completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_snapshot_in_a_removed_phase_never_stops_the_controller() {
+    let assets = require_envtest!();
+    support::init_tracing();
+    let env = Env::start(&assets).await;
+    let client = env.client().await;
+    snapshot_crd(&client, true).await;
+    create_snapshot(&client, "old", "vol").await;
+    let ack = |node: &str, phase: &str, pool: Option<&str>| json!({ "node": node, "phase": phase, "ok": true, "pool": pool });
+    Api::<Snapshot>::all(client.clone())
+        .patch_status(
+            "old",
+            &PatchParams::default(),
+            &Patch::Merge(json!({ "status": {
+                "phase": "Resuming",
+                "sizeBytes": GIB,
+                "acks": [
+                    ack("n1", "Resuming", Some("p1")),
+                    ack("n2", "Suspended", None),
+                    ack("n3", "Taken", None),
+                ],
+            }})),
+        )
+        .await
+        .expect("old status");
+    snapshot_crd(&client, false).await;
+
+    let _ctl = support::spawn(env.clients().await, support::config(&env, "ctl"));
+    node(&client, "n1", true).await;
+    pool(&client, "p1", "n1", "fast", 100 * GIB).await;
+    let agent = FakeAgent::new(&client, "n1");
+    let mut spec = volume_spec(GIB, 1, "fast");
+    spec.node = Some("n1".into());
+    create_volume(&client, "vol", spec).await;
+    volume_where(&client, "vol", |v| v.spec.assignment.is_some()).await;
+    agent.ready("vol").await;
+    volume_where(&client, "vol", |v| phase_of(v) == VolumePhase::Ready).await;
+
+    let s = get_snapshot(&client, "old").await.unwrap();
+    assert_eq!(snap_phase(&s), SnapshotPhase::Unknown, "left as it is");
+    Api::<Snapshot>::all(client.clone())
+        .delete("old", &DeleteParams::default())
+        .await
+        .expect("delete snapshot");
+    snapshot_where(&client, "old", |s| snap_phase(s) == SnapshotPhase::Deleting).await;
+    agent
+        .ack("old", SnapshotPhase::Deleting, true, Some("p1"))
+        .await;
+    support::eventually(Duration::from_secs(20), || async {
+        get_snapshot(&client, "old").await.is_none().then_some(())
     })
     .await;
 }

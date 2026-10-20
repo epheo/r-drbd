@@ -1,24 +1,30 @@
 //! Snapshot reconciler: drives the rounds through status.phase and the
 //! agents' acks.
 //!
-//! Suspended and Taken are markers the controller passes through on its
-//! own: the next round starts on the following pass without new acks.
+//! A replicated restore starts without a sync, so the copies one round
+//! takes must be identical: a round starts only on a volume in sync
+//! everywhere, every replica suspends IO before any take, and every agent
+//! resumes on its own (model::snapshot holds the bounds).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use k8s_openapi::jiff::Timestamp;
+use kube::api::ListParams;
 use kube::{Api, ResourceExt};
 use model::condition::{self, Condition, FALSE, TRUE, types};
 use model::keys::FINALIZER_SNAPSHOT;
-use model::{Role, Snapshot, SnapshotAck, SnapshotPhase, Volume, VolumePhase, VolumeStatus};
+use model::{Assignment, Role, Snapshot, SnapshotAck, SnapshotPhase, Volume, VolumePhase};
 use serde_json::json;
 use tracing::{debug, info};
 
 use crate::store::Stores;
 use crate::volume::{Cond, build_conditions};
-use crate::{Ctx, Memory, apply_status, has_finalizer, set_finalizer, valid_name};
+use crate::{Ctx, Memory, apply_status_at, has_finalizer, set_finalizer, valid_name};
+
+/// How long a Pending Snapshot waits for a Volume missing from the store.
+pub const VOLUME_GRACE: Duration = crate::RESYNC;
 
 /// Inputs of one state machine step.
 #[derive(Debug)]
@@ -26,24 +32,40 @@ pub struct Round<'a> {
     pub phase: SnapshotPhase,
     /// DRBD volume: IO is suspended around the take.
     pub replicated: bool,
-    pub diskful: &'a [String],
-    /// Replicas that must ack the current IO round, diskless and
-    /// tiebreaker included (`suspend_members`, `resume_members`).
-    pub members: &'a [String],
+    pub volume: &'a Volume,
+    /// Every replica, diskless and tiebreaker included.
+    pub assignment: &'a Assignment,
     pub acks: &'a [SnapshotAck],
-    pub volume_ready: bool,
-    pub volume_status: Option<&'a VolumeStatus>,
-    /// Set once a round failed while IO was suspended: Resuming then ends in Failed.
-    pub last_error: Option<&'a str>,
+    /// Listed nodes whose agent is not fresh.
+    pub stale: &'a [String],
+    /// Another Snapshot of the volume whose round runs.
+    pub other_round: Option<&'a str>,
     /// Time spent in the current phase, from status.phaseSince.
     pub phase_for: Option<Duration>,
     pub take_timeout: Duration,
     pub suspend_timeout: Duration,
 }
 
+impl Round<'_> {
+    fn nodes(&self, role: Option<Role>) -> Vec<&str> {
+        self.assignment
+            .replicas
+            .iter()
+            .filter(|r| role.is_none_or(|x| r.role == x))
+            .map(|r| r.node.as_str())
+            .collect()
+    }
+
+    fn ack(&self, node: &str) -> Option<&SnapshotAck> {
+        self.acks.iter().find(|a| a.node == node)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
     Stay,
+    /// Stay in Pending, saying why.
+    Hold(String),
     Go {
         phase: SnapshotPhase,
         error: Option<String>,
@@ -54,100 +76,194 @@ fn go(phase: SnapshotPhase, error: Option<String>) -> Step {
     Step::Go { phase, error }
 }
 
+fn failed(error: String) -> Step {
+    go(SnapshotPhase::Failed, Some(error))
+}
+
 /// The phase machine, pure.
 pub fn next(r: &Round<'_>) -> Step {
     use SnapshotPhase as P;
-    let current: Vec<&SnapshotAck> = r.acks.iter().filter(|a| a.phase == r.phase).collect();
-    // Taking needs a pool from every diskful replica; the IO rounds an ack
-    // from every member.
-    let need = match r.phase {
-        P::Suspending | P::Resuming => r.members,
-        _ => r.diskful,
-    };
-    let failed: Vec<String> = current
-        .iter()
-        .filter(|a| !a.ok && need.contains(&a.node))
-        .map(|a| format!("{}: {}", a.node, a.error.as_deref().unwrap_or("failed")))
-        .collect();
-    let all_ok = need.iter().all(|n| {
-        current
-            .iter()
-            .any(|a| a.node == *n && a.ok && (r.phase != P::Taking || a.pool.is_some()))
-    });
-    let failure =
-        (!failed.is_empty()).then(|| format!("{:?} failed on {}", r.phase, failed.join("; ")));
-    // While IO is suspended a failure first resumes, then fails.
-    let abort = |error: String| {
-        if r.replicated {
-            go(P::Resuming, Some(error))
-        } else {
-            go(P::Failed, Some(error))
-        }
-    };
     match r.phase {
-        P::Pending if r.volume_ready => go(
-            if r.replicated {
-                P::Suspending
-            } else {
-                P::Taking
-            },
-            None,
-        ),
-        P::Suspending | P::Taking if failure.is_some() => abort(failure.unwrap_or_default()),
-        P::Suspending if all_ok => go(P::Suspended, None),
-        // A dead member must not keep IO frozen on the others.
-        P::Suspending if r.phase_for.is_some_and(|d| d >= r.suspend_timeout) => {
-            let missing: Vec<&str> = need
-                .iter()
-                .filter(|n| !current.iter().any(|a| a.node == **n && a.ok))
-                .map(String::as_str)
-                .collect();
-            abort(format!(
-                "suspend not acknowledged within {} s by {}",
-                r.suspend_timeout.as_secs(),
-                missing.join(", ")
-            ))
-        }
-        P::Suspended => {
-            let stale: Vec<&str> = r
-                .diskful
-                .iter()
-                .filter(|n| {
-                    // No entry is not UpToDate: a replica just placed by
-                    // spec.evict has none yet, and its LV is blank.
-                    r.volume_status
-                        .and_then(|s| s.replicas.iter().find(|e| &e.node == *n))
-                        .and_then(|e| e.disk_state.as_deref())
-                        .is_none_or(|d| !d.eq_ignore_ascii_case("UpToDate"))
-                })
-                .map(String::as_str)
-                .collect();
-            if stale.is_empty() {
-                go(P::Taking, None)
-            } else {
-                abort(format!("not UpToDate on {}", stale.join(", ")))
-            }
-        }
-        P::Taking if all_ok => go(if r.replicated { P::Taken } else { P::Ready }, None),
-        P::Taking if r.phase_for.is_some_and(|d| d >= r.take_timeout) => abort(format!(
-            "take not acknowledged by every node within {} s",
-            r.take_timeout.as_secs()
-        )),
-        P::Taken => go(P::Resuming, None),
-        P::Resuming if failure.is_some() => {
-            let mut e = r.last_error.map(str::to_owned).unwrap_or_default();
-            if !e.is_empty() {
-                e.push_str("; ");
-            }
-            e.push_str(&failure.unwrap_or_default());
-            go(P::Failed, Some(e))
-        }
-        P::Resuming if all_ok => match r.last_error {
-            Some(e) => go(P::Failed, Some(e.to_owned())),
-            None => go(P::Ready, None),
+        P::Pending => match start_blocker(r) {
+            Some(why) => Step::Hold(why),
+            None if r.replicated => go(P::Suspending, None),
+            None => go(P::Taking, None),
         },
+        P::Suspending => suspending(r),
+        P::Taking => taking(r),
         _ => Step::Stay,
     }
+}
+
+/// Why a round must not start yet. Each copy must hold the same data: a
+/// replica out of sync or cut from a diskful peer would take other bytes,
+/// a replica whose agent cannot be reached would never suspend, and a
+/// resize moves DRBD metadata under the take.
+pub fn start_blocker(r: &Round<'_>) -> Option<String> {
+    let v = r.volume;
+    let st = v.status.as_ref();
+    if st.is_none_or(|s| s.phase != VolumePhase::Ready) {
+        return Some(format!("volume {} is not Ready", v.name_any()));
+    }
+    if let Some(other) = r.other_round {
+        return Some(format!(
+            "snapshot {other} of the same volume is in its round"
+        ));
+    }
+    if !r.replicated {
+        return None;
+    }
+    if !r.stale.is_empty() {
+        return Some(format!("agent not reachable on {}", r.stale.join(", ")));
+    }
+    let entries = st.map(|s| s.replicas.as_slice()).unwrap_or_default();
+    let entry = |n: &str| entries.iter().find(|e| e.node == n);
+    // Each Secondary suspends after the Primary drained; with two
+    // Primaries (a live migration) neither order holds for both.
+    let primaries: Vec<&str> = r
+        .nodes(None)
+        .into_iter()
+        .filter(|n| entry(n).is_some_and(|e| e.in_use))
+        .collect();
+    if primaries.len() > 1 {
+        return Some(format!(
+            "more than one Primary ({}): no round while two nodes write",
+            primaries.join(", ")
+        ));
+    }
+    let diskful = r.nodes(Some(Role::Diskful));
+    let mut problems = Vec::new();
+    for n in &diskful {
+        let e = entry(n);
+        let disk = e.and_then(|e| e.disk_state.as_deref());
+        if disk != Some("UpToDate") {
+            problems.push(format!("{n} is {}", disk.unwrap_or("unknown")));
+        }
+        if e.and_then(|e| e.observed_generation) != v.metadata.generation {
+            problems.push(format!("{n} has not applied the current spec"));
+        }
+    }
+    // Writers: diskful and attached replicas. A tiebreaker writes nothing.
+    let writers = r
+        .assignment
+        .replicas
+        .iter()
+        .filter(|x| x.role != Role::Tiebreaker);
+    for w in writers {
+        for p in diskful.iter().filter(|p| **p != w.node) {
+            let state = entry(&w.node).and_then(|e| e.peers.get(*p));
+            if state.map(String::as_str) != Some("Connected") {
+                problems.push(format!(
+                    "{} to {p} is {}",
+                    w.node,
+                    state.map_or("unknown", String::as_str)
+                ));
+            }
+        }
+    }
+    if st
+        .and_then(|s| s.usable_bytes)
+        .is_none_or(|u| u < v.spec.size_bytes)
+    {
+        problems.push("a resize is in flight".to_owned());
+    }
+    (!problems.is_empty()).then(|| format!("waiting: {}", problems.join("; ")))
+}
+
+/// Every listed replica suspends, within the bound. The bound wins over
+/// late acks: suspends spread wider than it would outrun the agents'
+/// resume deadlines.
+fn suspending(r: &Round<'_>) -> Step {
+    use SnapshotPhase as P;
+    let listed = r.nodes(None);
+    let errors: Vec<String> = listed
+        .iter()
+        .filter_map(|n| r.ack(n).filter(|a| a.phase == P::Suspending && !a.ok))
+        .map(|a| format!("{}: {}", a.node, a.error.as_deref().unwrap_or("failed")))
+        .collect();
+    if !errors.is_empty() {
+        return failed(format!("Suspending failed on {}", errors.join("; ")));
+    }
+    if r.phase_for.is_some_and(|d| d >= r.suspend_timeout) {
+        let missing: Vec<&str> = listed
+            .iter()
+            .filter(|n| !r.ack(n).is_some_and(|a| a.phase == P::Suspending && a.ok))
+            .copied()
+            .collect();
+        return failed(format!(
+            "suspend not acknowledged within {} s by {}",
+            r.suspend_timeout.as_secs(),
+            missing.join(", ")
+        ));
+    }
+    if !listed
+        .iter()
+        .all(|n| r.ack(n).is_some_and(|a| a.phase == P::Suspending && a.ok))
+    {
+        return Step::Stay;
+    }
+    let entries = r
+        .volume
+        .status
+        .as_ref()
+        .map(|s| s.replicas.as_slice())
+        .unwrap_or_default();
+    let stale: Vec<&str> = r
+        .nodes(Some(Role::Diskful))
+        .into_iter()
+        .filter(|n| {
+            // No entry is not UpToDate: a replica just placed by
+            // spec.evict has none yet, and its LV is blank.
+            entries
+                .iter()
+                .find(|e| e.node == *n)
+                .and_then(|e| e.disk_state.as_deref())
+                .is_none_or(|d| !d.eq_ignore_ascii_case("UpToDate"))
+        })
+        .collect();
+    if stale.is_empty() {
+        go(P::Taking, None)
+    } else {
+        failed(format!("not UpToDate on {}", stale.join(", ")))
+    }
+}
+
+/// Every listed replica acks Taking: a diskful one with its copy, the
+/// others with IO still suspended at ack time. A node that acked Taking
+/// resumes only once the phase leaves Taking or at RESUME_AFTER, past
+/// every take window, so no write lands between two copies.
+fn taking(r: &Round<'_>) -> Step {
+    use SnapshotPhase as P;
+    let asked: Vec<&model::AssignedReplica> = r
+        .assignment
+        .replicas
+        .iter()
+        .filter(|x| r.replicated || x.role == Role::Diskful)
+        .collect();
+    let errors: Vec<String> = asked
+        .iter()
+        .filter_map(|x| r.ack(&x.node))
+        .filter(|a| matches!(a.phase, P::Suspending | P::Taking) && !a.ok)
+        .map(|a| format!("{}: {}", a.node, a.error.as_deref().unwrap_or("failed")))
+        .collect();
+    if !errors.is_empty() {
+        return failed(format!("Taking failed on {}", errors.join("; ")));
+    }
+    let taken = asked.iter().all(|x| {
+        r.ack(&x.node).is_some_and(|a| {
+            a.phase == P::Taking && a.ok && (x.role != Role::Diskful || a.pool.is_some())
+        })
+    });
+    if taken {
+        return go(P::Ready, None);
+    }
+    if r.phase_for.is_some_and(|d| d >= r.take_timeout) {
+        return failed(format!(
+            "take not acknowledged by every node within {} s",
+            r.take_timeout.as_secs()
+        ));
+    }
+    Step::Stay
 }
 
 /// Nodes that may hold a snapshot LV: the agent set a pool when it took
@@ -250,13 +366,11 @@ fn phase_reason(p: SnapshotPhase) -> &'static str {
     match p {
         SnapshotPhase::Pending => "Pending",
         SnapshotPhase::Suspending => "Suspending",
-        SnapshotPhase::Suspended => "Suspended",
         SnapshotPhase::Taking => "Taking",
-        SnapshotPhase::Taken => "Taken",
-        SnapshotPhase::Resuming => "Resuming",
         SnapshotPhase::Ready => "Ready",
         SnapshotPhase::Failed => "Failed",
         SnapshotPhase::Deleting => "Deleting",
+        SnapshotPhase::Unknown => "Unknown",
     }
 }
 
@@ -272,10 +386,13 @@ async fn write(api: &Api<Snapshot>, s: &Snapshot, mut wanted: Owned) {
     if Owned::current(s) == wanted {
         return;
     }
-    apply_status(api, &s.name_any(), wanted.json()).await;
+    // Computed from `s`: a store copy that lags must never move the phase
+    // backwards, e.g. a started round back to Pending.
+    let rv = s.metadata.resource_version.as_deref();
+    apply_status_at(api, &s.name_any(), rv, wanted.json()).await;
 }
 
-/// Returns the time left until the earliest take timeout, if any.
+/// Returns the time left until the earliest bound, if any.
 pub(crate) async fn reconcile_all(ctx: &Ctx<'_>, memory: &mut Memory) -> Option<Duration> {
     let api: Api<Snapshot> = Api::all(ctx.client.clone());
     let snapshots = Stores::sorted(&ctx.stores.snapshots);
@@ -287,6 +404,41 @@ pub(crate) async fn reconcile_all(ctx: &Ctx<'_>, memory: &mut Memory) -> Option<
         }
     }
     wake
+}
+
+/// What a Snapshot whose Volume is not usable does: Failed once the volume
+/// is going away or stayed absent past the grace (the store may lag behind
+/// a Volume created just before), else Pending with when to look again.
+pub fn without_volume(
+    phase: SnapshotPhase,
+    name: &str,
+    volume: Option<&Volume>,
+    age: Duration,
+) -> (SnapshotPhase, String, Option<Duration>) {
+    let pending = phase == SnapshotPhase::Pending;
+    match volume {
+        Some(v) if v.metadata.deletion_timestamp.is_some() && pending => (
+            SnapshotPhase::Failed,
+            format!("volume {name} is being deleted"),
+            None,
+        ),
+        Some(_) if pending => (phase, format!("volume {name} is not placed yet"), None),
+        None if pending && age < VOLUME_GRACE => (
+            phase,
+            format!("volume {name} not found"),
+            Some(VOLUME_GRACE.saturating_sub(age)),
+        ),
+        Some(_) => (
+            SnapshotPhase::Failed,
+            format!("volume {name} is not placed"),
+            None,
+        ),
+        None => (
+            SnapshotPhase::Failed,
+            format!("volume {name} not found"),
+            None,
+        ),
+    }
 }
 
 async fn reconcile(
@@ -310,14 +462,20 @@ async fn reconcile(
         .collect();
     if s.metadata.deletion_timestamp.is_some() {
         let restoring = restores.get(&name).map(String::as_str);
-        delete(api, s, current, &diskful, restoring).await;
+        let exists = |n: &str| ctx.stores.node(n).is_some();
+        delete(api, s, current, &diskful, restoring, &exists).await;
         return None;
     }
     if !has_finalizer(s, FINALIZER_SNAPSHOT) {
         set_finalizer(api, s, FINALIZER_SNAPSHOT, true).await;
         return None;
     }
-    if matches!(current.phase, SnapshotPhase::Ready | SnapshotPhase::Failed) {
+    // Unknown: a phase another version wrote. Left as it is, like Failed:
+    // rewriting it could fail a newer version's good snapshot.
+    if matches!(
+        current.phase,
+        SnapshotPhase::Ready | SnapshotPhase::Failed | SnapshotPhase::Unknown
+    ) {
         return None;
     }
     if !valid_name(&name) {
@@ -334,13 +492,19 @@ async fn reconcile(
         .await;
         return None;
     }
-    let (Some(v), Some(a)) = (volume.as_deref(), assignment) else {
-        let error = format!("volume {} not found or not placed yet", s.spec.volume);
-        let phase = if current.phase == SnapshotPhase::Pending {
-            SnapshotPhase::Pending
-        } else {
-            SnapshotPhase::Failed
-        };
+    let usable = volume.as_deref().filter(|v| {
+        v.metadata.deletion_timestamp.is_none() || current.phase != SnapshotPhase::Pending
+    });
+    let (Some(v), Some(a)) = (usable, assignment) else {
+        let age = s
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .map_or(Duration::ZERO, |t| {
+                Duration::try_from(Timestamp::now().duration_since(t.0)).unwrap_or(Duration::ZERO)
+            });
+        let (phase, error, wake) =
+            without_volume(current.phase, &s.spec.volume, volume.as_deref(), age);
         write(
             api,
             s,
@@ -351,7 +515,7 @@ async fn reconcile(
             },
         )
         .await;
-        return None;
+        return wake;
     };
     // Before any suspend: a snapshot LV name LVM would refuse in some
     // replica's VG fails the snapshot here, not in Taking with IO suspended.
@@ -385,7 +549,7 @@ async fn reconcile(
         write(api, s, wanted).await;
         return bound(ctx, current.phase);
     }
-    step(ctx, memory, api, s, v, &diskful, current).await
+    step(ctx, api, s, v, &a, current).await
 }
 
 /// Why the snapshot LV cannot be made in the VG of some diskful replica.
@@ -412,11 +576,10 @@ fn lv_name_problem(
 /// One state machine step for a snapshot whose volume is placed.
 async fn step(
     ctx: &Ctx<'_>,
-    memory: &mut Memory,
     api: &Api<Snapshot>,
     s: &Snapshot,
     v: &Volume,
-    diskful: &[String],
+    a: &Assignment,
     current: Owned,
 ) -> Option<Duration> {
     // Measured from the persisted start, so a controller restart keeps the bound.
@@ -428,81 +591,51 @@ async fn step(
         .as_ref()
         .map(|st| st.acks.as_slice())
         .unwrap_or_default();
-    let replicated = v.spec.replicas >= 2;
-    if current.phase == SnapshotPhase::Pending
-        && replicated
-        && let Some(e) = primary_unreachable(ctx, v)
-    {
-        write(
-            api,
-            s,
-            Owned {
-                last_error: Some(e),
-                ..current
-            },
-        )
-        .await;
-        return None;
-    }
-    let members = members(ctx, memory, s, v, current.phase, acks);
+    let stale: Vec<String> = a
+        .replicas
+        .iter()
+        .filter(|r| !ctx.stores.agent_fresh(&r.node))
+        .map(|r| r.node.clone())
+        .collect();
+    let other = crate::volume::snapshot_in_progress(ctx.stores, &s.spec.volume);
     let round = Round {
         phase: current.phase,
-        replicated,
-        diskful,
-        members: &members,
+        replicated: v.spec.replicas >= 2,
+        volume: v,
+        assignment: a,
         acks,
-        volume_ready: volume_ready(v),
-        volume_status: v.status.as_ref(),
-        last_error: current.last_error.as_deref(),
+        stale: &stale,
+        other_round: other.as_deref(),
         phase_for,
         take_timeout: ctx.cfg.take_timeout,
         suspend_timeout: ctx.cfg.suspend_timeout,
     };
-    let step = next(&round);
+    let mut step = next(&round);
+    if current.phase == SnapshotPhase::Pending && matches!(step, Step::Go { .. }) {
+        match live_round(api, s).await {
+            Ok(None) => {}
+            Ok(Some(other)) => {
+                step = Step::Hold(format!(
+                    "snapshot {other} of the same volume is in its round"
+                ));
+            }
+            Err(e) => step = Step::Hold(format!("reading snapshots: {e}")),
+        }
+    }
     apply_step(ctx, api, s, v, current, phase_for, step).await
 }
 
-/// Suspending around an unreachable Primary could never be undone there.
-/// Read from the raw entries, as status.primary leaves unreachable nodes
-/// out. A reachable entry in use means a failover happened and the stale
-/// one is the old Primary; a node whose Node object is gone is ignored.
-fn primary_unreachable(ctx: &Ctx<'_>, v: &Volume) -> Option<String> {
-    let entries = &v.status.as_ref()?.replicas;
-    let reachable = |n: &str| ctx.stores.agent_fresh(n);
-    let exists = |n: &str| ctx.stores.node(n).is_some();
-    held_by_unreachable_primary(entries, &reachable, &exists)
-}
-
-/// The lastError holding a round, or None to let it start.
-pub fn held_by_unreachable_primary(
-    entries: &[model::ReplicaStatus],
-    reachable: &dyn Fn(&str) -> bool,
-    exists: &dyn Fn(&str) -> bool,
-) -> Option<String> {
-    if entries.iter().any(|e| e.in_use && reachable(&e.node)) {
-        return None;
-    }
-    let stale: Vec<&str> = entries
+/// Another Snapshot of the volume in its round, as the API server has it.
+/// The store may not show a round this controller started a moment ago,
+/// and two rounds at once would let one resume IO under the other's take.
+async fn live_round(api: &Api<Snapshot>, s: &Snapshot) -> Result<Option<String>, kube::Error> {
+    let all = api.list(&ListParams::default()).await?;
+    Ok(all
+        .items
         .iter()
-        .filter(|e| e.in_use && !reachable(&e.node) && exists(&e.node))
-        .map(|e| e.node.as_str())
-        .collect();
-    (!stale.is_empty()).then(|| format!("primary {} is unreachable (last known)", stale.join(", ")))
-}
-
-fn members(
-    ctx: &Ctx<'_>,
-    memory: &mut Memory,
-    s: &Snapshot,
-    v: &Volume,
-    phase: SnapshotPhase,
-    acks: &[SnapshotAck],
-) -> Vec<String> {
-    match phase {
-        SnapshotPhase::Suspending => suspend_members(ctx, memory, s, v),
-        SnapshotPhase::Resuming => resume_members(&listed(memory, v), acks),
-        _ => Vec::new(),
-    }
+        .filter(|x| x.metadata.uid != s.metadata.uid && x.spec.volume == s.spec.volume)
+        .find(|x| crate::volume::round_running(x))
+        .map(ResourceExt::name_any))
 }
 
 /// The bound of a phase, if it has one.
@@ -512,54 +645,6 @@ fn bound(ctx: &Ctx<'_>, phase: SnapshotPhase) -> Option<Duration> {
         SnapshotPhase::Taking => Some(ctx.cfg.take_timeout),
         _ => None,
     }
-}
-
-fn listed(memory: &Memory, v: &Volume) -> Vec<String> {
-    memory
-        .assignment(v)
-        .iter()
-        .flat_map(|a| &a.replicas)
-        .map(|r| r.node.clone())
-        .collect()
-}
-
-/// Suspending: the replicas listed with a reachable agent when the round
-/// started (first seen here, so after a restart: now) that are still
-/// listed. One added mid round never suspended; one removed or found dead
-/// at the start does not block.
-fn suspend_members(ctx: &Ctx<'_>, memory: &mut Memory, s: &Snapshot, v: &Volume) -> Vec<String> {
-    let listed = listed(memory, v);
-    let fresh = || -> Vec<String> {
-        listed
-            .iter()
-            .filter(|n| ctx.stores.agent_fresh(n))
-            .cloned()
-            .collect()
-    };
-    let Some(uid) = s.metadata.uid.clone() else {
-        return fresh();
-    };
-    memory
-        .rounds
-        .entry(uid)
-        .or_insert_with(fresh)
-        .iter()
-        .filter(|n| listed.contains(n))
-        .cloned()
-        .collect()
-}
-
-/// Resuming: every replica still listed that suspended, read from the acks
-/// so it survives a restart: an ok Suspending ack, or any later ack.
-pub fn resume_members(listed: &[String], acks: &[SnapshotAck]) -> Vec<String> {
-    acks.iter()
-        .filter(|a| {
-            (a.phase == SnapshotPhase::Suspending && a.ok)
-                || matches!(a.phase, SnapshotPhase::Taking | SnapshotPhase::Resuming)
-        })
-        .filter(|a| listed.contains(&a.node))
-        .map(|a| a.node.clone())
-        .collect()
 }
 
 /// What restores can rely on: the requested size, or less while a replica
@@ -583,29 +668,36 @@ async fn apply_step(
     let name = s.name_any();
     match step {
         Step::Stay => {
-            let mut wanted = current;
-            if wanted.phase == SnapshotPhase::Pending {
-                // The volume exists now; the earlier "not found" is stale.
-                wanted.last_error = None;
-            }
-            let left = bound(ctx, wanted.phase)
+            let left = bound(ctx, current.phase)
                 .zip(phase_for)
                 .map(|(b, t)| b.saturating_sub(t));
-            write(api, s, wanted).await;
+            write(api, s, current).await;
             left
+        }
+        Step::Hold(why) => {
+            if current.last_error.as_deref() != Some(why.as_str()) {
+                debug!(snapshot = name, why, "snapshot round held");
+            }
+            let wanted = Owned {
+                last_error: Some(why),
+                ..current
+            };
+            write(api, s, wanted).await;
+            None
         }
         Step::Go { phase, error } => {
             let from = current.phase;
             let mut wanted = current;
             wanted.phase_since = Some(crate::now());
+            if from == SnapshotPhase::Pending {
+                wanted.last_error = None;
+            }
             if phase == SnapshotPhase::Taking {
                 wanted.size_bytes = Some(restore_size(v));
                 // A restore starts with the source's filesystem marker.
                 wanted.file_system = v.status.as_ref().and_then(|st| st.file_system.clone());
             }
-            let taken = phase == SnapshotPhase::Taken
-                || (phase == SnapshotPhase::Ready && from == SnapshotPhase::Taking);
-            if taken && wanted.created_at.is_none() {
+            if phase == SnapshotPhase::Ready && wanted.created_at.is_none() {
                 wanted.created_at = Some(crate::now());
             }
             if error.is_some() {
@@ -638,13 +730,15 @@ pub fn restoring_from(volumes: &[std::sync::Arc<Volume>]) -> BTreeMap<String, St
 }
 
 /// Releases the finalizer once every node that may hold the LV removed it,
-/// and no uninitialized restore reads from it.
+/// and no uninitialized restore reads from it. A holder whose Node object
+/// is gone took its LV with it; one whose agent is only stale may return.
 async fn delete(
     api: &Api<Snapshot>,
     s: &Snapshot,
     current: Owned,
     diskful: &[String],
     restoring: Option<&str>,
+    exists: &(dyn Fn(&str) -> bool + Sync),
 ) {
     if !has_finalizer(s, FINALIZER_SNAPSHOT) {
         return;
@@ -656,14 +750,9 @@ async fn delete(
         .unwrap_or_default();
     // sizeBytes is written on the way into Taking.
     let reached_taking = current.size_bytes.is_some()
-        || matches!(
-            current.phase,
-            SnapshotPhase::Taking
-                | SnapshotPhase::Taken
-                | SnapshotPhase::Resuming
-                | SnapshotPhase::Ready
-        );
-    let held = holders(acks, if reached_taking { diskful } else { &[] });
+        || matches!(current.phase, SnapshotPhase::Taking | SnapshotPhase::Ready);
+    let mut held = holders(acks, if reached_taking { diskful } else { &[] });
+    held.retain(|n| exists(n));
     if let Some(v) = restoring {
         debug!(
             snapshot = s.name_any(),
@@ -686,16 +775,13 @@ async fn delete(
     }
 }
 
-fn volume_ready(v: &Volume) -> bool {
-    v.status
-        .as_ref()
-        .is_some_and(|s| s.phase == VolumePhase::Ready)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use SnapshotPhase as P;
+    use model::{AssignedReplica, ReplicaStatus, VolumeStatus};
+
+    const GI: u64 = 1 << 30;
 
     fn ack(node: &str, phase: P, ok: bool) -> SnapshotAck {
         SnapshotAck {
@@ -707,32 +793,53 @@ mod tests {
         }
     }
 
-    fn round<'a>(
-        phase: P,
-        replicated: bool,
-        diskful: &'a [String],
-        acks: &'a [SnapshotAck],
-    ) -> Round<'a> {
-        Round {
-            phase,
-            replicated,
-            diskful,
-            members: diskful,
-            acks,
-            volume_ready: true,
-            volume_status: None,
-            last_error: None,
-            phase_for: Some(Duration::ZERO),
-            take_timeout: Duration::from_secs(120),
-            suspend_timeout: Duration::from_secs(30),
+    fn replica(node: &str, role: Role) -> AssignedReplica {
+        AssignedReplica {
+            node: node.into(),
+            pool: (role == Role::Diskful).then(|| format!("p-{node}")),
+            node_id: 0,
+            port: None,
+            role,
         }
     }
 
-    fn volume(size: u64, usable: Option<u64>) -> Volume {
+    /// n1, n2 diskful, n3 tiebreaker; `extra` appended.
+    fn assignment(extra: &[(&str, Role)]) -> Assignment {
+        let mut replicas = vec![
+            replica("n1", Role::Diskful),
+            replica("n2", Role::Diskful),
+            replica("n3", Role::Tiebreaker),
+        ];
+        replicas.extend(extra.iter().map(|(n, r)| replica(n, *r)));
+        Assignment {
+            replicas,
+            minor: Some(1000),
+            secret: None,
+            initial_up_to_date_node: Some("n1".into()),
+        }
+    }
+
+    /// The entry an agent writes for a healthy replica at generation 3.
+    fn entry(node: &str, disk: &str, peers: &[&str]) -> ReplicaStatus {
+        ReplicaStatus {
+            node: node.into(),
+            present: true,
+            disk_state: Some(disk.into()),
+            peers: peers
+                .iter()
+                .map(|p| ((*p).to_owned(), "Connected".to_owned()))
+                .collect(),
+            observed_generation: Some(3),
+            ..ReplicaStatus::default()
+        }
+    }
+
+    /// A Ready replicated volume of 1 GiB, in sync everywhere.
+    fn volume() -> Volume {
         let mut v = Volume::new(
             "pvc-1",
             model::VolumeSpec {
-                size_bytes: size,
+                size_bytes: GI,
                 replicas: 2,
                 tier: "test".into(),
                 pool: None,
@@ -745,222 +852,385 @@ mod tests {
                 assignment: None,
             },
         );
+        v.metadata.generation = Some(3);
         v.status = Some(VolumeStatus {
-            usable_bytes: usable,
+            phase: VolumePhase::Ready,
+            usable_bytes: Some(GI + 4096),
+            replicas: vec![
+                entry("n1", "UpToDate", &["n2"]),
+                entry("n2", "UpToDate", &["n1"]),
+                entry("n3", "Diskless", &["n1", "n2"]),
+            ],
             ..VolumeStatus::default()
         });
         v
     }
 
-    #[test]
-    fn restore_size_is_the_request_not_the_drbd_device() {
-        const GI: u64 = 1 << 30;
-        // The DRBD device of a 1Gi replicated volume.
-        assert_eq!(restore_size(&volume(GI, Some(1_077_698_560))), GI);
-        assert_eq!(restore_size(&volume(GI, None)), GI);
-        // Mid-resize: a replica still at the old size bounds what a restore gets.
-        assert_eq!(
-            restore_size(&volume(2 * GI, Some(1_077_698_560))),
-            1_077_698_560
-        );
+    struct Case {
+        phase: P,
+        replicated: bool,
+        volume: Volume,
+        assignment: Assignment,
+        acks: Vec<SnapshotAck>,
+        stale: Vec<String>,
+        other: Option<&'static str>,
+        phase_for: Duration,
+    }
+
+    impl Case {
+        fn new(phase: P, acks: &[SnapshotAck]) -> Self {
+            Self {
+                phase,
+                replicated: true,
+                volume: volume(),
+                assignment: assignment(&[]),
+                acks: acks.to_vec(),
+                stale: vec![],
+                other: None,
+                phase_for: Duration::ZERO,
+            }
+        }
+
+        fn local(phase: P, acks: &[SnapshotAck]) -> Self {
+            let mut c = Self::new(phase, acks);
+            c.replicated = false;
+            c.assignment.replicas.truncate(1);
+            c
+        }
+
+        fn next(&self) -> Step {
+            next(&Round {
+                phase: self.phase,
+                replicated: self.replicated,
+                volume: &self.volume,
+                assignment: &self.assignment,
+                acks: &self.acks,
+                stale: &self.stale,
+                other_round: self.other,
+                phase_for: Some(self.phase_for),
+                take_timeout: model::snapshot::TAKE_BOUND,
+                suspend_timeout: model::snapshot::SUSPEND_BOUND,
+            })
+        }
+
+        fn status(&mut self) -> &mut VolumeStatus {
+            self.volume.status.as_mut().unwrap()
+        }
+    }
+
+    fn held(step: &Step, needle: &str) {
+        let Step::Hold(why) = step else {
+            panic!("expected Hold with {needle}, got {step:?}");
+        };
+        assert!(why.contains(needle), "{why}");
+    }
+
+    fn failed_with(step: &Step, needle: &str) {
+        let Step::Go {
+            phase: P::Failed,
+            error: Some(e),
+        } = step
+        else {
+            panic!("expected Failed with {needle}, got {step:?}");
+        };
+        assert!(e.contains(needle), "{e}");
     }
 
     #[test]
-    fn local_rounds() {
-        let d = vec!["n1".to_owned()];
-        assert_eq!(
-            next(&round(P::Pending, false, &d, &[])),
-            go(P::Taking, None)
-        );
-        let mut r = round(P::Pending, false, &d, &[]);
-        r.volume_ready = false;
-        assert_eq!(next(&r), Step::Stay);
-        assert_eq!(next(&round(P::Taking, false, &d, &[])), Step::Stay);
-        let acks = [ack("n1", P::Taking, true)];
-        assert_eq!(
-            next(&round(P::Taking, false, &d, &acks)),
-            go(P::Ready, None)
-        );
-        let acks = [ack("n1", P::Taking, false)];
-        assert!(matches!(
-            next(&round(P::Taking, false, &d, &acks)),
-            Step::Go {
-                phase: P::Failed,
-                error: Some(_)
-            }
-        ));
-        let mut r = round(P::Taking, false, &d, &[]);
-        r.phase_for = Some(Duration::from_secs(120));
-        assert!(matches!(
-            next(&r),
-            Step::Go {
-                phase: P::Failed,
-                error: Some(_)
-            }
-        ));
+    fn a_healthy_volume_starts() {
+        assert_eq!(Case::new(P::Pending, &[]).next(), go(P::Suspending, None));
+        assert_eq!(Case::local(P::Pending, &[]).next(), go(P::Taking, None));
     }
 
     #[test]
-    fn replicated_rounds() {
-        let d = vec!["n1".to_owned(), "n2".to_owned()];
-        assert_eq!(
-            next(&round(P::Pending, true, &d, &[])),
-            go(P::Suspending, None)
-        );
-        let half = [ack("n1", P::Suspending, true)];
-        assert_eq!(next(&round(P::Suspending, true, &d, &half)), Step::Stay);
-        let both = [
+    fn every_start_condition_holds_pending() {
+        type Edit = fn(&mut Case);
+        let cases: &[(&str, Edit, &str)] = &[
+            (
+                "not ready",
+                |c| c.status().phase = VolumePhase::Degraded,
+                "not Ready",
+            ),
+            ("other round", |c| c.other = Some("s0"), "snapshot s0"),
+            (
+                "stale agent",
+                |c| c.stale = vec!["n3".into()],
+                "agent not reachable on n3",
+            ),
+            (
+                "not up to date",
+                |c| c.status().replicas[1].disk_state = Some("Outdated".into()),
+                "n2 is Outdated",
+            ),
+            (
+                "no entry",
+                |c| {
+                    c.status().replicas.remove(1);
+                },
+                "n2 is unknown",
+            ),
+            (
+                "diskful peer cut",
+                |c| {
+                    c.status().replicas[1]
+                        .peers
+                        .insert("n1".into(), "Connecting".into());
+                },
+                "n2 to n1 is Connecting",
+            ),
+            (
+                "attached writer cut",
+                |c| {
+                    c.assignment = assignment(&[("n4", Role::Diskless)]);
+                    c.status().replicas.push(entry("n4", "Diskless", &["n1"]));
+                },
+                "n4 to n2 is unknown",
+            ),
+            (
+                "spec not applied",
+                |c| c.volume.metadata.generation = Some(4),
+                "has not applied",
+            ),
+            (
+                "resize in flight",
+                |c| c.volume.spec.size_bytes = 2 * GI,
+                "resize",
+            ),
+        ];
+        let two_primaries: Edit = |c| {
+            c.status().replicas[0].in_use = true;
+            c.status().replicas[1].in_use = true;
+        };
+        let cases = &[
+            cases,
+            &[(
+                "two primaries",
+                two_primaries,
+                "more than one Primary (n1, n2)",
+            )],
+        ]
+        .concat();
+        for (what, edit, needle) in cases {
+            let mut c = Case::new(P::Pending, &[]);
+            edit(&mut c);
+            let step = c.next();
+            assert!(matches!(step, Step::Hold(_)), "{what}: {step:?}");
+            held(&step, needle);
+        }
+        // One Primary is the common case.
+        let mut c = Case::new(P::Pending, &[]);
+        c.status().replicas[0].in_use = true;
+        assert_eq!(c.next(), go(P::Suspending, None));
+        // A cut tiebreaker writes nothing: no hold.
+        let mut c = Case::new(P::Pending, &[]);
+        c.status().replicas[2].peers.clear();
+        assert_eq!(c.next(), go(P::Suspending, None));
+        // A local volume needs no agent or peer condition, only no other round.
+        let mut c = Case::local(P::Pending, &[]);
+        c.stale = vec!["n1".into()];
+        c.volume.metadata.generation = Some(4);
+        assert_eq!(c.next(), go(P::Taking, None));
+        c.other = Some("s0");
+        held(&c.next(), "snapshot s0");
+    }
+
+    #[test]
+    fn every_listed_replica_suspends() {
+        let two = [
             ack("n1", P::Suspending, true),
             ack("n2", P::Suspending, true),
         ];
         assert_eq!(
-            next(&round(P::Suspending, true, &d, &both)),
-            go(P::Suspended, None)
+            Case::new(P::Suspending, &two).next(),
+            Step::Stay,
+            "n3 missing"
         );
-        let up = |n: &str| model::ReplicaStatus {
-            node: n.into(),
-            present: true,
-            disk_state: Some("UpToDate".into()),
-            ..model::ReplicaStatus::default()
-        };
-        let st = VolumeStatus {
-            replicas: vec![up("n1"), up("n2")],
-            ..VolumeStatus::default()
-        };
-        let mut r = round(P::Suspended, true, &d, &both);
-        r.volume_status = Some(&st);
-        assert_eq!(next(&r), go(P::Taking, None));
-        // A diskful node without an entry (just placed by spec.evict, its
-        // LV blank) is not UpToDate: no take.
-        let partial = VolumeStatus {
-            replicas: vec![up("n1")],
-            ..VolumeStatus::default()
-        };
-        r.volume_status = Some(&partial);
-        assert_eq!(next(&r), go(P::Resuming, Some("not UpToDate on n2".into())));
-        r.volume_status = None;
-        assert_eq!(
-            next(&r),
-            go(P::Resuming, Some("not UpToDate on n1, n2".into()))
-        );
-        // Acks of the previous round do not count for this one.
-        assert_eq!(next(&round(P::Taking, true, &d, &both)), Step::Stay);
-        let taken = [ack("n1", P::Taking, true), ack("n2", P::Taking, true)];
-        assert_eq!(
-            next(&round(P::Taking, true, &d, &taken)),
-            go(P::Taken, None)
-        );
-        assert_eq!(
-            next(&round(P::Taken, true, &d, &taken)),
-            go(P::Resuming, None)
-        );
-        let resumed = [ack("n1", P::Resuming, true), ack("n2", P::Resuming, true)];
-        assert_eq!(
-            next(&round(P::Resuming, true, &d, &resumed)),
-            go(P::Ready, None)
-        );
-    }
-
-    #[test]
-    fn every_member_acks_the_io_rounds() {
-        let d = vec!["n1".to_owned(), "n2".to_owned()];
-        let m = vec!["n1".to_owned(), "n2".to_owned(), "n3".to_owned()];
-        let with = |phase: P, acks: &[SnapshotAck]| -> Step {
-            let mut r = round(phase, true, &d, acks);
-            r.members = &m;
-            next(&r)
-        };
-        let both = [
-            ack("n1", P::Suspending, true),
-            ack("n2", P::Suspending, true),
-        ];
-        assert_eq!(with(P::Suspending, &both), Step::Stay, "tiebreaker missing");
         let all = [
             ack("n1", P::Suspending, true),
             ack("n2", P::Suspending, true),
             ack("n3", P::Suspending, true),
         ];
-        assert_eq!(with(P::Suspending, &all), go(P::Suspended, None));
-        // Taking: diskful only, and only acks naming a pool.
-        let mut no_pool = ack("n2", P::Taking, true);
-        no_pool.pool = None;
-        let taking = [ack("n1", P::Taking, true), no_pool];
-        assert_eq!(with(P::Taking, &taking), Step::Stay);
-        let taking = [ack("n1", P::Taking, true), ack("n2", P::Taking, true)];
-        assert_eq!(with(P::Taking, &taking), go(P::Taken, None));
-        // A diskless member failing to resume fails the snapshot.
-        let resumed = [
-            ack("n1", P::Resuming, true),
-            ack("n2", P::Resuming, true),
-            ack("n3", P::Resuming, false),
-        ];
-        assert!(matches!(
-            with(P::Resuming, &resumed),
-            Step::Go {
-                phase: P::Failed,
-                error: Some(_)
-            }
-        ));
-    }
-
-    #[test]
-    fn replicated_failures_resume_first() {
-        let d = vec!["n1".to_owned(), "n2".to_owned()];
-        let acks = [
+        assert_eq!(Case::new(P::Suspending, &all).next(), go(P::Taking, None));
+        // An attachment added during Suspending is waited for too.
+        let mut c = Case::new(P::Suspending, &all);
+        c.assignment = assignment(&[("n4", Role::Diskless)]);
+        assert_eq!(c.next(), Step::Stay);
+        let bad = [
             ack("n1", P::Suspending, true),
             ack("n2", P::Suspending, false),
         ];
-        let Step::Go {
-            phase: P::Resuming,
-            error: Some(e),
-        } = next(&round(P::Suspending, true, &d, &acks))
-        else {
-            panic!("expected Resuming");
-        };
-        assert!(e.contains("n2: boom"), "{e}");
-        let resumed = [ack("n1", P::Resuming, true), ack("n2", P::Resuming, true)];
-        let mut r = round(P::Resuming, true, &d, &resumed);
-        r.last_error = Some(&e);
-        assert_eq!(next(&r), go(P::Failed, Some(e.clone())));
+        failed_with(&Case::new(P::Suspending, &bad).next(), "n2: boom");
+        // UpToDate gate on the way to Taking.
+        let mut c = Case::new(P::Suspending, &all);
+        c.status().replicas[1].disk_state = Some("Inconsistent".into());
+        failed_with(&c.next(), "not UpToDate on n2");
+    }
 
-        let mut r = round(P::Taking, true, &d, &[]);
-        r.phase_for = Some(Duration::from_secs(121));
-        assert!(matches!(
-            next(&r),
-            Step::Go {
-                phase: P::Resuming,
-                error: Some(_)
-            }
-        ));
-
-        // UpToDate gate between suspend and take.
-        let st = VolumeStatus {
-            replicas: vec![model::ReplicaStatus {
-                node: "n2".into(),
-                disk_state: Some("Inconsistent".into()),
-                ..model::ReplicaStatus::default()
-            }],
-            ..VolumeStatus::default()
+    #[test]
+    fn the_suspend_bound_wins_over_late_acks() {
+        let all = [
+            ack("n1", P::Suspending, true),
+            ack("n2", P::Suspending, true),
+            ack("n3", P::Suspending, true),
+        ];
+        let mut c = Case::new(P::Suspending, &all);
+        c.phase_for = model::snapshot::SUSPEND_BOUND.saturating_sub(Duration::from_secs(1));
+        assert_eq!(c.next(), go(P::Taking, None));
+        c.phase_for = model::snapshot::SUSPEND_BOUND;
+        failed_with(&c.next(), "within 30 s");
+        let mut c = Case::new(P::Suspending, &all[..2]);
+        c.phase_for = model::snapshot::SUSPEND_BOUND;
+        let step = c.next();
+        failed_with(&step, "by n3");
+        let Step::Go { error: Some(e), .. } = step else {
+            unreachable!()
         };
-        let mut r = round(P::Suspended, true, &d, &[]);
-        r.volume_status = Some(&st);
-        let Step::Go {
-            phase: P::Resuming,
-            error: Some(e),
-        } = next(&r)
-        else {
-            panic!("expected Resuming");
-        };
-        assert!(e.contains("n2"));
+        assert!(!e.contains("n1"), "{e}");
+    }
 
-        let bad = [ack("n1", P::Resuming, false)];
-        assert!(matches!(
-            next(&round(P::Resuming, true, &d, &bad)),
-            Step::Go {
-                phase: P::Failed,
-                ..
-            }
-        ));
+    /// A diskless or tiebreaker Taking ack: IO still suspended there.
+    fn frozen(node: &str) -> SnapshotAck {
+        let mut a = ack(node, P::Taking, true);
+        a.pool = None;
+        a
+    }
+
+    #[test]
+    fn taking_needs_every_listed_replica() {
+        let sus = |n: &str| ack(n, P::Suspending, true);
+        let c = Case::new(P::Taking, &[sus("n1"), sus("n2"), sus("n3")]);
+        assert_eq!(c.next(), Step::Stay);
+        let mut no_pool = ack("n2", P::Taking, true);
+        no_pool.pool = None;
+        let c = Case::new(
+            P::Taking,
+            &[ack("n1", P::Taking, true), no_pool, frozen("n3")],
+        );
+        assert_eq!(c.next(), Step::Stay, "a diskful ack without its copy");
+        let copies = [
+            ack("n1", P::Taking, true),
+            ack("n2", P::Taking, true),
+            sus("n3"),
+        ];
+        assert_eq!(
+            Case::new(P::Taking, &copies).next(),
+            Step::Stay,
+            "the tiebreaker has not confirmed its freeze"
+        );
+        let done = [
+            ack("n1", P::Taking, true),
+            ack("n2", P::Taking, true),
+            frozen("n3"),
+        ];
+        assert_eq!(Case::new(P::Taking, &done).next(), go(P::Ready, None));
+        // All acked after the bound: each agent acked within its own window.
+        let mut c = Case::new(P::Taking, &done);
+        c.phase_for = model::snapshot::TAKE_BOUND * 2;
+        assert_eq!(c.next(), go(P::Ready, None));
+        // An attachment added mid round must confirm a freeze it never had.
+        let mut c = Case::new(P::Taking, &done);
+        c.assignment = assignment(&[("n4", Role::Diskless)]);
+        assert_eq!(c.next(), Step::Stay);
+        c.phase_for = model::snapshot::TAKE_BOUND;
+        failed_with(&c.next(), "within 120 s");
+        let bad = [
+            ack("n1", P::Taking, true),
+            ack("n2", P::Taking, false),
+            frozen("n3"),
+        ];
+        failed_with(&Case::new(P::Taking, &bad).next(), "n2: boom");
+    }
+
+    #[test]
+    fn taking_fails_on_a_replica_not_suspended() {
+        // Resumed on its own deadline, or found IO live again.
+        for late in [ack("n3", P::Taking, false), ack("n3", P::Suspending, false)] {
+            let acks = [ack("n1", P::Taking, true), ack("n2", P::Taking, true), late];
+            failed_with(&Case::new(P::Taking, &acks).next(), "n3: boom");
+        }
+    }
+
+    #[test]
+    fn unknown_phases_run_no_round_and_never_count() {
+        // A Snapshot in a phase another version wrote: no step at all.
+        let old = |n: &str| ack(n, P::Unknown, true);
+        let c = Case::new(P::Unknown, &[old("n1"), old("n2"), old("n3")]);
+        assert_eq!(c.next(), Step::Stay);
+        // An ack in an unknown phase counts toward nothing, even ok.
+        let c = Case::new(P::Suspending, &[old("n1"), old("n2"), old("n3")]);
+        assert_eq!(c.next(), Step::Stay);
+        let mut c = Case::new(
+            P::Taking,
+            &[
+                ack("n1", P::Taking, true),
+                ack("n2", P::Taking, true),
+                old("n3"),
+            ],
+        );
+        assert_eq!(c.next(), Step::Stay);
+        c.phase_for = model::snapshot::TAKE_BOUND;
+        failed_with(&c.next(), "within");
+    }
+
+    #[test]
+    fn local_rounds() {
+        assert_eq!(Case::local(P::Taking, &[]).next(), Step::Stay);
+        let acks = [ack("n1", P::Taking, true)];
+        assert_eq!(Case::local(P::Taking, &acks).next(), go(P::Ready, None));
+        let acks = [ack("n1", P::Taking, false)];
+        failed_with(&Case::local(P::Taking, &acks).next(), "n1: boom");
+        let mut c = Case::local(P::Taking, &[]);
+        c.phase_for = model::snapshot::TAKE_BOUND;
+        failed_with(&c.next(), "within");
+    }
+
+    #[test]
+    fn a_snapshot_without_its_volume() {
+        let mut v = volume();
+        let s = Duration::from_secs;
+        assert_eq!(
+            without_volume(P::Pending, "v", None, s(1)),
+            (
+                P::Pending,
+                "volume v not found".into(),
+                Some(VOLUME_GRACE.saturating_sub(s(1)))
+            )
+        );
+        assert_eq!(
+            without_volume(P::Pending, "v", None, VOLUME_GRACE).0,
+            P::Failed
+        );
+        assert_eq!(without_volume(P::Taking, "v", None, s(1)).0, P::Failed);
+        assert_eq!(
+            without_volume(P::Pending, "v", Some(&v), s(1)).0,
+            P::Pending
+        );
+        assert_eq!(without_volume(P::Taking, "v", Some(&v), s(1)).0, P::Failed);
+        v.metadata.deletion_timestamp = Some(Time(Timestamp::now()));
+        let (phase, why, _) = without_volume(P::Pending, "v", Some(&v), s(1));
+        assert_eq!(
+            (phase, why.as_str()),
+            (P::Failed, "volume v is being deleted")
+        );
+    }
+
+    fn sized(size: u64, usable: Option<u64>) -> Volume {
+        let mut v = volume();
+        v.spec.size_bytes = size;
+        v.status.as_mut().unwrap().usable_bytes = usable;
+        v
+    }
+
+    #[test]
+    fn restore_size_is_the_request_not_the_drbd_device() {
+        // The DRBD device of a 1Gi replicated volume.
+        assert_eq!(restore_size(&sized(GI, Some(1_077_698_560))), GI);
+        assert_eq!(restore_size(&sized(GI, None)), GI);
+        // Mid-resize: a replica still at the old size bounds what a restore gets.
+        assert_eq!(
+            restore_size(&sized(2 * GI, Some(1_077_698_560))),
+            1_077_698_560
+        );
     }
 
     #[test]
@@ -1015,71 +1285,5 @@ mod tests {
         for x in [init, unplaced, deleting] {
             assert!(restoring_from(&[Arc::new(x)]).is_empty());
         }
-    }
-
-    #[test]
-    fn suspend_bound_names_the_silent_members() {
-        let d = vec!["n1".to_owned(), "n2".to_owned()];
-        let m = vec!["n1".to_owned(), "n2".to_owned(), "n3".to_owned()];
-        let acks = [
-            ack("n1", P::Suspending, true),
-            ack("n2", P::Suspending, true),
-        ];
-        let mut r = round(P::Suspending, true, &d, &acks);
-        r.members = &m;
-        r.phase_for = Some(Duration::from_secs(29));
-        assert_eq!(next(&r), Step::Stay);
-        r.phase_for = Some(Duration::from_secs(30));
-        let Step::Go {
-            phase: P::Resuming,
-            error: Some(e),
-        } = next(&r)
-        else {
-            panic!("expected Resuming");
-        };
-        assert!(e.contains("n3") && !e.contains("n1"), "{e}");
-    }
-
-    #[test]
-    fn resume_members_from_acks() {
-        let listed: Vec<String> = ["n1", "n2", "n3", "n4", "n5"]
-            .iter()
-            .map(|n| (*n).to_owned())
-            .collect();
-        let acks = [
-            ack("n1", P::Taking, true),
-            ack("n2", P::Resuming, true),
-            ack("n3", P::Suspending, true),
-            // Failed to suspend: nothing to resume.
-            ack("n4", P::Suspending, false),
-            // Removed from the assignment mid round.
-            ack("gone", P::Suspending, true),
-        ];
-        // n5 was attached mid round and never acked.
-        assert_eq!(resume_members(&listed, &acks), ["n1", "n2", "n3"]);
-    }
-
-    #[test]
-    fn unreachable_primary_holds_the_round() {
-        let e = |node: &str, in_use: bool| model::ReplicaStatus {
-            node: node.into(),
-            present: true,
-            in_use,
-            ..model::ReplicaStatus::default()
-        };
-        let all = |_: &str| true;
-        let not_n2 = |n: &str| n != "n2";
-        // Halted Primary n2, nobody promoted yet: held.
-        let r = [e("n1", false), e("n2", true)];
-        let held = held_by_unreachable_primary(&r, &not_n2, &all).unwrap();
-        assert!(held.contains("n2"), "{held}");
-        // n1 took over: the stale entry no longer holds the round.
-        let r = [e("n1", true), e("n2", true)];
-        assert_eq!(held_by_unreachable_primary(&r, &not_n2, &all), None);
-        // n2's Node object is gone: ignored.
-        let r = [e("n1", false), e("n2", true)];
-        assert_eq!(held_by_unreachable_primary(&r, &not_n2, &not_n2), None);
-        // Everyone reachable: never held.
-        assert_eq!(held_by_unreachable_primary(&r, &all, &all), None);
     }
 }

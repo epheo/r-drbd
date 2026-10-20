@@ -284,6 +284,19 @@ fn group(
     hidden: &[(usize, usize)],
     source: Option<&str>,
 ) -> Vec<Member> {
+    group_with(h, size, specs, hidden, source, None)
+}
+
+/// `group`, with `identical` deciding whether a snapshot's copies are
+/// proven identical, in place of the agent's own rule.
+fn group_with(
+    h: &Host,
+    size: u64,
+    specs: &[Spec],
+    hidden: &[(usize, usize)],
+    source: Option<&str>,
+    identical: Option<fn(&Snapshot) -> bool>,
+) -> Vec<Member> {
     let addr = |me: usize, j: usize| -> std::net::IpAddr {
         if hidden.contains(&(me, j)) {
             format!("127.0.0.{}", 10 + me).parse().unwrap()
@@ -337,6 +350,9 @@ fn group(
             vol.metadata.uid = Some(format!("uid-{}", s.res));
             let mut env = DrbdEnv::new(Some(h.features), RES_DIR, h.tracker.clone());
             env.init_wait = Duration::from_secs(3);
+            if let Some(f) = identical {
+                env.copies_identical = f;
+            }
             let live = Arc::new(MemberLive::default());
             let mut rec = Reconciler::new(h.node.clone(), h.exec.clone())
                 .with_drbd(env)
@@ -610,24 +626,38 @@ async fn drbd_no_start_without_quorum() {
     delete(&h, a).await;
 }
 
-/// A replicated restore: each member restores from the snapshot LV and the
-/// initial node clears the bitmap, so nothing but metadata crosses the
-/// network and the copies verify equal. Restored to twice the size, the
-/// grown area syncs, mostly as discards.
+/// A replicated restore as it runs today: no holder copies are proven
+/// identical, so the initial node restores its copy and the peer syncs in
+/// full from it; the copies verify equal.
 #[tokio::test]
 #[ignore = "needs root, DRBD 9 and the test VG"]
-async fn drbd_restore_uses_every_copy() {
+async fn drbd_restore_syncs_from_one_copy() {
     if !enabled() {
         return;
     }
     let h = start().await;
-    restore_case(&h, 1, 8 * MIB).await;
-    restore_case(&h, 2, 64 * MIB).await;
+    restore_case(&h, 1, None).await;
 }
 
-/// Restores a 256 MiB snapshot to `factor` times its size; the peer may
-/// receive at most `max_received` bytes.
-async fn restore_case(h: &Host, factor: u64, max_received: u64) {
+/// The restore once the copies are proven identical: each member restores
+/// from the snapshot LV and the initial node clears the bitmap, so nothing
+/// but metadata crosses the network and the copies verify equal. Restored
+/// to twice the size, the grown area syncs, mostly as discards.
+#[tokio::test]
+#[ignore = "needs root, DRBD 9 and the test VG"]
+async fn drbd_restore_of_proven_copies_uses_every_copy() {
+    if !enabled() {
+        return;
+    }
+    let h = start().await;
+    restore_case(&h, 1, Some(8 * MIB)).await;
+    restore_case(&h, 2, Some(64 * MIB)).await;
+}
+
+/// Restores a 256 MiB snapshot to `factor` times its size. With
+/// `max_received`, its copies count as proven and the peer may receive at
+/// most that many bytes; without, the peer syncs the data in full.
+async fn restore_case(h: &Host, factor: u64, max_received: Option<u64>) {
     drbd_clean(EVERY).await;
     let source_size = 256 * MIB;
     let size = factor * source_size;
@@ -659,7 +689,15 @@ async fn restore_case(h: &Host, factor: u64, max_received: u64) {
     });
     let snaps = [Arc::new(snap)];
     let pools = [pool(&h.node).await];
-    let mut g = group(h, size, &[A, B], &[], Some("rw-snap"));
+    let identical: fn(&Snapshot) -> bool = |_| true;
+    let mut g = group_with(
+        h,
+        size,
+        &[A, B],
+        &[],
+        Some("rw-snap"),
+        max_received.map(|_| identical),
+    );
     let mut proven = [false, false];
     let mut done = false;
     for _ in 0..120 {
@@ -695,9 +733,11 @@ async fn restore_case(h: &Host, factor: u64, max_received: u64) {
         g.iter().map(Member::error).collect::<Vec<_>>()
     );
     // Reported while at the snapshot's size, so before any growth.
-    assert_eq!(proven, [true, true], "both members proved their copy");
+    let both = max_received.is_some();
+    assert_eq!(proven, [true, both], "the members that used their copy");
     let tags = l.tags(VG).await.unwrap();
-    for lv in ["rw-a", "rw-b"] {
+    let copies: &[&str] = if both { &["rw-a", "rw-b"] } else { &["rw-a"] };
+    for lv in copies.iter().copied() {
         assert!(
             tags[lv]
                 .iter()
@@ -713,10 +753,11 @@ async fn restore_case(h: &Host, factor: u64, max_received: u64) {
         "restore peer received {received} KiB of a {} KiB volume",
         size / 1024
     );
-    assert!(
-        received * 1024 < max_received,
-        "at most {max_received} bytes: {received} KiB"
-    );
+    match max_received {
+        Some(max) => assert!(received * 1024 < max, "at most {max} bytes: {received} KiB"),
+        // The full sync carries at least the snapshot's written data.
+        None => assert!(received >= 4 * 1024, "{received} KiB"),
+    }
 
     // Online verify compares every block; the resource files carry no
     // verify-alg, so it is set on the live connections for this check.
@@ -769,6 +810,144 @@ async fn restore_case(h: &Host, factor: u64, max_received: u64) {
         delete(h, m).await;
     }
     drbd_clean(&["rw-src"]).await;
+}
+
+/// Snapshot rounds under a writer mixing O_DIRECT and buffered writes on
+/// the Primary run to the end on both replicas. Their copies may differ: a
+/// page rewritten during writeback reaches each disk in another version,
+/// so only a content digest can prove them identical. The count of
+/// differing rounds is printed, a measurement, not a check.
+#[tokio::test]
+#[ignore = "needs root, DRBD 9 and the test VG"]
+#[allow(clippy::too_many_lines)]
+async fn drbd_snapshot_rounds_under_a_writer() {
+    if !enabled() {
+        return;
+    }
+    drbd_clean(EVERY).await;
+    let h = start().await;
+    let size = 256 * MIB;
+    let mut g = group(&h, size, &[A, B], &[], None);
+    let [a, b] = &mut g[..] else { unreachable!() };
+    settle(&h, &mut [a, b], "both UpToDate and connected", |t| {
+        disk(t, "rw-a").as_deref() == Some("UpToDate")
+            && disk(t, "rw-b").as_deref() == Some("UpToDate")
+            && connected(t, "rw-a")
+            && connected(t, "rw-b")
+    })
+    .await;
+    for m in [&mut *a, &mut *b] {
+        m.vol
+            .status
+            .get_or_insert_with(Default::default)
+            .initialized_at = Some(now());
+    }
+    let pools = [pool(&h.node).await];
+    assert_eq!(
+        sh(&["drbdsetup", "primary", "rw-a"]).await.exit_code,
+        Some(0)
+    );
+    let stop = format!("{RES_DIR}/rw-writer-stop");
+    let _ = std::fs::remove_file(&stop);
+    let dev = format!("/dev/drbd{}", A.minor);
+    // 12 O_DIRECT chunks of 128 KiB, each in its own place, and 8 MiB of
+    // buffered overwrites left to writeback, again and again.
+    let script = format!(
+        "i=0; while [ ! -e {stop} ]; do i=$((i+1)); \
+         dd if=/dev/urandom of={dev} bs=128K count=1 seek=$((i % 12)) oflag=direct conv=notrunc status=none; \
+         dd if=/dev/urandom of={dev} bs=1M count=8 seek=128 conv=notrunc status=none; done"
+    );
+    let writer = tokio::spawn(async move { sh(&["sh", "-c", &script]).await });
+
+    let rounds = 6;
+    let mut differ = Vec::new();
+    for i in 0..rounds {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let snap = |m: &Member, phase| {
+            let mut s = Snapshot::new(
+                &format!("rw-s{i}"),
+                SnapshotSpec {
+                    volume: m.res.into(),
+                },
+            );
+            s.metadata.uid = Some(format!("uid-{}-s{i}", m.res));
+            s.status = Some(SnapshotStatus {
+                phase,
+                ..SnapshotStatus::default()
+            });
+            Arc::new(s)
+        };
+        // Every replica suspends before any takes, as in a real round.
+        for phase in [SnapshotPhase::Suspending, SnapshotPhase::Taking] {
+            for m in [&mut *a, &mut *b] {
+                let s = snap(m, phase);
+                let w = m.pass(&pools, &[s]).await;
+                let ack = w.iter().find_map(|w| match w {
+                    StatusWrite::Snapshot { ack, .. } => Some(ack.clone()),
+                    _ => None,
+                });
+                assert!(
+                    ack.as_ref().is_some_and(|a| a.ok),
+                    "{phase:?} {}: {ack:?}",
+                    m.res
+                );
+            }
+            if phase == SnapshotPhase::Suspending {
+                wait(&h.tracker, "both suspended", |t| {
+                    ["rw-a", "rw-b"].iter().all(|r| {
+                        t.resource(r)
+                            .is_some_and(agent::events2::Resource::suspended_by_user)
+                    })
+                })
+                .await;
+            }
+        }
+        for m in [&mut *a, &mut *b] {
+            let s = snap(m, SnapshotPhase::Ready);
+            m.pass(&pools, &[s]).await;
+        }
+        wait(&h.tracker, "both resumed", |t| {
+            ["rw-a", "rw-b"]
+                .iter()
+                .all(|r| t.resource(r).is_some_and(|x| !x.suspended_by_user()))
+        })
+        .await;
+        let mut sums = Vec::new();
+        for res in ["rw-a", "rw-b"] {
+            let lv = format!("{VG}/{res}+rw-s{i}");
+            let out = sh(&["lvchange", "-ay", "-K", &lv]).await;
+            assert_eq!(out.exit_code, Some(0), "{out:?}");
+            let out = sh(&[
+                "sh",
+                "-c",
+                &format!(
+                    "dd if=/dev/{lv} bs=1M count={} iflag=direct status=none | sha256sum",
+                    size / MIB
+                ),
+            ])
+            .await;
+            assert_eq!(out.exit_code, Some(0), "{out:?}");
+            sums.push(out.stdout);
+            let out = sh(&["lvremove", "-f", &lv]).await;
+            assert_eq!(out.exit_code, Some(0), "{out:?}");
+        }
+        println!("round {i}: {} {}", sums[0].trim(), sums[1].trim());
+        if sums[0] != sums[1] {
+            differ.push(i);
+        }
+    }
+    std::fs::write(&stop, "").unwrap();
+    let out = writer.await.unwrap();
+    let _ = std::fs::remove_file(&stop);
+    assert_eq!(out.exit_code, Some(0), "{out:?}");
+    assert_eq!(
+        sh(&["drbdsetup", "secondary", "rw-a"]).await.exit_code,
+        Some(0)
+    );
+    println!("copies differ in rounds {differ:?} of {rounds}");
+    for m in [&mut *a, &mut *b] {
+        delete(&h, m).await;
+    }
 }
 
 /// Backing LVs sized in closed form: usable at least the net size, at most
@@ -859,19 +1038,18 @@ async fn drbd_replicated_lifecycle() {
     for phase in [
         SnapshotPhase::Suspending,
         SnapshotPhase::Taking,
-        SnapshotPhase::Resuming,
+        SnapshotPhase::Ready,
         SnapshotPhase::Deleting,
     ] {
         let w = a.pass(&pools, &[snap(phase)]).await;
-        let ack = w
-            .iter()
-            .find_map(|w| match w {
-                StatusWrite::Snapshot { ack, .. } => Some(ack.clone()),
-                _ => None,
-            })
-            .unwrap();
+        let ack = w.iter().find_map(|w| match w {
+            StatusWrite::Snapshot { ack, .. } => Some(ack.clone()),
+            _ => None,
+        });
         println!("{phase:?}: {ack:?}");
-        assert!(ack.ok, "{ack:?}");
+        // Ready: the agent resumes on its own and has nothing to report.
+        assert_eq!(ack.is_none(), phase == SnapshotPhase::Ready, "{ack:?}");
+        assert!(ack.is_none_or(|a| a.ok));
         let suspended = matches!(phase, SnapshotPhase::Suspending | SnapshotPhase::Taking);
         wait(&h.tracker, "suspend state", |t| {
             t.resource("rw-a")

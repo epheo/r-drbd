@@ -210,8 +210,17 @@ pub mod argv {
         ])
     }
 
-    pub fn suspend_io(res: &str) -> Vec<String> {
-        a(&["drbdadm", "suspend-io", res])
+    /// No block device freeze: it flushes the Primary's page cache into
+    /// its own backing device after IO is suspended, never to the peers,
+    /// so the copies of one snapshot round would differ. drbdadm has no
+    /// way to pass the option.
+    pub fn suspend_io(minor: u32) -> Vec<String> {
+        a(&[
+            "drbdsetup",
+            "suspend-io",
+            &minor.to_string(),
+            "--bdev-freeze=no",
+        ])
     }
 
     pub fn resume_io(res: &str) -> Vec<String> {
@@ -252,6 +261,10 @@ pub mod argv {
 
     pub fn status_json(res: &str) -> Vec<String> {
         a(&["drbdsetup", "status", "--json", res])
+    }
+
+    pub fn status_stats_json(res: &str) -> Vec<String> {
+        a(&["drbdsetup", "status", "--json", "--statistics", res])
     }
 
     pub fn events2() -> Vec<String> {
@@ -555,6 +568,38 @@ pub fn json_sync_percent(stdout: &str) -> Option<u32> {
         .filter_map(|p| p["percent-in-sync"].as_f64())
         .map(whole_percent)
         .min()
+}
+
+/// What a suspended Primary still has in flight, from `status --json
+/// --statistics`: writes pending on its disk, or pending or unacked toward
+/// a peer. None once drained. A counter it cannot read counts as in
+/// flight, except a diskless device's disk counter.
+pub fn json_in_flight(stdout: &str) -> Option<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout) else {
+        return Some("unreadable status".to_owned());
+    };
+    let mut busy = Vec::new();
+    for r in v.as_array().into_iter().flatten() {
+        for d in r["devices"].as_array().into_iter().flatten() {
+            let n = d["lower-pending"].as_u64().unwrap_or(0);
+            if n > 0 {
+                busy.push(format!("lower-pending {n}"));
+            }
+        }
+        for c in r["connections"].as_array().into_iter().flatten() {
+            let peer = c["name"].as_str().unwrap_or("?");
+            for p in c["peer_devices"].as_array().into_iter().flatten() {
+                for k in ["pending", "unacked"] {
+                    match p[k].as_u64() {
+                        Some(0) => {}
+                        Some(n) => busy.push(format!("{k} {n} to {peer}")),
+                        None => busy.push(format!("no {k} count for {peer}")),
+                    }
+                }
+            }
+        }
+    }
+    (!busy.is_empty()).then(|| busy.join(", "))
 }
 
 /// Facts of the last pass that events alone cannot tell.
