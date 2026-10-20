@@ -258,6 +258,9 @@ pub(crate) struct Memory {
     /// Per Volume uid: the EvictionBlocked text last sent as an Event, so a
     /// block that lasts emits one Event per reason, not one per pass.
     pub(crate) evict_blocked: HashMap<String, String>,
+    /// Per Volume uid: the kind of the status apply failure last sent as
+    /// an Event; cleared once an apply succeeds.
+    pub(crate) status_failed: HashMap<String, String>,
     /// Per Volume uid: the attached nodes without a replica, and the
     /// message last sent as an Event.
     pub(crate) attach_failed: HashMap<String, (Vec<String>, String)>,
@@ -361,6 +364,16 @@ impl Memory {
         }
     }
 
+    /// Notes a failed status apply; true when this kind is new for the
+    /// Volume and deserves an Event.
+    pub(crate) fn status_failure(&mut self, uid: &str, kind: String) -> bool {
+        if self.status_failed.get(uid) == Some(&kind) {
+            return false;
+        }
+        self.status_failed.insert(uid.to_owned(), kind);
+        true
+    }
+
     pub(crate) fn reserve(&mut self, v: &model::Volume, a: Assignment) {
         if let Some(uid) = v.metadata.uid.clone() {
             self.pending
@@ -420,6 +433,7 @@ async fn pass(ctx: &Ctx<'_>, memory: &mut Memory) -> Option<Duration> {
     memory.initialized.retain(|uid, _| seen.contains_key(uid));
     memory.evict_blocked.retain(|uid, _| seen.contains_key(uid));
     memory.attach_failed.retain(|uid, _| seen.contains_key(uid));
+    memory.status_failed.retain(|uid, _| seen.contains_key(uid));
     memory
         .peer_unreachable
         .retain(|uid, _| seen.contains_key(uid));
@@ -442,6 +456,9 @@ async fn pass(ctx: &Ctx<'_>, memory: &mut Memory) -> Option<Duration> {
         .flatten()
         .min()
 }
+
+/// Warning Event: the controller's own status apply failed.
+pub(crate) const STATUS_APPLY_FAILED: &str = "StatusApplyFailed";
 
 /// A Normal core/v1 Event on a Volume; cluster-scoped objects get theirs
 /// in "default", as kubectl describe looks there. Failure only logs: the
@@ -545,7 +562,27 @@ where
 /// Server-side apply of the controller's status fields, forced, under the
 /// controller field manager. `status` must hold only controller-owned
 /// fields: anything in it becomes ours, anything we stop sending is removed.
-pub(crate) async fn apply_status<K>(api: &Api<K>, name: &str, status: serde_json::Value)
+/// False when it did not apply; a failure is logged.
+pub(crate) async fn apply_status<K>(api: &Api<K>, name: &str, status: serde_json::Value) -> bool
+where
+    K: Resource<DynamicType = ()> + Clone + DeserializeOwned + std::fmt::Debug,
+{
+    match try_apply_status(api, name, status).await {
+        Ok(()) => true,
+        Err(kube::Error::Api(s)) if s.is_not_found() => false,
+        Err(e) => {
+            warn!(kind = %K::kind(&()), name, error = %e, "status apply failed");
+            false
+        }
+    }
+}
+
+/// `apply_status` that hands the error back instead of logging it.
+pub(crate) async fn try_apply_status<K>(
+    api: &Api<K>,
+    name: &str,
+    status: serde_json::Value,
+) -> Result<(), kube::Error>
 where
     K: Resource<DynamicType = ()> + Clone + DeserializeOwned + std::fmt::Debug,
 {
@@ -556,10 +593,18 @@ where
         "status": status,
     });
     let pp = PatchParams::apply(model::keys::CONTROLLER_FIELD_MANAGER).force();
-    match api.patch_status(name, &pp, &Patch::Apply(&patch)).await {
-        Ok(_) => debug!(kind = %K::kind(&()), name, "status applied"),
-        Err(kube::Error::Api(s)) if s.is_not_found() => {}
-        Err(e) => warn!(kind = %K::kind(&()), name, error = %e, "status apply failed"),
+    api.patch_status(name, &pp, &Patch::Apply(&patch)).await?;
+    debug!(kind = %K::kind(&()), name, "status applied");
+    Ok(())
+}
+
+/// What a failed write is filed under, so a lasting failure is announced
+/// once per kind, not once per pass.
+pub(crate) fn error_kind(e: &kube::Error) -> String {
+    match e {
+        kube::Error::Api(s) if !s.reason.is_empty() => format!("{} {}", s.code, s.reason),
+        kube::Error::Api(s) => s.code.to_string(),
+        _ => "request failed".into(),
     }
 }
 
@@ -638,6 +683,29 @@ mod tests {
         // Moved with it: held by the stored assignment.
         let landed = volume("a", "2", Some(assignment(minor, "n1", port)));
         assert_eq!(memory.used(&[landed]).lowest_free_minor(), Some(minor + 1));
+    }
+
+    #[test]
+    fn a_lasting_status_failure_is_announced_once_per_kind() {
+        let api = |code, reason: &str| {
+            kube::Error::Api(Box::new(kube::core::Status {
+                code,
+                reason: reason.into(),
+                ..kube::core::Status::default()
+            }))
+        };
+        let invalid = super::error_kind(&api(422, "Invalid"));
+        let forbidden = super::error_kind(&api(403, "Forbidden"));
+        assert_eq!(invalid, "422 Invalid");
+        assert_eq!(super::error_kind(&api(500, "")), "500");
+        let mut memory = Memory::default();
+        assert!(memory.status_failure("a", invalid.clone()));
+        assert!(!memory.status_failure("a", invalid.clone()));
+        assert!(memory.status_failure("b", invalid.clone()));
+        assert!(memory.status_failure("a", forbidden));
+        // An apply that succeeds forgets it.
+        memory.status_failed.remove("a");
+        assert!(memory.status_failure("a", invalid));
     }
 
     #[test]

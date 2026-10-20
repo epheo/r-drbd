@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 use crate::alloc::{self, Entropy, Used};
 use crate::pool::Usage;
 use crate::store::Stores;
-use crate::{Ctx, Memory, apply_status, has_finalizer, set_finalizer, valid_volume_name};
+use crate::{Ctx, Memory, has_finalizer, set_finalizer, valid_volume_name};
 
 pub mod reason {
     pub const INVALID_NAME: &str = "InvalidName";
@@ -943,13 +943,38 @@ async fn write(memory: &mut Memory, api: &Api<Volume>, v: &Volume, wanted: Owned
         v.status.as_ref().and_then(|s| s.initialized_at.as_ref()),
         wanted.initialized_at,
     );
-    if let (Some(uid), Some(t)) = (uid, &wanted.initialized_at) {
-        memory.initialized.insert(uid, t.clone());
-    }
     if Owned::current(v).as_ref() == Some(&wanted) {
         return;
     }
-    apply_status(api, &v.name_any(), wanted.json()).await;
+    let name = v.name_any();
+    let r = crate::try_apply_status(api, &name, wanted.json()).await;
+    // Not after a rejection: evict trusts the value as stored. Yes after an
+    // unknown outcome: a store copy lagging behind a write that landed
+    // would otherwise let a later apply replace it.
+    if Outcome::of(&r) != Outcome::Rejected
+        && let (Some(uid), Some(t)) = (&uid, &wanted.initialized_at)
+    {
+        memory.initialized.insert(uid.clone(), t.clone());
+    }
+    match r {
+        Ok(()) => {
+            if let Some(uid) = &uid {
+                memory.status_failed.remove(uid);
+            }
+        }
+        Err(kube::Error::Api(s)) if s.is_not_found() => {}
+        Err(e) => {
+            warn!(volume = name, error = %e, "status apply failed");
+            let kind = crate::error_kind(&e);
+            if let Some(uid) = uid
+                && memory.status_failure(&uid, kind)
+            {
+                let client = api.clone().into_client();
+                let message = format!("status apply failed: {e}");
+                crate::warning_event(&client, v, crate::STATUS_APPLY_FAILED, &message).await;
+            }
+        }
+    }
 }
 
 /// Placement inputs built once per pass and updated after every

@@ -182,7 +182,7 @@ Pool `Released`: `Removed` (True: thin pool, VG and PV labels removed), `RemoveB
 
 Pool Events: `DeviceNotUsable` (Warning: an appended path is not blank and stays out of the pool), `PoolNotGrown` (Warning: a growth step failed, or the metadata maximum leaves VG space out of the pool).
 
-Volume Events: `Evicted`, `EvictionBlocked`, `SplitBrainResolved`, `PeerUnreachable` (Warning), `PeersReachable`, `AttachmentFailed` (Warning, once per distinct message).
+Volume Events: `Evicted`, `EvictionBlocked`, `SplitBrainResolved`, `PeerUnreachable` (Warning), `PeersReachable`, `AttachmentFailed` (Warning, once per distinct message), `StatusApplyFailed` (Warning, once per error kind until an apply succeeds).
 
 ## CSI driver
 
