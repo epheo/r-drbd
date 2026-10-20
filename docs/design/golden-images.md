@@ -105,7 +105,7 @@ Not in this design (section 13): backing chains or qcow2, asynchronous replicati
 - DeleteSnapshot deletes the Snapshot object and returns success once it carries a deletion timestamp. It never waits for LV removal: with retention that wait could last months and the snapshot controller would retry forever.
 - On each pass for a Snapshot with a deletion timestamp:
   1. Phase not yet Retired or Deleting: write phase `Retired`, Ready False with reason `Retired`, one `ImageRetired` Event.
-  2. List Volumes live (a linearizable read); count references: any Volume object, whatever its phase or deletion timestamp, with `purpose: Disk` and this uid in `spec.source.snapshotUid`; write `status.referencingDisks`.
+  2. List Volumes live (a linearizable read); count references: any Volume object, whatever its phase or deletion timestamp, with `purpose: Disk` and this uid in `spec.source.snapshotUid`; write `status.referencingDisks`. On every other pass the controller keeps `status.referencingDisks` current from its cache, for visibility; only the release decision recounts from a live list.
   3. Above zero: stay Retired; the next pass comes from Volume events.
   4. Zero: phase `Deleting`; the holders remove their snapshot LVs; the finalizer goes when every holder acked.
 - A Retired Snapshot never returns to Ready, never starts a new disk and never gets a new warm copy. Repairs still use its copies.
@@ -248,7 +248,7 @@ A replicated restore from the snapshot of a single-replica volume is refused wit
 - The resource file keeps the fixed option set. Quorum holds where it matters: the target is the holder's only peer and a fallback, so it comes up at once and the holder becomes the sync source with 2 of 2 connected. A disconnect only pauses the sync: nothing ever writes a warm Volume.
 - Both LVs are exactly `lvBytes`: the holder side is a thin snapshot of the snapshot LV; the target creates its LV at `lvBytes` from the ack, never at its own rounding, which on a smaller extent could land below the holder's device size and make DRBD refuse the connection.
 - `ImageWarming` on the Snapshot names the Pool.
-- Never Primary, never attached, invisible to CSI, never counted in `committedBytes`; charged once to the target Pool's warm budget.
+- Never Primary, never attached, never counted in `committedBytes`; every CSI call refuses a WarmCopy Volume; charged once to the target Pool's warm budget.
 
 ### 8.3 Down and keep
 
@@ -353,7 +353,7 @@ Volume:
 - `spec.source.snapshotUid` (controller, required with a source, immutable).
 - `spec.purpose`: `Disk` (default) or `WarmCopy` (controller, immutable; WarmCopy needs a source, replicas 2 and ReadWriteOnce). Why not `role`: it already names replica roles.
 - `spec.assignment` of a WarmCopy Volume is written by the controller at creation.
-- `status.replicas[].copyOf`, `zeroedFrom`, `fallback` (values `NoLocalCopy`, `CopyNotUsable`, `RestoreFailed`, `ProofFailed`, `SnapshotNotFound`, `Unknown`), `seededFrom`; all agent-written from tags.
+- `status.replicas[].copyOf`, `zeroedFrom`, `fallback` (values `NoLocalCopy`, `CopyNotUsable`, `RestoreFailed`, `ProofFailed`, `SnapshotNotFound`, `Unknown`), `seededFrom`; all agent-written from tags. A replica entry names its restore source only by `copyOf`, the Snapshot uid; there is no name-based source field.
 - Ready reasons `WaitingForImageCopy`, `SnapshotRetired`, `SnapshotUidMismatch`; `UnsupportedRestore` also covers a single-replica source.
 
 Snapshot:
