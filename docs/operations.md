@@ -114,11 +114,12 @@ It refuses any move while:
 
 - A split brain is pending or being resolved.
 - A snapshot is suspending, taking or resuming.
-- The evicted node's agent is alive and its replica is in use or attached.
+- The evicted node is attached, or its replica is in use as last reported, unless its Node object is deleted: a stale agent alone does not prove the workload stopped.
 
 A diskful replica is also refused while:
 
-- `status.initializedAt` is not set: the volume was never Ready, or its status was lost.
+- `status.initializedAt` is not set and the evicted node is the one that makes the first data: a volume never Ready holds nothing, so delete and recreate it.
+  Any other replica of a volume never Ready moves as usual.
 - No other diskful replica is UpToDate with quorum, or a previous rebuild is still running.
 - The Volume is pinned to that node (`spec.node`, or `spec.pool` on that node).
 
@@ -127,11 +128,15 @@ A tiebreaker holds no data: it moves to another free node, or is dropped when th
 While blocked, it emits an `EvictionBlocked` Event and keeps trying.
 On success, it emits `Evicted`.
 
-Only one node per Volume moves at a time.
-Local volumes (`replicas: 1`) cannot be evicted.
+Only one node per Volume moves per pass; a blocked node does not hold back the others listed.
+Local volumes (`replicas: 1`) cannot be evicted; remove the node from `spec.evict`.
 
 If the evicted node is alive, its agent takes DRBD down and keeps the LV as an orphan.
 Remove it by hand once you no longer need it.
+
+An evicted node whose agent is down keeps its replica entry in the Volume status until the agent returns and tears the old replica down, or its Node object is deleted.
+Until then no new replica goes to that node.
+If that entry last reported the device in use, snapshots of the volume wait, the Snapshot `lastError` naming the node.
 
 A dead node that will never return: delete its Node object.
 That tells r-drbd the node is fenced, which lifts the quorum requirement on the remaining replica.

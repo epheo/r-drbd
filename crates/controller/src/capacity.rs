@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use model::Pool;
 use model::keys::PARAM_TIER;
-use placer::{Outcome, PoolView, Request};
+use placer::{PoolView, Request};
 
 use crate::pool::Usage;
 
@@ -18,7 +18,7 @@ use crate::pool::Usage;
 // scheduler reads that and a missing object alike, as no capacity.
 pub fn answer<S: std::hash::BuildHasher>(
     pools: &[Arc<Pool>],
-    ready_nodes: &[String],
+    live_nodes: &[String],
     parameters: &HashMap<String, String, S>,
     segment: Option<&str>,
 ) -> Result<u64, String> {
@@ -27,7 +27,7 @@ pub fn answer<S: std::hash::BuildHasher>(
         .get(PARAM_TIER)
         .map(String::as_str)
         .filter(|t| !t.is_empty());
-    Ok(largest(pools, ready_nodes, tier, replicas, segment))
+    Ok(largest(pools, live_nodes, tier, replicas, segment))
 }
 
 /// Largest volume of `replicas` diskful replicas of `tier` (every tier
@@ -35,16 +35,16 @@ pub fn answer<S: std::hash::BuildHasher>(
 /// when None. 0 when none fits.
 pub fn largest(
     pools: &[Arc<Pool>],
-    ready_nodes: &[String],
+    live_nodes: &[String],
     tier: Option<&str>,
     replicas: u32,
     node: Option<&str>,
 ) -> u64 {
     // Only a local volume lives on the pod's node. A replicated one is
-    // placed by free space anywhere and any node attaches it diskless, so
+    // placed by room anywhere and any node attaches it diskless, so
     // every node sees the cluster-wide answer.
     let node = node.filter(|_| replicas == 1);
-    let views: Vec<PoolView> = pools.iter().map(|p| view(p, ready_nodes)).collect();
+    let views: Vec<PoolView> = pools.iter().map(|p| view(p, live_nodes)).collect();
     let mut tiers: Vec<&str> = match tier {
         Some(t) => vec![t],
         None => views.iter().map(|v| v.tier.as_str()).collect(),
@@ -62,7 +62,7 @@ pub fn largest(
 // placeableBytes is the room the pool pass published, counting assignments
 // not yet in the store, which the CSI side cannot see; a pool holding exactly
 // that much with no policy on top lets place() judge it unchanged.
-fn view(p: &Pool, ready_nodes: &[String]) -> PoolView {
+fn view(p: &Pool, live_nodes: &[String]) -> PoolView {
     let room = p
         .status
         .as_ref()
@@ -74,7 +74,7 @@ fn view(p: &Pool, ready_nodes: &[String]) -> PoolView {
         committed_bytes: 0,
         overcommit_percent: 100,
         reserve_percent: 0,
-        ..crate::pool::view(p, &Usage::new(), ready_nodes)
+        ..crate::pool::view(p, &Usage::new(), live_nodes)
     }
 }
 
@@ -100,10 +100,8 @@ fn placed(views: &[PoolView], tier: &str, replicas: u32, node: Option<&str>, siz
         tier: tier.to_owned(),
         pool: None,
         node: node.map(str::to_owned),
-        existing: Vec::new(),
-        holds_data: false,
     };
-    matches!(placer::place(&request, views), Outcome::Placed { .. })
+    placer::place(&request, views).is_ok()
 }
 
 #[cfg(test)]
@@ -224,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_pools_and_unready_nodes_hold_nothing() {
+    fn unavailable_pools_and_unlive_nodes_hold_nothing() {
         let r = ready(&["n1", "n2"]);
         let pools = published(vec![pool("a", "n1", "fast", 100 * G)], &r, &[]);
         let fast = Some("fast");

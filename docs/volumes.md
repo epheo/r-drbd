@@ -38,7 +38,7 @@ Two PVC annotations override placement:
         r-drbd.io/node: node2
         r-drbd.io/pool: node2-nvme
 
-- `r-drbd.io/node`: one of the diskful replicas goes to this node.
+- `r-drbd.io/node`: one diskful replica goes to this node, the others anywhere; the claim stays Pending while that node has no room.
 - `r-drbd.io/pool`: every diskful replica goes to this Pool; only sensible with `replicas: 1`.
 
 The CSI driver copies the annotations into the Volume (`spec.node`, `spec.pool`) once, at creation.
@@ -75,7 +75,7 @@ A node without such a Pool has none, so it is not chosen for a local claim.
 For `replicas` 2 or 3, every node sees the same number, the largest volume placement can spread over that many nodes, since any node can attach it.
 Only local claims are kept off nodes without a Pool.
 A claim no Pool can hold stays Pending; the pod's events carry the scheduler's message, `node(s) did not have enough free storage`.
-A restore claim must fit the current capacity too: the scheduler checks every claim, while placement never charges a restore against capacity, so a restore on a nearly full Pool can stay Pending although placement would accept it.
+A restore claim must fit the current capacity too: the scheduler checks every claim, while placement charges a restore only for its growth beyond the snapshot, so a restore on a nearly full Pool can stay Pending although placement would accept it.
 A pinned local claim (`r-drbd.io/pool`, `r-drbd.io/node`) lands on the pinned node whatever capacity says; if the scheduler picks another node, the PV node affinity then sends the pod to the pinned node.
 If capacity changes between two refreshes, CreateVolume refuses the node and the scheduler picks again.
 
@@ -99,11 +99,11 @@ A volume that was never Ready (a restore larger than its snapshot) stays Provisi
 
 | Phase | Meaning |
 |---|---|
-| Pending | Not placed yet; reason `Insufficient` while no Pool has room, retried when Pools change |
+| Pending | Not placed yet; reason `Insufficient` while no Pool has room or no DRBD minor or port is free, retried when Pools change |
 | Provisioning | Placed; replicas being created or synced for the first time |
 | Ready | Every diskful replica and the tiebreaker present; diskful replicas up to date and connected |
 | Degraded | Usable, but a replica is missing, out of date or on an unreachable node |
-| Failed | Invalid name, no free DRBD minor, port or node id, or a restore that cannot proceed; the `Ready` condition says why |
+| Failed | Invalid name or a restore that cannot proceed; the `Ready` condition says why; final until the spec changes, and CreateVolume deletes it |
 | Deleting | Agents are tearing down |
 
 CSI calls wait for Ready up to 30 s, then return an error; the CSI sidecars retry.

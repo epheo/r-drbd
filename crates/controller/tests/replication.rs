@@ -238,6 +238,32 @@ async fn publish_appends_diskless_and_unpublish_removes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn node_pin_places_one_of_the_replicas() {
+    let assets = require_envtest!();
+    let (_env, client, _cfg, _ctl) = setup(&assets).await;
+    cluster(&client).await;
+    // Equal pools: without the pin n1 would come first.
+    let mut spec = volume_spec(GIB, 2, "fast");
+    spec.node = Some("n2".into());
+    create_volume(&client, "pinned", spec).await;
+    let v = volume_where(&client, "pinned", |v| v.spec.assignment.is_some()).await;
+    let a = v.spec.assignment.as_ref().unwrap();
+    assert_eq!(a.initial_up_to_date_node.as_deref(), Some("n2"));
+    assert_eq!(role_of(&v, "n1"), Some(Role::Diskful));
+    // A pinned node without a pool: Pending, naming the pin.
+    let mut spec = volume_spec(GIB, 2, "fast");
+    spec.node = Some("n3".into());
+    create_volume(&client, "nowhere", spec).await;
+    let v = volume_where(&client, "nowhere", |v| {
+        ready_reason(v).as_deref() == Some("Insufficient")
+    })
+    .await;
+    let message = &cond(&v, types::READY).unwrap().message;
+    assert!(message.contains("one must be on n3"), "{message}");
+    assert!(v.spec.assignment.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_volumes_attach_to_one_node_in_one_pass() {
     let assets = require_envtest!();
     let (_env, client, _cfg, _ctl) = setup(&assets).await;
@@ -247,7 +273,9 @@ async fn two_volumes_attach_to_one_node_in_one_pass() {
         .map(|n| FakeAgent::new(&client, n).spawn_auto())
         .collect();
     // Attached from the start: both get placed, then both get their
-    // diskless n4 entry, typically in the same pass.
+    // diskless n4 entry, typically in the same pass. A pool of the tier
+    // too small for them keeps the spreading tiebreakers off n4.
+    pool(&client, "p4", "n4", "fast", GIB / 2).await;
     for name in ["va", "vb"] {
         let mut spec = volume_spec(GIB, 2, "fast");
         spec.attachments = vec!["n4".into()];
@@ -596,6 +624,29 @@ async fn stale_lease_marks_node_unreachable() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn placement_skips_nodes_without_a_live_agent() {
+    let assets = require_envtest!();
+    let (_env, client, _cfg, _ctl) = setup(&assets).await;
+    cluster(&client).await;
+    // Ready Nodes whose agent never renewed: neither a pool nor the
+    // tiebreaker may land there.
+    support::delete_agent_lease(&client, "n2").await;
+    support::delete_agent_lease(&client, "n3").await;
+    create_volume(&client, "rep", volume_spec(GIB, 2, "fast")).await;
+    let v = volume_where(&client, "rep", |v| {
+        ready_reason(v).as_deref() == Some("Insufficient")
+    })
+    .await;
+    let message = &cond(&v, types::READY).unwrap().message;
+    assert!(message.contains("n2/p2 NodeUnreachable"), "{message}");
+    support::agent_lease(&client, "n2", Duration::ZERO, false).await;
+    let v = volume_where(&client, "rep", |v| v.spec.assignment.is_some()).await;
+    assert_eq!(role_of(&v, "n2"), Some(Role::Diskful));
+    assert_eq!(role_of(&v, "n3"), None);
+    assert_eq!(role_of(&v, "n4"), Some(Role::Tiebreaker));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deletion_with_gone_or_stale_nodes() {
     let assets = require_envtest!();
     let (_env, client, _cfg, _ctl) = setup_with(&assets, |c| c.lease_stale = SHORT_STALE).await;
@@ -646,6 +697,8 @@ async fn replicated_restore_from_acks() {
     let assets = require_envtest!();
     let (_env, client, _cfg, _ctl) = setup(&assets).await;
     cluster(&client).await;
+    // No agent runs on n4: it is no tiebreaker candidate.
+    support::delete_agent_lease(&client, "n4").await;
     let _agents: Vec<_> = ["n1", "n2", "n3"]
         .iter()
         .map(|n| FakeAgent::new(&client, n).spawn_auto())
@@ -718,6 +771,8 @@ async fn snapshot_outlives_an_uninitialized_restore() {
     let assets = require_envtest!();
     let (_env, client, _cfg, _ctl) = setup(&assets).await;
     cluster(&client).await;
+    // No agent runs on n4: it is no tiebreaker candidate.
+    support::delete_agent_lease(&client, "n4").await;
     let auto: Vec<_> = ["n1", "n2", "n3"]
         .iter()
         .map(|n| FakeAgent::new(&client, n).spawn_auto())
@@ -780,6 +835,8 @@ async fn larger_restore_is_ready_only_at_the_full_size() {
     let assets = require_envtest!();
     let (_env, client, _cfg, _ctl) = setup(&assets).await;
     cluster(&client).await;
+    // No agent runs on n4: it is no tiebreaker candidate.
+    support::delete_agent_lease(&client, "n4").await;
     let auto: Vec<_> = ["n1", "n2", "n3"]
         .iter()
         .map(|n| FakeAgent::new(&client, n).spawn_auto())
@@ -1129,11 +1186,13 @@ async fn evict_stale_diskful_to_a_fourth_node() {
     assert_eq!(role_of(&v, "n2"), Some(Role::Diskful));
     assert_eq!(role_of(&v, "n3"), Some(Role::Tiebreaker));
     assert_eq!(a.minor, before.minor);
-    // n1 leaves spec.evict, its stale entry leaves the status.
-    let v = volume_where(&client, "rep", |v| {
-        v.spec.evict.is_empty() && entry_of(v, "n1").is_none()
-    })
-    .await;
+    // n1 leaves spec.evict; its stale entry stays while its Node exists,
+    // since its agent may return to an old replica, and goes with the Node.
+    volume_where(&client, "rep", |v| v.spec.evict.is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(entry_of(&get_volume(&client, "rep").await.unwrap(), "n1").is_some());
+    support::delete_node(&client, "n1").await;
+    let v = volume_where(&client, "rep", |v| entry_of(v, "n1").is_none()).await;
     assert!(v.status.as_ref().unwrap().initialized_at.is_some());
     let ev = events_of(&client, "rep", "Evicted").await;
     assert_eq!(ev.len(), 1);
@@ -1232,11 +1291,14 @@ async fn evict_blocked_then_tiebreaker_takes_over() {
     );
     assert!(!a.replicas.iter().any(|r| r.role == Role::Tiebreaker));
     assert_eq!(a.replicas.len(), 2);
-    let v = volume_where(&client, "rep", |v| {
-        v.spec.evict.is_empty() && entry_of(v, "n2").is_none() && phase_of(v) == VolumePhase::Ready
+    // A status from the pass before the move can stand a moment longer.
+    volume_where(&client, "rep", |v| {
+        v.spec.evict.is_empty()
+            && entry_of(v, "n2").is_none()
+            && phase_of(v) == VolumePhase::Ready
+            && v.status.as_ref().and_then(|s| s.nodes.as_deref()) == Some("n1,n3")
     })
     .await;
-    assert_eq!(v.status.as_ref().unwrap().nodes.as_deref(), Some("n1,n3"));
     let ev = events_of(&client, "rep", "Evicted").await;
     assert_eq!(ev.len(), 1);
     assert_eq!(

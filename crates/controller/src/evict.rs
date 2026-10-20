@@ -1,13 +1,13 @@
 //! spec.evict: re-placing the replica a dead or retired node holds.
 //! The controller never fills the list itself; an operator or a human
-//! does, because only they know a node is fenced. One node per volume at a time, the smallest name first.
+//! does, because only they know a node is fenced. One move per volume and
+//! pass: the first listed node by name that can act.
 
 use std::collections::BTreeSet;
 
-use model::keys::NODE_ID_MAX;
 use model::{AssignedReplica, Assignment, ReplicaStatus, Role, VolumeSpec};
 
-use crate::alloc::Used;
+use crate::alloc::{Used, next_node_id};
 
 /// What the pass knows besides the Volume itself.
 pub struct Input<'a> {
@@ -26,9 +26,10 @@ pub struct Input<'a> {
     /// The core Node object exists; deleting it is the operator's proof
     /// that a node is dead for good.
     pub node_exists: &'a dyn Fn(&str) -> bool,
+    /// Every Pool as placement sees it: `live` folds in `fresh`.
     pub views: &'a [placer::PoolView],
-    /// Nodes whose Node Ready condition is True, sorted.
-    pub ready_nodes: &'a [String],
+    /// Nodes placement may use (Ready, agent fresh), sorted.
+    pub live_nodes: &'a [String],
     pub used: &'a Used,
 }
 
@@ -82,31 +83,23 @@ fn up_to_date(e: &ReplicaStatus) -> bool {
             .is_some_and(|d| d.eq_ignore_ascii_case("UpToDate"))
 }
 
-/// The lowest DRBD node id no entry of `a` uses, never `retired`: within
-/// one move the peers still know the evicted node under its id until they
-/// forget-peer it. A later allocation may reuse it once it departed.
-pub fn free_node_id(a: &Assignment, retired: u8) -> Option<u8> {
-    (0..=NODE_ID_MAX).find(|id| *id != retired && !a.replicas.iter().any(|r| r.node_id == *id))
-}
-
 /// A status entry of a node outside the assignment: its agent has not torn
 /// the old replica down yet, so a new one there would meet stale state.
 fn departing(a: &Assignment, entries: &[ReplicaStatus], node: &str) -> bool {
     entries.iter().any(|e| e.node == node) && !a.replicas.iter().any(|r| r.node == node)
 }
 
-/// Pools a moved diskful replica may land in: fresh agent, no diskful
-/// entry of this volume, not being evicted itself, not departing.
+/// Pools a moved diskful replica may land in: no diskful entry of this
+/// volume, not being evicted itself, not departing. The placer checks the
+/// rest.
 pub fn candidates(
     views: &[placer::PoolView],
     a: &Assignment,
     entries: &[ReplicaStatus],
     evict: &[String],
-    fresh: &dyn Fn(&str) -> bool,
 ) -> Vec<placer::PoolView> {
     views
         .iter()
-        .filter(|p| fresh(&p.node))
         .filter(|p| !evict.contains(&p.node))
         .filter(|p| !departing(a, entries, &p.node))
         .filter(|p| {
@@ -131,25 +124,34 @@ fn common_precondition(i: &Input<'_>, node: &str) -> Option<String> {
     if let Some(snap) = i.snapshot_in_progress {
         return Some(format!("snapshot {snap} in progress"));
     }
-    // A stale node cannot report either; its Lease is the operator's proof.
-    if (i.fresh)(node) {
-        if i.spec.attachments.iter().any(|n| n == node) {
-            return Some(format!("attached to {node}; unpublish it first"));
-        }
-        if i.entries.iter().any(|e| e.node == node && e.in_use) {
-            return Some(format!("in use on {node}"));
-        }
+    // A stale Lease shows only that the agent is down, not that the node
+    // stopped serving; a deleted Node is the operator's proof it did.
+    if !(i.node_exists)(node) {
+        return None;
+    }
+    let hint = if (i.fresh)(node) {
+        ""
+    } else {
+        " (agent stale; delete its Node once fenced)"
+    };
+    if i.spec.attachments.iter().any(|n| n == node) {
+        return Some(format!("attached to {node}; unpublish it first{hint}"));
+    }
+    if i.entries.iter().any(|e| e.node == node && e.in_use) {
+        return Some(format!("in use on {node}{hint}"));
     }
     None
 }
 
 /// What a diskful move needs on top, as the blocking reason.
 fn diskful_precondition(i: &Input<'_>, node: &str) -> Option<String> {
-    if !i.initialized {
-        return Some(
-            "status.initializedAt is not set: the volume was never Ready, or its status was lost; an operator may set it once an UpToDate replica holds the data"
-                .into(),
-        );
+    // Before initializedAt only the initial node makes data; any other
+    // replica joins it as on any move.
+    let initial = i.assignment.initial_up_to_date_node.as_deref();
+    if !i.initialized && initial.is_none_or(|n| n == node) {
+        return Some(format!(
+            "status.initializedAt is not set and {node} makes the first data: a volume never Ready holds nothing, delete and recreate it; if its status was lost, an operator may set initializedAt once an UpToDate replica holds the data"
+        ));
     }
     let entry = |n: &str| i.entries.iter().find(|e| e.node == n);
     let others: Vec<&str> = i
@@ -184,8 +186,8 @@ fn diskful_precondition(i: &Input<'_>, node: &str) -> Option<String> {
 }
 
 /// A tiebreaker for `next` when it has none and two diskful replicas:
-/// a ready node with a fresh agent and no entry, not being evicted.
-fn add_tiebreaker(i: &Input<'_>, next: &mut Assignment, retired: u8) -> Option<String> {
+/// a live node with no entry, not being evicted.
+fn add_tiebreaker(i: &Input<'_>, next: &mut Assignment) -> Option<String> {
     let diskful: Vec<String> = next
         .replicas
         .iter()
@@ -198,17 +200,18 @@ fn add_tiebreaker(i: &Input<'_>, next: &mut Assignment, retired: u8) -> Option<S
     {
         return None;
     }
-    let ready: Vec<String> = i
-        .ready_nodes
+    let live: Vec<String> = i
+        .live_nodes
         .iter()
-        .filter(|n| (i.fresh)(n))
         .filter(|n| !i.spec.evict.contains(n))
         .filter(|n| !departing(i.assignment, i.entries, n))
         .filter(|n| !next.replicas.iter().any(|r| &r.node == *n))
         .cloned()
         .collect();
-    let node = placer::tiebreaker(&diskful, &ready, i.views, &i.spec.tier)?;
-    let node_id = free_node_id(next, retired)?;
+    let node = placer::tiebreaker(&diskful, &live, i.views, &i.spec.tier, &|n| {
+        i.used.resources_on(n)
+    })?;
+    let node_id = next_node_id(i.assignment, next)?;
     let port = i.used.lowest_free_port(&node)?;
     next.replicas.push(AssignedReplica {
         node: node.clone(),
@@ -228,20 +231,18 @@ fn move_diskful(i: &Input<'_>, gone: &AssignedReplica) -> Step {
     if i.spec.node.as_deref() == Some(node) || pinned_pool_here {
         return blocked(node, format!("pinned to {node}"));
     }
-    let pools = candidates(i.views, i.assignment, i.entries, &i.spec.evict, i.fresh);
+    let pools = candidates(i.views, i.assignment, i.entries, &i.spec.evict);
     let req = placer::Request {
         size_bytes: i.spec.size_bytes,
         replicas: 1,
         tier: i.spec.tier.clone(),
         pool: i.spec.pool.clone(),
         node: None,
-        existing: Vec::new(),
-        holds_data: false,
     };
     let mut full: Vec<String> = Vec::new();
     let chosen = match placer::place(&req, &pools) {
-        placer::Outcome::Placed { diskful, .. } => diskful.into_iter().next(),
-        placer::Outcome::Insufficient { rejected, .. } => {
+        Ok(diskful) => diskful.into_iter().next(),
+        Err(placer::Insufficient { rejected, .. }) => {
             full.extend(
                 rejected
                     .iter()
@@ -250,7 +251,6 @@ fn move_diskful(i: &Input<'_>, gone: &AssignedReplica) -> Step {
             );
             None
         }
-        placer::Outcome::AlreadyPlaced => None,
     };
     let Some(chosen) = chosen else {
         // Departing nodes are skipped only until their agent drops the old
@@ -258,7 +258,7 @@ fn move_diskful(i: &Input<'_>, gone: &AssignedReplica) -> Step {
         let mut leaving: Vec<&str> = i
             .views
             .iter()
-            .filter(|v| v.tier == i.spec.tier && (i.fresh)(&v.node))
+            .filter(|v| v.tier == i.spec.tier && v.live)
             .filter(|v| !i.spec.evict.contains(&v.node))
             .map(|v| v.node.as_str())
             .filter(|n| departing(i.assignment, i.entries, n))
@@ -284,7 +284,7 @@ fn move_diskful(i: &Input<'_>, gone: &AssignedReplica) -> Step {
         r.role = Role::Diskful;
         r.pool = Some(chosen.pool.clone());
     } else {
-        let Some(node_id) = free_node_id(i.assignment, gone.node_id) else {
+        let Some(node_id) = next_node_id(i.assignment, &next) else {
             return blocked(node, "no free DRBD node id");
         };
         let port = match i.assignment.minor {
@@ -302,7 +302,7 @@ fn move_diskful(i: &Input<'_>, gone: &AssignedReplica) -> Step {
             role: Role::Diskful,
         });
     }
-    let tiebreaker = add_tiebreaker(i, &mut next, gone.node_id);
+    let tiebreaker = add_tiebreaker(i, &mut next);
     let mut event = format!("replica of {} moved from {node} to {}", i.name, chosen.node);
     if let Some(t) = tiebreaker {
         event = format!("{event}; tiebreaker on {t}");
@@ -319,7 +319,7 @@ fn move_tiebreaker(i: &Input<'_>, gone: &AssignedReplica) -> Step {
     let node = gone.node.as_str();
     let mut next = i.assignment.clone();
     next.replicas.retain(|r| r.node != node);
-    let event = match add_tiebreaker(i, &mut next, gone.node_id) {
+    let event = match add_tiebreaker(i, &mut next) {
         Some(t) => format!("tiebreaker of {} moved from {node} to {t}", i.name),
         None => format!(
             "tiebreaker of {} removed from {node}; no node for a new one",
@@ -334,11 +334,28 @@ fn move_tiebreaker(i: &Input<'_>, gone: &AssignedReplica) -> Step {
     }
 }
 
-/// The step for the smallest node in spec.evict.
+/// The first step of spec.evict, by node name, that moves or clears; else
+/// the first Blocked, so its Event stays the same pass after pass; else the
+/// first Wait.
 pub fn decide(i: &Input<'_>) -> Step {
-    let Some(node) = i.spec.evict.iter().min() else {
-        return Step::Idle;
-    };
+    let nodes: BTreeSet<&String> = i.spec.evict.iter().collect();
+    let mut held = None;
+    for node in nodes {
+        let step = decide_node(i, node);
+        match step {
+            Step::Move { .. } | Step::Clear { .. } => return step,
+            Step::Blocked { .. } if !matches!(held, Some(Step::Blocked { .. })) => {
+                held = Some(step);
+            }
+            _ => {
+                held.get_or_insert(step);
+            }
+        }
+    }
+    held.unwrap_or(Step::Idle)
+}
+
+fn decide_node(i: &Input<'_>, node: &String) -> Step {
     let held = i.assignment.replicas.iter().find(|r| &r.node == node);
     let attached = i.spec.attachments.contains(node);
     let Some(r) = held else {
@@ -353,6 +370,12 @@ pub fn decide(i: &Input<'_>) -> Step {
     };
     if r.role == Role::Diskless {
         return Step::Wait { node: node.clone() };
+    }
+    if r.role == Role::Diskful && i.spec.replicas < 2 {
+        return blocked(
+            node,
+            format!("a local volume has no other copy; remove {node} from spec.evict"),
+        );
     }
     let why = common_precondition(i, node).or_else(|| {
         (r.role == Role::Diskful)
@@ -369,19 +392,19 @@ pub fn decide(i: &Input<'_>) -> Step {
 }
 
 /// Indices of status entries the controller removes: the node holds no
-/// replica in the assignment and its agent is stale or its Node is gone, so
-/// no agent will ever drop the entry.
+/// replica in the assignment and its Node is gone, so no agent will ever
+/// drop the entry. A stale agent on an existing Node keeps its entry: it
+/// marks the node departing until the agent tears the old replica down.
 pub fn orphan_entries(
     a: &Assignment,
     entries: &[ReplicaStatus],
-    fresh: &dyn Fn(&str) -> bool,
     exists: &dyn Fn(&str) -> bool,
 ) -> Vec<(usize, String)> {
     entries
         .iter()
         .enumerate()
         .filter(|(_, e)| !a.replicas.iter().any(|r| r.node == e.node))
-        .filter(|(_, e)| !fresh(&e.node) || !exists(&e.node))
+        .filter(|(_, e)| !exists(&e.node))
         .map(|(i, e)| (i, e.node.clone()))
         .collect()
 }

@@ -45,9 +45,9 @@ A node may hold several Pools of the same tier.
 ## Placement
 
 - Each diskful replica goes to a distinct node.
-- Candidates are Available Pools of the requested tier on Ready nodes.
+- Candidates are Available Pools of the requested tier on Ready nodes whose agent is alive (Lease renewed within 40 s); the tiebreaker node too.
 - A Pool accepts a volume only while its capacity policy allows it; by default, never more than the pool holds less a 5 percent reserve (see [Pools](pools.md#capacity)).
-- Among the candidates, the most free space wins.
+- Among the candidates, the Pool with the most room under its capacity policy wins.
 - A PVC can pin a node or a Pool with annotations (see [Volumes](volumes.md)).
 - A restore always lands where the snapshot lives.
 

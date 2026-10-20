@@ -319,22 +319,24 @@ impl Csi {
         Api::all(self.client.clone())
     }
 
-    /// Pins from the PVC annotations; a failed lookup only loses the pins.
-    async fn pvc_pins(&self, pvc: Option<&(String, String)>) -> (Option<String>, Option<String>) {
+    /// Pins from the PVC annotations. A PVC already gone has none; any
+    /// other failed read is retried, since pins are read once and a volume
+    /// placed without them never moves to them.
+    async fn pvc_pins(&self, pvc: Option<&(String, String)>) -> Result<Pins, Status> {
         let Some((ns, name)) = pvc else {
-            return (None, None);
+            return Ok((None, None));
         };
         let api: Api<PersistentVolumeClaim> = Api::namespaced(self.client.clone(), ns);
-        match api.get(name).await {
-            Ok(pvc) => {
+        match api.get_opt(name).await {
+            Ok(Some(pvc)) => {
                 let a = pvc.annotations();
                 let pin = |k: &str| a.get(k).filter(|v| !v.is_empty()).cloned();
-                (pin(ANNOTATION_PIN_NODE), pin(ANNOTATION_PIN_POOL))
+                Ok((pin(ANNOTATION_PIN_NODE), pin(ANNOTATION_PIN_POOL)))
             }
-            Err(e) => {
-                warn!(namespace = ns, pvc = name, error = %e, "PVC lookup failed; placing without pins");
-                (None, None)
-            }
+            Ok(None) => Ok((None, None)),
+            Err(e) => Err(Status::unavailable(format!(
+                "reading PVC {ns}/{name} for its pins: {e}"
+            ))),
         }
     }
 
@@ -431,12 +433,14 @@ impl Csi {
     }
 
     /// Deletes a Volume that never got an assignment, so a CO that treats
-    /// RESOURCE_EXHAUSTED as "nothing exists" (csi-provisioner reschedules
-    /// or finishes, and never calls DeleteVolume) leaves no orphan. The
-    /// preconditions keep a Volume assigned in the meantime.
-    /// `expect` is the (uid, generation) that reported Insufficient: a
-    /// Volume recreated or respecified since is a different request and is
-    /// left alone. None takes whatever unassigned Volume is there.
+    /// RESOURCE_EXHAUSTED or a final error as "nothing exists"
+    /// (csi-provisioner reschedules or finishes, and never calls
+    /// DeleteVolume) leaves no orphan. The preconditions keep a Volume
+    /// assigned in the meantime.
+    /// `expect` is the (uid, generation) that reported Insufficient or
+    /// Failed: a Volume recreated or respecified since is a different
+    /// request and is left alone. None takes whatever unassigned Volume is
+    /// there.
     async fn discard_unassigned(&self, name: &str, expect: Option<(String, i64)>) {
         let api = self.volumes();
         let matches = |v: &Volume| {
@@ -527,24 +531,35 @@ impl Csi {
                     )));
                 }
                 size = Some(size.unwrap_or(0).max(snap_size));
-                // Restores land where the snapshot lives.
-                if let Some((node, _)) = crate::volume::snapshot_holder(&snap).filter(|_| local) {
+                // Restores land where the snapshot lives: a local one on a
+                // holder in the requisite topology, one with a live agent
+                // first.
+                let holders = crate::volume::snapshot_holders(&snap);
+                if local && !holders.is_empty() {
                     let requisite = req
                         .accessibility_requirements
                         .as_ref()
                         .map(|t| t.requisite.as_slice())
                         .unwrap_or_default();
-                    if !requisite.is_empty()
-                        && !requisite
-                            .iter()
-                            .any(|t| t.segments.get(TOPOLOGY_KEY) == Some(&node))
-                    {
+                    let mut allowed: Vec<String> = holders
+                        .into_iter()
+                        .map(|(n, _)| n)
+                        .filter(|n| {
+                            requisite.is_empty()
+                                || requisite
+                                    .iter()
+                                    .any(|t| t.segments.get(TOPOLOGY_KEY) == Some(n))
+                        })
+                        .collect();
+                    if allowed.is_empty() {
                         self.discard_unassigned(name, None).await;
                         return Err(Status::resource_exhausted(format!(
-                            "snapshot {id} lives on {node}, outside the requisite topology"
+                            "snapshot {id} lives outside the requisite topology"
                         )));
                     }
-                    holder_node = Some(node);
+                    let live = self.stores.live_nodes();
+                    allowed.sort_by_key(|n| live.binary_search(n).is_err());
+                    holder_node = allowed.into_iter().next();
                 }
                 Some(VolumeSource {
                     snapshot: id.to_owned(),
@@ -631,7 +646,8 @@ impl Csi {
 
     /// Waits for the Volume `uid` to be usable; Failed maps to the CSI code
     /// the CO acts on.
-    /// Insufficient also yields the (uid, generation) it was reported for.
+    /// Insufficient and Failed also yield the (uid, generation) they were
+    /// reported for.
     async fn wait_volume_ready(
         &self,
         name: &str,
@@ -772,7 +788,7 @@ impl Controller for Csi {
         let size = size
             .filter(|s| *s > 0)
             .ok_or_else(|| Status::invalid_argument("capacity_range.required_bytes is required"))?;
-        let (pvc_node, pool) = self.pvc_pins(params.pvc.as_ref()).await;
+        let (pvc_node, pool) = self.pvc_pins(params.pvc.as_ref()).await?;
         let mut node = pvc_node.or(holder_node);
         // WaitForFirstConsumer: the scheduler's node, unless the PVC pins placement.
         if node.is_none() && pool.is_none() && params.replicas == 1 {
@@ -1048,9 +1064,9 @@ impl Controller for Csi {
             .as_ref()
             .and_then(|t| t.segments.get(TOPOLOGY_KEY))
             .map(String::as_str);
-        let ready_nodes = self.stores.ready_nodes();
+        let live_nodes = self.stores.live_nodes();
         let pools = Stores::sorted(&self.stores.pools);
-        let bytes = crate::capacity::answer(&pools, &ready_nodes, &req.parameters, segment)
+        let bytes = crate::capacity::answer(&pools, &live_nodes, &req.parameters, segment)
             .map_err(Status::invalid_argument)?;
         Ok(Response::new(GetCapacityResponse {
             available_capacity: to_i64(bytes),
@@ -1269,6 +1285,9 @@ impl Controller for Csi {
 
 type Outcome = Result<Arc<Volume>, (Status, Option<(String, i64)>)>;
 
+/// (node, pool) pins of a PVC.
+type Pins = (Option<String>, Option<String>);
+
 /// What one Volume read tells CreateVolume: Ok once Ready or Degraded at
 /// least at the requested size, an error when it can never be, None to
 /// wait. The size check holds even if the Ready rule changes: a restore
@@ -1293,13 +1312,16 @@ fn ready_outcome(name: &str, v: Arc<Volume>, generation: i64, requested: u64) ->
                 reported,
             )))
         }
+        // Final for the CO, which never calls DeleteVolume after it: the
+        // caller discards the unassigned Volume.
         VolumePhase::Failed => {
             let msg = format!(
                 "volume {name} failed: {}",
                 c.map(|c| format!("{}: {}", c.reason, c.message))
                     .unwrap_or_default()
             );
-            Some(Err((Status::failed_precondition(msg), None)))
+            let reported = v.metadata.uid.clone().zip(st.observed_generation);
+            Some(Err((Status::failed_precondition(msg), reported)))
         }
         _ => None,
     }
@@ -1333,6 +1355,27 @@ mod tests {
         assert_eq!(at(VolumePhase::Ready, Some(1024)), None);
         assert_eq!(at(VolumePhase::Ready, None), None);
         assert_eq!(at(VolumePhase::Provisioning, Some(2048)), None);
+    }
+
+    #[test]
+    fn a_failed_volume_is_reported_for_discarding() {
+        let mut v: Volume = serde_json::from_value(serde_json::json!({
+            "apiVersion": "r-drbd.io/v1alpha1",
+            "kind": "Volume",
+            "metadata": { "name": "v", "uid": "u", "generation": 2 },
+            "spec": { "sizeBytes": 2048, "tier": "t" },
+        }))
+        .unwrap();
+        v.status = Some(model::VolumeStatus {
+            phase: VolumePhase::Failed,
+            observed_generation: Some(2),
+            ..model::VolumeStatus::default()
+        });
+        let Some(Err((status, reported))) = ready_outcome("v", Arc::new(v), 2, 2048) else {
+            panic!("not an error");
+        };
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(reported, Some(("u".to_owned(), 2)));
     }
 
     fn params(kv: &[(&str, &str)]) -> HashMap<String, String> {

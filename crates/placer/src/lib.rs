@@ -1,8 +1,8 @@
-//! Placement of volume replicas and the quorum tiebreaker.
+//! Placement of volume replicas and the choice of the quorum tiebreaker.
 //!
 //! Pure crate, deliberately small: distinct nodes, tier or pool or node
-//! filter, capacity from the pool's own policy (see `room`), most free
-//! space first, deterministic ties.
+//! filter, capacity from the pool's own policy (see `room`), most room
+//! first, deterministic ties.
 
 #![forbid(unsafe_code)]
 
@@ -11,13 +11,13 @@ pub struct PoolView {
     pub name: String,
     pub node: String,
     pub tier: String,
-    pub node_ready: bool,
+    /// The node is Ready and its agent fresh.
+    pub live: bool,
     pub available: bool,
     pub total_bytes: u64,
     pub free_bytes: u64,
     /// Sum of the sizes of volumes already placed in this pool.
     pub committed_bytes: u64,
-    pub volume_count: u32,
     pub overcommit_percent: u32,
     pub reserve_percent: u32,
 }
@@ -29,16 +29,10 @@ pub struct Request {
     /// 0 behaves like already satisfied.
     pub replicas: u32,
     pub tier: String,
+    /// Every diskful replica goes to this pool.
     pub pool: Option<String>,
+    /// The first diskful replica goes to this node; the others go anywhere.
     pub node: Option<String>,
-    /// Nodes that already hold a diskful replica (re-placement after a
-    /// loss or a split-brain resolve); they are kept and not chosen again.
-    /// Duplicates are collapsed; order is irrelevant.
-    pub existing: Vec<String>,
-    /// The pinned pool already holds this volume's blocks (a restore from
-    /// its snapshot): the volume has nowhere else to go, so capacity is not
-    /// checked there. It still counts in `committed_bytes` afterwards.
-    pub holds_data: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,24 +41,13 @@ pub struct Chosen {
     pub pool: String,
 }
 
+/// Not enough nodes or capacity; `rejected` names every rejected pool once
+/// with the first reason that rejected it, in declaration order of Reason
+/// and input order of pools; `missing` counts the replicas still wanted.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Outcome {
-    /// New diskful replicas, in choice order, plus the tiebreaker node when
-    /// the diskful count is even and above one. Never partial.
-    Placed {
-        diskful: Vec<Chosen>,
-        tiebreaker: Option<String>,
-    },
-    /// Nothing to do: `existing` already satisfies `replicas`.
-    AlreadyPlaced,
-    /// Not enough nodes or capacity; `rejected` names every rejected pool
-    /// once with the first reason that rejected it, in declaration order of
-    /// Reason and input order of pools; `missing` counts the replicas still
-    /// wanted.
-    Insufficient {
-        missing: u32,
-        rejected: Vec<Rejected>,
-    },
+pub struct Insufficient {
+    pub missing: u32,
+    pub rejected: Vec<Rejected>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,12 +61,10 @@ pub struct Rejected {
 /// rejects it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
-    NodeNotReady,
+    NodeUnreachable,
     PoolUnavailable,
     WrongTier,
     NotThePinnedPool,
-    NotThePinnedNode,
-    NodeAlreadyHolds,
     NoCapacity,
 }
 
@@ -121,27 +102,23 @@ fn reserve(pool: &PoolView) -> u128 {
     (u128::from(pool.total_bytes) * u128::from(pool.reserve_percent)).div_ceil(100)
 }
 
+/// Placement may use the pool at all: its node is live and the pool
+/// Available. Capacity is apart, see `fits`.
+pub fn usable(pool: &PoolView) -> bool {
+    pool.live && pool.available
+}
+
 /// A pool with total 0 (capacity not reported yet) never fits.
 pub fn fits(pool: &PoolView, size_bytes: u64) -> bool {
     pool.total_bytes > 0 && size_bytes <= room(pool)
 }
 
-/// Diskful placement: filter pools, order by free bytes descending then
-/// node then pool name, pick one pool per node until `replicas` are held.
-///
-/// The tiebreaker in `Placed` is chosen among nodes with at least one pool
-/// whose `node_ready` is true. Nodes without any pool are tiebreaker
-/// candidates only through a direct `tiebreaker()` call (the controller does
-/// that with the Node list).
-pub fn place(req: &Request, pools: &[PoolView]) -> Outcome {
-    let mut existing = req.existing.clone();
-    existing.sort();
-    existing.dedup();
+/// Diskful placement: filter pools, order by room descending then node
+/// then pool name, the pinned node first, pick one pool per node until
+/// `replicas` are held. Never partial; with a node pin, Insufficient unless
+/// the first choice is on that node.
+pub fn place(req: &Request, pools: &[PoolView]) -> Result<Vec<Chosen>, Insufficient> {
     let wanted = usize::try_from(req.replicas).unwrap_or(usize::MAX);
-    if existing.len() >= wanted {
-        return Outcome::AlreadyPlaced;
-    }
-
     let mut rejected = Vec::new();
     let mut survivors = Vec::new();
     for pool in pools {
@@ -154,18 +131,21 @@ pub fn place(req: &Request, pools: &[PoolView]) -> Outcome {
             None => survivors.push(pool),
         }
     }
+    // Room, not freeBytes: committed grows with every placement of a pass,
+    // so a burst spreads instead of filling the pool with most unwritten space.
+    let off_pin = |node: &str| req.node.as_deref().is_some_and(|n| n != node);
     survivors.sort_by(|a, b| {
-        b.free_bytes
-            .cmp(&a.free_bytes)
+        off_pin(&a.node)
+            .cmp(&off_pin(&b.node))
+            .then_with(|| room(b).cmp(&room(a)))
             .then_with(|| a.node.cmp(&b.node))
             .then_with(|| a.name.cmp(&b.name))
     });
 
-    let missing = wanted - existing.len();
-    // Not with_capacity(missing): replicas is caller input and u32::MAX would abort.
+    // Not with_capacity(wanted): replicas is caller input and u32::MAX would abort.
     let mut diskful: Vec<Chosen> = Vec::new();
     for pool in survivors {
-        if diskful.len() == missing {
+        if diskful.len() == wanted {
             break;
         }
         if diskful.iter().any(|c| c.node == pool.node) {
@@ -176,73 +156,53 @@ pub fn place(req: &Request, pools: &[PoolView]) -> Outcome {
             pool: pool.name.clone(),
         });
     }
-    if diskful.len() < missing {
-        let short = u32::try_from(missing - diskful.len()).unwrap_or(u32::MAX);
-        return Outcome::Insufficient {
-            missing: short,
-            rejected,
-        };
-    }
-
-    let all: Vec<String> = existing
-        .into_iter()
-        .chain(diskful.iter().map(|c| c.node.clone()))
-        .collect();
-    let tiebreaker = if all.len() >= 2 && all.len().is_multiple_of(2) {
-        let mut ready: Vec<String> = pools
-            .iter()
-            .filter(|p| p.node_ready)
-            .map(|p| p.node.clone())
-            .collect();
-        ready.sort();
-        ready.dedup();
-        tiebreaker(&all, &ready, pools, &req.tier)
-    } else {
-        None
+    // Without a pool on the pinned node, that replica is missing whatever
+    // the other nodes offer.
+    let held = match diskful.first() {
+        Some(c) if off_pin(&c.node) => diskful.len().min(wanted - 1),
+        _ => diskful.len(),
     };
-    Outcome::Placed {
-        diskful,
-        tiebreaker,
+    if held < wanted {
+        return Err(Insufficient {
+            missing: u32::try_from(wanted - held).unwrap_or(u32::MAX),
+            rejected,
+        });
     }
+    Ok(diskful)
 }
 
 fn reject(req: &Request, pool: &PoolView) -> Option<Reason> {
-    if !pool.node_ready {
-        Some(Reason::NodeNotReady)
+    if !pool.live {
+        Some(Reason::NodeUnreachable)
     } else if !pool.available {
         Some(Reason::PoolUnavailable)
     } else if pool.tier != req.tier {
         Some(Reason::WrongTier)
     } else if req.pool.as_ref().is_some_and(|p| *p != pool.name) {
         Some(Reason::NotThePinnedPool)
-    } else if req.node.as_ref().is_some_and(|n| *n != pool.node) {
-        Some(Reason::NotThePinnedNode)
-    } else if req.existing.contains(&pool.node) {
-        Some(Reason::NodeAlreadyHolds)
-    } else if !((req.holds_data && req.pool.is_some()) || fits(pool, req.size_bytes)) {
+    } else if !fits(pool, req.size_bytes) {
         Some(Reason::NoCapacity)
     } else {
         None
     }
 }
 
-/// Tiebreaker node for an even diskful count: a ready node that holds no
-/// replica, preferring nodes with no pool of this tier (such as a control plane node),
-/// then the node with the fewest volumes, then by name.
+/// Tiebreaker node for an even diskful count: a live node that holds no
+/// replica, preferring nodes with no pool of this tier (such as a control
+/// plane node), then the node with the lowest `load`, then by name.
 pub fn tiebreaker(
     diskful_nodes: &[String],
-    ready_nodes: &[String],
+    live_nodes: &[String],
     pools: &[PoolView],
     tier: &str,
+    load: &dyn Fn(&str) -> usize,
 ) -> Option<String> {
-    ready_nodes
+    live_nodes
         .iter()
         .filter(|n| !diskful_nodes.contains(n))
         .min_by_key(|n| {
-            let mine = pools.iter().filter(|p| &p.node == *n);
-            let has_tier = mine.clone().any(|p| p.tier == tier);
-            let volumes: u64 = mine.map(|p| u64::from(p.volume_count)).sum();
-            (has_tier, volumes, n.as_str())
+            let has_tier = pools.iter().any(|p| &p.node == *n && p.tier == tier);
+            (has_tier, load(n), n.as_str())
         })
         .cloned()
 }

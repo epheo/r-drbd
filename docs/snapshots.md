@@ -70,10 +70,11 @@ It always lands in the Pools that hold the snapshot.
 
 Rules:
 
-- A local restore (`replicas: 1`) uses one of the nodes holding the snapshot.
+- A local restore (`replicas: 1`) uses one of the nodes holding the snapshot, preferring one whose agent is alive.
 - A replicated restore needs `replicas` equal to the number of nodes holding the snapshot.
   Every node holding the snapshot restores it from its own copy, so the restore is instant, shares blocks on every node and needs no sync.
   The copies are identical because the snapshot was taken with IO suspended on every replica.
+- A holder whose node is down, whose agent is stale or whose Pool is not Available keeps the restore Pending, reason `Insufficient`, naming it.
 - A replicated restore larger than its snapshot starts at the snapshot's size with identical copies, then grows online.
   The new area syncs between the replicas; zero blocks travel as discards, so it costs little network and no thin pool space.
   During that sync the other replica is Inconsistent on the new area only, and the volume is not Ready yet.
@@ -82,7 +83,8 @@ Rules:
   The first replica must hold its copy: without it the restore does not start.
 - The requested size may be larger than the snapshot; it may not be smaller.
 - Pins that point away from the snapshot's nodes or Pools fail the restore with reason `RestoreNodeConflict`.
-- The claim must still fit the scheduler's capacity check (see [Scheduling](volumes.md#scheduling)), although placement never charges a restore against capacity.
+- Placement charges only the growth beyond the snapshot: each holding Pool's capacity policy must still allow it, or the restore stays Pending, reason `Insufficient`.
+  The claim must also fit the scheduler's capacity check (see [Scheduling](volumes.md#scheduling)).
 
 The restored volume keeps the source's file system; it is never formatted again.
 

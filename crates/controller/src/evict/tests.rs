@@ -1,5 +1,6 @@
 use super::*;
 use model::Resolve;
+use model::keys::NODE_ID_MAX;
 
 const G: u64 = 1 << 30;
 
@@ -32,14 +33,13 @@ fn view(node: &str, free: u64) -> placer::PoolView {
         name: format!("p-{node}"),
         node: node.into(),
         tier: "fast".into(),
-        node_ready: true,
+        live: true,
         available: true,
         total_bytes: 100 * G,
         free_bytes: free,
         committed_bytes: 0,
         overcommit_percent: 100,
         reserve_percent: 5,
-        volume_count: 0,
     }
 }
 
@@ -121,6 +121,21 @@ impl Case {
         let fresh = move |n: &str| !stale.contains(&n);
         let gone = self.gone.clone();
         let exists = move |n: &str| !gone.contains(&n);
+        // As in production: liveness folds in a fresh agent and the Node.
+        let live: Vec<String> = self
+            .ready
+            .iter()
+            .filter(|n| fresh(n) && exists(n))
+            .cloned()
+            .collect();
+        let views: Vec<placer::PoolView> = self
+            .views
+            .iter()
+            .map(|v| placer::PoolView {
+                live: v.live && live.contains(&v.node),
+                ..v.clone()
+            })
+            .collect();
         decide(&Input {
             name: "vol",
             spec: &self.spec,
@@ -131,8 +146,8 @@ impl Case {
             snapshot_in_progress: self.snapshot,
             fresh: &fresh,
             node_exists: &exists,
-            views: &self.views,
-            ready_nodes: &self.ready,
+            views: &views,
+            live_nodes: &live,
             used: &self.used,
         })
     }
@@ -160,8 +175,8 @@ fn moved(s: Step) -> (Assignment, Option<(String, String)>, String) {
 #[test]
 fn idle_clear_and_wait() {
     assert_eq!(Case::new(&[]).decide(), Step::Idle);
-    // Not in the assignment, not attached: leaves the list; only the
-    // smallest node is looked at.
+    // Not in the assignment, not attached: leaves the list, the smallest
+    // name first.
     assert_eq!(
         Case::new(&["n9", "n7"]).decide(),
         Step::Clear {
@@ -179,15 +194,82 @@ fn idle_clear_and_wait() {
 }
 
 #[test]
-fn blocked_reasons() {
+fn a_blocked_node_holds_no_other() {
+    // n1 is blocked (in use), n2 can move: n2 moves.
+    let c = Case::new(&["n1", "n2"]);
+    let (next, _, _) = moved(c.decide());
+    assert!(!next.replicas.iter().any(|r| r.node == "n2"));
+    // A Wait ahead does not hold a Clear behind.
+    let mut c = Case::new(&["n0", "n7"]);
+    c.spec.attachments = vec!["n0".into()];
+    assert_eq!(
+        c.decide(),
+        Step::Clear {
+            node: "n7".into(),
+            rest: vec!["n0".into()]
+        }
+    );
+    // Nothing acts: the first Blocked is reported over any Wait.
+    let mut c = Case::new(&["n0", "n1"]);
+    c.spec.attachments = vec!["n0".into()];
+    assert_eq!(message(&c.decide()), "eviction of n1 blocked: in use on n1");
+}
+
+#[test]
+fn only_a_deleted_node_waives_the_workload_guard() {
     let base = || Case::new(&["n2"]);
-    let mut c = base();
-    c.initialized = false;
-    // The text names the way out.
+    // In use, even as last reported by a stale agent; only a deleted Node
+    // proves the workload is gone.
+    let mut c = Case::new(&["n1"]);
+    assert_eq!(message(&c.decide()), "eviction of n1 blocked: in use on n1");
+    c.stale = vec!["n1"];
     assert_eq!(
         message(&c.decide()),
-        "eviction of n2 blocked: status.initializedAt is not set: the volume was never Ready, or its status was lost; an operator may set it once an UpToDate replica holds the data"
+        "eviction of n1 blocked: in use on n1 (agent stale; delete its Node once fenced)"
     );
+    c.gone = vec!["n1"];
+    assert!(matches!(c.decide(), Step::Move { .. }));
+    // Attached, even when not in use.
+    let mut c = base();
+    c.spec.attachments = vec!["n2".into()];
+    assert_eq!(
+        message(&c.decide()),
+        "eviction of n2 blocked: attached to n2; unpublish it first"
+    );
+    c.stale = vec!["n2"];
+    assert!(message(&c.decide()).ends_with("(agent stale; delete its Node once fenced)"));
+    c.gone = vec!["n2"];
+    assert!(matches!(c.decide(), Step::Move { .. }));
+    // A local volume has nowhere to move.
+    let mut c = base();
+    c.spec.replicas = 1;
+    c.a.replicas.truncate(1);
+    c.spec.evict = vec!["n1".into()];
+    c.gone = vec!["n1"];
+    assert_eq!(
+        message(&c.decide()),
+        "eviction of n1 blocked: a local volume has no other copy; remove n1 from spec.evict"
+    );
+}
+
+#[test]
+fn blocked_reasons() {
+    let base = || Case::new(&["n2"]);
+    // Never Ready: only the initial node is refused, and the text names
+    // the way out; n2 joins n1 as on any move.
+    let mut c = Case::new(&["n1"]);
+    c.initialized = false;
+    c.entries[0].in_use = false;
+    assert_eq!(
+        message(&c.decide()),
+        "eviction of n1 blocked: status.initializedAt is not set and n1 makes the first data: a volume never Ready holds nothing, delete and recreate it; if its status was lost, an operator may set initializedAt once an UpToDate replica holds the data"
+    );
+    let mut c = base();
+    c.initialized = false;
+    assert!(matches!(c.decide(), Step::Move { .. }));
+    // The initial node must still hold the data.
+    c.entries[0].disk_state = Some("Inconsistent".into());
+    assert!(message(&c.decide()).contains("no UpToDate replica with quorum"));
     let mut c = base();
     c.snapshot = Some("snap-1");
     assert_eq!(
@@ -235,20 +317,6 @@ fn blocked_reasons() {
     // A stale lagging peer does not block.
     c.stale = vec!["n5"];
     assert!(matches!(c.decide(), Step::Move { .. }));
-    // In use on a reachable node; a stale one may still read in use.
-    let mut c = Case::new(&["n1"]);
-    assert_eq!(message(&c.decide()), "eviction of n1 blocked: in use on n1");
-    c.stale = vec!["n1"];
-    assert!(matches!(c.decide(), Step::Move { .. }));
-    // Attached on a fresh node, even when not in use; a stale one may go.
-    let mut c = base();
-    c.spec.attachments = vec!["n2".into()];
-    assert_eq!(
-        message(&c.decide()),
-        "eviction of n2 blocked: attached to n2; unpublish it first"
-    );
-    c.stale = vec!["n2"];
-    assert!(matches!(c.decide(), Step::Move { .. }));
     // Pins.
     let mut c = base();
     c.spec.node = Some("n2".into());
@@ -292,17 +360,17 @@ fn candidate_filter() {
         view("n5", G),
         view("n6", G),
     ];
-    let fresh = |n: &str| n != "n5";
     // n7 left the assignment but its agent has not dropped the entry yet.
     let mut views = views;
     views.push(view("n7", G));
     let entries = vec![up("n1", false), up("n2", false), tb("n3"), up("n7", false)];
-    let got: Vec<String> = candidates(&views, &a, &entries, &["n2".into(), "n6".into()], &fresh)
+    let got: Vec<String> = candidates(&views, &a, &entries, &["n2".into(), "n6".into()])
         .into_iter()
         .map(|p| p.node)
         .collect();
     // n3 holds only the tiebreaker: allowed, its entry is in the assignment.
-    assert_eq!(got, ["n3", "n4"]);
+    // Liveness is the placer's.
+    assert_eq!(got, ["n3", "n4", "n5"]);
 }
 
 #[test]
@@ -324,19 +392,20 @@ fn departing_nodes_are_no_target() {
 #[test]
 fn node_ids_never_reuse_the_evicted_one() {
     let a = two();
-    assert_eq!(free_node_id(&a, 0), Some(3));
+    assert_eq!(next_node_id(&a, &a), Some(3));
     let mut gap = two();
     gap.replicas.retain(|r| r.node != "n1");
-    // Id 0 is free in the assignment but was n1's.
-    assert_eq!(free_node_id(&gap, 0), Some(3));
-    assert_eq!(free_node_id(&gap, 5), Some(0));
+    // Id 0 is free after the write but was n1's before it.
+    assert_eq!(next_node_id(&a, &gap), Some(3));
+    // A later write may take it.
+    assert_eq!(next_node_id(&gap, &gap), Some(0));
     let full = Assignment {
         replicas: (0..=NODE_ID_MAX)
             .map(|id| rep(&format!("x{id}"), id, 11000, Role::Diskless))
             .collect(),
         ..two()
     };
-    assert_eq!(free_node_id(&full, 0), None);
+    assert_eq!(next_node_id(&full, &gap), None);
 }
 
 #[test]
@@ -437,16 +506,15 @@ fn tiebreaker_moves_or_goes() {
     c.entries[0].disk_state = Some("Inconsistent".into());
     c.entries[1].quorum = Some(false);
     assert!(matches!(c.decide(), Step::Move { .. }));
-    // Attached or in use on a fresh node blocks the tiebreaker too; a stale
-    // one may go.
+    // Attached or in use blocks the tiebreaker too, until its Node is gone.
     c.spec.attachments = vec!["n3".into()];
     assert_eq!(
         message(&c.decide()),
         "eviction of n3 blocked: attached to n3; unpublish it first"
     );
-    c.stale = vec!["n3"];
+    c.gone = vec!["n3"];
     assert!(matches!(c.decide(), Step::Move { .. }));
-    c.stale.clear();
+    c.gone.clear();
     c.spec.attachments.clear();
     c.entries[2].in_use = true;
     assert_eq!(message(&c.decide()), "eviction of n3 blocked: in use on n3");
@@ -469,12 +537,15 @@ fn orphans() {
     let mut a = two();
     a.replicas.retain(|r| r.node != "n2");
     let entries = vec![up("n1", false), up("n2", true), tb("n3"), up("n4", false)];
-    let fresh = |n: &str| n != "n2";
-    let exists = |n: &str| n != "n4";
-    let o = orphan_entries(&a, &entries, &fresh, &exists);
+    let exists = |n: &str| n != "n2" && n != "n4";
+    let o = orphan_entries(&a, &entries, &exists);
     assert_eq!(o, [(1, "n2".to_owned()), (3, "n4".to_owned())]);
-    // A fresh agent outside the assignment drops its own entry.
-    assert_eq!(orphan_entries(&a, &entries[..3], &|_| true, &|_| true), []);
+    // An existing Node keeps the entry, stale agent or not: its agent
+    // drops it, and until then the node is departing.
+    assert_eq!(
+        orphan_entries(&a, &entries, &|n| n != "n4"),
+        [(3, "n4".to_owned())]
+    );
     assert_eq!(
         orphan_patch(&o),
         serde_json::json!([

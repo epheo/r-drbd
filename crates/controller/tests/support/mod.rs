@@ -79,11 +79,13 @@ macro_rules! require_envtest {
     };
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .expect("free port")
+/// Three distinct free ports: each listener stays bound until all are
+/// chosen, or the kernel may hand the same port out twice.
+fn free_ports() -> (u16, u16, u16) {
+    let bind = || TcpListener::bind("127.0.0.1:0").expect("free port");
+    let held = [bind(), bind(), bind()];
+    let port = |i: usize| held[i].local_addr().expect("free port").port();
+    (port(0), port(1), port(2))
 }
 
 fn log_file(dir: &Path, name: &str) -> Stdio {
@@ -170,7 +172,7 @@ impl Drop for Env {
 impl Env {
     /// Starts etcd and kube-apiserver, installs the CRDs and the namespace.
     pub async fn start(assets: &Path) -> Self {
-        // free_port can lose a race with another test for its port; the
+        // free_ports can lose a race with another test for its port; the
         // losing process exits, and fresh ports almost always win.
         for _ in 0..3 {
             if let Some(env) = Self::try_start(assets).await {
@@ -187,7 +189,7 @@ impl Env {
             .tempdir()
             .expect("tempdir");
         let d = dir.path();
-        let (client_port, peer_port, api_port) = (free_port(), free_port(), free_port());
+        let (client_port, peer_port, api_port) = free_ports();
         let etcd = Killed(
             Command::new(assets.join("etcd"))
                 .args([

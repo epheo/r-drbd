@@ -37,6 +37,11 @@ impl Used {
         MINOR_RANGE.into_iter().find(|m| !self.minors.contains(m))
     }
 
+    /// DRBD resources on `node`, every role counted: a tiebreaker's load.
+    pub fn resources_on(&self, node: &str) -> usize {
+        self.ports.get(node).map_or(0, BTreeSet::len)
+    }
+
     pub fn lowest_free_port(&self, node: &str) -> Option<u16> {
         let taken = self.ports.get(node);
         PORT_RANGE
@@ -75,6 +80,20 @@ pub enum AllocError {
     TooManyPeers,
     #[error("no diskful replica to assign")]
     Empty,
+}
+
+/// The lowest DRBD node id neither `before` nor `after` uses. An id freed
+/// by the write from `before` to `after` waits for a later write: peers
+/// still know the departing node under it until they forget it.
+pub fn next_node_id(before: &Assignment, after: &Assignment) -> Option<u8> {
+    let used = |id: u8| {
+        before
+            .replicas
+            .iter()
+            .chain(&after.replicas)
+            .any(|r| r.node_id == id)
+    };
+    (0..=NODE_ID_MAX).find(|id| !used(*id))
 }
 
 /// Builds the assignment for freshly placed replicas. One diskful replica

@@ -33,7 +33,6 @@ pub mod reason {
     pub const ATTACHMENT_FAILED: &str = "AttachmentFailed";
     /// AttachmentFailed False.
     pub const ATTACHED: &str = "Attached";
-    pub const PLACING: &str = "Placing";
     pub const WAITING: &str = "Waiting";
     pub const ALL_UP_TO_DATE: &str = "AllReplicasUpToDate";
     pub const REPLICA_MISSING: &str = "ReplicaMissing";
@@ -738,9 +737,9 @@ pub fn resolve_action(split_brain: bool, seen_split: bool, done: bool) -> Resolv
 }
 
 /// Diskless entries converged to the attachments: a diskless entry whose
-/// node is no longer attached goes first, so its node id is free again;
-/// then an attached node without a replica gets one (lowest free node id
-/// in the volume, lowest free port on that node). A node in spec.evict
+/// node is no longer attached goes; then an attached node without a
+/// replica gets one (alloc::next_node_id, so never an id this write
+/// frees; lowest free port on that node). A node in spec.evict
 /// never gets a new one, but keeps the one it has while attached: that is
 /// a running workload. Diskful and tiebreaker entries never change. A node
 /// that cannot get a replica is reported and never holds back another.
@@ -760,8 +759,7 @@ pub fn converge_attachments(
         if evict.contains(node) || out.replicas.iter().any(|r| r.node == *node) {
             continue;
         }
-        let node_id = (0..=model::keys::NODE_ID_MAX)
-            .find(|id| !out.replicas.iter().any(|r| r.node_id == *id));
+        let node_id = alloc::next_node_id(a, &out);
         let port = used.lowest_free_port(node);
         let (node_id, port) = match (node_id, port) {
             (Some(id), Some(port)) => (id, port),
@@ -982,17 +980,17 @@ async fn write(memory: &mut Memory, api: &Api<Volume>, v: &Volume, wanted: Owned
 struct Placing {
     views: Vec<placer::PoolView>,
     used: Used,
-    ready_nodes: Vec<String>,
+    live_nodes: Vec<String>,
 }
 
 impl Placing {
     fn new(stores: &Stores, usage: &Usage, memory: &Memory, volumes: &[Arc<Volume>]) -> Self {
         let pools = Stores::sorted(&stores.pools);
-        let ready_nodes = stores.ready_nodes();
+        let live_nodes = stores.live_nodes();
         Self {
-            views: pool_views(&pools, usage, &ready_nodes),
+            views: pool_views(&pools, usage, &live_nodes),
             used: memory.used(volumes),
-            ready_nodes,
+            live_nodes,
         }
     }
 
@@ -1005,7 +1003,6 @@ impl Placing {
             .find(|p| p.node == node && p.name == pool)
         {
             view.committed_bytes = view.committed_bytes.saturating_add(size);
-            view.volume_count = view.volume_count.saturating_add(1);
         }
     }
 
@@ -1019,10 +1016,10 @@ impl Placing {
     }
 }
 
-fn pool_views(pools: &[Arc<Pool>], usage: &Usage, ready_nodes: &[String]) -> Vec<placer::PoolView> {
+fn pool_views(pools: &[Arc<Pool>], usage: &Usage, live_nodes: &[String]) -> Vec<placer::PoolView> {
     pools
         .iter()
-        .map(|p| crate::pool::view(p, usage, ready_nodes))
+        .map(|p| crate::pool::view(p, usage, live_nodes))
         .collect()
 }
 
@@ -1106,12 +1103,7 @@ pub(crate) struct Health {
 }
 
 impl Health {
-    fn new(
-        stores: &Stores,
-        ready_nodes: &[String],
-        volumes: &[Arc<Volume>],
-        memory: &Memory,
-    ) -> Self {
+    fn new(stores: &Stores, volumes: &[Arc<Volume>], memory: &Memory) -> Self {
         let mut holding: HashSet<&str> = volumes
             .iter()
             .filter_map(|v| memory.assignment(v))
@@ -1129,7 +1121,7 @@ impl Health {
             .map(str::to_owned)
             .collect();
         Self {
-            ready: ready_nodes.iter().cloned().collect(),
+            ready: stores.ready_nodes().into_iter().collect(),
             unreachable,
             exists: stores.nodes.state().iter().map(|n| n.name_any()).collect(),
             leases: stores
@@ -1198,7 +1190,7 @@ pub(crate) async fn reconcile_all(ctx: &Ctx<'_>, memory: &mut Memory) {
     let volumes = Stores::sorted(&ctx.stores.volumes);
     let usage = crate::pool::usage(&volumes, memory);
     let mut placing = Placing::new(ctx.stores, &usage, memory, &volumes);
-    let health = Health::new(ctx.stores, &placing.ready_nodes, &volumes, memory);
+    let health = Health::new(ctx.stores, &volumes, memory);
     for v in &volumes {
         reconcile(ctx, memory, &mut placing, &health, &api, v).await;
     }
@@ -1246,7 +1238,7 @@ async fn reconcile(
         let mut summary = health.summarize(v, &a, &memory.latched(v), &seen);
         memory.latch(v, summary.split_pairs.clone());
         evict_step(ctx, memory, placing, api, v, &a, &mut summary).await;
-        remove_orphans(ctx, health, api, v, &a).await;
+        remove_orphans(health, api, v, &a).await;
         if v.spec.resolve.is_some() {
             resolve_step(ctx, memory, api, v, &a, &mut summary, health).await;
         } else if let Some(uid) = &v.metadata.uid {
@@ -1259,6 +1251,13 @@ async fn reconcile(
         let mut wanted = Owned::wanted(v, summary.phase, &conds, Some(&summary));
         wanted.attachment_errors = attach_errors;
         write(memory, api, v, wanted).await;
+        return;
+    }
+    let failed = v.status.as_ref().is_some_and(|s| {
+        s.phase == VolumePhase::Failed && s.observed_generation == v.metadata.generation
+    });
+    if failed {
+        // Final until the spec changes: CreateVolume has given up on it.
         return;
     }
     match place(ctx, placing, v) {
@@ -1448,7 +1447,7 @@ async fn evict_step(
         fresh: &fresh,
         node_exists: &|n| ctx.stores.node(n).is_some(),
         views: &placing.views,
-        ready_nodes: &placing.ready_nodes,
+        live_nodes: &placing.live_nodes,
         used: &placing.used,
     });
     if !matches!(step, crate::evict::Step::Blocked { .. }) {
@@ -1611,19 +1610,12 @@ async fn peer_event(ctx: &Ctx<'_>, memory: &mut Memory, v: &Volume, now: &Cond) 
 }
 
 /// Status entries no agent will remove (crate::evict::orphan_entries).
-async fn remove_orphans(
-    ctx: &Ctx<'_>,
-    health: &Health,
-    api: &Api<Volume>,
-    v: &Volume,
-    a: &Assignment,
-) {
+async fn remove_orphans(health: &Health, api: &Api<Volume>, v: &Volume, a: &Assignment) {
     let Some(status) = v.status.as_ref() else {
         return;
     };
-    let fresh = |n: &str| ctx.stores.agent_fresh(n);
     let exists = |n: &str| health.exists.contains(n);
-    let orphans = crate::evict::orphan_entries(a, &status.replicas, &fresh, &exists);
+    let orphans = crate::evict::orphan_entries(a, &status.replicas, &exists);
     if orphans.is_empty() {
         return;
     }
@@ -1843,12 +1835,6 @@ enum Placement {
     Fail(Cond),
 }
 
-/// The (node, pool) holding a snapshot's LV: the first acked holder by
-/// node name.
-pub fn snapshot_holder(snap: &Snapshot) -> Option<(String, String)> {
-    snapshot_holders(snap).into_iter().next()
-}
-
 /// Every (node, pool) holding the snapshot LV, by node name: acks that
 /// succeeded and name a pool (set at Taking and carried by later acks).
 pub fn snapshot_holders(snap: &Snapshot) -> Vec<(String, String)> {
@@ -1864,13 +1850,11 @@ pub fn snapshot_holders(snap: &Snapshot) -> Vec<(String, String)> {
     holders
 }
 
-/// The restore's diskful (node, pool) pairs: the snapshot's holders, one
-/// for a local volume, all of them for a replicated one.
-fn restore_holders(
-    v: &Volume,
-    snap: Option<&Snapshot>,
+/// The Snapshot a restore reads and its size, once Ready.
+fn ready_snapshot<'a>(
+    snap: Option<&'a Snapshot>,
     wanted: &str,
-) -> Result<Vec<(String, String)>, Placement> {
+) -> Result<(&'a Snapshot, u64), Placement> {
     let Some(snap) = snap else {
         return Err(Placement::Wait(Cond::new(
             FALSE,
@@ -1880,25 +1864,35 @@ fn restore_holders(
     };
     let status = snap.status.clone().unwrap_or_default();
     match status.phase {
-        SnapshotPhase::Ready => {}
-        SnapshotPhase::Failed => {
-            return Err(Placement::Fail(Cond::new(
-                FALSE,
-                reason::SNAPSHOT_FAILED,
-                format!(
-                    "snapshot {wanted} failed: {}",
-                    status.last_error.unwrap_or_default()
-                ),
-            )));
-        }
-        p => {
-            return Err(Placement::Wait(Cond::new(
-                FALSE,
-                reason::SNAPSHOT_NOT_READY,
-                format!("snapshot {wanted} is {p:?}"),
-            )));
-        }
+        SnapshotPhase::Ready => Ok((snap, status.size_bytes.unwrap_or(0))),
+        SnapshotPhase::Failed => Err(Placement::Fail(Cond::new(
+            FALSE,
+            reason::SNAPSHOT_FAILED,
+            format!(
+                "snapshot {wanted} failed: {}",
+                status.last_error.unwrap_or_default()
+            ),
+        ))),
+        p => Err(Placement::Wait(Cond::new(
+            FALSE,
+            reason::SNAPSHOT_NOT_READY,
+            format!("snapshot {wanted} is {p:?}"),
+        ))),
     }
+}
+
+/// The restore's diskful replicas: the snapshot's holders, one for a local
+/// volume (the first usable one on the pinned node, if any), all of them
+/// for a replicated one. Each must be usable, and its pool must promise the
+/// growth beyond the snapshot: the shared blocks are already there, the
+/// growth is new data.
+fn restore_holders(
+    v: &Volume,
+    snap: Option<&Snapshot>,
+    wanted: &str,
+    views: &[placer::PoolView],
+) -> Result<Vec<placer::Chosen>, Placement> {
+    let (snap, snap_size) = ready_snapshot(snap, wanted)?;
     let mut holders = snapshot_holders(snap);
     if holders.is_empty() {
         return Err(Placement::Fail(Cond::new(
@@ -1907,9 +1901,9 @@ fn restore_holders(
             format!("snapshot {wanted} has no node holding it"),
         )));
     }
-    if v.spec.replicas == 1 {
-        holders.truncate(1);
-    } else if holders.len() != usize::try_from(v.spec.replicas).unwrap_or(usize::MAX) {
+    let at: Vec<String> = holders.iter().map(|(n, p)| format!("{n}/{p}")).collect();
+    let local = v.spec.replicas == 1;
+    if !local && holders.len() != usize::try_from(v.spec.replicas).unwrap_or(usize::MAX) {
         return Err(Placement::Fail(Cond::new(
             FALSE,
             reason::UNSUPPORTED_RESTORE,
@@ -1920,19 +1914,16 @@ fn restore_holders(
             ),
         )));
     }
-    let node_conflict = v
-        .spec
-        .node
-        .as_ref()
-        .is_some_and(|n| !holders.iter().any(|(h, _)| h == n));
     // A pool pin holds every replica; a node pin only one of them.
-    let pool_conflict = v
-        .spec
-        .pool
-        .as_ref()
-        .is_some_and(|p| !holders.iter().all(|(_, h)| h == p));
-    if node_conflict || pool_conflict {
-        let at: Vec<String> = holders.iter().map(|(n, p)| format!("{n}/{p}")).collect();
+    let pinned_node = |n: &str| v.spec.node.as_deref().is_none_or(|p| p == n);
+    let pinned_pool = |p: &str| v.spec.pool.as_deref().is_none_or(|x| x == p);
+    if local {
+        holders.retain(|(n, p)| pinned_node(n) && pinned_pool(p));
+    }
+    let conflict = holders.is_empty()
+        || !holders.iter().any(|(n, _)| pinned_node(n))
+        || !holders.iter().all(|(_, p)| pinned_pool(p));
+    if conflict {
         return Err(Placement::Fail(Cond::new(
             FALSE,
             reason::RESTORE_NODE_CONFLICT,
@@ -1944,16 +1935,53 @@ fn restore_holders(
             ),
         )));
     }
-    Ok(holders)
+    let view = |(n, p): &(String, String)| views.iter().find(|x| x.name == *p && x.node == *n);
+    let unusable = |h: &(String, String)| !view(h).is_some_and(placer::usable);
+    if local && let Some(i) = holders.iter().position(|h| !unusable(h)) {
+        holders = vec![holders.swap_remove(i)];
+    }
+    if let Some((n, p)) = holders.iter().find(|h| unusable(h)) {
+        return Err(Placement::Wait(Cond::new(
+            FALSE,
+            reason::INSUFFICIENT,
+            format!(
+                "snapshot {wanted} holder {n}/{p} is not usable: node down, agent stale or pool not Available"
+            ),
+        )));
+    }
+    let growth = v.spec.size_bytes.saturating_sub(snap_size);
+    for h in &holders {
+        let promise = view(h).map_or(0, placer::promise);
+        if growth > promise {
+            return Err(Placement::Wait(Cond::new(
+                FALSE,
+                reason::INSUFFICIENT,
+                format!(
+                    "pool {}/{}: growth of {growth} bytes beyond snapshot {wanted} exceeds the {promise} bytes its capacity policy still allows",
+                    h.0, h.1
+                ),
+            )));
+        }
+    }
+    Ok(holders
+        .into_iter()
+        .map(|(node, pool)| placer::Chosen { node, pool })
+        .collect())
 }
 
 /// Assignment for chosen diskful replicas, with a tiebreaker when their
-/// count is even; recomputed with the Node list because a node without
-/// pools (such as a control plane node) is the preferred tiebreaker.
+/// count is even, chosen from the Node list: a node without pools (such as
+/// a control plane node) is the preferred tiebreaker.
 fn assign(placing: &Placing, v: &Volume, diskful: &[placer::Chosen]) -> Placement {
     let nodes: Vec<String> = diskful.iter().map(|c| c.node.clone()).collect();
     let tiebreaker = if nodes.len() >= 2 && nodes.len().is_multiple_of(2) {
-        let t = placer::tiebreaker(&nodes, &placing.ready_nodes, &placing.views, &v.spec.tier);
+        let t = placer::tiebreaker(
+            &nodes,
+            &placing.live_nodes,
+            &placing.views,
+            &v.spec.tier,
+            &|n| placing.used.resources_on(n),
+        );
         if t.is_none() {
             warn!(volume = v.name_any(), "no node for the quorum tiebreaker");
         }
@@ -1973,6 +2001,11 @@ fn assign(placing: &Placing, v: &Volume, diskful: &[placer::Chosen]) -> Placemen
     };
     match alloc::allocate(diskful, tiebreaker.as_deref(), &placing.used, entropy) {
         Ok(a) => Placement::Assign(a),
+        // Exhaustion clears as volumes go: Insufficient, which CSI reports
+        // as ResourceExhausted.
+        Err(e @ (alloc::AllocError::NoMinor | alloc::AllocError::NoPort(_))) => {
+            Placement::Wait(Cond::new(FALSE, reason::INSUFFICIENT, e.to_string()))
+        }
         Err(e) => Placement::Fail(Cond::new(FALSE, reason::ALLOCATION_FAILED, e.to_string())),
     }
 }
@@ -1994,52 +2027,28 @@ fn lv_name_fits(ctx: &Ctx<'_>, v: &Volume, diskful: &[placer::Chosen]) -> Option
 }
 
 fn place(ctx: &Ctx<'_>, placing: &Placing, v: &Volume) -> Placement {
-    let (mut node, mut pool) = (v.spec.node.clone(), v.spec.pool.clone());
-    let mut holds_data = false;
     if let Some(src) = &v.spec.source {
-        let holders = match restore_holders(
-            v,
-            ctx.stores.snapshot(&src.snapshot).as_deref(),
-            &src.snapshot,
-        ) {
-            Ok(h) => h,
-            Err(p) => return p,
+        let snap = ctx.stores.snapshot(&src.snapshot);
+        return match restore_holders(v, snap.as_deref(), &src.snapshot, &placing.views) {
+            Ok(diskful) => {
+                lv_name_fits(ctx, v, &diskful).unwrap_or_else(|| assign(placing, v, &diskful))
+            }
+            Err(p) => p,
         };
-        // Holders are never gated by capacity: each one already holds the
-        // restore's blocks and has nowhere else to go.
-        if v.spec.replicas >= 2 {
-            // The agent restores every diskful replica of an uninitialized
-            // restore from its node's snapshot LV, a thin snapshot that only
-            // grows by what the volume later writes. The Snapshot and every
-            // holder's copy stay until this volume is initialized.
-            let diskful: Vec<placer::Chosen> = holders
-                .into_iter()
-                .map(|(node, pool)| placer::Chosen { node, pool })
-                .collect();
-            return lv_name_fits(ctx, v, &diskful).unwrap_or_else(|| assign(placing, v, &diskful));
-        }
-        if let Some((n, p)) = holders.into_iter().next() {
-            node = Some(n);
-            pool = Some(p);
-            holds_data = true;
-        }
     }
     let req = placer::Request {
         size_bytes: v.spec.size_bytes,
         replicas: v.spec.replicas,
         tier: v.spec.tier.clone(),
-        pool,
-        node,
-        existing: Vec::new(),
-        holds_data,
+        pool: v.spec.pool.clone(),
+        node: v.spec.node.clone(),
     };
     match placer::place(&req, &placing.views) {
-        placer::Outcome::Placed { diskful, .. } => {
+        Ok(diskful) => {
             lv_name_fits(ctx, v, &diskful).unwrap_or_else(|| assign(placing, v, &diskful))
         }
-        placer::Outcome::AlreadyPlaced => Placement::Wait(Cond::new(FALSE, reason::PLACING, "")),
         // Pending, not Failed: placement is retried whenever Pools or Nodes change.
-        placer::Outcome::Insufficient { missing, rejected } => {
+        Err(placer::Insufficient { missing, rejected }) => {
             let list = if rejected.is_empty() {
                 "none (no pools)".to_owned()
             } else {
@@ -2049,11 +2058,15 @@ fn place(ctx: &Ctx<'_>, placing: &Placing, v: &Volume) -> Placement {
                     .collect::<Vec<_>>()
                     .join(", ")
             };
+            let pin = req
+                .node
+                .map(|n| format!("; one must be on {n}"))
+                .unwrap_or_default();
             Placement::Wait(Cond::new(
                 FALSE,
                 reason::INSUFFICIENT,
                 format!(
-                    "{missing} more replica(s) of tier {} and {} bytes needed; rejected: {list}",
+                    "{missing} more replica(s) of tier {} and {} bytes needed{pin}; rejected: {list}",
                     v.spec.tier, v.spec.size_bytes
                 ),
             ))
@@ -3042,13 +3055,13 @@ mod tests {
         let att = ["n4".to_owned(), "n5".to_owned(), "n6".to_owned()];
         let (next, failed) = converge_attachments(&a, &att, &[], &used);
         let next = next.unwrap();
-        // n9 is detached: gone, and its node id 3 goes to n4.
+        // n9 is detached: gone, and its node id 3 waits for a later write.
         let ids: Vec<(&str, u8)> = next
             .replicas
             .iter()
             .map(|r| (r.node.as_str(), r.node_id))
             .collect();
-        assert_eq!(ids, [("n1", 0), ("n2", 1), ("n3", 2), ("n4", 3), ("n6", 4)]);
+        assert_eq!(ids, [("n1", 0), ("n2", 1), ("n3", 2), ("n4", 4), ("n6", 5)]);
         assert_eq!(failed.len(), 1);
         assert_eq!(
             (failed[0].node.as_str(), failed[0].reason),
@@ -3060,7 +3073,8 @@ mod tests {
             failed[0].message
         );
 
-        // At the node id limit, a detached entry's id is what the add gets.
+        // At the node id limit, a detached entry's id goes to the add one
+        // write later.
         let mut crowded = two_with_tb();
         crowded.replicas = (0..=model::keys::NODE_ID_MAX)
             .map(|id| AssignedReplica {
@@ -3076,6 +3090,9 @@ mod tests {
             })
             .collect();
         let (next, failed) = converge_attachments(&crowded, &["n5".into()], &[], &Used::default());
+        assert_eq!(failed[0].reason, AttachmentErrorReason::TooManyPeers);
+        let (next, failed) =
+            converge_attachments(&next.unwrap(), &["n5".into()], &[], &Used::default());
         assert!(failed.is_empty(), "{failed:?}");
         let added = next.unwrap();
         assert!(
@@ -3096,7 +3113,7 @@ mod tests {
         );
         let (next, failed) =
             converge_attachments(&crowded, &["n5".into(), "n6".into()], &[], &Used::default());
-        assert_eq!(failed.len(), 1, "m8 detached frees one id: {failed:?}");
+        assert_eq!(failed.len(), 2, "m8's id waits a write: {failed:?}");
         assert!(next.unwrap().replicas.iter().all(|r| r.node != "m8"));
     }
 
@@ -3205,7 +3222,106 @@ mod tests {
                 ("n2".to_owned(), "p2".to_owned())
             ]
         );
-        assert_eq!(snapshot_holder(&snap), Some(("n1".into(), "p1".into())));
+    }
+
+    fn restore_case(replicas: u32, size: u64) -> (Volume, Snapshot, Vec<placer::PoolView>) {
+        let ack = |node: &str, pool: &str| model::SnapshotAck {
+            node: node.into(),
+            phase: SnapshotPhase::Ready,
+            pool: Some(pool.into()),
+            ok: true,
+            error: None,
+        };
+        let mut snap = Snapshot::new("s", model::SnapshotSpec { volume: "v".into() });
+        snap.status = Some(model::SnapshotStatus {
+            phase: SnapshotPhase::Ready,
+            size_bytes: Some(10 * G),
+            acks: vec![ack("n1", "p1"), ack("n2", "p2")],
+            ..model::SnapshotStatus::default()
+        });
+        let mut v = Volume::new(
+            "r",
+            model::VolumeSpec {
+                size_bytes: size,
+                replicas,
+                tier: "fast".into(),
+                pool: None,
+                node: None,
+                access_mode: model::AccessMode::ReadWriteOnce,
+                attachments: Vec::new(),
+                evict: Vec::new(),
+                source: Some(model::VolumeSource {
+                    snapshot: "s".into(),
+                }),
+                resolve: None,
+                assignment: None,
+            },
+        );
+        v.metadata.generation = Some(1);
+        let view = |node: &str, pool: &str| placer::PoolView {
+            name: pool.into(),
+            node: node.into(),
+            tier: "fast".into(),
+            live: true,
+            available: true,
+            total_bytes: 100 * G,
+            free_bytes: 0,
+            committed_bytes: 90 * G,
+            overcommit_percent: 100,
+            reserve_percent: 0,
+        };
+        (v, snap, vec![view("n1", "p1"), view("n2", "p2")])
+    }
+
+    fn holders_of(r: Result<Vec<placer::Chosen>, Placement>) -> Result<Vec<String>, String> {
+        match r {
+            Ok(c) => Ok(c.into_iter().map(|c| c.node).collect()),
+            Err(Placement::Wait(c) | Placement::Fail(c)) => Err(c.message),
+            Err(Placement::Assign(_)) => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn restore_holders_must_be_usable() {
+        let (v, snap, mut views) = restore_case(2, 10 * G);
+        let got =
+            |views: &[placer::PoolView]| holders_of(restore_holders(&v, Some(&snap), "s", views));
+        // Full pools: a restore at the snapshot size grows nothing.
+        assert_eq!(got(&views), Ok(vec!["n1".into(), "n2".into()]));
+        views[0].live = false;
+        let why = got(&views).unwrap_err();
+        assert!(why.contains("holder n1/p1 is not usable"), "{why}");
+        views[0].live = true;
+        views[1].available = false;
+        assert!(got(&views).unwrap_err().contains("n2/p2"));
+        assert!(got(&views[..1]).unwrap_err().contains("n2/p2"));
+        // A local restore takes the first usable holder.
+        let (mut v, snap, mut views) = restore_case(1, 10 * G);
+        views[0].live = false;
+        let got = |v: &Volume, views: &[placer::PoolView]| {
+            holders_of(restore_holders(v, Some(&snap), "s", views))
+        };
+        assert_eq!(got(&v, &views), Ok(vec!["n2".into()]));
+        views[1].live = false;
+        assert!(got(&v, &views).unwrap_err().contains("holder n1/p1"));
+        // Pinned to a node: only that holder.
+        views[1].live = true;
+        v.spec.node = Some("n1".into());
+        assert!(got(&v, &views).unwrap_err().contains("holder n1/p1"));
+        v.spec.node = Some("n3".into());
+        assert!(got(&v, &views).unwrap_err().contains("pinned to n3/any"));
+    }
+
+    #[test]
+    fn restore_growth_is_charged_against_each_holder() {
+        // Each pool promises 10 GiB more; the snapshot holds 10 GiB.
+        let (v, snap, mut views) = restore_case(2, 20 * G);
+        let got =
+            |views: &[placer::PoolView]| holders_of(restore_holders(&v, Some(&snap), "s", views));
+        assert!(got(&views).is_ok());
+        views[1].committed_bytes += 1;
+        let why = got(&views).unwrap_err();
+        assert!(why.starts_with("pool n2/p2: growth of"), "{why}");
     }
 
     #[test]
