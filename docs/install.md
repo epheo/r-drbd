@@ -79,7 +79,7 @@ Host paths it writes:
 
 Install the CRDs, printed by the binary itself; use the tag `deploy/base` pins, so the CRDs match the controller and agents:
 
-    podman run --rm ghcr.io/epheo/r-drbd:sha-ace4402 crds | kubectl apply -f -
+    podman run --rm ghcr.io/epheo/r-drbd:sha-6765eba crds | kubectl apply -f -
 
 Install the controller, the agent, RBAC, the CSIDriver and default StorageClasses:
 

@@ -10,4 +10,4 @@ resources:
 # bumps this tag. deploy/dev follows :latest instead.
 images:
   - name: ghcr.io/epheo/r-drbd
-    newTag: sha-ace4402
+    newTag: sha-6765eba
