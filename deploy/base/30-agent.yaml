@@ -24,7 +24,7 @@ spec:
       containers:
         - name: agent
           image: ghcr.io/epheo/r-drbd:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           args: ["agent"]
           securityContext:
             privileged: true

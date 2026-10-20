@@ -86,6 +86,7 @@ Install the controller, the agent, RBAC, the CSIDriver and default StorageClasse
     kubectl apply -k deploy/base
 
 Everything runs in namespace `r-drbd-system`.
+The base follows `:latest` with `imagePullPolicy: Always`; to pin one build for the controller and every agent, see `deploy/README.md`.
 
 OpenShift and MicroShift: `deploy/base/00-namespace-rbac.yaml` already binds the privileged SCC to the agent's service account.
 On plain Kubernetes that binding is harmless: its role does not exist.

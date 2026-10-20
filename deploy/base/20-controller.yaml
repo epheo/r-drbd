@@ -36,7 +36,7 @@ spec:
       containers:
         - name: controller
           image: ghcr.io/epheo/r-drbd:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           args: ["controller"]
           env:
             - name: CSI_ENDPOINT
