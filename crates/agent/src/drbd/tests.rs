@@ -33,7 +33,10 @@ fn command_lines() {
     assert_eq!(j(argv::status("r")), "drbdsetup status r");
     assert_eq!(j(argv::down("r")), "drbdsetup down r");
     assert_eq!(j(argv::disconnect("r")), "drbdadm disconnect r");
-    assert_eq!(j(argv::suspend_io("r")), "drbdadm suspend-io r");
+    assert_eq!(
+        j(argv::suspend_io(1000)),
+        "drbdsetup suspend-io 1000 --bdev-freeze=no"
+    );
     assert_eq!(j(argv::resume_io("r")), "drbdadm resume-io r");
     assert_eq!(
         j(argv::dump_superblock(1000, "/dev/vg/r_00000")),

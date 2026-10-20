@@ -771,6 +771,146 @@ async fn restore_case(h: &Host, factor: u64, max_received: u64) {
     drbd_clean(&["rw-src"]).await;
 }
 
+/// A snapshot round under a writer mixing O_DIRECT and buffered writes on
+/// the Primary: every round's two copies hold the same bytes. A block
+/// device freeze at suspend flushed the Primary's page cache into its own
+/// backing LV only, so this failed with it.
+#[tokio::test]
+#[ignore = "needs root, DRBD 9 and the test VG"]
+#[allow(clippy::too_many_lines)]
+async fn drbd_snapshot_copies_match_under_a_writer() {
+    if !enabled() {
+        return;
+    }
+    drbd_clean(EVERY).await;
+    let h = start().await;
+    let size = 256 * MIB;
+    let mut g = group(&h, size, &[A, B], &[], None);
+    let [a, b] = &mut g[..] else { unreachable!() };
+    settle(&h, &mut [a, b], "both UpToDate and connected", |t| {
+        disk(t, "rw-a").as_deref() == Some("UpToDate")
+            && disk(t, "rw-b").as_deref() == Some("UpToDate")
+            && connected(t, "rw-a")
+            && connected(t, "rw-b")
+    })
+    .await;
+    for m in [&mut *a, &mut *b] {
+        m.vol
+            .status
+            .get_or_insert_with(Default::default)
+            .initialized_at = Some(now());
+    }
+    let pools = [pool(&h.node).await];
+    assert_eq!(
+        sh(&["drbdsetup", "primary", "rw-a"]).await.exit_code,
+        Some(0)
+    );
+    let stop = format!("{RES_DIR}/rw-writer-stop");
+    let _ = std::fs::remove_file(&stop);
+    let dev = format!("/dev/drbd{}", A.minor);
+    // 12 O_DIRECT chunks of 128 KiB, each in its own place, and 8 MiB of
+    // buffered overwrites left to writeback, again and again.
+    let script = format!(
+        "i=0; while [ ! -e {stop} ]; do i=$((i+1)); \
+         dd if=/dev/urandom of={dev} bs=128K count=1 seek=$((i % 12)) oflag=direct conv=notrunc status=none; \
+         dd if=/dev/urandom of={dev} bs=1M count=8 seek=128 conv=notrunc status=none; done"
+    );
+    let writer = tokio::spawn(async move { sh(&["sh", "-c", &script]).await });
+
+    let rounds = 6;
+    let mut differ = Vec::new();
+    for i in 0..rounds {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let snap = |m: &Member, phase| {
+            let mut s = Snapshot::new(
+                &format!("rw-s{i}"),
+                SnapshotSpec {
+                    volume: m.res.into(),
+                },
+            );
+            s.metadata.uid = Some(format!("uid-{}-s{i}", m.res));
+            s.status = Some(SnapshotStatus {
+                phase,
+                ..SnapshotStatus::default()
+            });
+            Arc::new(s)
+        };
+        // Every replica suspends before any takes, as in a real round.
+        for phase in [SnapshotPhase::Suspending, SnapshotPhase::Taking] {
+            for m in [&mut *a, &mut *b] {
+                let s = snap(m, phase);
+                let w = m.pass(&pools, &[s]).await;
+                let ack = w.iter().find_map(|w| match w {
+                    StatusWrite::Snapshot { ack, .. } => Some(ack.clone()),
+                    _ => None,
+                });
+                assert!(
+                    ack.as_ref().is_some_and(|a| a.ok),
+                    "{phase:?} {}: {ack:?}",
+                    m.res
+                );
+            }
+            if phase == SnapshotPhase::Suspending {
+                wait(&h.tracker, "both suspended", |t| {
+                    ["rw-a", "rw-b"].iter().all(|r| {
+                        t.resource(r)
+                            .is_some_and(agent::events2::Resource::suspended_by_user)
+                    })
+                })
+                .await;
+            }
+        }
+        for m in [&mut *a, &mut *b] {
+            let s = snap(m, SnapshotPhase::Ready);
+            m.pass(&pools, &[s]).await;
+        }
+        wait(&h.tracker, "both resumed", |t| {
+            ["rw-a", "rw-b"]
+                .iter()
+                .all(|r| t.resource(r).is_some_and(|x| !x.suspended_by_user()))
+        })
+        .await;
+        let mut sums = Vec::new();
+        for res in ["rw-a", "rw-b"] {
+            let lv = format!("{VG}/{res}+rw-s{i}");
+            let out = sh(&["lvchange", "-ay", "-K", &lv]).await;
+            assert_eq!(out.exit_code, Some(0), "{out:?}");
+            let out = sh(&[
+                "sh",
+                "-c",
+                &format!(
+                    "dd if=/dev/{lv} bs=1M count={} iflag=direct status=none | sha256sum",
+                    size / MIB
+                ),
+            ])
+            .await;
+            assert_eq!(out.exit_code, Some(0), "{out:?}");
+            sums.push(out.stdout);
+            let out = sh(&["lvremove", "-f", &lv]).await;
+            assert_eq!(out.exit_code, Some(0), "{out:?}");
+        }
+        println!("round {i}: {} {}", sums[0].trim(), sums[1].trim());
+        if sums[0] != sums[1] {
+            differ.push(i);
+        }
+    }
+    std::fs::write(&stop, "").unwrap();
+    let out = writer.await.unwrap();
+    let _ = std::fs::remove_file(&stop);
+    assert_eq!(out.exit_code, Some(0), "{out:?}");
+    assert_eq!(
+        sh(&["drbdsetup", "secondary", "rw-a"]).await.exit_code,
+        Some(0)
+    );
+    assert!(
+        differ.is_empty(),
+        "copies differ in rounds {differ:?} of {rounds}"
+    );
+    for m in [&mut *a, &mut *b] {
+        delete(&h, m).await;
+    }
+}
+
 /// Backing LVs sized in closed form: usable at least the net size, at most
 /// one extent more.
 #[tokio::test]

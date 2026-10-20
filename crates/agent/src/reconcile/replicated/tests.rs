@@ -2059,7 +2059,7 @@ async fn suspend_pass(r: &mut Rig) {
     r.expect_check();
     r.expect_sweep();
     dry(&r.x, "");
-    r.x.expect(argv::suspend_io("pvc-1"), ok(""));
+    r.x.expect(argv::suspend_io(50000), ok(""));
     let w = r
         .pass(&[volume(GIB)], &[snapshot(SnapshotPhase::Suspending)])
         .await;
@@ -2239,7 +2239,7 @@ async fn nothing_grows_during_a_round() {
     r.expect_check();
     r.expect_sweep();
     dry(&r.x, "");
-    r.x.expect(argv::suspend_io("pvc-1"), ok(""));
+    r.x.expect(argv::suspend_io(50000), ok(""));
     let w = r.pass(&[grown(2 * GIB, 4, Some(LV_KIB))], &round).await;
     assert_eq!(entry_of(&w).observed_generation, Some(3));
     assert!(!seen(&r.x, "lvextend"));
@@ -2249,7 +2249,7 @@ async fn nothing_grows_during_a_round() {
     r.expect_check();
     r.expect_sweep();
     dry(&r.x, "");
-    r.x.expect(argv::suspend_io("pvc-1"), ok(""));
+    r.x.expect(argv::suspend_io(50000), ok(""));
     let w = r.pass(&[grown(2 * GIB, 4, Some(LV2_KIB))], &round).await;
     assert_eq!(entry_of(&w).observed_generation, Some(3));
     assert!(!seen(&r.x, "resize"));
@@ -2322,7 +2322,7 @@ async fn diskless_replica_suspends_and_acks_without_pool() {
     );
     r.expect_check();
     dry(&r.x, "");
-    r.x.expect(argv::suspend_io("pvc-1"), ok(""));
+    r.x.expect(argv::suspend_io(50000), ok(""));
     let w = r
         .pass(&[volume(GIB)], &[snapshot(SnapshotPhase::Suspending)])
         .await;

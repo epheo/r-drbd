@@ -210,8 +210,17 @@ pub mod argv {
         ])
     }
 
-    pub fn suspend_io(res: &str) -> Vec<String> {
-        a(&["drbdadm", "suspend-io", res])
+    /// No block device freeze: it flushes the Primary's page cache into
+    /// its own backing device after IO is suspended, never to the peers,
+    /// so the copies of one snapshot round would differ. drbdadm has no
+    /// way to pass the option.
+    pub fn suspend_io(minor: u32) -> Vec<String> {
+        a(&[
+            "drbdsetup",
+            "suspend-io",
+            &minor.to_string(),
+            "--bdev-freeze=no",
+        ])
     }
 
     pub fn resume_io(res: &str) -> Vec<String> {

@@ -1084,9 +1084,7 @@ impl Reconciler {
                                 let place = place.ok()?;
                                 lvm::names::check_new_lv(&place.vg, &lv).err()
                             });
-                        let res = self
-                            .suspend_step(&snap.spec.volume, prev.as_ref(), refused)
-                            .await?;
+                        let res = self.suspend_step(v, prev.as_ref(), refused).await?;
                         ack(&self.node, SnapshotPhase::Suspending, pool_name, res)
                     } else {
                         replica?;
@@ -1110,14 +1108,18 @@ impl Reconciler {
     /// Suspending on a replicated volume; None leaves the ack as it is.
     async fn suspend_step(
         &mut self,
-        volume: &str,
+        vol: &Volume,
         prev: Option<&SnapshotAck>,
         refused: Option<String>,
     ) -> Option<Result<(), String>> {
+        let volume = &vol.name_any();
         let Some(p) = prev.filter(|a| a.phase == SnapshotPhase::Suspending) else {
             return Some(match refused {
                 Some(e) => Err(e),
-                None => self.suspend(volume).await,
+                None => match vol.spec.assignment.as_ref().and_then(|a| a.minor) {
+                    Some(minor) => self.suspend(volume, minor).await,
+                    None => Err("assignment has no minor".to_owned()),
+                },
             });
         };
         // Never a second suspend in one round: its take window would start

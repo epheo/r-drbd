@@ -1787,13 +1787,13 @@ impl Reconciler {
 
     /// Suspends IO for a round; the take window and the resume deadline
     /// count from here, on this agent's clock.
-    pub(super) async fn suspend(&mut self, volume: &str) -> Result<(), String> {
+    pub(super) async fn suspend(&mut self, volume: &str, minor: u32) -> Result<(), String> {
         let r = self
             .tracked(volume)
             .ok_or_else(|| format!("DRBD resource {volume} is not up"))?;
         if !r.suspended_by_user() {
             tracing::info!(volume, "suspending IO for a snapshot");
-            self.drbd_cmd(&argv::suspend_io(volume), DRBD_TIMEOUT)
+            self.drbd_cmd(&argv::suspend_io(minor), DRBD_TIMEOUT)
                 .await?;
         }
         // Set after the suspend and before the ack: the window then never
