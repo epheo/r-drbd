@@ -137,7 +137,6 @@ Wait for the pools, then check one node:
 
 As in [Install](install.md):
 
-    podman run --rm ghcr.io/epheo/r-drbd:sha-6765eba crds | oc apply -f -
     oc apply -k deploy/base
 
 The namespace is labelled `pod-security.kubernetes.io/enforce: privileged`, and the agent's service account is bound to the `privileged` SCC by the manifests.
@@ -234,7 +233,7 @@ r-drbd upgrade: [Operations](operations.md).
 
 ## Uninstall
 
-Follow the order in [Install](install.md): claims and snapshots, then Pools, then `deploy/base` and the CRDs.
+Follow the order in [Install](install.md): claims and snapshots, then Pools, then `deploy/base`, which holds the CRDs.
 Then `oc delete -k deploy/openshift/kmm`: KMM unloads the module on each node; a node still holding a DRBD resource keeps it until it reboots.
 The node settings can stay; deleting them reboots the pools again, and the devices file stays either way.
 
