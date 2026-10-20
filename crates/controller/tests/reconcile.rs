@@ -24,7 +24,7 @@ async fn setup(
     let client = env.client().await;
     let mut c = support::config(&env, "ctl");
     cfg(&mut c);
-    let running = support::spawn(client.clone(), c);
+    let running = support::spawn(env.clients().await, c);
     (env, client, running)
 }
 
@@ -774,7 +774,7 @@ async fn take_bound_survives_restart() {
     let client = env.client().await;
     let mut cfg = support::config(&env, "ctl");
     cfg.take_timeout = Duration::from_secs(6);
-    let first = support::spawn(client.clone(), cfg.clone());
+    let first = support::spawn(env.clients().await, cfg.clone());
     node(&client, "n1", true).await;
     pool(&client, "p1", "n1", "fast", 100 * GIB).await;
     let agent = FakeAgent::new(&client, "n1");
@@ -791,7 +791,7 @@ async fn take_bound_survives_restart() {
     // Same identity: the lease is ours at once. The bound already passed,
     // so the new process fails the round without waiting another 6 s.
     let started = std::time::Instant::now();
-    let _second = support::spawn(client.clone(), cfg);
+    let _second = support::spawn(env.clients().await, cfg);
     snapshot_where(&client, "snap", |s| snap_phase(s) == SnapshotPhase::Failed).await;
     assert!(
         started.elapsed() < Duration::from_secs(4),
@@ -998,7 +998,7 @@ async fn taking_without_start_gets_one() {
     let mut cfg = support::config(&env, "ctl");
     cfg.take_timeout = Duration::from_secs(3);
     let started = std::time::Instant::now();
-    let _ctl = support::spawn(client.clone(), cfg);
+    let _ctl = support::spawn(env.clients().await, cfg);
     snapshot_where(&client, "snap", |s| {
         s.status.as_ref().is_some_and(|st| st.phase_since.is_some())
     })

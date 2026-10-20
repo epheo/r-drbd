@@ -42,7 +42,7 @@ async fn setup_with(
     let client = env.client().await;
     let mut cfg = support::config(&env, "ctl");
     tweak(&mut cfg);
-    let running = support::spawn(client.clone(), cfg.clone());
+    let running = support::spawn(env.clients().await, cfg.clone());
     (env, client, cfg, running)
 }
 

@@ -67,7 +67,7 @@ async fn controller_calls() {
     pool(&client, "p2a", "n2", "fast", 50 * GIB).await;
     pool(&client, "p2b", "n2", "fast", 40 * GIB).await;
     let cfg = support::config(&env, "ctl");
-    let _ctl = support::spawn(client.clone(), cfg.clone());
+    let _ctl = support::spawn(env.clients().await, cfg.clone());
     let _agents = [
         FakeAgent::new(&client, "n1").spawn_auto(),
         FakeAgent::new(&client, "n2").spawn_auto(),
@@ -359,7 +359,7 @@ async fn wffc_reschedule_and_restore_topology() {
     pool(&client, "full", "n1", "fast", 0).await;
     pool(&client, "p2", "n2", "fast", 100 * GIB).await;
     let cfg = support::config(&env, "ctl");
-    let _ctl = support::spawn(client.clone(), cfg.clone());
+    let _ctl = support::spawn(env.clients().await, cfg.clone());
     let _agents = [
         FakeAgent::new(&client, "n1").spawn_auto(),
         FakeAgent::new(&client, "n2").spawn_auto(),
@@ -512,7 +512,7 @@ async fn read_write_many() {
     pool(&client, "p1", "n1", "fast", 100 * GIB).await;
     pool(&client, "p2", "n2", "fast", 100 * GIB).await;
     let cfg = support::config(&env, "ctl");
-    let _ctl = support::spawn(client.clone(), cfg.clone());
+    let _ctl = support::spawn(env.clients().await, cfg.clone());
     let _agents: Vec<_> = ["n1", "n2", "n3", "n4"]
         .iter()
         .map(|n| FakeAgent::new(&client, n).spawn_auto())
@@ -645,7 +645,7 @@ async fn publish_lost(
     pool(&client, "p2", "n2", "fast", 100 * GIB).await;
     let mut cfg = support::config(&env, "ctl");
     cfg.ready_timeout = ready_timeout;
-    let _ctl = support::spawn(client.clone(), cfg.clone());
+    let _ctl = support::spawn(env.clients().await, cfg.clone());
     let mut spec = support::volume_spec(GIB, replicas, "fast");
     if replicas == 1 {
         spec.node = Some("n1".into());

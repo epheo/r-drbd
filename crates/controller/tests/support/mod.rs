@@ -224,12 +224,20 @@ impl Env {
         env
     }
 
-    pub async fn client(&self) -> Client {
+    async fn kube_config(&self) -> kube::Config {
         let kc = Kubeconfig::read_from(&self.kubeconfig).expect("read kubeconfig");
-        let cfg = kube::Config::from_custom_kubeconfig(kc, &KubeConfigOptions::default())
+        kube::Config::from_custom_kubeconfig(kc, &KubeConfigOptions::default())
             .await
-            .expect("kube config");
-        Client::try_from(cfg).expect("client")
+            .expect("kube config")
+    }
+
+    pub async fn client(&self) -> Client {
+        Client::try_from(self.kube_config().await).expect("client")
+    }
+
+    /// The controller's clients, built as `controller::run` builds them.
+    pub async fn clients(&self) -> controller::Clients {
+        controller::Clients::new(self.kube_config().await).expect("clients")
     }
 
     /// Status patches of Volume `name` sent under the controller's field
@@ -343,8 +351,8 @@ pub fn config(env: &Env, identity: &str) -> controller::Config {
     cfg
 }
 
-pub fn spawn(client: Client, cfg: controller::Config) -> Running {
-    Running(tokio::spawn(controller::run_with_client(cfg, client)))
+pub fn spawn(clients: controller::Clients, cfg: controller::Config) -> Running {
+    Running(tokio::spawn(controller::run_with_clients(cfg, clients)))
 }
 
 /// Renews `node`'s agent Lease every second like a live agent, until the test
