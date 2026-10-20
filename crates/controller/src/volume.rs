@@ -1880,14 +1880,18 @@ fn ready_snapshot<'a>(
 /// for a replicated one. Each must be usable, and its pool must promise the
 /// growth beyond the snapshot: the shared blocks are already there, the
 /// growth is new data.
+/// A holder whose Node object is gone took its copy with it.
 fn restore_holders(
     v: &Volume,
     snap: Option<&Snapshot>,
     wanted: &str,
     views: &[placer::PoolView],
+    exists: &dyn Fn(&str) -> bool,
 ) -> Result<Vec<placer::Chosen>, Placement> {
     let (snap, snap_size) = ready_snapshot(snap, wanted)?;
     let mut holders = snapshot_holders(snap);
+    holders.retain(|(n, _)| exists(n));
+    holders.retain(|(n, _)| exists(n));
     if holders.is_empty() {
         return Err(Placement::Fail(Cond::new(
             FALSE,
@@ -2023,7 +2027,8 @@ fn lv_name_fits(ctx: &Ctx<'_>, v: &Volume, diskful: &[placer::Chosen]) -> Option
 fn place(ctx: &Ctx<'_>, placing: &Placing, v: &Volume) -> Placement {
     if let Some(src) = &v.spec.source {
         let snap = ctx.stores.snapshot(&src.snapshot);
-        return match restore_holders(v, snap.as_deref(), &src.snapshot, &placing.views) {
+        let exists = |n: &str| ctx.stores.node(n).is_some();
+        return match restore_holders(v, snap.as_deref(), &src.snapshot, &placing.views, &exists) {
             Ok(diskful) => {
                 lv_name_fits(ctx, v, &diskful).unwrap_or_else(|| assign(placing, v, &diskful))
             }
@@ -3275,8 +3280,9 @@ mod tests {
     #[test]
     fn restore_holders_must_be_usable() {
         let (v, snap, mut views) = restore_case(2, 10 * G);
-        let got =
-            |views: &[placer::PoolView]| holders_of(restore_holders(&v, Some(&snap), "s", views));
+        let got = |views: &[placer::PoolView]| {
+            holders_of(restore_holders(&v, Some(&snap), "s", views, &|_| true))
+        };
         // Full pools: a restore at the snapshot size grows nothing.
         assert_eq!(got(&views), Ok(vec!["n1".into(), "n2".into()]));
         views[0].live = false;
@@ -3290,7 +3296,7 @@ mod tests {
         let (mut v, snap, mut views) = restore_case(1, 10 * G);
         views[0].live = false;
         let got = |v: &Volume, views: &[placer::PoolView]| {
-            holders_of(restore_holders(v, Some(&snap), "s", views))
+            holders_of(restore_holders(v, Some(&snap), "s", views, &|_| true))
         };
         assert_eq!(got(&v, &views), Ok(vec!["n2".into()]));
         views[1].live = false;
@@ -3307,12 +3313,24 @@ mod tests {
     fn restore_growth_is_charged_against_each_holder() {
         // Each pool promises 10 GiB more; the snapshot holds 10 GiB.
         let (v, snap, mut views) = restore_case(2, 20 * G);
-        let got =
-            |views: &[placer::PoolView]| holders_of(restore_holders(&v, Some(&snap), "s", views));
+        let got = |views: &[placer::PoolView]| {
+            holders_of(restore_holders(&v, Some(&snap), "s", views, &|_| true))
+        };
         assert!(got(&views).is_ok());
         views[1].committed_bytes += 1;
         let why = got(&views).unwrap_err();
         assert!(why.starts_with("pool n2/p2: growth of"), "{why}");
+    }
+
+    #[test]
+    fn restore_holders_skip_gone_nodes() {
+        let not_n1 = |n: &str| n != "n1";
+        let (v, snap, views) = restore_case(1, 10 * G);
+        let got = holders_of(restore_holders(&v, Some(&snap), "s", &views, &not_n1));
+        assert_eq!(got, Ok(vec!["n2".into()]));
+        let (v, snap, views) = restore_case(2, 10 * G);
+        let why = holders_of(restore_holders(&v, Some(&snap), "s", &views, &not_n1)).unwrap_err();
+        assert_eq!(why, "snapshot holders 1, replicas 2");
     }
 
     #[test]
