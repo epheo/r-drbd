@@ -10,7 +10,6 @@ dependencies = [
  "csi",
  "drbd-config",
  "futures",
- "hyper-util",
  "k8s-openapi",
  "kube",
  "lvm",
@@ -21,8 +20,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
- "tonic",
- "tower",
  "tracing",
 ]
 

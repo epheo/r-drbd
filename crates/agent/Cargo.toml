@@ -23,10 +23,7 @@ tokio-stream = { version = "0.1.19", features = ["net"] }
 tracing = "0.1.44"
 
 [dev-dependencies]
-hyper-util = { version = "0.1.21", features = ["tokio"] }
-tonic = { version = "0.14.6", default-features = false, features = ["channel"] }
 tokio = { version = "1.53.3", features = ["test-util"] }
-tower = { version = "0.5.3", default-features = false, features = ["util"] }
 
 [lints]
 workspace = true
