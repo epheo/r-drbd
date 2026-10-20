@@ -59,12 +59,13 @@ Status:
 | Field | Notes |
 |---|---|
 | `phase` | Pending, Provisioning, Ready, Degraded, Failed, Deleting |
-| `conditions` | `Ready`, `Degraded`, `QuorumLost`, `SplitBrain`, `PeerUnreachable` |
+| `conditions` | `Ready`, `Degraded`, `QuorumLost`, `SplitBrain`, `PeerUnreachable`, `AttachmentFailed` |
 | `usableBytes` | Smallest size the diskful replicas on reachable nodes provide |
 | `primary` | Node where the device is open |
 | `nodes` | Comma separated diskful nodes |
 | `initializedAt` | First time the volume was Ready |
 | `fileSystem` | File system the node plugin created or inherited |
+| `attachmentErrors[]` | Attached nodes without a diskless replica: `node`, `reason` (NoPort, TooManyPeers), `message`; an entry goes once the node has a replica or is unpublished |
 | `observedGeneration` | Spec generation the controller last wrote status for |
 | `replicas[]` | `node`, `present`, `diskState`, `syncPercent`, `peers`, `inUse`, `quorum`, `devicePath`, `allocatedBytes`, `sizeBytes`, `observedGeneration`, `lastError`, `unreachablePeers` |
 | `replicas[].unreachablePeers[]` | Stuck DRBD connections from this node: `node`, `address`, `port`, `since`, `result` (Refused, Filtered, TimedOut, Accepted, Failed), `probedAt`, `error`, `peerRun` (the peer agent run probed) |
@@ -161,6 +162,8 @@ Volume `QuorumLost`: `NoQuorum`, `Quorate`.
 
 Volume `SplitBrain`: `SplitBrain`, `NoSplitBrain`.
 
+Volume `AttachmentFailed`: True with reason `AttachmentFailed` while `attachmentErrors` is not empty, the message naming each node and cause; False with reason `Attached`.
+
 Volume `PeerUnreachable`:
 
 | Reason | Meaning |
@@ -179,7 +182,7 @@ Pool `Released`: `Removed` (True: thin pool, VG and PV labels removed), `RemoveB
 
 Pool Events: `DeviceNotUsable` (Warning: an appended path is not blank and stays out of the pool), `PoolNotGrown` (Warning: a growth step failed, or the metadata maximum leaves VG space out of the pool).
 
-Volume Events: `Evicted`, `EvictionBlocked`, `SplitBrainResolved`, `PeerUnreachable` (Warning), `PeersReachable`.
+Volume Events: `Evicted`, `EvictionBlocked`, `SplitBrainResolved`, `PeerUnreachable` (Warning), `PeersReachable`, `AttachmentFailed` (Warning, once per distinct message).
 
 ## CSI driver
 

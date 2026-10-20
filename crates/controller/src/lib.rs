@@ -243,6 +243,9 @@ pub(crate) struct Memory {
     /// Per Volume uid: the EvictionBlocked text last sent as an Event, so a
     /// block that lasts emits one Event per reason, not one per pass.
     pub(crate) evict_blocked: HashMap<String, String>,
+    /// Per Volume uid: the attached nodes without a replica, and the
+    /// message last sent as an Event.
+    pub(crate) attach_failed: HashMap<String, (Vec<String>, String)>,
     /// Per Volume uid: when each PeerUnreachable probe record was first seen.
     pub(crate) probes: HashMap<String, volume::ProbesSeen>,
     /// Volume uids with a probe record awaiting a Lease renewal.
@@ -376,6 +379,7 @@ async fn pass(ctx: &Ctx<'_>, memory: &mut Memory) -> Option<Duration> {
     memory.resolving.retain(|uid| seen.contains_key(uid));
     memory.initialized.retain(|uid, _| seen.contains_key(uid));
     memory.evict_blocked.retain(|uid, _| seen.contains_key(uid));
+    memory.attach_failed.retain(|uid, _| seen.contains_key(uid));
     memory
         .peer_unreachable
         .retain(|uid, _| seen.contains_key(uid));

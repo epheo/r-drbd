@@ -25,6 +25,7 @@ Useful Volume status fields:
 | `replicas[].quorum` | Whether this replica has quorum |
 | `replicas[].lastError` | Last failed command on that node |
 | `replicas[].unreachablePeers` | Peers this node's DRBD has not reached for a while, with a TCP probe result |
+| `attachmentErrors[]` | Attached nodes the controller could not give a diskless replica, and why |
 
 Conditions:
 
@@ -35,9 +36,11 @@ Conditions:
 | `QuorumLost` | A replica in use has no quorum; IO there is suspended until quorum returns |
 | `SplitBrain` | Two replicas diverged; the message names them |
 | `PeerUnreachable` | A DRBD connection between two running nodes does not come up; the message names both nodes, the address and the likely cause |
+| `AttachmentFailed` | A node in `spec.attachments` has no diskless replica (no free DRBD port on it, or all 32 node ids of the volume taken); `attachmentErrors` names it |
 
 Degraded reasons: `ReplicaMissing`, `ReplicaNotUpToDate`, `ReplicaDisconnected`, `NodeUnreachable`.
 A resize in progress keeps `Ready` True with reason `Resizing`.
+A publish to a node listed in `attachmentErrors` fails at once with ResourceExhausted and that entry's message; the pod event shows it, other nodes are not affected.
 
 Logs:
 

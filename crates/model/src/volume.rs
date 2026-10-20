@@ -217,8 +217,33 @@ pub struct VolumeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 16))]
     pub file_system: Option<String>,
+    /// Nodes in spec.attachments the controller could not give a diskless
+    /// replica, as of observedGeneration. An entry goes once its node has
+    /// a replica or leaves spec.attachments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[x_kube(merge_strategy = ListMerge::Map(vec!["node".into()]))]
+    pub attachment_errors: Vec<AttachmentError>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
+}
+
+/// An attached node without a diskless replica, and why.
+#[derive(KubeSchema, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentError {
+    #[schemars(length(min = 1, max = 253))]
+    pub node: String,
+    pub reason: AttachmentErrorReason,
+    #[schemars(length(max = 1024))]
+    pub message: String,
+}
+
+#[derive(JsonSchema, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentErrorReason {
+    /// Every DRBD port of the node is taken.
+    NoPort,
+    /// Every DRBD node id of the volume is taken.
+    TooManyPeers,
 }
 
 /// What one agent sees of its replica. `observed_generation` is the spec

@@ -10,8 +10,8 @@ use kube::{Api, ResourceExt};
 use model::condition::{self, Condition, FALSE, TRUE, types};
 use model::keys::{CONTROLLER_FIELD_MANAGER, FINALIZER_VOLUME};
 use model::{
-    AssignedReplica, Assignment, Pool, Role, Snapshot, SnapshotPhase, Volume, VolumePhase,
-    VolumeStatus,
+    AssignedReplica, Assignment, AttachmentError, AttachmentErrorReason, Pool, Role, Snapshot,
+    SnapshotPhase, Volume, VolumePhase, VolumeStatus,
 };
 use serde_json::json;
 use tracing::{debug, info, warn};
@@ -29,9 +29,10 @@ pub mod reason {
     pub const SNAPSHOT_NOT_READY: &str = "SnapshotNotReady";
     pub const SNAPSHOT_FAILED: &str = "SnapshotFailed";
     pub const ALLOCATION_FAILED: &str = "AllocationFailed";
-    /// Ready reason while an attached node gets no diskless replica;
-    /// ControllerPublish fails on it at once.
+    /// AttachmentFailed True, and its Warning Event.
     pub const ATTACHMENT_FAILED: &str = "AttachmentFailed";
+    /// AttachmentFailed False.
+    pub const ATTACHED: &str = "Attached";
     pub const PLACING: &str = "Placing";
     pub const WAITING: &str = "Waiting";
     pub const ALL_UP_TO_DATE: &str = "AllReplicasUpToDate";
@@ -64,8 +65,9 @@ pub mod reason {
 }
 
 /// Condition types the controller owns on a Volume.
-const OWNED_TYPES: [&str; 5] = [
+const OWNED_TYPES: [&str; 6] = [
     types::READY,
+    types::ATTACHMENT_FAILED,
     types::DEGRADED,
     types::QUORUM_LOST,
     types::SPLIT_BRAIN,
@@ -706,47 +708,51 @@ pub fn resolve_action(split_brain: bool, seen_split: bool, done: bool) -> Resolv
     }
 }
 
-/// An attached node that gets no diskless replica.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("no diskless replica for the attachment on {node}: {cause}")]
-pub struct AttachError {
-    pub node: String,
-    pub cause: alloc::AllocError,
-}
-
-impl AttachError {
-    fn new(node: &str, cause: alloc::AllocError) -> Self {
-        Self {
-            node: node.to_owned(),
-            cause,
-        }
-    }
-}
-
-/// Diskless entries converged to the attachments: an attached node without
-/// a replica gets one (lowest free node id in the volume, lowest free port
-/// on that node); a diskless entry whose node is no longer attached goes.
-/// A node in spec.evict never gets a new one, but keeps the one it has
-/// while attached: that is a running workload. Diskful and tiebreaker
-/// entries never change. None when nothing changes.
+/// Diskless entries converged to the attachments: a diskless entry whose
+/// node is no longer attached goes first, so its node id is free again;
+/// then an attached node without a replica gets one (lowest free node id
+/// in the volume, lowest free port on that node). A node in spec.evict
+/// never gets a new one, but keeps the one it has while attached: that is
+/// a running workload. Diskful and tiebreaker entries never change. A node
+/// that cannot get a replica is reported and never holds back another.
+/// The assignment is None when nothing changes.
 pub fn converge_attachments(
     a: &Assignment,
     attachments: &[String],
     evict: &[String],
     used: &Used,
-) -> Result<Option<Assignment>, AttachError> {
+) -> (Option<Assignment>, Vec<AttachmentError>) {
     let mut out = a.clone();
-    let mut changed = false;
+    out.replicas
+        .retain(|r| r.role != Role::Diskless || attachments.contains(&r.node));
+    let mut changed = out.replicas.len() != a.replicas.len();
+    let mut failed = Vec::new();
     for node in attachments {
         if evict.contains(node) || out.replicas.iter().any(|r| r.node == *node) {
             continue;
         }
         let node_id = (0..=model::keys::NODE_ID_MAX)
-            .find(|id| !out.replicas.iter().any(|r| r.node_id == *id))
-            .ok_or_else(|| AttachError::new(node, alloc::AllocError::TooManyPeers))?;
-        let port = used
-            .lowest_free_port(node)
-            .ok_or_else(|| AttachError::new(node, alloc::AllocError::NoPort(node.clone())))?;
+            .find(|id| !out.replicas.iter().any(|r| r.node_id == *id));
+        let port = used.lowest_free_port(node);
+        let (node_id, port) = match (node_id, port) {
+            (Some(id), Some(port)) => (id, port),
+            (None, _) => {
+                failed.push(attach_error(
+                    node,
+                    AttachmentErrorReason::TooManyPeers,
+                    &alloc::AllocError::TooManyPeers,
+                ));
+                continue;
+            }
+            (_, None) => {
+                failed.push(attach_error(
+                    node,
+                    AttachmentErrorReason::NoPort,
+                    &alloc::AllocError::NoPort(node.clone()),
+                ));
+                continue;
+            }
+        };
         out.replicas.push(AssignedReplica {
             node: node.clone(),
             pool: None,
@@ -756,11 +762,19 @@ pub fn converge_attachments(
         });
         changed = true;
     }
-    let before = out.replicas.len();
-    out.replicas
-        .retain(|r| r.role != Role::Diskless || attachments.contains(&r.node));
-    changed |= out.replicas.len() != before;
-    Ok(changed.then_some(out))
+    (changed.then_some(out), failed)
+}
+
+fn attach_error(
+    node: &str,
+    reason: AttachmentErrorReason,
+    cause: &alloc::AllocError,
+) -> AttachmentError {
+    AttachmentError {
+        node: node.to_owned(),
+        reason,
+        message: format!("no diskless replica on {node}: {cause}"),
+    }
 }
 
 /// Controller-owned part of a Volume status, as compared and applied.
@@ -772,6 +786,7 @@ struct Owned {
     primary: Option<String>,
     nodes: Option<String>,
     initialized_at: Option<Time>,
+    attachment_errors: Vec<AttachmentError>,
     observed_generation: Option<i64>,
 }
 
@@ -792,6 +807,7 @@ impl Owned {
             primary: s.primary.clone(),
             nodes: s.nodes.clone(),
             initialized_at: s.initialized_at.clone(),
+            attachment_errors: s.attachment_errors.clone(),
             observed_generation: s.observed_generation,
         })
     }
@@ -819,6 +835,7 @@ impl Owned {
             primary: summary.and_then(|s| s.primary.clone()),
             nodes: summary.and_then(|s| s.nodes.clone()),
             initialized_at,
+            attachment_errors: Vec::new(),
             observed_generation: generation,
         }
     }
@@ -843,6 +860,9 @@ impl Owned {
             }
             if let Some(t) = &self.initialized_at {
                 m.insert("initializedAt".into(), json!(t));
+            }
+            if !self.attachment_errors.is_empty() {
+                m.insert("attachmentErrors".into(), json!(self.attachment_errors));
             }
         }
         s
@@ -1164,7 +1184,7 @@ async fn reconcile(
         return;
     }
     if let Some(a) = memory.assignment(v).cloned() {
-        let (a, attach_failed) = converge(memory, placing, api, v, a).await;
+        let (a, attach_errors) = converge(memory, placing, api, v, a).await;
         let seen = memory.probes_seen(v);
         memory.set_probe_wait(v, health.awaiting(v, &seen));
         let mut summary = health.summarize(v, &a, &memory.latched(v), &seen);
@@ -1177,11 +1197,11 @@ async fn reconcile(
             memory.resolving.remove(uid);
         }
         peer_event(ctx, memory, v, &summary.peer_unreachable).await;
-        // The phase stays: the replicas serve, only the new node waits.
-        if let Some(c) = attach_failed {
-            summary.ready = c;
-        }
-        let wanted = Owned::wanted(v, summary.phase, &summary.conds(), Some(&summary));
+        let attach = attach_report(ctx, memory, v, &attach_errors).await;
+        let mut conds = summary.conds().to_vec();
+        conds.push((types::ATTACHMENT_FAILED, &attach));
+        let mut wanted = Owned::wanted(v, summary.phase, &conds, Some(&summary));
+        wanted.attachment_errors = attach_errors;
         write(memory, api, v, wanted).await;
         return;
     }
@@ -1214,35 +1234,82 @@ async fn reconcile(
 }
 
 /// Converges the diskless entries of a DRBD volume to spec.attachments;
-/// returns the assignment the rest of the pass works with, and the Ready
-/// condition when an attachment gets no replica.
+/// returns the assignment the rest of the pass works with and the
+/// attached nodes left without a replica, sorted by node.
 async fn converge(
     memory: &mut Memory,
     placing: &mut Placing,
     api: &Api<Volume>,
     v: &Volume,
     a: Assignment,
-) -> (Assignment, Option<Cond>) {
+) -> (Assignment, Vec<AttachmentError>) {
     if v.spec.replicas < 2 || a.minor.is_none() {
-        return (a, None);
+        return (a, Vec::new());
     }
-    match converge_attachments(&a, &v.spec.attachments, &v.spec.evict, &placing.used) {
-        Ok(None) => (a, None),
-        Ok(Some(next)) => {
-            if write_assignment(api, v, &next).await {
-                placing.used.add(&next);
-                memory.remember(v, next.clone());
-                (next, None)
-            } else {
-                (a, None)
-            }
-        }
-        Err(e) => {
-            debug!(volume = v.name_any(), error = %e, "attachment failed");
-            let ready = Cond::new(FALSE, reason::ATTACHMENT_FAILED, e.to_string());
-            (a, Some(ready))
-        }
+    let (next, mut failed) =
+        converge_attachments(&a, &v.spec.attachments, &v.spec.evict, &placing.used);
+    failed.sort_by(|x, y| x.node.cmp(&y.node));
+    let Some(next) = next else {
+        return (a, failed);
+    };
+    if write_assignment(api, v, &next).await {
+        placing.used.add(&next);
+        memory.remember(v, next.clone());
+        (next, failed)
+    } else {
+        (a, failed)
     }
+}
+
+/// The AttachmentFailed condition. A change in the set of failed nodes
+/// logs at warn and each new message is one Warning Event, so a stuck
+/// attachment shows without a log line or Event per pass.
+async fn attach_report(
+    ctx: &Ctx<'_>,
+    memory: &mut Memory,
+    v: &Volume,
+    failed: &[AttachmentError],
+) -> Cond {
+    let name = v.name_any();
+    let uid = v.metadata.uid.clone().unwrap_or_default();
+    let nodes: Vec<&str> = failed.iter().map(|e| e.node.as_str()).collect();
+    let message = failed
+        .iter()
+        .map(|e| e.message.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let before = memory.attach_failed.get(&uid);
+    let nodes_before: Vec<&str> = before
+        .map(|(n, _)| n.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    if nodes != nodes_before {
+        if failed.is_empty() {
+            info!(volume = name, "every attached node has a replica");
+        } else {
+            warn!(
+                volume = name,
+                ?nodes,
+                message,
+                "attached nodes without a replica"
+            );
+        }
+    } else if !failed.is_empty() {
+        debug!(
+            volume = name,
+            ?nodes,
+            "attached nodes still without a replica"
+        );
+    }
+    if failed.is_empty() {
+        memory.attach_failed.remove(&uid);
+        return Cond::new(FALSE, reason::ATTACHED, "");
+    }
+    if before.is_none_or(|(_, m)| *m != message) {
+        crate::warning_event(ctx.client, v, reason::ATTACHMENT_FAILED, &message).await;
+    }
+    let nodes = nodes.iter().map(|n| (*n).to_owned()).collect();
+    memory.attach_failed.insert(uid, (nodes, message.clone()));
+    Cond::new(TRUE, reason::ATTACHMENT_FAILED, message)
 }
 
 /// A snapshot round runs from Suspending to Resuming. Pending is not one:
@@ -2807,10 +2874,10 @@ mod tests {
         // Nodes with a diskful or tiebreaker replica need nothing.
         assert_eq!(
             converge_attachments(&two, &att(&["n1", "n3"]), &[], &used),
-            Ok(None)
+            (None, vec![])
         );
         let a = converge_attachments(&two, &att(&["n4"]), &[], &used)
-            .unwrap()
+            .0
             .unwrap();
         let added = a.replicas.last().unwrap();
         assert_eq!(
@@ -2826,35 +2893,42 @@ mod tests {
         assert_eq!(a.replicas[..3], two.replicas[..]);
         assert_eq!(
             converge_attachments(&a, &att(&["n4"]), &[], &used),
-            Ok(None)
+            (None, vec![])
         );
         // Unpublished (or a missed unpublish): the diskless entry goes, the
         // tiebreaker stays.
-        let back = converge_attachments(&a, &[], &[], &used).unwrap().unwrap();
+        let back = converge_attachments(&a, &[], &[], &used).0.unwrap();
         assert_eq!(back, two);
         // spec.evict: no new diskless entry; an attached one is a running
         // workload and stays until the attachment goes.
         assert_eq!(
             converge_attachments(&two, &att(&["n4"]), &att(&["n4"]), &used),
-            Ok(None)
+            (None, vec![])
         );
         assert_eq!(
             converge_attachments(&a, &att(&["n4"]), &att(&["n4"]), &used),
-            Ok(None)
+            (None, vec![])
         );
         let back = converge_attachments(&a, &[], &att(&["n4"]), &used)
-            .unwrap()
+            .0
             .unwrap();
         assert_eq!(back, two);
     }
 
     #[test]
     fn attachment_failures_name_the_node() {
-        let two = two_with_tb();
+        let mut a = two_with_tb();
+        a.replicas.push(AssignedReplica {
+            node: "n9".into(),
+            pool: None,
+            node_id: 3,
+            port: Some(11000),
+            role: Role::Diskless,
+        });
         let full: Vec<Assignment> = model::keys::PORT_RANGE
             .map(|port| Assignment {
                 replicas: vec![AssignedReplica {
-                    node: "n4".into(),
+                    node: "n5".into(),
                     pool: Some("p".into()),
                     node_id: 0,
                     port: Some(port),
@@ -2866,26 +2940,65 @@ mod tests {
             })
             .collect();
         let used = Used::from_assignments(&full);
-        let err = converge_attachments(&two, &["n4".into()], &[], &used).unwrap_err();
-        assert_eq!(err.cause, alloc::AllocError::NoPort("n4".into()));
-        assert!(err.to_string().contains("on n4:"), "{err}");
+        let att = ["n4".to_owned(), "n5".to_owned(), "n6".to_owned()];
+        let (next, failed) = converge_attachments(&a, &att, &[], &used);
+        let next = next.unwrap();
+        // n9 is detached: gone, and its node id 3 goes to n4.
+        let ids: Vec<(&str, u8)> = next
+            .replicas
+            .iter()
+            .map(|r| (r.node.as_str(), r.node_id))
+            .collect();
+        assert_eq!(ids, [("n1", 0), ("n2", 1), ("n3", 2), ("n4", 3), ("n6", 4)]);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            (failed[0].node.as_str(), failed[0].reason),
+            ("n5", AttachmentErrorReason::NoPort)
+        );
+        assert!(
+            failed[0].message.contains("on n5:"),
+            "{}",
+            failed[0].message
+        );
 
-        let mut crowded = two.clone();
+        // At the node id limit, a detached entry's id is what the add gets.
+        let mut crowded = two_with_tb();
         crowded.replicas = (0..=model::keys::NODE_ID_MAX)
             .map(|id| AssignedReplica {
                 node: format!("m{id}"),
                 pool: None,
                 node_id: id,
                 port: Some(11000),
-                role: Role::Diskful,
+                role: if id == 7 {
+                    Role::Diskless
+                } else {
+                    Role::Diskful
+                },
             })
             .collect();
-        let err =
-            converge_attachments(&crowded, &["n5".into()], &[], &Used::default()).unwrap_err();
-        assert_eq!(
-            (err.node.as_str(), err.cause),
-            ("n5", alloc::AllocError::TooManyPeers)
+        let (next, failed) = converge_attachments(&crowded, &["n5".into()], &[], &Used::default());
+        assert!(failed.is_empty(), "{failed:?}");
+        let added = next.unwrap();
+        assert!(
+            added
+                .replicas
+                .iter()
+                .any(|r| r.node == "n5" && r.node_id == 7)
         );
+        // Every id held: n5 fails alone, and the detached entry still goes.
+        crowded.replicas[7].role = Role::Diskful;
+        crowded.replicas[8].role = Role::Diskless;
+        let attached = ["m8".to_owned(), "n5".to_owned()];
+        let (next, failed) = converge_attachments(&crowded, &attached, &[], &Used::default());
+        assert_eq!(next, None);
+        assert_eq!(
+            (failed[0].node.as_str(), failed[0].reason),
+            ("n5", AttachmentErrorReason::TooManyPeers)
+        );
+        let (next, failed) =
+            converge_attachments(&crowded, &["n5".into(), "n6".into()], &[], &Used::default());
+        assert_eq!(failed.len(), 1, "m8 detached frees one id: {failed:?}");
+        assert!(next.unwrap().replicas.iter().all(|r| r.node != "m8"));
     }
 
     #[test]

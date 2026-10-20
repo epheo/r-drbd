@@ -25,8 +25,9 @@ pub use pool::{
 };
 pub use snapshot::{Snapshot, SnapshotAck, SnapshotPhase, SnapshotSpec, SnapshotStatus};
 pub use volume::{
-    AccessMode, AssignedReplica, Assignment, PeerProbe, ProbeResult, ReplicaStatus, Resolve, Role,
-    Volume, VolumePhase, VolumeSource, VolumeSpec, VolumeStatus,
+    AccessMode, AssignedReplica, Assignment, AttachmentError, AttachmentErrorReason, PeerProbe,
+    ProbeResult, ReplicaStatus, Resolve, Role, Volume, VolumePhase, VolumeSource, VolumeSpec,
+    VolumeStatus,
 };
 
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;

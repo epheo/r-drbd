@@ -951,13 +951,12 @@ impl Controller for Csi {
             }
             // The generation keeps a failure from before this attachment
             // out; the reconciler retries on later passes, the CO on this error.
-            if let Some(c) = condition::get(&st.conditions, condition::types::READY).filter(|c| {
-                c.reason == crate::volume::reason::ATTACHMENT_FAILED
-                    && c.observed_generation.unwrap_or(0) >= generation
-            }) {
+            if st.observed_generation.unwrap_or(0) >= generation
+                && let Some(e) = st.attachment_errors.iter().find(|e| e.node == node)
+            {
                 return Some(Err(Status::resource_exhausted(format!(
                     "volume {name}: {}",
-                    c.message
+                    e.message
                 ))));
             }
             // The agent never recreates a lost LV and a replicas 1 volume has

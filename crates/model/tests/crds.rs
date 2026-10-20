@@ -68,6 +68,17 @@ fn per_node_lists_are_maps_keyed_by_node() {
     );
     let attachments = &schema(&crd)["properties"]["spec"]["properties"]["attachments"];
     assert_eq!(attachments["x-kubernetes-list-type"], "set");
+    let errors = &status["attachmentErrors"];
+    assert_eq!(errors["x-kubernetes-list-type"], "map");
+    assert_eq!(errors["x-kubernetes-list-map-keys"], json!(["node"]));
+    assert_eq!(
+        errors["items"]["properties"]["reason"]["enum"],
+        json!(["NoPort", "TooManyPeers"])
+    );
+    assert_eq!(
+        errors["items"]["required"],
+        json!(["message", "node", "reason"])
+    );
 
     let snap = to_json(&Snapshot::crd());
     let acks = &schema(&snap)["properties"]["status"]["properties"]["acks"];
