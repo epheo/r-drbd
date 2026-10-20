@@ -91,6 +91,7 @@ Shrinking is refused.
 
 `status.usableBytes` keeps the old size until every diskful replica on a reachable node reports the new one.
 Meanwhile the Volume stays Ready, with `Ready` reason `Resizing`.
+A volume that was never Ready (a restore larger than its snapshot) stays Provisioning below its size instead, `Ready` False with the same reason.
 
 ## Lifecycle
 

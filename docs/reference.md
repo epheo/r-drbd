@@ -143,7 +143,7 @@ Volume `Ready`:
 | Reason | Meaning |
 |---|---|
 | `AllReplicasUpToDate` | Ready |
-| `Resizing` | Ready, still growing: `usableBytes` is below `sizeBytes` |
+| `Resizing` | Still growing: `usableBytes` is below `sizeBytes`; Ready True once the volume was Ready before, False while a restore grows before its first Ready |
 | `Placing`, `Waiting` | Not ready yet |
 | `Insufficient` | No Pool of the tier has room on enough nodes |
 | `AllocationFailed` | No free DRBD minor, port or node id |
