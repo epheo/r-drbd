@@ -23,14 +23,11 @@ metadata:
   name: r-drbd-controller
 rules:
   - apiGroups: ["r-drbd.io"]
-    resources: ["pools"]
-    verbs: ["list", "watch", "patch"]
-  - apiGroups: ["r-drbd.io"]
-    resources: ["volumes", "snapshots"]
-    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+    resources: ["pools", "volumes", "snapshots"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["r-drbd.io"]
     resources: ["pools/status", "volumes/status", "snapshots/status"]
-    verbs: ["patch"]
+    verbs: ["get", "update", "patch"]
   - apiGroups: [""]
     resources: ["nodes", "persistentvolumeclaims"]
     verbs: ["get", "list", "watch"]
@@ -90,10 +87,10 @@ metadata:
 rules:
   - apiGroups: ["r-drbd.io"]
     resources: ["pools", "volumes", "snapshots"]
-    verbs: ["list", "watch"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["r-drbd.io"]
     resources: ["pools/status", "volumes/status", "snapshots/status"]
-    verbs: ["patch"]
+    verbs: ["get", "update", "patch"]
   - apiGroups: ["r-drbd.io"]
     resources: ["nodedisks"]
     verbs: ["get", "create"]
@@ -102,7 +99,7 @@ rules:
     verbs: ["patch"]
   - apiGroups: [""]
     resources: ["nodes"]
-    verbs: ["list", "watch", "patch"]
+    verbs: ["get", "list", "watch", "patch"]
   # Warnings about the node's shutdown setup, as core Events on the Node:
   # one per node and reason, read to bump its count.
   - apiGroups: [""]
