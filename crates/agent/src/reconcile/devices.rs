@@ -2,7 +2,7 @@
 //! one step at a time, and removal under reclaimPolicy Delete. Once the
 //! thin pool is ready the Pool goes on as one on an existing VG.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use kube::ResourceExt;
@@ -75,7 +75,7 @@ impl Look {
     }
 
     /// Listed paths that are PVs without a VG and were `members`.
-    fn orphans(&self, members: &HashSet<&str>) -> Vec<String> {
+    fn orphans(&self, members: &BTreeSet<&str>) -> Vec<String> {
         self.checked
             .iter()
             .filter(|c| members.contains(c.row.path.as_str()))
@@ -388,7 +388,7 @@ impl Reconciler {
         let status = pool.status.clone().unwrap_or_default();
         // Recorded while the VG stood: a PV left orphan by a crash after
         // vgremove is cleared only if it was ours.
-        let members: HashSet<&str> = status
+        let members: BTreeSet<&str> = status
             .devices
             .iter()
             .filter(|d| d.state == DeviceState::Member)
@@ -412,7 +412,7 @@ impl Reconciler {
                 r.state = DeviceState::Member;
                 r.message = Some("PV label left after the VG was removed: pvremove pending".into());
             }
-            out.rows = Some(rows);
+            out.rows = Some(rows.clone());
             out.unready = !look.built(t);
             if let Some(e) = look.foreign(t) {
                 out.gate = Err(e);
@@ -443,7 +443,7 @@ impl Reconciler {
             } else {
                 Vec::new()
             };
-            let step = match plan::release(t, look.vg.as_ref(), &lvs, &orphans) {
+            let step = match plan::release(t, look.vg.as_ref(), &lvs, &orphans, &rows, &members) {
                 Ok(Release::Done) => {
                     out.released = Some((
                         condition::TRUE,
