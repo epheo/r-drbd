@@ -614,7 +614,7 @@ pub struct Notify {
 /// quick; the cap bounds how stale status can get while drbdsetup keeps
 /// failing.
 const RESTART_FIRST: Duration = Duration::from_secs(1);
-const RESTART_MAX: Duration = Duration::from_secs(30);
+pub(crate) const RESTART_MAX: Duration = Duration::from_secs(30);
 /// A stream that ran this long without ending was healthy: the next end
 /// starts the schedule over.
 const QUIET: Duration = Duration::from_secs(60);

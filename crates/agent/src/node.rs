@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use drbd_config::Features;
@@ -14,8 +15,8 @@ use kube::{Api, Client};
 use model::keys;
 use serde_json::json;
 
-use crate::Exec;
 use crate::exec::{DEFAULT_TIMEOUT, argv, run_any};
+use crate::{Exec, ExecError, ExecMode, Output};
 
 /// Version strings (`X.Y.Z` as the tool prints it) found at startup;
 /// `None` when the tool is absent or prints no version.
@@ -497,13 +498,143 @@ pub fn lease(node: &str, namespace: &str, now: Timestamp, started: Timestamp) ->
     }
 }
 
+/// How long past the loop's own deadline renewals go on: covers the work
+/// between two awaits and the write backoff sleeps.
+pub const PROGRESS_SLACK: Duration = Duration::from_secs(10);
+
+/// The reconcile loop's promise: before every await it sets when that
+/// await ends at the latest. An await that sets nothing inherits the last
+/// deadline, so it cannot hang unnoticed.
+#[derive(Debug, Clone)]
+pub struct Progress(Arc<(tokio::time::Instant, AtomicU64)>);
+
+impl Default for Progress {
+    fn default() -> Self {
+        Self(Arc::new((tokio::time::Instant::now(), AtomicU64::new(0))))
+    }
+}
+
+impl Progress {
+    pub fn until(&self, deadline: tokio::time::Instant) {
+        let ms = deadline.saturating_duration_since(self.0.0).as_millis();
+        // 0 means unset.
+        let ms = u64::try_from(ms).unwrap_or(u64::MAX - 1) + 1;
+        self.0.1.store(ms, Ordering::Relaxed);
+    }
+
+    pub fn within(&self, bound: Duration) {
+        self.until(tokio::time::Instant::now() + bound);
+    }
+
+    /// Set, and not past its deadline plus [`PROGRESS_SLACK`].
+    pub fn alive(&self) -> bool {
+        match self.0.1.load(Ordering::Relaxed) {
+            0 => false,
+            ms => {
+                let deadline = self.0.0 + Duration::from_millis(ms - 1) + PROGRESS_SLACK;
+                tokio::time::Instant::now() <= deadline
+            }
+        }
+    }
+}
+
+/// The reconciler's runner: every command declares its own bound first.
+pub struct ProgressExec {
+    inner: Arc<dyn Exec>,
+    progress: Progress,
+}
+
+impl ProgressExec {
+    pub fn new(inner: Arc<dyn Exec>, progress: Progress) -> Self {
+        Self { inner, progress }
+    }
+
+    pub fn progress(&self) -> &Progress {
+        &self.progress
+    }
+}
+
+impl std::fmt::Debug for ProgressExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProgressExec").finish_non_exhaustive()
+    }
+}
+
+/// The longest a command can hold its caller in `mode`.
+fn exec_bound(mode: ExecMode) -> Duration {
+    match mode {
+        // A grandchild holding the pipes adds up to term + kill after an exit.
+        ExecMode::Timeout { wait, term, kill } => wait + term + kill,
+        ExecMode::Finish { wait } | ExecMode::IoProgress { wait } => wait,
+        ExecMode::Daemon => Duration::ZERO,
+    }
+}
+
+#[async_trait::async_trait]
+impl Exec for ProgressExec {
+    async fn run(&self, argv: &[String], mode: ExecMode) -> Result<Output, ExecError> {
+        self.progress.within(exec_bound(mode));
+        self.inner.run(argv, mode).await
+    }
+}
+
+/// Whether this agent may say it is alive: its loop keeps its deadlines,
+/// and the DRBD event stream, where there is one, came back within two
+/// restart delays. Without either its statuses are stale.
+#[derive(Debug)]
+pub struct Liveness {
+    progress: Progress,
+    /// None without DRBD on this node.
+    tracker: Option<Arc<std::sync::Mutex<crate::events2::Tracker>>>,
+    lost_since: std::sync::Mutex<Option<tokio::time::Instant>>,
+}
+
+impl Liveness {
+    pub fn new(
+        progress: Progress,
+        tracker: Option<Arc<std::sync::Mutex<crate::events2::Tracker>>>,
+    ) -> Self {
+        Self {
+            progress,
+            tracker,
+            lost_since: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn may_renew(&self) -> bool {
+        if !self.progress.alive() {
+            return false;
+        }
+        let Some(t) = &self.tracker else {
+            return true;
+        };
+        let up = t.lock().is_ok_and(|t| t.is_available());
+        let mut since = self
+            .lost_since
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if up {
+            *since = None;
+            return true;
+        }
+        let now = tokio::time::Instant::now();
+        now.duration_since(*since.get_or_insert(now)) <= crate::drbd::RESTART_MAX * 2
+    }
+}
+
 /// Bound on one Lease write: a renewal never blocks past the renew interval.
 pub const LEASE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Renews the Lease forever, and applies the Node annotations until they
 /// stick in a task of their own. Failures are logged and retried on the
 /// next tick, the controller decides what a stale Lease means.
-pub async fn heartbeat(client: Client, namespace: String, node: String, tools: Tools) {
+pub async fn heartbeat(
+    client: Client,
+    namespace: String,
+    node: String,
+    tools: Tools,
+    liveness: Liveness,
+) {
     tokio::spawn(annotate_until_done(client.clone(), node.clone(), tools));
     let api = Api::<Lease>::namespaced(client, &namespace);
     let params = PatchParams::apply(&keys::agent_field_manager(&node)).force();
@@ -516,7 +647,7 @@ pub async fn heartbeat(client: Client, namespace: String, node: String, tools: T
     renew_loop(
         every,
         Timestamp::now,
-        || true,
+        || liveness.may_renew(),
         |now| {
             let lease = lease(&node, &namespace, now, started);
             let (api, params) = (api.clone(), params.clone());
@@ -543,9 +674,21 @@ where
 {
     let mut tick = tokio::time::interval(every);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut held = false;
     loop {
         tick.tick().await;
-        if !may_renew() {
+        let may = may_renew();
+        if may == held {
+            held = !may;
+            if held {
+                tracing::warn!(
+                    "reconcile loop past its deadline or DRBD events lost: Lease left to go stale"
+                );
+            } else {
+                tracing::info!("Lease renewals resume");
+            }
+        }
+        if !may {
             continue;
         }
         match tokio::time::timeout(LEASE_WRITE_TIMEOUT, renew(clock())).await {
@@ -873,6 +1016,95 @@ mod tests {
         assert_eq!(s[1].0, Duration::from_secs(10), "hung first attempt cut");
         assert!(s[1].1 > s[0].1, "later renewTime");
         task.abort();
+    }
+
+    /// A command that takes `0` whatever its mode.
+    #[derive(Debug)]
+    struct Takes(Duration);
+
+    #[async_trait::async_trait]
+    impl Exec for Takes {
+        async fn run(&self, _: &[String], _: ExecMode) -> Result<Output, ExecError> {
+            tokio::time::sleep(self.0).await;
+            Ok(Output {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                duration: self.0,
+            })
+        }
+    }
+
+    /// When the Lease was renewed over `watch` while one command taking
+    /// `takes` runs in `mode` from the start.
+    async fn renewals(takes: Duration, mode: ExecMode, watch: Duration) -> Vec<u64> {
+        let progress = Progress::default();
+        let live = Liveness::new(progress.clone(), None);
+        let base = tokio::time::Instant::now();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = seen.clone();
+        let exec = ProgressExec::new(Arc::new(Takes(takes)), progress);
+        let cmd = tokio::spawn(async move { exec.run(&argv(&["x"]), mode).await });
+        let hb = tokio::spawn(renew_loop(
+            Duration::from_secs(10),
+            Timestamp::now,
+            move || live.may_renew(),
+            move |_| {
+                rec.lock().unwrap().push(base.elapsed().as_secs());
+                async { Ok(()) }
+            },
+        ));
+        tokio::time::sleep(watch).await;
+        hb.abort();
+        cmd.abort();
+        seen.lock().unwrap().clone()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn long_commands_within_their_bound_keep_the_lease() {
+        let adjust = renewals(
+            Duration::from_secs(40),
+            crate::drbd::DRBD_TIMEOUT,
+            Duration::from_secs(45),
+        )
+        .await;
+        assert_eq!(adjust, [0, 10, 20, 30, 40]);
+        let lvcreate = renewals(
+            Duration::from_secs(90),
+            crate::exec::LVM_CHANGE_TIMEOUT,
+            Duration::from_secs(95),
+        )
+        .await;
+        assert_eq!(lvcreate, (0..=90).step_by(10).collect::<Vec<_>>());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_command_hung_past_its_bound_stops_renewals() {
+        // DRBD_TIMEOUT holds a caller 40 s at most; 10 s of slack after.
+        let hung = renewals(
+            Duration::from_secs(3600),
+            crate::drbd::DRBD_TIMEOUT,
+            Duration::from_secs(300),
+        )
+        .await;
+        assert_eq!(hung, [0, 10, 20, 30, 40, 50]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_renewal_before_the_loop_runs_or_with_events_lost() {
+        let progress = Progress::default();
+        let tracker = Arc::new(std::sync::Mutex::new(crate::events2::Tracker::default()));
+        let live = Liveness::new(progress.clone(), Some(tracker.clone()));
+        assert!(!live.may_renew(), "caches not ready: no deadline yet");
+        progress.within(Duration::from_secs(3600));
+        // The event stream has not delivered its dump yet.
+        assert!(live.may_renew());
+        tokio::time::sleep(crate::drbd::RESTART_MAX * 2).await;
+        assert!(live.may_renew());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!live.may_renew(), "events lost past two restart delays");
+        tracker.lock().unwrap().feed("exists -").unwrap();
+        assert!(live.may_renew());
     }
 
     #[test]

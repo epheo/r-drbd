@@ -70,6 +70,23 @@ impl Error {
 /// watches keep their own client without it.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// One request on the writes client; a backoff sleep fits the progress slack.
+const REQUEST_BOUND: Duration = CONNECT_TIMEOUT.saturating_add(READ_TIMEOUT);
+
+/// Live reads on the writes client, bounded like a write.
+#[derive(Debug)]
+struct ProgressLive {
+    inner: KubeLiveVolumes,
+    progress: node::Progress,
+}
+
+#[async_trait::async_trait]
+impl crate::reconcile::LiveVolumes for ProgressLive {
+    async fn get(&self, volume: &str) -> Result<model::Volume, String> {
+        self.progress.within(REQUEST_BOUND);
+        self.inner.get(volume).await
+    }
+}
 
 async fn clients() -> Result<(Client, Client), Error> {
     let config = kube::Config::infer().await.map_err(Error::KubeConfig)?;
@@ -123,13 +140,12 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
     // LVM change begins that kubelet's kill could cut while the guard runs.
     let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
     let inv = spawn_inventory(&cfg.node, &client, &exec, &stores, &stop_rx);
-    let mut drbd_env = DrbdEnv::new(features, cfg.res_dir.clone(), tracker.clone());
-    drbd_env.host_name = host_name();
-    let reconciler = Reconciler::new(cfg.node.clone(), exec.clone())
-        .with_drbd(drbd_env)
-        .with_disks(inv.disks.clone())
-        .with_disk_lock(inv.lock.clone())
-        .with_live(Arc::new(KubeLiveVolumes::new(client.clone())));
+    // Shared by the reconcile loop, which sets a deadline before each of its
+    // awaits, and the heartbeat, which renews only while it is kept.
+    let progress = node::Progress::default();
+    let rexec = Arc::new(node::ProgressExec::new(exec.clone(), progress.clone()));
+    let liveness = node::Liveness::new(progress, events.is_some().then(|| tracker.clone()));
+    let reconciler = reconciler(&cfg, &rexec, &client, features, &tracker, &inv);
 
     let listener = ::csi::bind_unix(&cfg.csi_endpoint)
         .and_then(tokio::net::UnixListener::from_std)
@@ -151,10 +167,11 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
         cfg.namespace.clone(),
         cfg.node.clone(),
         tools,
+        liveness,
     ));
     let mut reconcile = tokio::spawn(reconcile_loop(
         client,
-        exec.clone(),
+        rexec,
         reconciler,
         stores,
         Triggers {
@@ -213,6 +230,27 @@ fn host_name() -> Option<String> {
         .inspect_err(|e| tracing::warn!(error = %e, "host name unreadable; using the node name"))
         .ok()?;
     Some(name.trim().to_owned()).filter(|n| !n.is_empty())
+}
+
+/// The reconciler, on the runner that keeps the loop's deadlines.
+fn reconciler(
+    cfg: &Config,
+    exec: &Arc<node::ProgressExec>,
+    client: &Client,
+    features: Option<drbd_config::Features>,
+    tracker: &Arc<Mutex<Tracker>>,
+    inv: &Inventory,
+) -> Reconciler {
+    let mut drbd = DrbdEnv::new(features, cfg.res_dir.clone(), tracker.clone());
+    drbd.host_name = host_name();
+    Reconciler::new(cfg.node.clone(), exec.clone())
+        .with_drbd(drbd)
+        .with_disks(inv.disks.clone())
+        .with_disk_lock(inv.lock.clone())
+        .with_live(Arc::new(ProgressLive {
+            inner: KubeLiveVolumes::new(client.clone()),
+            progress: exec.progress().clone(),
+        }))
 }
 
 /// `drbdsetup events2` from the image (no host prefix) feeding the tracker.
@@ -385,7 +423,7 @@ struct Triggers {
 
 async fn reconcile_loop(
     client: Client,
-    exec: Arc<dyn Exec>,
+    exec: Arc<node::ProgressExec>,
     rec: Reconciler,
     stores: watch::Stores,
     triggers: Triggers,
@@ -399,9 +437,11 @@ async fn reconcile_loop(
     triggers.ready.send_replace(true);
     let node = rec.node().to_owned();
     tracing::info!(node, "caches ready, reconciling");
+    let progress = exec.progress().clone();
     let mut work = LoopWork {
         client,
         exec,
+        progress: progress.clone(),
         rec,
         stores,
         node,
@@ -415,6 +455,7 @@ async fn reconcile_loop(
         changes: triggers.changes,
         gate,
         stop,
+        progress,
     };
     drive(&mut work, schedule).await;
     Ok(())
@@ -435,6 +476,8 @@ struct Schedule {
     /// True once no new pass may start.
     gate: tokio::sync::watch::Receiver<bool>,
     stop: tokio::sync::watch::Receiver<bool>,
+    /// Idle, the loop promises to wake by the resync.
+    progress: node::Progress,
 }
 
 /// Passes and refreshes run to completion; `stop` and the gate are only
@@ -449,6 +492,11 @@ async fn drive(work: &mut dyn Work, mut s: Schedule) {
         // Fixed per pass so a stream of refreshes cannot push the resync out.
         let resync = tokio::time::Instant::now() + watch::RESYNC;
         loop {
+            if open {
+                s.progress.until(resync + watch::COALESCE);
+            } else {
+                s.progress.within(watch::RESYNC);
+            }
             tokio::select! {
                 biased;
                 () = stopped(&mut s.stop) => return,
@@ -478,7 +526,8 @@ async fn drive(work: &mut dyn Work, mut s: Schedule) {
 
 struct LoopWork {
     client: Client,
-    exec: Arc<dyn Exec>,
+    exec: Arc<node::ProgressExec>,
+    progress: node::Progress,
     rec: Reconciler,
     stores: watch::Stores,
     node: String,
@@ -503,7 +552,7 @@ impl Work for LoopWork {
         let volumes = stores.volumes.state();
         let snapshots = stores.snapshots.state();
         let writes = rec.pass(&pools, &volumes, &snapshots).await;
-        for pool in apply(&self.client, node, writes).await {
+        for pool in apply(&self.client, node, &self.progress, writes).await {
             rec.events_unsent(&pool);
         }
         let pool_set_changed = self.pool_set.update(&pools, node);
@@ -514,7 +563,8 @@ impl Work for LoopWork {
 
     async fn refresh(&mut self) -> bool {
         let volumes = self.stores.volumes.state();
-        apply(&self.client, &self.node, self.rec.refresh(&volumes).await).await;
+        let writes = self.rec.refresh(&volumes).await;
+        apply(&self.client, &self.node, &self.progress, writes).await;
         self.rec.take_pass_wanted()
     }
 }
@@ -554,13 +604,17 @@ fn addresses(stores: &watch::Stores) -> BTreeMap<String, std::net::IpAddr> {
 async fn apply(
     client: &Client,
     node: &str,
+    progress: &node::Progress,
     writes: Vec<crate::reconcile::StatusWrite>,
 ) -> Vec<String> {
     let results = crate::retry::each_with_backoff(
         &writes,
         &crate::retry::BACKOFF,
         crate::retry::retryable,
-        |w| w.apply(client, node),
+        |w| {
+            progress.within(REQUEST_BOUND);
+            w.apply(client, node)
+        },
     )
     .await;
     let mut skipped = 0;
@@ -782,6 +836,7 @@ mod tests {
             changes: changes.clone(),
             gate,
             stop,
+            progress: node::Progress::default(),
         };
         let mut work = FakeWork(counted.clone());
         let task = tokio::spawn(async move { drive(&mut work, schedule).await });
