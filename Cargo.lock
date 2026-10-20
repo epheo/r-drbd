@@ -1751,12 +1751,10 @@ dependencies = [
  "agent",
  "clap",
  "controller",
- "kube",
  "model",
  "rustix",
  "serde_json",
  "tokio",
- "tracing",
  "tracing-subscriber",
 ]
 
