@@ -1354,12 +1354,7 @@ impl Reconciler {
             return Ok(());
         }
         if source.is_some() && (!identical || !at_snapshot_size || !waiting.is_empty()) {
-            tracing::warn!(
-                volume = name,
-                ?waiting,
-                at_snapshot_size,
-                "restored copies not all identical: this one is the source, the others full-sync"
-            );
+            log_source_start(name, &waiting, at_snapshot_size);
             self.drbd_cmd(&argv::start_as_source(name), DRBD_TIMEOUT)
                 .await?;
             self.init_started.remove(name);
@@ -1983,3 +1978,19 @@ impl Step<'_> {
 
 #[cfg(test)]
 mod tests;
+
+/// Until digests prove copies, every restore starts as the sync source;
+/// only a lost peer or a size mismatch deserves a warning.
+fn log_source_start(name: &str, waiting: &[&str], at_snapshot_size: bool) {
+    let why = "source here, others full-sync";
+    if at_snapshot_size && waiting.is_empty() {
+        tracing::info!(volume = name, "copies unproven: {why}");
+    } else {
+        tracing::warn!(
+            volume = name,
+            ?waiting,
+            at_snapshot_size,
+            "copies not all usable: {why}"
+        );
+    }
+}
