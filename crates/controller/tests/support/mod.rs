@@ -247,7 +247,7 @@ impl Env {
             ),
         )
         .expect("kubeconfig");
-        let env = Self {
+        let mut env = Self {
             apiserver,
             etcd,
             dir,
@@ -292,12 +292,25 @@ impl Env {
             .count()
     }
 
-    async fn wait_up(&self) {
+    async fn wait_up(&mut self) {
         let client = self.client().await;
         let api: Api<Namespace> = Api::all(client);
         for _ in 0..1200 {
             if api.get_opt("default").await.ok().flatten().is_some() {
                 return;
+            }
+            // free_port can race another test for a port; a dead process
+            // never answers, so fail now instead of after the full wait.
+            for (name, child) in [
+                ("etcd", &mut self.etcd),
+                ("kube-apiserver", &mut self.apiserver),
+            ] {
+                if let Ok(Some(status)) = child.0.try_wait() {
+                    panic!(
+                        "{name} exited ({status}); logs in {}",
+                        self.dir.path().display()
+                    );
+                }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
