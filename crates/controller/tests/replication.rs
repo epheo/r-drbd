@@ -1186,11 +1186,13 @@ async fn evict_stale_diskful_to_a_fourth_node() {
     assert_eq!(role_of(&v, "n2"), Some(Role::Diskful));
     assert_eq!(role_of(&v, "n3"), Some(Role::Tiebreaker));
     assert_eq!(a.minor, before.minor);
-    // n1 leaves spec.evict, its stale entry leaves the status.
-    let v = volume_where(&client, "rep", |v| {
-        v.spec.evict.is_empty() && entry_of(v, "n1").is_none()
-    })
-    .await;
+    // n1 leaves spec.evict; its stale entry stays while its Node exists,
+    // since its agent may return to an old replica, and goes with the Node.
+    volume_where(&client, "rep", |v| v.spec.evict.is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(entry_of(&get_volume(&client, "rep").await.unwrap(), "n1").is_some());
+    support::delete_node(&client, "n1").await;
+    let v = volume_where(&client, "rep", |v| entry_of(v, "n1").is_none()).await;
     assert!(v.status.as_ref().unwrap().initialized_at.is_some());
     let ev = events_of(&client, "rep", "Evicted").await;
     assert_eq!(ev.len(), 1);

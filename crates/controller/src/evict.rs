@@ -400,19 +400,19 @@ fn decide_node(i: &Input<'_>, node: &String) -> Step {
 }
 
 /// Indices of status entries the controller removes: the node holds no
-/// replica in the assignment and its agent is stale or its Node is gone, so
-/// no agent will ever drop the entry.
+/// replica in the assignment and its Node is gone, so no agent will ever
+/// drop the entry. A stale agent on an existing Node keeps its entry: it
+/// marks the node departing until the agent tears the old replica down.
 pub fn orphan_entries(
     a: &Assignment,
     entries: &[ReplicaStatus],
-    fresh: &dyn Fn(&str) -> bool,
     exists: &dyn Fn(&str) -> bool,
 ) -> Vec<(usize, String)> {
     entries
         .iter()
         .enumerate()
         .filter(|(_, e)| !a.replicas.iter().any(|r| r.node == e.node))
-        .filter(|(_, e)| !fresh(&e.node) || !exists(&e.node))
+        .filter(|(_, e)| !exists(&e.node))
         .map(|(i, e)| (i, e.node.clone()))
         .collect()
 }

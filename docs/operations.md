@@ -134,6 +134,10 @@ Local volumes (`replicas: 1`) cannot be evicted; remove the node from `spec.evic
 If the evicted node is alive, its agent takes DRBD down and keeps the LV as an orphan.
 Remove it by hand once you no longer need it.
 
+An evicted node whose agent is down keeps its replica entry in the Volume status until the agent returns and tears the old replica down, or its Node object is deleted.
+Until then no new replica goes to that node.
+If that entry last reported the device in use, snapshots of the volume wait, the Snapshot `lastError` naming the node.
+
 A dead node that will never return: delete its Node object.
 That tells r-drbd the node is fenced, which lifts the quorum requirement on the remaining replica.
 Never delete the Node of a machine that may still be writing.

@@ -535,12 +535,15 @@ fn orphans() {
     let mut a = two();
     a.replicas.retain(|r| r.node != "n2");
     let entries = vec![up("n1", false), up("n2", true), tb("n3"), up("n4", false)];
-    let fresh = |n: &str| n != "n2";
-    let exists = |n: &str| n != "n4";
-    let o = orphan_entries(&a, &entries, &fresh, &exists);
+    let exists = |n: &str| n != "n2" && n != "n4";
+    let o = orphan_entries(&a, &entries, &exists);
     assert_eq!(o, [(1, "n2".to_owned()), (3, "n4".to_owned())]);
-    // A fresh agent outside the assignment drops its own entry.
-    assert_eq!(orphan_entries(&a, &entries[..3], &|_| true, &|_| true), []);
+    // An existing Node keeps the entry, stale agent or not: its agent
+    // drops it, and until then the node is departing.
+    assert_eq!(
+        orphan_entries(&a, &entries, &|n| n != "n4"),
+        [(3, "n4".to_owned())]
+    );
     assert_eq!(
         orphan_patch(&o),
         serde_json::json!([

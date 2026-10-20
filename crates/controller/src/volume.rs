@@ -1239,7 +1239,7 @@ async fn reconcile(
         let mut summary = health.summarize(v, &a, &memory.latched(v), &seen);
         memory.latch(v, summary.split_pairs.clone());
         evict_step(ctx, memory, placing, api, v, &a, &mut summary).await;
-        remove_orphans(ctx, health, api, v, &a).await;
+        remove_orphans(health, api, v, &a).await;
         if v.spec.resolve.is_some() {
             resolve_step(ctx, memory, api, v, &a, &mut summary, health).await;
         } else if let Some(uid) = &v.metadata.uid {
@@ -1611,19 +1611,12 @@ async fn peer_event(ctx: &Ctx<'_>, memory: &mut Memory, v: &Volume, now: &Cond) 
 }
 
 /// Status entries no agent will remove (crate::evict::orphan_entries).
-async fn remove_orphans(
-    ctx: &Ctx<'_>,
-    health: &Health,
-    api: &Api<Volume>,
-    v: &Volume,
-    a: &Assignment,
-) {
+async fn remove_orphans(health: &Health, api: &Api<Volume>, v: &Volume, a: &Assignment) {
     let Some(status) = v.status.as_ref() else {
         return;
     };
-    let fresh = |n: &str| ctx.stores.agent_fresh(n);
     let exists = |n: &str| health.exists.contains(n);
-    let orphans = crate::evict::orphan_entries(a, &status.replicas, &fresh, &exists);
+    let orphans = crate::evict::orphan_entries(a, &status.replicas, &exists);
     if orphans.is_empty() {
         return;
     }
