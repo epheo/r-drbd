@@ -942,11 +942,23 @@ impl Controller for Csi {
         // tearing down from an earlier publish.
         let path = wait::until(&self.stores, self.cfg.ready_timeout, |s| {
             let v = s.volume(&name)?;
-            let entries = &v.status.as_ref()?.replicas;
+            let st = v.status.as_ref()?;
+            let entries = &st.replicas;
             if let Some(e) = entries.iter().find(|e| {
                 e.node == node && e.present && e.observed_generation.unwrap_or(0) >= generation
             }) {
                 return e.device_path.clone().map(Ok);
+            }
+            // The generation keeps a failure from before this attachment
+            // out; the reconciler retries on later passes, the CO on this error.
+            if let Some(c) = condition::get(&st.conditions, condition::types::READY).filter(|c| {
+                c.reason == crate::volume::reason::ATTACHMENT_FAILED
+                    && c.observed_generation.unwrap_or(0) >= generation
+            }) {
+                return Some(Err(Status::resource_exhausted(format!(
+                    "volume {name}: {}",
+                    c.message
+                ))));
             }
             // The agent never recreates a lost LV and a replicas 1 volume has
             // no peer to serve it diskless, so waiting cannot succeed. No

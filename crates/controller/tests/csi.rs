@@ -709,3 +709,71 @@ async fn lost_replica_of_a_replicated_volume_still_waits() {
     assert_eq!(err.code(), Code::DeadlineExceeded, "{err}");
     assert!(err.message().contains("not recreated"), "{err}");
 }
+
+/// An attached node that gets no diskless replica (here every DRBD node id
+/// is taken) shows in Ready and fails the publish at once, not at the
+/// ready timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attachment_failure_fails_publish_fast() {
+    let assets = require_envtest!();
+    support::init_tracing();
+    let env = Env::start(&assets).await;
+    let client = env.client().await;
+    node(&client, "nx", true).await;
+    let cfg = support::config(&env, "ctl");
+    let _ctl = support::spawn(env.clients().await, cfg.clone());
+    let mut spec = support::volume_spec(GIB, 2, "fast");
+    spec.assignment = Some(model::Assignment {
+        replicas: (0..=model::keys::NODE_ID_MAX)
+            .map(|id| model::AssignedReplica {
+                node: format!("m{id}"),
+                pool: Some("p".into()),
+                node_id: id,
+                port: Some(*model::keys::PORT_RANGE.start()),
+                role: model::Role::Diskful,
+            })
+            .collect(),
+        minor: Some(*model::keys::MINOR_RANGE.start()),
+        secret: None,
+        initial_up_to_date_node: None,
+    });
+    support::create_volume(&client, "pvc-crowded", spec).await;
+    support::volume_where(&client, "pvc-crowded", |v| v.status.is_some()).await;
+    let (stores, watchers) = controller::store::start(
+        client.clone(),
+        support::NAMESPACE,
+        controller::store::LEASE_STALE,
+    );
+    let _watchers = tokio::spawn(watchers);
+    stores.wait_ready().await.unwrap();
+    let svc = controller::csi::Csi::new(client.clone(), stores, cfg.clone());
+    let start = Instant::now();
+    let err = svc
+        .controller_publish_volume(Request::new(ControllerPublishVolumeRequest {
+            volume_id: "pvc-crowded".into(),
+            node_id: "nx".into(),
+            volume_capability: Some(mount()),
+            ..ControllerPublishVolumeRequest::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::ResourceExhausted, "{err}");
+    assert!(err.message().contains("on nx: more than 32"), "{err}");
+    assert!(
+        start.elapsed() < cfg.ready_timeout / 4,
+        "{:?}",
+        start.elapsed()
+    );
+    let v = get_volume(&client, "pvc-crowded").await.unwrap();
+    let ready = v
+        .status
+        .as_ref()
+        .and_then(|s| model::condition::get(&s.conditions, model::condition::types::READY))
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        (ready.status.as_str(), ready.reason.as_str()),
+        ("False", "AttachmentFailed")
+    );
+    assert!(ready.message.contains("nx"), "{}", ready.message);
+}

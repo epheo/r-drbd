@@ -29,6 +29,9 @@ pub mod reason {
     pub const SNAPSHOT_NOT_READY: &str = "SnapshotNotReady";
     pub const SNAPSHOT_FAILED: &str = "SnapshotFailed";
     pub const ALLOCATION_FAILED: &str = "AllocationFailed";
+    /// Ready reason while an attached node gets no diskless replica;
+    /// ControllerPublish fails on it at once.
+    pub const ATTACHMENT_FAILED: &str = "AttachmentFailed";
     pub const PLACING: &str = "Placing";
     pub const WAITING: &str = "Waiting";
     pub const ALL_UP_TO_DATE: &str = "AllReplicasUpToDate";
@@ -703,6 +706,23 @@ pub fn resolve_action(split_brain: bool, seen_split: bool, done: bool) -> Resolv
     }
 }
 
+/// An attached node that gets no diskless replica.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("no diskless replica for the attachment on {node}: {cause}")]
+pub struct AttachError {
+    pub node: String,
+    pub cause: alloc::AllocError,
+}
+
+impl AttachError {
+    fn new(node: &str, cause: alloc::AllocError) -> Self {
+        Self {
+            node: node.to_owned(),
+            cause,
+        }
+    }
+}
+
 /// Diskless entries converged to the attachments: an attached node without
 /// a replica gets one (lowest free node id in the volume, lowest free port
 /// on that node); a diskless entry whose node is no longer attached goes.
@@ -714,7 +734,7 @@ pub fn converge_attachments(
     attachments: &[String],
     evict: &[String],
     used: &Used,
-) -> Result<Option<Assignment>, alloc::AllocError> {
+) -> Result<Option<Assignment>, AttachError> {
     let mut out = a.clone();
     let mut changed = false;
     for node in attachments {
@@ -723,10 +743,10 @@ pub fn converge_attachments(
         }
         let node_id = (0..=model::keys::NODE_ID_MAX)
             .find(|id| !out.replicas.iter().any(|r| r.node_id == *id))
-            .ok_or(alloc::AllocError::TooManyPeers)?;
+            .ok_or_else(|| AttachError::new(node, alloc::AllocError::TooManyPeers))?;
         let port = used
             .lowest_free_port(node)
-            .ok_or_else(|| alloc::AllocError::NoPort(node.clone()))?;
+            .ok_or_else(|| AttachError::new(node, alloc::AllocError::NoPort(node.clone())))?;
         out.replicas.push(AssignedReplica {
             node: node.clone(),
             pool: None,
@@ -1144,7 +1164,7 @@ async fn reconcile(
         return;
     }
     if let Some(a) = memory.assignment(v).cloned() {
-        let a = converge(memory, placing, api, v, a).await;
+        let (a, attach_failed) = converge(memory, placing, api, v, a).await;
         let seen = memory.probes_seen(v);
         memory.set_probe_wait(v, health.awaiting(v, &seen));
         let mut summary = health.summarize(v, &a, &memory.latched(v), &seen);
@@ -1157,6 +1177,10 @@ async fn reconcile(
             memory.resolving.remove(uid);
         }
         peer_event(ctx, memory, v, &summary.peer_unreachable).await;
+        // The phase stays: the replicas serve, only the new node waits.
+        if let Some(c) = attach_failed {
+            summary.ready = c;
+        }
         let wanted = Owned::wanted(v, summary.phase, &summary.conds(), Some(&summary));
         write(memory, api, v, wanted).await;
         return;
@@ -1190,31 +1214,33 @@ async fn reconcile(
 }
 
 /// Converges the diskless entries of a DRBD volume to spec.attachments;
-/// returns the assignment the rest of the pass works with.
+/// returns the assignment the rest of the pass works with, and the Ready
+/// condition when an attachment gets no replica.
 async fn converge(
     memory: &mut Memory,
     placing: &mut Placing,
     api: &Api<Volume>,
     v: &Volume,
     a: Assignment,
-) -> Assignment {
+) -> (Assignment, Option<Cond>) {
     if v.spec.replicas < 2 || a.minor.is_none() {
-        return a;
+        return (a, None);
     }
     match converge_attachments(&a, &v.spec.attachments, &v.spec.evict, &placing.used) {
-        Ok(None) => a,
+        Ok(None) => (a, None),
         Ok(Some(next)) => {
             if write_assignment(api, v, &next).await {
                 placing.used.add(&next);
                 memory.remember(v, next.clone());
-                next
+                (next, None)
             } else {
-                a
+                (a, None)
             }
         }
         Err(e) => {
-            warn!(volume = v.name_any(), error = %e, "no diskless replica for an attachment");
-            a
+            debug!(volume = v.name_any(), error = %e, "attachment failed");
+            let ready = Cond::new(FALSE, reason::ATTACHMENT_FAILED, e.to_string());
+            (a, Some(ready))
         }
     }
 }
@@ -2820,6 +2846,46 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(back, two);
+    }
+
+    #[test]
+    fn attachment_failures_name_the_node() {
+        let two = two_with_tb();
+        let full: Vec<Assignment> = model::keys::PORT_RANGE
+            .map(|port| Assignment {
+                replicas: vec![AssignedReplica {
+                    node: "n4".into(),
+                    pool: Some("p".into()),
+                    node_id: 0,
+                    port: Some(port),
+                    role: Role::Diskful,
+                }],
+                minor: None,
+                secret: None,
+                initial_up_to_date_node: None,
+            })
+            .collect();
+        let used = Used::from_assignments(&full);
+        let err = converge_attachments(&two, &["n4".into()], &[], &used).unwrap_err();
+        assert_eq!(err.cause, alloc::AllocError::NoPort("n4".into()));
+        assert!(err.to_string().contains("on n4:"), "{err}");
+
+        let mut crowded = two.clone();
+        crowded.replicas = (0..=model::keys::NODE_ID_MAX)
+            .map(|id| AssignedReplica {
+                node: format!("m{id}"),
+                pool: None,
+                node_id: id,
+                port: Some(11000),
+                role: Role::Diskful,
+            })
+            .collect();
+        let err =
+            converge_attachments(&crowded, &["n5".into()], &[], &Used::default()).unwrap_err();
+        assert_eq!(
+            (err.node.as_str(), err.cause),
+            ("n5", alloc::AllocError::TooManyPeers)
+        );
     }
 
     #[test]
