@@ -92,6 +92,7 @@ fn derivation_into_status() {
         allocated_bytes: Some(1_052_672 * 1024),
         observed_generation: Some(4),
         last_error: None,
+        restored_from: None,
     };
     let e = entry("a", t.resource("r"), &facts, Some(2_104_816), None);
     assert!(e.present && e.in_use);
@@ -145,6 +146,7 @@ fn sync_target_without_done_uses_the_fallback() {
         allocated_bytes: Some(1),
         observed_generation: None,
         last_error: None,
+        restored_from: None,
     };
     let e = entry("a", t.resource("r"), &facts, Some(8), Some(37));
     assert_eq!(e.sync_percent, Some(37));

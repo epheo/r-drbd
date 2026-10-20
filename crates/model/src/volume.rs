@@ -182,6 +182,20 @@ pub enum VolumePhase {
     Deleting,
 }
 
+impl Volume {
+    /// The snapshot this volume restores from while it has not made its
+    /// first data (no initializedAt). Until then every diskful replica
+    /// restores from its own copy, and the Snapshot must stay.
+    pub fn restoring(&self) -> Option<&str> {
+        let src = self.spec.source.as_ref()?;
+        let initialized = self
+            .status
+            .as_ref()
+            .is_some_and(|st| st.initialized_at.is_some());
+        (!initialized).then_some(src.snapshot.as_str())
+    }
+}
+
 #[derive(KubeSchema, Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct VolumeStatus {
@@ -284,6 +298,12 @@ pub struct ReplicaStatus {
     pub observed_generation: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// The source Snapshot this replica's backing LV was restored from,
+    /// while that Snapshot exists. The initial node starts a restore
+    /// without a sync only when every diskful replica reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 253))]
+    pub restored_from: Option<String>,
     /// Peers whose DRBD connection has stayed out of Connected for a while,
     /// with what a TCP connect to their DRBD port found.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -11,7 +11,7 @@ use kube::{Client, ResourceExt};
 use crate::devices::{HostDisks, SysDisks};
 use crate::events2::Tracker;
 use crate::exec::TokioExec;
-use crate::reconcile::{DrbdEnv, Reconciler};
+use crate::reconcile::{DrbdEnv, KubeLiveVolumes, Reconciler};
 use crate::watch::{self, Trigger};
 use crate::{Exec, csi, drbd, inventory, node, shutdown};
 
@@ -121,7 +121,8 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
     let reconciler = Reconciler::new(cfg.node.clone(), exec.clone())
         .with_drbd(DrbdEnv::new(features, cfg.res_dir.clone(), tracker.clone()))
         .with_disks(inv.disks.clone())
-        .with_disk_lock(inv.lock.clone());
+        .with_disk_lock(inv.lock.clone())
+        .with_live(Arc::new(KubeLiveVolumes::new(client.clone())));
 
     let socket = csi::socket_path(&cfg.csi_endpoint);
     let listener = csi::bind(&socket)?;

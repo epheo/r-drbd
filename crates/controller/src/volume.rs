@@ -540,6 +540,59 @@ fn replica_errors(status: Option<&VolumeStatus>) -> Vec<String> {
     errors
 }
 
+/// `m` followed by the agents' errors, if any.
+fn join_errors(m: String, errors: &[String]) -> String {
+    if errors.is_empty() {
+        m
+    } else if m.is_empty() {
+        format!("errors: {}", errors.join("; "))
+    } else {
+        format!("{m}; errors: {}", errors.join("; "))
+    }
+}
+
+/// Phase, Ready and Degraded with every replica up. A volume below its size
+/// before its first Ready (a restore grows from its snapshot's size) is not
+/// Ready yet, so it is not initialized and CreateVolume waits; once Ready,
+/// an expand keeps it Ready.
+fn all_up(
+    size_bytes: u64,
+    usable_bytes: Option<u64>,
+    initialized_before: bool,
+    errors: &[String],
+) -> (VolumePhase, Cond, Cond) {
+    let growing = || {
+        join_errors(
+            format!(
+                "growing to {size_bytes} bytes, usable {}",
+                usable_bytes.unwrap_or(0)
+            ),
+            errors,
+        )
+    };
+    match usable_bytes {
+        Some(u) if u >= size_bytes => (
+            VolumePhase::Ready,
+            Cond::new(
+                TRUE,
+                reason::ALL_UP_TO_DATE,
+                join_errors(String::new(), errors),
+            ),
+            Cond::new(FALSE, reason::ALL_UP_TO_DATE, ""),
+        ),
+        _ if !initialized_before => (
+            VolumePhase::Provisioning,
+            Cond::new(FALSE, reason::RESIZING, growing()),
+            Cond::new(FALSE, reason::PROVISIONING, ""),
+        ),
+        _ => (
+            VolumePhase::Ready,
+            Cond::new(TRUE, reason::RESIZING, growing()),
+            Cond::new(FALSE, reason::ALL_UP_TO_DATE, ""),
+        ),
+    }
+}
+
 /// `aggregate` with agent reachability (an unreachable node's entries
 /// count as unknown) and the split pairs latched so far.
 pub fn aggregate_nodes(
@@ -572,34 +625,10 @@ pub fn aggregate_nodes(
 
     let parts = describe(&g);
     let gap = parts.join("; ");
-    let with_errors = |m: String| {
-        if errors.is_empty() {
-            m
-        } else if m.is_empty() {
-            format!("errors: {}", errors.join("; "))
-        } else {
-            format!("{m}; errors: {}", errors.join("; "))
-        }
-    };
+    let with_errors = |m: String| join_errors(m, &errors);
+    let initialized_before = was_ready || status.is_some_and(|s| s.initialized_at.is_some());
     let (phase, ready, degraded) = if parts.is_empty() {
-        let ready = match usable_bytes {
-            Some(u) if u >= size_bytes => {
-                Cond::new(TRUE, reason::ALL_UP_TO_DATE, with_errors(String::new()))
-            }
-            u => Cond::new(
-                TRUE,
-                reason::RESIZING,
-                with_errors(format!(
-                    "growing to {size_bytes} bytes, usable {}",
-                    u.unwrap_or(0)
-                )),
-            ),
-        };
-        (
-            VolumePhase::Ready,
-            ready,
-            Cond::new(FALSE, reason::ALL_UP_TO_DATE, ""),
-        )
+        all_up(size_bytes, usable_bytes, initialized_before, &errors)
     } else {
         let why = if !g.unreachable.is_empty() {
             reason::NODE_UNREACHABLE
@@ -1914,7 +1943,10 @@ fn place(ctx: &Ctx<'_>, placing: &Placing, v: &Volume) -> Placement {
         // Holders are never gated by capacity: each one already holds the
         // restore's blocks and has nowhere else to go.
         if v.spec.replicas >= 2 {
-            // Every replica restores from its own copy of the snapshot.
+            // The agent restores every diskful replica of an uninitialized
+            // restore from its node's snapshot LV, a thin snapshot that only
+            // grows by what the volume later writes. The Snapshot and every
+            // holder's copy stay until this volume is initialized.
             let diskful: Vec<placer::Chosen> = holders
                 .into_iter()
                 .map(|(node, pool)| placer::Chosen { node, pool })
@@ -3217,10 +3249,22 @@ mod tests {
             alive_across: &|_, _| true,
         };
         assert!(!init(&r, &stale));
-        // Ready while resizing still counts.
+        // Below its size before the first Ready (a restore growing from its
+        // snapshot's size): not Ready, not initialized.
         let st = status(VolumePhase::Provisioning, r.clone());
         let s = aggregate(2 * G, &two, Some(&st), &|_| true);
-        assert_eq!(s.ready.reason, reason::RESIZING);
+        assert_eq!(
+            (s.phase, s.ready.status, s.ready.reason),
+            (VolumePhase::Provisioning, FALSE, reason::RESIZING)
+        );
+        assert!(!s.initialized);
+        // Once Ready, an expand keeps it Ready.
+        let st = status(VolumePhase::Ready, r.clone());
+        let s = aggregate(2 * G, &two, Some(&st), &|_| true);
+        assert_eq!(
+            (s.phase, s.ready.reason),
+            (VolumePhase::Ready, reason::RESIZING)
+        );
         assert!(s.initialized);
         // replicas 1: present from a fresh agent.
         let one = assignment(&[("n1", Role::Diskful)]);

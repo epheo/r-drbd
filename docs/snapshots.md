@@ -72,7 +72,14 @@ Rules:
 
 - A local restore (`replicas: 1`) uses one of the nodes holding the snapshot.
 - A replicated restore needs `replicas` equal to the number of nodes holding the snapshot.
-  The first node restores the snapshot; DRBD copies it in full to the other replicas, which start empty.
+  Every node holding the snapshot restores it from its own copy, so the restore is instant, shares blocks on every node and needs no sync.
+  The copies are identical because the snapshot was taken with IO suspended on every replica.
+- A replicated restore larger than its snapshot starts at the snapshot's size with identical copies, then grows online.
+  The new area syncs between the replicas; zero blocks travel as discards, so it costs little network and no thin pool space.
+  During that sync the other replica is Inconsistent on the new area only, and the volume is not Ready yet.
+  The claim is usable once the volume is Ready at the requested size.
+- A replica that cannot restore from its own copy, for any reason (the Snapshot, its snapshot LV or the lvcreate), starts empty and is copied in full from the first one; a full thin pool stays an error.
+  The first replica must hold its copy: without it the restore does not start.
 - The requested size may be larger than the snapshot; it may not be smaller.
 - Pins that point away from the snapshot's nodes or Pools fail the restore with reason `RestoreNodeConflict`.
 - The claim must still fit the scheduler's capacity check (see [Scheduling](volumes.md#scheduling)), although placement never charges a restore against capacity.
@@ -87,3 +94,6 @@ Snapshot it, then restore the snapshot.
 ## Deleting
 
 Deleting the VolumeSnapshot (deletion policy Delete) deletes the Snapshot, and each node removes its snapshot LV.
+A Snapshot waits for the restores from it that are not yet initialized: it stays until each restored volume is first Ready, and a node holding a copy for such a restore keeps it until then.
+A restore that cannot start says why in its Ready condition, for example "LV <vg>/<lv> is not this restore's copy of snapshot <name>; delete the claim and restore again".
+Deleting a stuck claim removes its LVs and releases the Snapshot.

@@ -453,6 +453,22 @@ pub fn host_scan_warning(
 /// replaces it lives in `drbd::md_tag`.
 pub const NEW_TAG: &str = "r-drbd.new";
 
+pub const FROM_TAG_PREFIX: &str = "r-drbd.from.";
+
+/// Set by the lvcreate that restores a DRBD backing LV from a snapshot:
+/// the on-disk proof that this Volume's LV holds that snapshot's data,
+/// which lets a restore start without a sync. Both uids, so an LV left
+/// behind by a deleted Volume of the same name never passes for a new
+/// restore's copy; every path that makes an LV new again or leaves it
+/// behind drops it too.
+pub fn from_tag(volume_uid: &str, snapshot_uid: &str) -> String {
+    format!("{FROM_TAG_PREFIX}{volume_uid}.{snapshot_uid}")
+}
+
+pub fn is_from_tag(tag: &str) -> bool {
+    tag.starts_with(FROM_TAG_PREFIX)
+}
+
 /// Pool capacity from one lvs read of the VG.
 pub fn pool_capacity(lvs: &[Lv], thin: &str) -> Result<PoolCapacity, String> {
     let pool = lvs

@@ -524,6 +524,15 @@ async fn snapshot_local_and_restore() {
     .await;
     assert_eq!(ready_reason(&r).as_deref(), Some("UnsupportedRestore"));
 
+    // A restore that never made its first data would hold the Snapshot.
+    a1.ready("restored").await;
+    volume_where(&client, "restored", |v| {
+        v.status
+            .as_ref()
+            .is_some_and(|s| s.initialized_at.is_some())
+    })
+    .await;
+
     // Delete waits for the holder to remove its LV.
     Api::<Snapshot>::all(client.clone())
         .delete("snap1", &DeleteParams::default())

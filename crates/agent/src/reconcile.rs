@@ -30,7 +30,9 @@ use crate::events2::Tracker;
 use crate::storage::{self, Lvm, PoolCapacity};
 
 mod devices;
+mod live;
 mod replicated;
+pub use live::{KubeLiveVolumes, LiveVolumes, NoLiveVolumes};
 pub use replicated::DrbdEnv;
 
 const DISK_UP_TO_DATE: &str = "UpToDate";
@@ -361,6 +363,8 @@ pub struct Reconciler {
     device_rows: HashMap<String, Vec<DeviceStatus>>,
     /// Shared with the NodeDisks inventory.
     disk_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Live reads for the restore decisions the watch cache cannot prove.
+    live: Arc<dyn LiveVolumes>,
 }
 
 impl Reconciler {
@@ -395,7 +399,14 @@ impl Reconciler {
             disks_changed: false,
             device_rows: HashMap::new(),
             disk_lock: Arc::default(),
+            live: Arc::new(NoLiveVolumes),
         }
+    }
+
+    #[must_use]
+    pub fn with_live(mut self, live: Arc<dyn LiveVolumes>) -> Self {
+        self.live = live;
+        self
     }
 
     #[must_use]
@@ -628,6 +639,14 @@ impl Reconciler {
         self.my_replica(vol).filter(|r| r.role == Role::Diskful)
     }
 
+    /// `vol` restores from `snapshot` on this node and has not made its first
+    /// data yet: until then a lost LV is restored again from this copy.
+    fn restores_here_from(&self, vol: &Volume, snapshot: &str) -> bool {
+        vol.restoring() == Some(snapshot)
+            && vol.metadata.deletion_timestamp.is_none()
+            && self.local_replica(vol).is_some()
+    }
+
     fn place(&self, pools: &[&Pool], pool_name: Option<&str>) -> Result<Place, String> {
         let name = pool_name.ok_or_else(|| "assignment has no pool".to_owned())?;
         if let Some(e) = &self.lvm_unsupported {
@@ -726,8 +745,15 @@ impl Reconciler {
                 let res = if lost_after_report(prev) {
                     Err(LV_LOST.to_owned())
                 } else {
-                    self.create_lv(&rows, snapshots, place, vol, &lv, desired)
-                        .await
+                    self.create_lv(
+                        &rows,
+                        source_snapshot(vol, snapshots),
+                        place,
+                        vol,
+                        &lv,
+                        desired,
+                    )
+                    .await
                 };
                 match res {
                     Ok(()) => {
@@ -787,21 +813,32 @@ impl Reconciler {
     async fn create_lv(
         &self,
         rows: &[Lv],
-        snapshots: &[Arc<Snapshot>],
+        source: Option<&Snapshot>,
         place: &Place,
         vol: &Volume,
         lv: &str,
         desired: u64,
     ) -> Result<(), String> {
-        let tags: &[&str] = if vol.spec.replicas >= 2 {
-            &[storage::NEW_TAG]
-        } else {
-            &[]
-        };
+        let drbd = vol.spec.replicas >= 2;
+        let tags: &[&str] = if drbd { &[storage::NEW_TAG] } else { &[] };
         if let Some(src) = &vol.spec.source {
-            return self
-                .restore(rows, snapshots, place, &src.snapshot, lv, tags)
-                .await;
+            let snapshot = &src.snapshot;
+            let snap = source.ok_or_else(|| format!("source snapshot {snapshot} not found"))?;
+            // In the same lvcreate, so a restored DRBD backing LV never
+            // exists without its proof.
+            let from = if drbd {
+                let uid = snap
+                    .metadata
+                    .uid
+                    .as_deref()
+                    .ok_or_else(|| format!("source snapshot {snapshot} has no uid"))?;
+                let vol_uid = vol.metadata.uid.as_deref().ok_or("Volume has no uid")?;
+                Some(storage::from_tag(vol_uid, uid))
+            } else {
+                None
+            };
+            let tags: Vec<&str> = tags.iter().copied().chain(from.as_deref()).collect();
+            return self.restore(rows, place, snap, lv, &tags).await;
         }
         tracing::info!(lv, vg = place.vg, bytes = desired, "creating volume LV");
         self.lvm
@@ -823,16 +860,12 @@ impl Reconciler {
     async fn restore(
         &self,
         rows: &[Lv],
-        snapshots: &[Arc<Snapshot>],
         place: &Place,
-        snapshot: &str,
+        snap: &Snapshot,
         lv: &str,
         tags: &[&str],
     ) -> Result<(), String> {
-        let snap = snapshots
-            .iter()
-            .find(|s| s.name_any() == snapshot)
-            .ok_or_else(|| format!("source snapshot {snapshot} not found"))?;
+        let snapshot = snap.name_any();
         if let Some(pool) = snap
             .status
             .as_ref()
@@ -845,7 +878,7 @@ impl Reconciler {
                 place.pool
             ));
         }
-        let source = lvm::names::snapshot_lv(&snap.spec.volume, snapshot);
+        let source = lvm::names::snapshot_lv(&snap.spec.volume, &snapshot);
         if find_in_pool(rows, &source, &place.thin)?.is_none() {
             return Err(format!(
                 "snapshot LV {}/{source} not found on this node",
@@ -889,9 +922,16 @@ impl Reconciler {
 
         let ack = if deleting {
             pool_name.as_ref()?;
-            let res = match self.place(pools, pool_name.as_deref()) {
-                Ok(place) => self.remove_snapshot(reads, &place, &lv).await,
-                Err(e) => Err(e),
+            let restoring = vols
+                .iter()
+                .find(|v| self.restores_here_from(v, &name))
+                .map(|v| v.name_any());
+            let res = match (restoring, self.place(pools, pool_name.as_deref())) {
+                (Some(v), _) => Err(format!(
+                    "kept: volume {v} restores from it here and is not initialized yet"
+                )),
+                (None, Ok(place)) => self.remove_snapshot(reads, &place, &lv).await,
+                (None, Err(e)) => Err(e),
             };
             ack(&self.node, SnapshotPhase::Deleting, pool_name, res)
         } else {
@@ -973,12 +1013,15 @@ impl Reconciler {
             return Err(e);
         }
         // Thin snapshots copy no tags (seen on LVM 2.03); kept as a guard,
-        // since a snapshot must never carry the proof of the origin's metadata.
+        // since a snapshot must never carry the origin's proofs of metadata
+        // or provenance.
         let inherited: Vec<String> = reads
             .tags(&self.lvm, &place.vg, origin)
             .await?
             .into_iter()
-            .filter(|t| crate::drbd::is_md_tag(t) || t == storage::NEW_TAG)
+            .filter(|t| {
+                crate::drbd::is_md_tag(t) || t == storage::NEW_TAG || storage::is_from_tag(t)
+            })
             .collect();
         tracing::info!(lv, origin, vg = place.vg, "taking snapshot");
         let res = self.lvm.snapshot(&place.vg, origin, lv).await;
@@ -1129,6 +1172,15 @@ fn ack(
         ok: res.is_ok(),
         error: res.err(),
     }
+}
+
+/// The Snapshot a volume restores from, when it exists.
+fn source_snapshot<'a>(vol: &Volume, snapshots: &'a [Arc<Snapshot>]) -> Option<&'a Snapshot> {
+    let src = vol.spec.source.as_ref()?;
+    snapshots
+        .iter()
+        .find(|x| x.name_any() == src.snapshot)
+        .map(AsRef::as_ref)
 }
 
 /// This node's Volume status entry from the LV row after the pass.

@@ -106,9 +106,18 @@ async fn drbd_clean(names: &[&str]) {
     }
 }
 
-fn pool(node: &str) -> Arc<Pool> {
+/// The test Pool on `node`, with the chunk size the agent's pool pass reads
+/// from the thin pool: without it the resource files lack
+/// rs-discard-granularity and a resync sends zero blocks as data.
+async fn pool(node: &str) -> Arc<Pool> {
     let mut p = (*super::pool()).clone();
     node.clone_into(&mut p.spec.node);
+    let rows = lvm().lvs(VG).await.unwrap();
+    let cap = agent::storage::pool_capacity(&rows, super::THIN).unwrap();
+    p.status = Some(model::PoolStatus {
+        chunk_bytes: Some(cap.chunk_bytes),
+        ..model::PoolStatus::default()
+    });
     Arc::new(p)
 }
 
@@ -128,6 +137,47 @@ fn sectors(minor: u32) -> u64 {
         .trim()
         .parse()
         .unwrap()
+}
+
+/// What a sync must carry: zero blocks travel as discards, so only written
+/// data proves one.
+const PAYLOAD: u64 = 64 * MIB;
+
+/// Writes PAYLOAD of random data at the start of `res` through its device,
+/// Primary for the write only; returns its sha256 line.
+async fn write_payload(res: &str, minor: u32) -> String {
+    assert_eq!(sh(&["drbdsetup", "primary", res]).await.exit_code, Some(0));
+    let out = sh(&[
+        "sh",
+        "-c",
+        &format!(
+            "dd if=/dev/urandom of=/dev/drbd{minor} bs=1M count={} oflag=direct status=none && dd if=/dev/drbd{minor} bs=1M count={} iflag=direct status=none | sha256sum",
+            PAYLOAD / MIB,
+            PAYLOAD / MIB
+        ),
+    ])
+    .await;
+    assert_eq!(
+        sh(&["drbdsetup", "secondary", res]).await.exit_code,
+        Some(0)
+    );
+    assert_eq!(out.exit_code, Some(0), "{out:?}");
+    out.stdout
+}
+
+/// The sha256 line of PAYLOAD at the start of a backing LV, read directly:
+/// the data area starts at offset 0 under internal metadata.
+async fn payload_on(lv: &str) -> String {
+    sh(&[
+        "sh",
+        "-c",
+        &format!(
+            "dd if=/dev/{VG}/{lv} bs=1M count={} iflag=direct status=none | sha256sum",
+            PAYLOAD / MIB
+        ),
+    ])
+    .await
+    .stdout
 }
 
 /// KiB received and sent by resync and replication on every peer device.
@@ -166,10 +216,27 @@ struct Spec {
     role: Role,
 }
 
+/// The API server of a member: the Volume its pass was last given, so a
+/// live read agrees with what the member saw.
+#[derive(Debug, Default)]
+struct MemberLive(Mutex<Option<Volume>>);
+
+#[async_trait::async_trait]
+impl agent::reconcile::LiveVolumes for MemberLive {
+    async fn get(&self, _: &str) -> Result<Volume, String> {
+        self.0
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "no pass yet".to_owned())
+    }
+}
+
 struct Member {
     res: &'static str,
     minor: u32,
     rec: Reconciler,
+    live: Arc<MemberLive>,
     vol: Volume,
     entry: Option<ReplicaStatus>,
 }
@@ -183,10 +250,9 @@ impl Member {
     }
 
     async fn pass(&mut self, pools: &[Arc<Pool>], snaps: &[Arc<Snapshot>]) -> Vec<StatusWrite> {
-        let w = self
-            .rec
-            .pass(pools, &[Arc::new(self.current())], snaps)
-            .await;
+        let v = self.current();
+        *self.live.0.lock().unwrap() = Some(v.clone());
+        let w = self.rec.pass(pools, &[Arc::new(v)], snaps).await;
         for x in &w {
             match x {
                 StatusWrite::Volume { name, entry } if name == self.res => {
@@ -271,7 +337,10 @@ fn group(
             vol.metadata.uid = Some(format!("uid-{}", s.res));
             let mut env = DrbdEnv::new(Some(h.features), RES_DIR, h.tracker.clone());
             env.init_wait = Duration::from_secs(3);
-            let mut rec = Reconciler::new(h.node.clone(), h.exec.clone()).with_drbd(env);
+            let live = Arc::new(MemberLive::default());
+            let mut rec = Reconciler::new(h.node.clone(), h.exec.clone())
+                .with_drbd(env)
+                .with_live(live.clone());
             rec.set_addresses(
                 (0..specs.len())
                     .map(|j| (name_of(me, j), addr(me, j)))
@@ -281,6 +350,7 @@ fn group(
                 res: s.res,
                 minor: s.minor,
                 rec,
+                live,
                 vol,
                 entry: None,
             }
@@ -295,7 +365,7 @@ async fn settle<F: Fn(&Tracker) -> bool>(
     what: &str,
     done: F,
 ) {
-    let pools = [pool(&h.node)];
+    let pools = [pool(&h.node).await];
     for _ in 0..120 {
         for m in members.iter_mut() {
             m.pass(&pools, &[]).await;
@@ -316,7 +386,7 @@ async fn settle<F: Fn(&Tracker) -> bool>(
 
 async fn delete(h: &Host, m: &mut Member) {
     m.vol.metadata.deletion_timestamp = Some(now());
-    m.pass(&[pool(&h.node)], &[]).await;
+    m.pass(&[pool(&h.node).await], &[]).await;
     assert_eq!(m.error(), None, "{}", m.res);
 }
 
@@ -380,7 +450,7 @@ async fn drbd_fresh_volume_starts_without_sync() {
         assert_eq!(d, "");
     }
     for p in [&mut *a, &mut *b] {
-        p.pass(&[pool(&h.node)], &[]).await;
+        p.pass(&[pool(&h.node).await], &[]).await;
         assert_eq!(p.error(), None);
     }
     assert_eq!(
@@ -496,6 +566,7 @@ async fn drbd_late_peer_full_syncs() {
     let tb = traffic("rw-b").await;
     println!("b, started with a: (received, sent) {tb:?} KiB");
     assert_eq!(tb, (0, 0), "no sync between the two that started");
+    let written = write_payload("rw-a", A.minor).await;
     // b's path to a would clash with e's in this one kernel: b goes down.
     assert_eq!(sh(&["drbdsetup", "down", "rw-b"]).await.exit_code, Some(0));
     wait(&h.tracker, "b down", |t| t.resource("rw-b").is_none()).await;
@@ -505,10 +576,12 @@ async fn drbd_late_peer_full_syncs() {
     .await;
     let (received, _) = traffic("rw-e").await;
     println!(
-        "late peer received {received} KiB of a {} KiB volume",
-        size / 1024
+        "late peer received {received} KiB of a {} KiB volume, {} KiB written",
+        size / 1024,
+        PAYLOAD / 1024
     );
-    assert!(received * 1024 >= size, "full sync");
+    assert!(received * 1024 >= PAYLOAD, "full sync carries the data");
+    assert_eq!(payload_on("rw-e").await, written, "the late peer holds it");
     for m in [&mut *a, &mut *b, &mut *e] {
         delete(&h, m).await;
     }
@@ -526,7 +599,7 @@ async fn drbd_no_start_without_quorum() {
     let h = start().await;
     let mut g = group(&h, 64 * MIB, &[A, B], &[(0, 1)], None);
     let a = &mut g[0];
-    let pools = [pool(&h.node)];
+    let pools = [pool(&h.node).await];
     for _ in 0..20 {
         a.pass(&pools, &[]).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -537,19 +610,30 @@ async fn drbd_no_start_without_quorum() {
     delete(&h, a).await;
 }
 
-/// A restored volume: the initial node's restored data becomes current and
-/// the empty peer full-syncs from it.
+/// A replicated restore: each member restores from the snapshot LV and the
+/// initial node clears the bitmap, so nothing but metadata crosses the
+/// network and the copies verify equal. Restored to twice the size, the
+/// grown area syncs, mostly as discards.
 #[tokio::test]
 #[ignore = "needs root, DRBD 9 and the test VG"]
-async fn drbd_restore_source_full_syncs() {
+async fn drbd_restore_uses_every_copy() {
     if !enabled() {
         return;
     }
-    drbd_clean(EVERY).await;
     let h = start().await;
-    let size = 256 * MIB;
+    restore_case(&h, 1, 8 * MIB).await;
+    restore_case(&h, 2, 64 * MIB).await;
+}
+
+/// Restores a 256 MiB snapshot to `factor` times its size; the peer may
+/// receive at most `max_received` bytes.
+async fn restore_case(h: &Host, factor: u64, max_received: u64) {
+    drbd_clean(EVERY).await;
+    let source_size = 256 * MIB;
+    let size = factor * source_size;
+    println!("restore of {source_size} bytes to {size}");
     let l = lvm();
-    let gross = drbd_config::gross_bytes(size, model::keys::PEER_SLOTS);
+    let gross = drbd_config::gross_bytes(source_size, model::keys::PEER_SLOTS);
     let bytes = agent::storage::desired_bytes(gross, EXTENT);
     l.create(VG, super::THIN, "rw-src", bytes, &[])
         .await
@@ -567,23 +651,39 @@ async fn drbd_restore_source_full_syncs() {
             volume: "rw-src".into(),
         },
     );
+    snap.metadata.uid = Some("uid-rw-snap".into());
     snap.status = Some(SnapshotStatus {
         phase: SnapshotPhase::Ready,
+        size_bytes: Some(source_size),
         ..SnapshotStatus::default()
     });
     let snaps = [Arc::new(snap)];
-    let pools = [pool(&h.node)];
-    let mut g = group(&h, size, &[A, B], &[], Some("rw-snap"));
+    let pools = [pool(&h.node).await];
+    let mut g = group(h, size, &[A, B], &[], Some("rw-snap"));
+    let mut proven = [false, false];
     let mut done = false;
     for _ in 0..120 {
-        for m in &mut g {
-            m.pass(&pools, &snaps).await;
+        // Each member sees the other's entry, as Volume status shows it.
+        for i in 0..g.len() {
+            let others: Vec<(String, ReplicaStatus)> = (0..g.len())
+                .filter(|j| *j != i)
+                .filter_map(|j| Some((format!("m{j}"), g[j].entry.clone()?)))
+                .collect();
+            let others: Vec<(&str, ReplicaStatus)> = others
+                .iter()
+                .map(|(n, e)| (n.as_str(), e.clone()))
+                .collect();
+            g[i].pass_seeing_snapshots(&pools, &others, &snaps).await;
+            proven[i] |= g[i]
+                .entry
+                .as_ref()
+                .is_some_and(|e| e.restored_from.as_deref() == Some("rw-snap"));
         }
         done = {
             let t = h.tracker.lock().unwrap();
             disk(&t, "rw-b").as_deref() == Some("UpToDate")
                 && disk(&t, "rw-a").as_deref() == Some("UpToDate")
-        };
+        } && g.iter().all(|m| sectors(m.minor) * 512 >= size);
         if done {
             break;
         }
@@ -594,12 +694,54 @@ async fn drbd_restore_source_full_syncs() {
         "{:?}",
         g.iter().map(Member::error).collect::<Vec<_>>()
     );
+    // Reported while at the snapshot's size, so before any growth.
+    assert_eq!(proven, [true, true], "both members proved their copy");
+    let tags = l.tags(VG).await.unwrap();
+    for lv in ["rw-a", "rw-b"] {
+        assert!(
+            tags[lv]
+                .iter()
+                .any(|t| *t == format!("r-drbd.from.uid-{lv}.uid-rw-snap")),
+            "{lv}: {:?}",
+            tags[lv]
+        );
+        let origin = sh(&["lvs", "--noheadings", "-o", "origin", &format!("{VG}/{lv}")]).await;
+        assert_eq!(origin.stdout.trim(), "rw-src+rw-snap", "{lv}");
+    }
     let (received, _) = traffic("rw-b").await;
     println!(
         "restore peer received {received} KiB of a {} KiB volume",
         size / 1024
     );
-    assert!(received * 1024 >= size, "full sync");
+    assert!(
+        received * 1024 < max_received,
+        "at most {max_received} bytes: {received} KiB"
+    );
+
+    // Online verify compares every block; the resource files carry no
+    // verify-alg, so it is set on the live connections for this check.
+    for (res, peer) in [("rw-a", "1"), ("rw-b", "0")] {
+        let out = sh(&["drbdsetup", "net-options", res, peer, "--verify-alg=sha256"]).await;
+        assert_eq!(out.exit_code, Some(0), "{out:?}");
+    }
+    let out = sh(&["drbdadm", "verify", "rw-a"]).await;
+    assert_eq!(out.exit_code, Some(0), "{out:?}");
+    let mut verified = None;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let out = sh(&["drbdsetup", "status", "--json", "--statistics", "rw-a"]).await;
+        let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+        let p = &v[0]["connections"][0]["peer_devices"][0];
+        let state = p["replication-state"].as_str().unwrap_or_default();
+        if !state.starts_with("Verify") {
+            verified = Some((p["out-of-sync"].as_u64(), out.stdout));
+            break;
+        }
+    }
+    let (oos, status) = verified.expect("verify did not end within 60 s");
+    println!("after verify: {status}");
+    assert_eq!(oos, Some(0), "out of sync after verify");
+
     // Direct reads: udev probed the new LVs through the page cache before
     // DRBD wrote under it.
     let head = |lv: &'static str| async move {
@@ -613,7 +755,7 @@ async fn drbd_restore_source_full_syncs() {
     };
     let (source, copy) = (head("rw-a").await, head("rw-b").await);
     println!(
-        "first 4 MiB: snapshot {} restored {} peer {}",
+        "first 4 MiB: snapshot {} initial {} peer {}",
         marker.stdout.trim(),
         source.trim(),
         copy.trim()
@@ -624,7 +766,7 @@ async fn drbd_restore_source_full_syncs() {
     );
     assert_eq!(copy, marker.stdout, "the peer holds the restored data");
     for m in &mut g {
-        delete(&h, m).await;
+        delete(h, m).await;
     }
     drbd_clean(&["rw-src"]).await;
 }
@@ -683,7 +825,7 @@ async fn drbd_replicated_lifecycle() {
     }
     drbd_clean(EVERY).await;
     let h = start().await;
-    let pools = [pool(&h.node)];
+    let pools = [pool(&h.node).await];
     let mut g = group(&h, GIB, &[A], &[], None);
     let a = &mut g[0];
     settle(&h, &mut [&mut *a], "UpToDate alone", |t| {
@@ -809,9 +951,10 @@ async fn drbd_lost_lv_is_rebuilt_and_synced() {
             .status
             .get_or_insert_with(Default::default)
             .initialized_at = Some(now());
-        m.pass(&[pool(&h.node)], &[]).await;
+        m.pass(&[pool(&h.node).await], &[]).await;
     }
     assert!(b.entry.as_ref().is_some_and(|e| e.present));
+    let written = write_payload("rw-a", A.minor).await;
 
     // b's LV vanishes behind the agent's back.
     assert_eq!(sh(&["drbdsetup", "down", "rw-b"]).await.exit_code, Some(0));
@@ -822,8 +965,12 @@ async fn drbd_lost_lv_is_rebuilt_and_synced() {
     })
     .await;
     let (received, _) = traffic("rw-b").await;
-    println!("rebuilt replica received {received} KiB");
-    assert!(received * 1024 >= size, "full sync");
+    println!(
+        "rebuilt replica received {received} KiB, {} KiB written",
+        PAYLOAD / 1024
+    );
+    assert!(received * 1024 >= PAYLOAD, "full sync carries the data");
+    assert_eq!(payload_on("rw-b").await, written, "the rebuilt LV holds it");
     assert_eq!(b.error(), None);
     for m in [&mut *a, &mut *b] {
         delete(&h, m).await;
@@ -882,6 +1029,7 @@ async fn drbd_attachment_then_promoted() {
     );
     println!("a slots with d diskless: {before:?}");
     assert!(!before.contains(&1));
+    let written = write_payload("rw-a", A.minor).await;
 
     for m in [&mut *a, &mut *d] {
         let r = m
@@ -911,9 +1059,13 @@ async fn drbd_attachment_then_promoted() {
         .stdout,
     );
     let (received, _) = traffic("rw-d").await;
-    println!("a slots after the promotion: {after:?}; d received {received} KiB");
+    println!(
+        "a slots after the promotion: {after:?}; d received {received} KiB, {} KiB written",
+        PAYLOAD / 1024
+    );
     assert!(after.contains(&1), "bitmap slot for the promoted peer");
-    assert!(received * 1024 >= size, "full sync");
+    assert!(received * 1024 >= PAYLOAD, "full sync carries the data");
+    assert_eq!(payload_on("rw-d").await, written, "the new disk holds it");
     for m in [&mut *a, &mut *d] {
         delete(&h, m).await;
     }
@@ -966,6 +1118,15 @@ impl Member {
         pools: &[Arc<Pool>],
         others: &[(&str, ReplicaStatus)],
     ) -> Vec<StatusWrite> {
+        self.pass_seeing_snapshots(pools, others, &[]).await
+    }
+
+    async fn pass_seeing_snapshots(
+        &mut self,
+        pools: &[Arc<Pool>],
+        others: &[(&str, ReplicaStatus)],
+        snaps: &[Arc<Snapshot>],
+    ) -> Vec<StatusWrite> {
         let mut v = self.current();
         let st = v.status.get_or_insert_with(Default::default);
         for (name, e) in others {
@@ -973,7 +1134,8 @@ impl Member {
             (*name).clone_into(&mut e.node);
             st.replicas.push(e);
         }
-        let w = self.rec.pass(pools, &[Arc::new(v)], &[]).await;
+        *self.live.0.lock().unwrap() = Some(v.clone());
+        let w = self.rec.pass(pools, &[Arc::new(v)], snaps).await;
         for x in &w {
             if let StatusWrite::Volume { name, entry } = x
                 && name == self.res
@@ -1045,7 +1207,7 @@ async fn drbd_blocked_port_is_reported() {
     assert!(e.unwrap().starts_with("bind 192.0.2.1"));
 
     let h = start().await;
-    let pools = [pool(&h.node)];
+    let pools = [pool(&h.node).await];
     let mut g = group(&h, GIB, &[A, B], &[], None);
     let [a, b] = &mut g[..] else { unreachable!() };
     let started = tokio::time::Instant::now();

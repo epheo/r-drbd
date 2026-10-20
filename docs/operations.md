@@ -39,7 +39,8 @@ Conditions:
 | `AttachmentFailed` | A node in `spec.attachments` has no diskless replica (no free DRBD port on it, or all 32 node ids of the volume taken); `attachmentErrors` names it |
 
 Degraded reasons: `ReplicaMissing`, `ReplicaNotUpToDate`, `ReplicaDisconnected`, `NodeUnreachable`.
-A resize in progress keeps `Ready` True with reason `Resizing`.
+A resize of a Ready volume keeps `Ready` True with reason `Resizing`.
+A volume never Ready yet stays Provisioning below its size, with `Ready` False and reason `Resizing`: a restore larger than its snapshot grows before its first Ready.
 A publish to a node listed in `attachmentErrors` fails at once with ResourceExhausted and that entry's message; the pod event shows it, other nodes are not affected.
 
 Logs:

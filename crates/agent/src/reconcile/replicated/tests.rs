@@ -34,6 +34,9 @@ const NET_SECTORS: u64 = 1_052_440 * 2;
 const NEW: &str = storage::NEW_TAG;
 /// n1's ownership tag (node id 0).
 const OWN: &str = "r-drbd.md.uid-1.0";
+const SNAP_UID: &str = "snap-uid-1";
+/// The restore's proof that an LV came from snap-1.
+const FROM: &str = "r-drbd.from.uid-1.snap-uid-1";
 const ALL: Features = Features {
     tiebreaker: true,
     discard_granularity: true,
@@ -121,7 +124,32 @@ fn healthy() -> Vec<String> {
     up("UpToDate", "UpToDate")
 }
 
+/// Live reads for the tests: by default what the pass was given, the API
+/// server agreeing with the cache; a test may script another answer.
+#[derive(Debug, Default)]
+struct ScriptedLive {
+    echo: Mutex<Option<Volume>>,
+    scripted: Mutex<Option<Result<Volume, String>>>,
+    reads: AtomicU32,
+}
+
+#[async_trait::async_trait]
+impl crate::reconcile::LiveVolumes for ScriptedLive {
+    async fn get(&self, _: &str) -> Result<Volume, String> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        if let Some(r) = self.scripted.lock().unwrap().clone() {
+            return r;
+        }
+        self.echo
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "nothing to read".to_owned())
+    }
+}
+
 struct Rig {
+    live: Arc<ScriptedLive>,
     x: Arc<ScriptedExec>,
     rec: Reconciler,
     dir: PathBuf,
@@ -144,9 +172,13 @@ impl Rig {
         env.host = host.clone();
         env.down_wait = Duration::ZERO;
         env.adjust_retry = vec![Duration::ZERO; 2];
-        let mut rec = Reconciler::new(node, x.clone()).with_drbd(env);
+        let live = Arc::new(ScriptedLive::default());
+        let mut rec = Reconciler::new(node, x.clone())
+            .with_drbd(env)
+            .with_live(live.clone());
         rec.set_addresses(addresses(&["n1", "n2", "n3"]));
         Self {
+            live,
             x,
             rec,
             dir,
@@ -165,6 +197,7 @@ impl Rig {
         vols: &[Volume],
         snaps: &[Snapshot],
     ) -> Vec<StatusWrite> {
+        *self.live.echo.lock().unwrap() = vols.first().cloned();
         let vols: Vec<Arc<Volume>> = vols.iter().cloned().map(Arc::new).collect();
         let snaps: Vec<Arc<Snapshot>> = snaps.iter().cloned().map(Arc::new).collect();
         let w = self.rec.pass(pools, &vols, &snaps).await;
@@ -329,7 +362,35 @@ fn restored(mut v: Volume) -> Volume {
 fn source_snapshot() -> Snapshot {
     let mut s = snapshot(SnapshotPhase::Ready);
     s.spec.volume = "pvc-0".into();
+    s.metadata.uid = Some(SNAP_UID.into());
+    s.status.as_mut().unwrap().size_bytes = Some(GIB);
     s
+}
+
+/// A peer's entry; `restored` sets restoredFrom to the source.
+fn peer_entry(node: &str, restored: bool) -> ReplicaStatus {
+    ReplicaStatus {
+        node: node.into(),
+        present: true,
+        disk_state: Some("Inconsistent".into()),
+        device_path: Some("/dev/drbd50000".into()),
+        restored_from: restored.then(|| "snap-1".into()),
+        ..ReplicaStatus::default()
+    }
+}
+
+/// The restore lvcreate of pvc-1 from this node's copy, with both tags,
+/// then the fresh read.
+fn expect_restore(x: &ScriptedExec) {
+    x.expect(
+        lvm::cmd::restore(VG, "pvc-0+snap-1", "pvc-1", &[NEW, FROM]),
+        ok(""),
+    );
+    expect_lvs(x, &[source_lv(), lv(LV_KIB)]);
+}
+
+fn empty_create() -> Vec<String> {
+    lvm::cmd::create_thin(VG, THIN, "pvc-1", LV_KIB * 1024, &[NEW])
 }
 
 fn source_lv() -> String {
@@ -543,46 +604,699 @@ async fn only_the_initial_node_of_an_uninitialized_volume_starts_it() {
 }
 
 #[tokio::test]
-async fn restore_initial_node_is_the_source_at_once() {
-    let mut r = Rig::new(&[], FakeHost::default());
+async fn restore_every_holder_from_its_copy() {
+    // Both diskful members restore from their own snapshot LV; the proof
+    // tag survives the metadata tag swap.
+    for (node, own) in [("n1", OWN), ("n2", "r-drbd.md.uid-1.1")] {
+        let mut r = Rig::on(node, &[], FakeHost::default());
+        let x = r.x.clone();
+        reads(&x, &[source_lv()]);
+        expect_restore(&x);
+        r.expect_check();
+        expect_lv_tags(&x, &[("pvc-1", &[NEW, FROM])]);
+        expect_md_as(&x, own, &[NEW]);
+        up_plan(&x);
+        let w = r
+            .pass_pools(
+                &[pool_on(node)],
+                &[restored(volume(GIB))],
+                &[source_snapshot()],
+            )
+            .await;
+        let e = entry_of(&w);
+        assert_eq!(e.last_error, None, "{node}");
+        assert_eq!(e.restored_from.as_deref(), Some("snap-1"), "{node}");
+        assert!(
+            !x.seen.lock().unwrap().contains(&empty_create()),
+            "{node}: never an empty LV"
+        );
+        assert!(!seen(&x, "new-current-uuid"), "{node}");
+    }
+    // The tiebreaker reads no LVM and creates nothing.
+    let mut r = Rig::on("n3", &[], FakeHost::default());
     let x = r.x.clone();
-    reads(&x, &[source_lv()]);
+    r.expect_check();
+    up_plan(&x);
+    let w = r.pass(&[restored(volume(GIB))], &[source_snapshot()]).await;
+    let e = entry_of(&w);
+    assert_eq!((e.last_error, e.restored_from), (None, None));
+    assert!(!seen(&x, "lvcreate"));
+}
+
+#[tokio::test]
+async fn restore_starts_without_sync_when_every_peer_restored() {
+    let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
     x.expect(
-        lvm::cmd::restore(VG, "pvc-0+snap-1", "pvc-1", &[NEW]),
+        vec![
+            "drbdadm".into(),
+            "new-current-uuid".into(),
+            "--clear-bitmap".into(),
+            "pvc-1/0".into(),
+        ],
         ok(""),
     );
-    expect_lvs(&x, &[source_lv(), lv(LV_KIB)]);
+    let vol = with_entries(restored(volume(GIB)), vec![peer_entry("n2", true)]);
+    let w = r.pass(&[vol], &[source_snapshot()]).await;
+    assert_eq!(entry_of(&w).restored_from.as_deref(), Some("snap-1"));
+    assert!(!seen(&x, "--force-resync"));
+    assert!(r.rec.init_started.is_empty());
+}
+
+#[tokio::test]
+async fn restore_falls_back_to_a_full_sync_when_a_peer_did_not_restore() {
+    // n2 is connected and Inconsistent, but its entry has no restoredFrom:
+    // it may be empty, so the bitmap is never cleared.
+    let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    r.rec.drbd.init_wait = Duration::from_millis(100);
+    let x = r.x.clone();
+    let vol = with_entries(restored(volume(GIB)), vec![peer_entry("n2", false)]);
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
     r.expect_check();
-    // The source's tags came along with the copy.
-    expect_lv_tags(&x, &[("pvc-1", &["r-drbd.md.uid-0.0", NEW])]);
-    expect_md(&x, &["r-drbd.md.uid-0.0", NEW]);
-    up_plan(&x);
-    let vol = restored(volume(GIB));
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
     r.pass(std::slice::from_ref(&vol), &[source_snapshot()])
         .await;
+    assert!(!seen(&x, "new-current-uuid"));
 
-    // Up and Inconsistent, n2 not even connected: the source now.
-    let mut lines = up("Inconsistent", "DUnknown");
-    lines[1] = "exists connection name:pvc-1 peer-node-id:1 conn-name:n2 connection:Connecting role:Unknown".into();
-    r.feed(&lines.iter().map(String::as_str).collect::<Vec<_>>());
-    *r.host.sectors.lock().unwrap() = NET_SECTORS;
+    tokio::time::sleep(Duration::from_millis(150)).await;
     reads_again(&x, &[source_lv(), lv(LV_KIB)]);
-    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
     dry(&x, "");
-    x.expect(argv::start_as_source("pvc-1"), ok(""));
+    x.expect(
+        vec![
+            "drbdadm".into(),
+            "new-current-uuid".into(),
+            "--force-resync".into(),
+            "pvc-1/0".into(),
+        ],
+        ok(""),
+    );
     r.pass(&[vol], &[source_snapshot()]).await;
     assert!(!seen(&x, "--clear-bitmap"));
 }
 
 #[tokio::test]
-async fn restore_peers_start_empty() {
+async fn restore_waits_for_its_peers_before_any_uuid_step() {
+    // n2 restored but is not connected yet; then connected but not yet
+    // reporting restoredFrom. Neither moves the UUIDs before init_wait.
+    let mut lines = up("Inconsistent", "DUnknown");
+    lines[1] = "exists connection name:pvc-1 peer-node-id:1 conn-name:n2 connection:Connecting role:Unknown".into();
+    let mut r = Rig::new(&lines, up_host());
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    let vol = with_entries(restored(volume(GIB)), vec![peer_entry("n2", true)]);
+    r.pass(&[vol], &[source_snapshot()]).await;
+    assert!(r.rec.init_started["pvc-1"].is_some());
+
+    r.feed(&[
+        "change connection name:pvc-1 conn-name:n2 connection:Connected",
+        "change peer-device name:pvc-1 conn-name:n2 volume:0 replication:Established peer-disk:Inconsistent",
+    ]);
+    reads_again(&x, &[source_lv(), lv(LV_KIB)]);
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    let vol = with_entries(restored(volume(GIB)), vec![peer_entry("n2", false)]);
+    r.pass(&[vol], &[source_snapshot()]).await;
+    assert!(!seen(&x, "new-current-uuid"));
+}
+
+/// n2's entry: restored, its LV at `kib`.
+fn restored_peer(kib: u64) -> ReplicaStatus {
+    ReplicaStatus {
+        allocated_bytes: Some(kib * 1024),
+        ..peer_entry("n2", true)
+    }
+}
+
+#[tokio::test]
+async fn larger_restore_starts_at_the_snapshot_size_then_grows() {
+    let resize_synced: Vec<String> = ["drbdadm", "resize", "pvc-1/0"].map(str::to_owned).to_vec();
+    let mut r = Rig::new(&[], FakeHost::default());
+    let x = r.x.clone();
+    let vol = |peer_kib| with_entries(restored(volume(2 * GIB)), vec![restored_peer(peer_kib)]);
+    // At the snapshot's size: no size on the lvcreate, no lvextend.
+    reads(&x, &[source_lv()]);
+    expect_restore(&x);
+    r.expect_check();
+    expect_lv_tags(&x, &[("pvc-1", &[NEW, FROM])]);
+    expect_md(&x, &[NEW]);
+    up_plan(&x);
+    let w = r.pass(&[vol(LV_KIB)], &[source_snapshot()]).await;
+    let e = entry_of(&w);
+    assert_eq!(e.allocated_bytes, Some(LV_KIB * 1024));
+    assert_eq!(
+        e.observed_generation, None,
+        "not applied at the snapshot size"
+    );
+    assert!(!seen(&x, "lvextend"));
+
+    // Up, Inconsistent beside a restored n2: the bitmap is cleared at the
+    // snapshot size; the resize waits for n2's LV.
+    r.feed(
+        &up("Inconsistent", "Inconsistent")
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    *r.host.sectors.lock().unwrap() = NET_SECTORS;
+    reads_again(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    x.expect(argv::start_without_sync("pvc-1"), ok(""));
+    let w = r.pass(&[vol(LV_KIB)], &[source_snapshot()]).await;
+    assert_eq!(entry_of(&w).observed_generation, None);
+
+    // UpToDate: the LV grows to the gross size.
+    r.feed(&[
+        "change device name:pvc-1 volume:0 disk:UpToDate",
+        "change peer-device name:pvc-1 conn-name:n2 volume:0 peer-disk:UpToDate",
+    ]);
+    reads_again(&x, &[source_lv(), lv(LV_KIB)]);
+    x.expect(lvm::cmd::extend(VG, "pvc-1", LV2_KIB * 1024), ok(""));
+    expect_lvs(&x, &[source_lv(), lv(LV2_KIB)]);
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    let w = r.pass(&[vol(LV_KIB)], &[source_snapshot()]).await;
+    assert_eq!(entry_of(&w).observed_generation, None, "resize waits");
+
+    // n2 grew too: the lowest node id resizes, and the new area syncs.
+    reads_again(&x, &[source_lv(), lv(LV2_KIB)]);
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    x.expect(resize_synced, ok(""));
+    dry(&x, "");
+    let w = r.pass(&[vol(LV2_KIB)], &[source_snapshot()]).await;
+    assert_eq!(entry_of(&w).observed_generation, Some(3));
+    assert!(!seen(&x, "--assume-clean") && !seen(&x, "--force-resync"));
+}
+
+#[tokio::test]
+async fn expand_after_initialization_keeps_assume_clean() {
+    let mut r = Rig::new(&healthy(), up_host());
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV2_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    x.expect(
+        ["drbdadm", "resize", "--assume-clean", "pvc-1/0"]
+            .map(str::to_owned)
+            .to_vec(),
+        ok(""),
+    );
+    dry(&x, "");
+    let vol = initialized(with_entries(
+        restored(volume(2 * GIB)),
+        vec![restored_peer(LV2_KIB)],
+    ));
+    r.pass(&[vol], &[source_snapshot()]).await;
+}
+
+#[tokio::test]
+async fn restore_never_clears_the_bitmap_when_its_lv_is_not_at_the_snapshot_size() {
+    // Every peer restored and connected, but this LV is larger than its
+    // snapshot LV, or the snapshot LV is not in the report.
+    for rows in [vec![source_lv(), lv(LV2_KIB)], vec![lv(LV_KIB)]] {
+        let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+        let x = r.x.clone();
+        reads(&x, &rows);
+        r.expect_check();
+        r.expect_sweep();
+        expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+        dry(&x, "");
+        x.expect(argv::start_as_source("pvc-1"), ok(""));
+        let vol = with_entries(restored(volume(GIB)), vec![peer_entry("n2", true)]);
+        r.pass(&[vol], &[source_snapshot()]).await;
+        assert!(!seen(&x, "--clear-bitmap"));
+    }
+}
+
+/// n2 (not the initial node) with its restored LV up; returns its entry.
+async fn restored_from_on_n2(
+    vol: Volume,
+    snaps: &[Snapshot],
+    tags: Option<&[&str]>,
+) -> ReplicaStatus {
+    let mut lines = up("Inconsistent", "Inconsistent");
+    lines[1] = "exists connection name:pvc-1 peer-node-id:0 conn-name:n1 connection:Connected role:Secondary".into();
+    lines[4] = "exists peer-device name:pvc-1 peer-node-id:0 conn-name:n1 volume:0 replication:Established peer-disk:Inconsistent".into();
+    let mut r = Rig::on("n2", &lines, up_host());
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    if let Some(tags) = tags {
+        expect_lv_tags(&x, &[("pvc-1", tags)]);
+    }
+    dry(&x, "");
+    let w = r.pass_pools(&[pool_on("n2")], &[vol], snaps).await;
+    entry_of(&w)
+}
+
+#[tokio::test]
+async fn restored_from_is_reported_from_the_tag_only_while_the_snapshot_exists() {
+    const N2: &str = "r-drbd.md.uid-1.1";
+    let vol = || restored(volume(GIB));
+    let e = restored_from_on_n2(vol(), &[source_snapshot()], Some(&[N2, FROM])).await;
+    assert_eq!(e.restored_from.as_deref(), Some("snap-1"));
+    // No tag: an LV made empty.
+    let e = restored_from_on_n2(vol(), &[source_snapshot()], Some(&[N2])).await;
+    assert_eq!(e.restored_from, None);
+    // The Snapshot is a new object of the same name.
+    let mut other = source_snapshot();
+    other.metadata.uid = Some("snap-uid-2".into());
+    let e = restored_from_on_n2(vol(), &[other], Some(&[N2, FROM])).await;
+    assert_eq!(e.restored_from, None);
+    // The Snapshot is gone, or the volume initialized: LVM is not read.
+    let e = restored_from_on_n2(vol(), &[], None).await;
+    assert_eq!(e.restored_from, None);
+    let e = restored_from_on_n2(initialized(vol()), &[source_snapshot()], None).await;
+    assert_eq!(e.restored_from, None);
+}
+
+#[tokio::test]
+async fn restore_holder_without_its_snapshot_lv_reports_an_error_and_creates_nothing() {
+    // The initial node: nobody else could hold the data.
+    let mut r = Rig::new(&[], FakeHost::default());
+    let x = r.x.clone();
+    reads(&x, &[]);
+    expect_lvs(&x, &[]);
+    let w = r.pass(&[restored(volume(GIB))], &[source_snapshot()]).await;
+    let e = entry_of(&w);
+    let err = e.last_error.unwrap();
+    assert!(
+        err.contains("snapshot LV vg1/pvc-0+snap-1 not found on this node"),
+        "{err}"
+    );
+    assert_eq!(e.restored_from, None);
+    assert!(!seen(&x, "lvcreate") && !seen(&x, "create-md"));
+    assert!(r.res_file().is_none());
+}
+
+#[tokio::test]
+async fn restore_peer_without_its_copy_starts_empty_and_full_syncs() {
+    // n2 reported its restored copy, then lost its LV and its snapshot LV:
+    // an empty LV, no proof tag, and nothing of DRBD before the entry that
+    // drops restoredFrom is written.
+    let stale = ReplicaStatus {
+        node: "n2".into(),
+        allocated_bytes: Some(LV_KIB * 1024),
+        observed_generation: Some(3),
+        ..peer_entry("n2", true)
+    };
+    let vol = with_entries(restored(volume(GIB)), vec![stale]);
+    let mut r = Rig::on("n2", &[], FakeHost::default());
+    let x = r.x.clone();
+    reads(&x, &[]);
+    expect_create(&x, &[]);
+    let w = r
+        .pass_pools(
+            &[pool_on("n2")],
+            std::slice::from_ref(&vol),
+            &[source_snapshot()],
+        )
+        .await;
+    let e = entry_of(&w);
+    assert_eq!(e.restored_from, None);
+    assert!(!seen(&x, "drbdadm") && !seen(&x, "--snapshot"));
+
+    // The next pass carries on: metadata, then up.
+    reads_again(&x, &[lv(LV_KIB)]);
+    r.expect_check();
+    expect_lv_tags(&x, &[("pvc-1", &[NEW])]);
+    expect_md_as(&x, "r-drbd.md.uid-1.1", &[NEW]);
+    up_plan(&x);
+    // Nothing changed in the entry until DRBD reports: no write.
+    let w = r
+        .pass_pools(
+            &[pool_on("n2")],
+            &[with_entries(restored(volume(GIB)), vec![e.clone()])],
+            &[source_snapshot()],
+        )
+        .await;
+    assert!(
+        !w.iter()
+            .any(|w| matches!(w, StatusWrite::Volume { name, .. } if name == "pvc-1")),
+        "{w:?}"
+    );
+
+    // The initial node sees n2 without restoredFrom: it is the sync source.
+    let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    r.rec.drbd.init_wait = Duration::ZERO;
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    x.expect(argv::start_as_source("pvc-1"), ok(""));
+    let n2 = ReplicaStatus {
+        node: "n2".into(),
+        ..e
+    };
+    let vol = with_entries(restored(volume(GIB)), vec![n2]);
+    r.pass(&[vol], &[source_snapshot()]).await;
+    assert!(!seen(&x, "--clear-bitmap"));
+}
+
+/// One pass of n2 restoring pvc-1 from `snaps`, script set by the caller.
+async fn n2_restore_pass(r: &mut Rig, snaps: &[Snapshot]) -> ReplicaStatus {
+    let w = r
+        .pass_pools(&[pool_on("n2")], &[restored(volume(GIB))], snaps)
+        .await;
+    entry_of(&w)
+}
+
+#[tokio::test]
+async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
+    let empty = || lvm::cmd::create_thin(VG, THIN, "pvc-1", LV_KIB * 1024, &[NEW]);
+    // No Snapshot object.
     let mut r = Rig::on("n2", &[], FakeHost::default());
     let x = r.x.clone();
     reads(&x, &[source_lv()]);
     expect_create(&x, &[source_lv()]);
+    let e = n2_restore_pass(&mut r, &[]).await;
+    assert_eq!((e.last_error, e.restored_from), (None, None));
+
+    // The snapshot LV lives in another pool.
+    let mut snap = source_snapshot();
+    snap.status.as_mut().unwrap().acks = vec![SnapshotAck {
+        node: "n2".into(),
+        phase: SnapshotPhase::Ready,
+        pool: Some("pool-elsewhere".into()),
+        ok: true,
+        error: None,
+    }];
+    let mut r = Rig::on("n2", &[], FakeHost::default());
+    let x = r.x.clone();
+    reads(&x, &[source_lv()]);
+    expect_create(&x, &[source_lv()]);
+    let e = n2_restore_pass(&mut r, &[snap]).await;
+    assert_eq!(e.last_error, None);
+
+    // The restore lvcreate fails.
+    let mut r = Rig::on("n2", &[], FakeHost::default());
+    let x = r.x.clone();
+    reads(&x, &[source_lv()]);
+    x.expect(
+        lvm::cmd::restore(VG, "pvc-0+snap-1", "pvc-1", &[NEW, FROM]),
+        code(5, "", "lvcreate failed"),
+    );
+    expect_create(&x, &[source_lv()]);
+    let e = n2_restore_pass(&mut r, &[source_snapshot()]).await;
+    assert_eq!(e.last_error, None);
+    assert!(x.seen.lock().unwrap().contains(&empty()));
+
+    // A full pool fails the empty LV too: an error entry.
+    let mut r = Rig::on("n2", &[], FakeHost::default());
+    let x = r.x.clone();
+    reads(&x, &[]);
+    x.expect(empty(), code(5, "", "insufficient free space"));
+    expect_lvs(&x, &[]);
+    let e = n2_restore_pass(&mut r, &[source_snapshot()]).await;
+    let err = e.last_error.unwrap();
+    assert!(err.contains("the empty LV failed too"), "{err}");
+    assert!(!seen(&x, "drbdadm"));
+}
+
+#[tokio::test]
+async fn degraded_restore_starts_without_quorum() {
+    // The peer and the tiebreaker away: no quorum, yet the initial node's
+    // copy is the snapshot's, so after the wait it is the sync source.
+    let mut r = Rig::new(&waiting_lines(false), up_host());
+    r.rec.drbd.init_wait = Duration::ZERO;
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    x.expect(argv::start_as_source("pvc-1"), ok(""));
+    r.pass(&[restored(volume(GIB))], &[source_snapshot()]).await;
+    assert!(!seen(&x, "--clear-bitmap"));
+}
+
+#[tokio::test]
+async fn initial_node_lost_during_the_grow_starts_as_source() {
+    // n1 lost its LV while the grown area synced; n2 is Inconsistent at the
+    // grown size. n1 restores its copy again and, the loss still on record,
+    // takes the timeout path as the sync source.
+    let mut r = Rig::new(&up("Diskless", "Inconsistent"), up_host());
+    r.rec.drbd.init_wait = Duration::ZERO;
+    let x = r.x.clone();
+    let n1 = ReplicaStatus {
+        allocated_bytes: Some(LV2_KIB * 1024),
+        ..reported()
+    };
+    let n2 = ReplicaStatus {
+        allocated_bytes: Some(LV2_KIB * 1024),
+        restored_from: None,
+        ..peer_entry("n2", false)
+    };
+    let vol = |me: ReplicaStatus| with_entries(restored(volume(2 * GIB)), vec![me, n2.clone()]);
+    reads(&x, &[source_lv()]);
+    expect_restore(&x);
+    r.expect_check();
+    expect_lv_tags(&x, &[("pvc-1", &[NEW, FROM])]);
+    expect_md(&x, &[NEW]);
+    dry(&x, PLAN);
+    x.expect(argv::adjust("pvc-1"), code(10, "", "attach failed"));
+    let w = r.pass(&[vol(n1)], &[source_snapshot()]).await;
+    let e = entry_of(&w);
+    assert!(
+        e.last_error.as_deref().unwrap().starts_with(LV_LOST),
+        "{e:?}"
+    );
+
+    r.feed(&["change device name:pvc-1 volume:0 disk:Inconsistent"]);
+    reads_again(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    x.expect(argv::start_as_source("pvc-1"), ok(""));
+    r.pass(&[vol(e)], &[source_snapshot()]).await;
+    assert!(!seen(&x, "--clear-bitmap"));
+}
+
+/// n1 lost its reported LV; n2 is Inconsistent with a device of
+/// `peer_bytes`.
+fn lost_beside(peer_bytes: u64) -> (Volume, ReplicaStatus) {
+    let n1 = ReplicaStatus {
+        allocated_bytes: Some(LV2_KIB * 1024),
+        ..reported()
+    };
+    let n2 = ReplicaStatus {
+        allocated_bytes: Some(LV2_KIB * 1024),
+        size_bytes: Some(peer_bytes),
+        ..peer_entry("n2", false)
+    };
+    (
+        with_entries(restored(volume(2 * GIB)), vec![n1, n2.clone()]),
+        n2,
+    )
+}
+
+#[tokio::test]
+async fn restored_again_beside_a_grown_peer_grows_first_and_starts_as_source() {
+    let mut r = Rig::new(&up("Diskless", "Inconsistent"), up_host());
+    r.rec.drbd.init_wait = Duration::ZERO;
+    let x = r.x.clone();
+    let (vol, n2) = lost_beside(2 * GIB);
+    reads(&x, &[source_lv()]);
+    expect_restore(&x);
+    // Grown before create-md, so the metadata lands at the gross end.
+    x.expect(lvm::cmd::extend(VG, "pvc-1", LV2_KIB * 1024), ok(""));
+    expect_lvs(&x, &[source_lv(), lv(LV2_KIB)]);
+    r.expect_check();
+    expect_lv_tags(&x, &[("pvc-1", &[NEW, FROM])]);
+    expect_md(&x, &[NEW]);
+    up_plan(&x);
+    let w = r.pass(&[vol], &[source_snapshot()]).await;
+    let e = entry_of(&w);
+    assert_eq!(e.last_error, None);
+
+    // Up and Inconsistent: not at the snapshot's size, so the sync source.
+    r.feed(&["change device name:pvc-1 volume:0 disk:Inconsistent"]);
+    reads_again(&x, &[source_lv(), lv(LV2_KIB)]);
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    x.expect(argv::start_as_source("pvc-1"), ok(""));
+    let vol = with_entries(restored(volume(2 * GIB)), vec![e, n2]);
+    r.pass(&[vol], &[source_snapshot()]).await;
+    assert!(!seen(&x, "--clear-bitmap"));
+}
+
+#[tokio::test]
+async fn restored_again_without_a_grown_peer_stays_at_the_snapshot_size() {
+    let mut r = Rig::new(&up("Diskless", "Inconsistent"), up_host());
+    let x = r.x.clone();
+    let (vol, _) = lost_beside(NET_SECTORS * 512);
+    reads(&x, &[source_lv()]);
+    expect_restore(&x);
+    r.expect_check();
+    expect_lv_tags(&x, &[("pvc-1", &[NEW, FROM])]);
+    expect_md(&x, &[NEW]);
+    up_plan(&x);
+    r.pass(&[vol], &[source_snapshot()]).await;
+    assert!(!seen(&x, "lvextend"));
+}
+
+#[tokio::test]
+async fn fallback_peer_attaches_only_once_the_live_entry_drops_restored_from() {
+    // n2's empty fallback LV exists; its entry with restoredFrom from before
+    // the loss is still in the cache and, the write having failed, in the
+    // API server.
+    let stale = ReplicaStatus {
+        allocated_bytes: Some(LV_KIB * 1024),
+        ..peer_entry("n2", true)
+    };
+    let vol = with_entries(restored(volume(GIB)), vec![stale]);
+    let mut r = Rig::on("n2", &[], FakeHost::default());
+    let x = r.x.clone();
+    *r.live.scripted.lock().unwrap() = Some(Ok(vol.clone()));
+    reads(&x, &[lv(LV_KIB)]);
     r.expect_check();
     expect_lv_tags(&x, &[("pvc-1", &[NEW])]);
+    let w = r
+        .pass_pools(
+            &[pool_on("n2")],
+            std::slice::from_ref(&vol),
+            &[source_snapshot()],
+        )
+        .await;
+    assert_eq!(entry_of(&w).restored_from, None, "the write goes again");
+    assert!(!seen(&x, "create-md") && !seen(&x, "adjust"));
+
+    // A failed live read waits too.
+    *r.live.scripted.lock().unwrap() = Some(Err("unreachable".into()));
+    reads_again(&x, &[lv(LV_KIB)]);
+    expect_lv_tags(&x, &[("pvc-1", &[NEW])]);
+    let w = r
+        .pass_pools(
+            &[pool_on("n2")],
+            std::slice::from_ref(&vol),
+            &[source_snapshot()],
+        )
+        .await;
+    assert_eq!(entry_of(&w).last_error, None);
+    assert!(!seen(&x, "create-md") && !seen(&x, "adjust"));
+
+    // The API server has the entry without restoredFrom: metadata, then up.
+    let committed = with_entries(
+        restored(volume(GIB)),
+        vec![ReplicaStatus {
+            restored_from: None,
+            ..peer_entry("n2", false)
+        }],
+    );
+    *r.live.scripted.lock().unwrap() = Some(Ok(committed));
+    reads_again(&x, &[lv(LV_KIB)]);
+    expect_lv_tags(&x, &[("pvc-1", &[NEW])]);
     expect_md_as(&x, "r-drbd.md.uid-1.1", &[NEW]);
+    up_plan(&x);
+    r.pass_pools(&[pool_on("n2")], &[vol], &[source_snapshot()])
+        .await;
+}
+
+#[tokio::test]
+async fn initial_node_clears_the_bitmap_only_on_the_live_proof() {
+    let cached = with_entries(restored(volume(GIB)), vec![peer_entry("n2", true)]);
+    // The cache shows n2's proof, the API server no longer does.
+    let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    r.rec.drbd.init_wait = Duration::ZERO;
+    let x = r.x.clone();
+    *r.live.scripted.lock().unwrap() = Some(Ok(with_entries(
+        restored(volume(GIB)),
+        vec![peer_entry("n2", false)],
+    )));
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    x.expect(argv::start_as_source("pvc-1"), ok(""));
+    r.pass(std::slice::from_ref(&cached), &[source_snapshot()])
+        .await;
+    assert!(!seen(&x, "--clear-bitmap"));
+
+    // A failed live read: no uuid step of either kind.
+    let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    r.rec.drbd.init_wait = Duration::ZERO;
+    let x = r.x.clone();
+    *r.live.scripted.lock().unwrap() = Some(Err("unreachable".into()));
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    r.pass(std::slice::from_ref(&cached), &[source_snapshot()])
+        .await;
+    assert!(!seen(&x, "new-current-uuid"));
+    assert_eq!(r.live.reads.load(Ordering::Relaxed), 1);
+
+    // Live and cache agree on the proof: the bitmap is cleared.
+    let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    x.expect(argv::start_without_sync("pvc-1"), ok(""));
+    r.pass(&[cached], &[source_snapshot()]).await;
+    assert_eq!(r.live.reads.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn a_stale_peer_entry_never_clears_the_bitmap() {
+    // restoredFrom without a present entry and a device: written before
+    // the LV it speaks of.
+    for (present, device) in [(false, true), (true, false)] {
+        let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+        r.rec.drbd.init_wait = Duration::ZERO;
+        let x = r.x.clone();
+        reads(&x, &[source_lv(), lv(LV_KIB)]);
+        r.expect_check();
+        r.expect_sweep();
+        expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+        dry(&x, "");
+        x.expect(argv::start_as_source("pvc-1"), ok(""));
+        let n2 = ReplicaStatus {
+            present,
+            device_path: device.then(|| "/dev/drbd50000".into()),
+            ..peer_entry("n2", true)
+        };
+        let vol = with_entries(restored(volume(GIB)), vec![n2]);
+        r.pass(&[vol], &[source_snapshot()]).await;
+        assert!(!seen(&x, "--clear-bitmap"));
+    }
+}
+
+#[tokio::test]
+async fn stale_lv_with_another_volumes_from_tag_is_made_new_and_not_a_copy() {
+    // Left on n2 by a deleted Volume of the same name, restored from the
+    // same snapshot: its tags name another Volume uid.
+    const OLD_MD: &str = "r-drbd.md.uid-0.1";
+    const OLD_FROM: &str = "r-drbd.from.uid-0.snap-uid-1";
+    const N2: &str = "r-drbd.md.uid-1.1";
+    let mut r = Rig::on("n2", &[], FakeHost::default());
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    expect_lv_tags(&x, &[("pvc-1", &[OLD_MD, OLD_FROM])]);
+    expect_change(&x, "pvc-1", &[NEW], &[OLD_MD, OLD_FROM]);
+    expect_md_as(&x, N2, &[NEW]);
     up_plan(&x);
     let w = r
         .pass_pools(
@@ -591,7 +1305,148 @@ async fn restore_peers_start_empty() {
             &[source_snapshot()],
         )
         .await;
-    assert_eq!(entry_of(&w).last_error, None);
+    let e = entry_of(&w);
+    assert_eq!((e.last_error, e.restored_from), (None, None));
+    // Without its report, the initial node force-resyncs: see
+    // restore_falls_back_to_a_full_sync_when_a_peer_did_not_restore.
+}
+
+#[tokio::test]
+async fn restore_peer_larger_than_its_snapshot_reports_no_restored_from() {
+    const N2: &str = "r-drbd.md.uid-1.1";
+    let mut lines = up("Inconsistent", "Inconsistent");
+    lines[1] = "exists connection name:pvc-1 peer-node-id:0 conn-name:n1 connection:Connected role:Secondary".into();
+    lines[4] = "exists peer-device name:pvc-1 peer-node-id:0 conn-name:n1 volume:0 replication:Established peer-disk:Inconsistent".into();
+    let mut r = Rig::on("n2", &lines, up_host());
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV2_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[N2, FROM])]);
+    dry(&x, "");
+    let w = r
+        .pass_pools(
+            &[pool_on("n2")],
+            &[restored(volume(GIB))],
+            &[source_snapshot()],
+        )
+        .await;
+    assert_eq!(entry_of(&w).restored_from, None);
+}
+
+#[tokio::test]
+async fn initial_node_with_an_orphan_lv_refuses_until_the_claim_is_deleted() {
+    // An LV of a deleted Volume of the same name: another md tag, no from
+    // tag of this Volume. Made new, but never started as the restore.
+    const OLD_MD: &str = "r-drbd.md.uid-0.0";
+    let mut r = Rig::new(&[], FakeHost::default());
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    expect_lv_tags(&x, &[("pvc-1", &[OLD_MD])]);
+    expect_change(&x, "pvc-1", &[NEW], &[OLD_MD]);
+    expect_md(&x, &[NEW]);
+    up_plan(&x);
+    let vol = with_entries(restored(volume(GIB)), vec![peer_entry("n2", true)]);
+    let w = r
+        .pass(std::slice::from_ref(&vol), &[source_snapshot()])
+        .await;
+    assert_eq!(entry_of(&w).restored_from, None);
+
+    r.feed(
+        &up("Inconsistent", "Inconsistent")
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    *r.host.sectors.lock().unwrap() = NET_SECTORS;
+    r.rec.drbd.init_wait = Duration::ZERO;
+    reads_again(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN])]);
+    dry(&x, "");
+    let w = r
+        .pass(std::slice::from_ref(&vol), &[source_snapshot()])
+        .await;
+    assert_eq!(
+        entry_of(&w).last_error.as_deref(),
+        Some(
+            "LV vg1/pvc-1 is not this restore's copy of snapshot snap-1; delete the claim and restore again"
+        )
+    );
+    assert!(!seen(&x, "new-current-uuid"));
+
+    // Deleting the claim removes the LV, so the Snapshot guard lets go.
+    reads_again(&x, &[source_lv(), lv(LV_KIB)]);
+    x.expect(argv::down("pvc-1"), ok("")).expect(
+        argv::status("pvc-1"),
+        code(10, "", "pvc-1: No such resource"),
+    );
+    expect_lvs(&x, &[source_lv(), lv(LV_KIB)]);
+    x.expect(lvm::cmd::remove(VG, "pvc-1"), ok(""));
+    expect_lvs(&x, &[source_lv()]);
+    let w = r.pass(&[deleting(vol)], &[source_snapshot()]).await;
+    let e = entry_of(&w);
+    assert!(!e.present && e.last_error.is_none(), "{e:?}");
+}
+
+#[tokio::test]
+async fn a_failed_proof_read_fails_the_pass_and_starts_nothing() {
+    let mut r = Rig::new(&up("Inconsistent", "Inconsistent"), up_host());
+    r.rec.drbd.init_wait = Duration::ZERO;
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    x.expect(lvm::cmd::lv_tags(VG), code(5, "", "lvs failed"));
+    let vol = with_entries(restored(volume(GIB)), vec![peer_entry("n2", true)]);
+    let w = r.pass(&[vol], &[source_snapshot()]).await;
+    let e = entry_of(&w);
+    assert!(e.last_error.unwrap().contains("lvs failed"));
+    assert!(!seen(&x, "new-current-uuid"));
+}
+
+#[tokio::test]
+async fn snapshot_lv_is_kept_while_a_restore_here_is_not_initialized() {
+    let mut snap = deleting(source_snapshot());
+    snap.status.as_mut().unwrap().acks = vec![SnapshotAck {
+        node: NODE.into(),
+        phase: SnapshotPhase::Ready,
+        pool: Some(POOL.into()),
+        ok: true,
+        error: None,
+    }];
+    let mut r = Rig::new(&healthy(), up_host());
+    let x = r.x.clone();
+    reads(&x, &[source_lv(), lv(LV_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    let vol = restored(volume(GIB));
+    let w = r
+        .pass(std::slice::from_ref(&vol), std::slice::from_ref(&snap))
+        .await;
+    let a = acks(&w);
+    assert_eq!((a[0].phase, a[0].ok), (SnapshotPhase::Deleting, false));
+    assert!(
+        a[0].error
+            .as_deref()
+            .unwrap()
+            .contains("volume pvc-1 restores from it"),
+        "{a:?}"
+    );
+    assert!(!seen(&x, "lvremove"));
+
+    // Initialized: the copy goes.
+    reads_again(&x, &[source_lv(), lv(LV_KIB)]);
+    dry(&x, "");
+    expect_lvs(&x, &[source_lv(), lv(LV_KIB)]);
+    x.expect(lvm::cmd::remove(VG, "pvc-0+snap-1"), ok(""));
+    expect_lvs(&x, &[lv(LV_KIB)]);
+    let w = r.pass(&[initialized(vol)], &[snap]).await;
+    let a = acks(&w);
+    assert_eq!((a[0].phase, a[0].ok), (SnapshotPhase::Deleting, true));
 }
 
 #[tokio::test]
@@ -1044,8 +1899,8 @@ async fn node_leaving_the_assignment_keeps_its_data() {
     x.expect(argv::down("pvc-1"), ok(""))
         .expect(argv::status("pvc-1"), code(10, "", ""));
     // The bytes stay, the proof of ownership goes.
-    expect_lv_tags(&x, &[("pvc-1", &[OWN, "other"])]);
-    expect_change(&x, "pvc-1", &[], &[OWN]);
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM, "other"])]);
+    expect_change(&x, "pvc-1", &[], &[OWN, FROM]);
     let w = r.pass(&[with_entries(v, vec![reported()])], &[]).await;
     assert!(
         w.iter()
@@ -1366,38 +2221,41 @@ async fn restore_lost_before_initialized_is_restored_again() {
     let mut r = Rig::new(&[], FakeHost::default());
     let x = r.x.clone();
     reads(&x, &[source_lv()]);
-    x.expect(
-        lvm::cmd::restore(VG, "pvc-0+snap-1", "pvc-1", &[NEW]),
-        ok(""),
-    );
-    expect_lvs(&x, &[source_lv(), lv(LV_KIB)]);
+    expect_restore(&x);
     r.expect_check();
-    expect_lv_tags(&x, &[("pvc-1", &[NEW])]);
+    expect_lv_tags(&x, &[("pvc-1", &[NEW, FROM])]);
     expect_md(&x, &[NEW]);
     up_plan(&x);
-    let vol = with_entries(restored(volume(GIB)), vec![reported()]);
+    let vol = with_entries(
+        restored(volume(GIB)),
+        vec![reported(), peer_entry("n2", true)],
+    );
     let w = r
         .pass(std::slice::from_ref(&vol), &[source_snapshot()])
         .await;
     let e = entry_of(&w);
     assert_eq!(e.last_error, None);
-    let empty = lvm::cmd::create_thin(VG, THIN, "pvc-1", LV_KIB * 1024, &[NEW]);
     assert!(
-        !x.seen.lock().unwrap().contains(&empty),
+        !x.seen.lock().unwrap().contains(&empty_create()),
         "never an empty LV"
     );
     assert!(!r.rec.rebuilt_seen.contains("pvc-1"));
 
-    // Up and Inconsistent: the restored copy is the source.
+    // Up and Inconsistent beside a restored peer: the copies are the same
+    // snapshot again, nobody syncs.
     let lines = up("Inconsistent", "Inconsistent");
     r.feed(&lines.iter().map(String::as_str).collect::<Vec<_>>());
     *r.host.sectors.lock().unwrap() = NET_SECTORS;
     reads_again(&x, &[source_lv(), lv(LV_KIB)]);
     r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
     dry(&x, "");
-    x.expect(argv::start_as_source("pvc-1"), ok(""));
-    r.pass(&[with_entries(vol, vec![e])], &[source_snapshot()])
-        .await;
+    x.expect(argv::start_without_sync("pvc-1"), ok(""));
+    r.pass(
+        &[with_entries(vol, vec![e, peer_entry("n2", true)])],
+        &[source_snapshot()],
+    )
+    .await;
 }
 
 #[tokio::test]

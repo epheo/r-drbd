@@ -6,8 +6,11 @@ resources:
   - 20-controller.yaml
   - 30-agent.yaml
   - 40-storageclasses.yaml
-# One immutable build for the controller and every agent; a release
-# bumps this tag. deploy/dev follows :latest instead.
+# One immutable build for the controller and every agent. A release bumps
+# every place that names this tag together, as deploy/README.md lists:
+# 20-controller.yaml, 30-agent.yaml, newTag here, and the CRD commands in
+# README.md, docs/install.md and docs/openshift.md; a test checks they
+# agree. deploy/dev follows :latest instead.
 images:
   - name: ghcr.io/epheo/r-drbd
     newTag: sha-6765eba

@@ -299,3 +299,27 @@ fn nodedisks_rows_keyed_by_path_with_blank_column() {
         }]})
     );
 }
+
+#[test]
+fn replica_restored_from_is_optional_and_bounded() {
+    let crd = to_json(&Volume::crd());
+    let entry = &schema(&crd)["properties"]["status"]["properties"]["replicas"]["items"];
+    let field = &entry["properties"]["restoredFrom"];
+    assert_eq!(field["type"], "string");
+    assert_eq!(field["maxLength"], 253);
+    assert_eq!(field["nullable"], true);
+    let required = entry["required"].as_array().cloned().unwrap_or_default();
+    assert!(!required.contains(&json!("restoredFrom")), "{required:?}");
+
+    let e = model::ReplicaStatus {
+        node: "n1".into(),
+        restored_from: Some("snap-1".into()),
+        ..model::ReplicaStatus::default()
+    };
+    assert_eq!(
+        to_json(&e),
+        json!({"node": "n1", "present": false, "inUse": false, "restoredFrom": "snap-1"})
+    );
+    let back: model::ReplicaStatus = serde_json::from_value(json!({"node": "n1"})).unwrap();
+    assert_eq!(back.restored_from, None);
+}

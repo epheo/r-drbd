@@ -219,9 +219,17 @@ pub mod argv {
     }
 
     /// --assume-clean: the grown part of every thin backing LV reads as
-    /// zeros, so there is nothing to sync.
+    /// zeros where no old metadata lies, so there is nothing to sync. Not
+    /// so for a restore growing from its snapshot's size: see
+    /// [`resize_synced`].
     pub fn resize(res: &str) -> Vec<String> {
         a(&["drbdadm", "resize", "--assume-clean", &vol(res)])
+    }
+
+    /// A resize whose new area syncs: it holds each node's old metadata.
+    /// Zero blocks travel as discards (rs-discard-granularity).
+    pub fn resize_synced(res: &str) -> Vec<String> {
+        a(&["drbdadm", "resize", &vol(res)])
     }
 
     pub fn disconnect(res: &str) -> Vec<String> {
@@ -543,6 +551,8 @@ pub struct Facts {
     pub allocated_bytes: Option<u64>,
     pub observed_generation: Option<i64>,
     pub last_error: Option<String>,
+    /// The source Snapshot the backing LV provably came from.
+    pub restored_from: Option<String>,
 }
 
 /// This node's status entry for a DRBD volume. `sectors` is the sysfs
@@ -572,6 +582,7 @@ pub fn entry(
         size_bytes,
         observed_generation: facts.observed_generation,
         last_error: facts.last_error.clone(),
+        restored_from: facts.restored_from.clone(),
         unreachable_peers: Vec::new(),
     }
 }

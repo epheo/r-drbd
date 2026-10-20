@@ -756,6 +756,13 @@ impl FakeAgent {
             .status
             .as_ref()
             .and_then(|s| s.replicas.iter().find(|e| e.node == self.node));
+        // As the agent: proof of a restored copy until the first data.
+        let restored_from = v
+            .spec
+            .source
+            .as_ref()
+            .filter(|_| diskful && minor.is_some() && initialized.is_none())
+            .map(|s| s.snapshot.clone());
         let rebuild = diskful
             && minor.is_some()
             && initialized.is_some()
@@ -783,6 +790,7 @@ impl FakeAgent {
                     .as_ref()
                     .and_then(|a| a.minor)
                     .map(|_| true),
+                restored_from,
                 ..ReplicaStatus::default()
             },
         )
