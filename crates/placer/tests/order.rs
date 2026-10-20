@@ -1,16 +1,13 @@
 mod common;
 
 use common::{GIB, pool, request};
-use placer::{Chosen, Outcome, place};
+use placer::{Chosen, Insufficient, place};
 
-fn chosen(out: Outcome) -> Vec<(String, String)> {
-    match out {
-        Outcome::Placed { diskful, .. } => diskful
-            .into_iter()
-            .map(|Chosen { node, pool }| (node, pool))
-            .collect(),
-        other => panic!("expected Placed, got {other:?}"),
-    }
+fn chosen(out: Result<Vec<Chosen>, Insufficient>) -> Vec<(String, String)> {
+    out.expect("placed")
+        .into_iter()
+        .map(|Chosen { node, pool }| (node, pool))
+        .collect()
 }
 
 fn pair(node: &str, pool: &str) -> (String, String) {

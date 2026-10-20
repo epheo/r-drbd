@@ -1,15 +1,14 @@
 mod common;
 
-use common::{GIB, names, pool, request};
-use placer::{Outcome, PoolView, Reason, Request, place};
+use common::{GIB, pool, request};
+use placer::{Chosen, Insufficient, PoolView, Reason, Request, place};
 
-fn reasons(out: Outcome) -> Vec<(String, Reason)> {
-    match out {
-        Outcome::Insufficient { rejected, .. } => {
-            rejected.into_iter().map(|r| (r.pool, r.reason)).collect()
-        }
-        other => panic!("expected Insufficient, got {other:?}"),
-    }
+fn reasons(out: Result<Vec<Chosen>, Insufficient>) -> Vec<(String, Reason)> {
+    out.expect_err("insufficient")
+        .rejected
+        .into_iter()
+        .map(|r| (r.pool, r.reason))
+        .collect()
 }
 
 fn only_reason(req: &Request, pool: PoolView) -> Reason {
@@ -25,7 +24,6 @@ fn every_reason_in_order() {
     let mut req = request(3);
     req.pool = Some("p".to_string());
     req.node = Some("n1".to_string());
-    req.existing = names(&["n2"]);
 
     let mut p = pool("q", "n2", 0);
     p.node_ready = false;
@@ -40,15 +38,11 @@ fn every_reason_in_order() {
     assert_eq!(only_reason(&req, p.clone()), Reason::NotThePinnedPool);
     p.name = "p".to_string();
     assert_eq!(only_reason(&req, p.clone()), Reason::NotThePinnedNode);
-    // A node pin and an existing replica on another node cannot both apply
-    // to one pool, so the last two reasons are checked without the node pin.
-    req.node = None;
-    assert_eq!(only_reason(&req, p.clone()), Reason::NodeAlreadyHolds);
-    p.node = "n3".to_string();
+    p.node = "n1".to_string();
     assert_eq!(only_reason(&req, p.clone()), Reason::NoCapacity);
     p.free_bytes = 50 * GIB;
-    req.replicas = 2;
-    assert!(matches!(place(&req, &[p]), Outcome::Placed { .. }));
+    req.replicas = 1;
+    assert!(place(&req, &[p]).is_ok());
 }
 
 #[test]
@@ -86,14 +80,10 @@ fn node_pin() {
     let mut req = request(1);
     req.node = Some("n2".to_string());
     let pools = [pool("a", "n1", 90 * GIB), pool("b", "n2", 10 * GIB)];
-    match place(&req, &pools) {
-        Outcome::Placed { diskful, .. } => {
-            assert_eq!(diskful.len(), 1);
-            assert_eq!(diskful[0].node, "n2");
-            assert_eq!(diskful[0].pool, "b");
-        }
-        other => panic!("{other:?}"),
-    }
+    let diskful = place(&req, &pools).unwrap();
+    assert_eq!(diskful.len(), 1);
+    assert_eq!(diskful[0].node, "n2");
+    assert_eq!(diskful[0].pool, "b");
 }
 
 #[test]
@@ -101,24 +91,5 @@ fn pool_pin() {
     let mut req = request(1);
     req.pool = Some("b".to_string());
     let pools = [pool("a", "n1", 90 * GIB), pool("b", "n1", 10 * GIB)];
-    match place(&req, &pools) {
-        Outcome::Placed { diskful, .. } => {
-            assert_eq!(diskful[0].pool, "b");
-        }
-        other => panic!("{other:?}"),
-    }
-}
-
-#[test]
-fn node_already_holding_is_skipped() {
-    let mut req = request(2);
-    req.existing = names(&["n1"]);
-    let pools = [pool("a", "n1", 90 * GIB), pool("b", "n2", 10 * GIB)];
-    match place(&req, &pools) {
-        Outcome::Placed { diskful, .. } => {
-            assert_eq!(diskful.len(), 1);
-            assert_eq!(diskful[0].node, "n2");
-        }
-        other => panic!("{other:?}"),
-    }
+    assert_eq!(place(&req, &pools).unwrap()[0].pool, "b");
 }

@@ -1,7 +1,7 @@
 mod common;
 
 use common::{GIB, pool, request};
-use placer::{Outcome, Reason, fits, place, promise, room};
+use placer::{Reason, fits, place, promise, room};
 
 // common::pool: total 100 GiB, overcommit 100, reserve 5, committed 0.
 
@@ -120,11 +120,11 @@ fn a_pool_holding_the_data_is_not_gated() {
     req.node = Some("n1".into());
     assert!(matches!(
         place(&req, &[p.clone()]),
-        Outcome::Insufficient { rejected, .. } if rejected[0].reason == Reason::NoCapacity
+        Err(i) if i.rejected[0].reason == Reason::NoCapacity
     ));
     req.holds_data = true;
-    assert!(matches!(place(&req, &[p.clone()]), Outcome::Placed { .. }));
+    assert!(place(&req, &[p.clone()]).is_ok());
     // Only a pinned pool can hold the data; the flag alone exempts nothing.
     req.pool = None;
-    assert!(matches!(place(&req, &[p]), Outcome::Insufficient { .. }));
+    assert!(place(&req, &[p]).is_err());
 }

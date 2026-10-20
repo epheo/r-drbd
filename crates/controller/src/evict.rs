@@ -235,13 +235,12 @@ fn move_diskful(i: &Input<'_>, gone: &AssignedReplica) -> Step {
         tier: i.spec.tier.clone(),
         pool: i.spec.pool.clone(),
         node: None,
-        existing: Vec::new(),
         holds_data: false,
     };
     let mut full: Vec<String> = Vec::new();
     let chosen = match placer::place(&req, &pools) {
-        placer::Outcome::Placed { diskful, .. } => diskful.into_iter().next(),
-        placer::Outcome::Insufficient { rejected, .. } => {
+        Ok(diskful) => diskful.into_iter().next(),
+        Err(placer::Insufficient { rejected, .. }) => {
             full.extend(
                 rejected
                     .iter()
@@ -250,7 +249,6 @@ fn move_diskful(i: &Input<'_>, gone: &AssignedReplica) -> Step {
             );
             None
         }
-        placer::Outcome::AlreadyPlaced => None,
     };
     let Some(chosen) = chosen else {
         // Departing nodes are skipped only until their agent drops the old

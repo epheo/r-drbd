@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use model::Pool;
 use model::keys::PARAM_TIER;
-use placer::{Outcome, PoolView, Request};
+use placer::{PoolView, Request};
 
 use crate::pool::Usage;
 
@@ -100,10 +100,9 @@ fn placed(views: &[PoolView], tier: &str, replicas: u32, node: Option<&str>, siz
         tier: tier.to_owned(),
         pool: None,
         node: node.map(str::to_owned),
-        existing: Vec::new(),
         holds_data: false,
     };
-    matches!(placer::place(&request, views), Outcome::Placed { .. })
+    placer::place(&request, views).is_ok()
 }
 
 #[cfg(test)]

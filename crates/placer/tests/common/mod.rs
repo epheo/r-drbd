@@ -27,7 +27,6 @@ pub(crate) fn request(replicas: u32) -> Request {
         tier: "fast".to_string(),
         pool: None,
         node: None,
-        existing: Vec::new(),
         holds_data: false,
     }
 }

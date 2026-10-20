@@ -33,7 +33,6 @@ pub mod reason {
     pub const ATTACHMENT_FAILED: &str = "AttachmentFailed";
     /// AttachmentFailed False.
     pub const ATTACHED: &str = "Attached";
-    pub const PLACING: &str = "Placing";
     pub const WAITING: &str = "Waiting";
     pub const ALL_UP_TO_DATE: &str = "AllReplicasUpToDate";
     pub const REPLICA_MISSING: &str = "ReplicaMissing";
@@ -1948,8 +1947,8 @@ fn restore_holders(
 }
 
 /// Assignment for chosen diskful replicas, with a tiebreaker when their
-/// count is even; recomputed with the Node list because a node without
-/// pools (such as a control plane node) is the preferred tiebreaker.
+/// count is even, chosen from the Node list: a node without pools (such as
+/// a control plane node) is the preferred tiebreaker.
 fn assign(placing: &Placing, v: &Volume, diskful: &[placer::Chosen]) -> Placement {
     let nodes: Vec<String> = diskful.iter().map(|c| c.node.clone()).collect();
     let tiebreaker = if nodes.len() >= 2 && nodes.len().is_multiple_of(2) {
@@ -2030,16 +2029,14 @@ fn place(ctx: &Ctx<'_>, placing: &Placing, v: &Volume) -> Placement {
         tier: v.spec.tier.clone(),
         pool,
         node,
-        existing: Vec::new(),
         holds_data,
     };
     match placer::place(&req, &placing.views) {
-        placer::Outcome::Placed { diskful, .. } => {
+        Ok(diskful) => {
             lv_name_fits(ctx, v, &diskful).unwrap_or_else(|| assign(placing, v, &diskful))
         }
-        placer::Outcome::AlreadyPlaced => Placement::Wait(Cond::new(FALSE, reason::PLACING, "")),
         // Pending, not Failed: placement is retried whenever Pools or Nodes change.
-        placer::Outcome::Insufficient { missing, rejected } => {
+        Err(placer::Insufficient { missing, rejected }) => {
             let list = if rejected.is_empty() {
                 "none (no pools)".to_owned()
             } else {

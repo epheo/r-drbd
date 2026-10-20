@@ -1,4 +1,4 @@
-//! Placement of volume replicas and the quorum tiebreaker.
+//! Placement of volume replicas and the choice of the quorum tiebreaker.
 //!
 //! Pure crate, deliberately small: distinct nodes, tier or pool or node
 //! filter, capacity from the pool's own policy (see `room`), most free
@@ -31,10 +31,6 @@ pub struct Request {
     pub tier: String,
     pub pool: Option<String>,
     pub node: Option<String>,
-    /// Nodes that already hold a diskful replica (re-placement after a
-    /// loss or a split-brain resolve); they are kept and not chosen again.
-    /// Duplicates are collapsed; order is irrelevant.
-    pub existing: Vec<String>,
     /// The pinned pool already holds this volume's blocks (a restore from
     /// its snapshot): the volume has nowhere else to go, so capacity is not
     /// checked there. It still counts in `committed_bytes` afterwards.
@@ -47,24 +43,13 @@ pub struct Chosen {
     pub pool: String,
 }
 
+/// Not enough nodes or capacity; `rejected` names every rejected pool once
+/// with the first reason that rejected it, in declaration order of Reason
+/// and input order of pools; `missing` counts the replicas still wanted.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Outcome {
-    /// New diskful replicas, in choice order, plus the tiebreaker node when
-    /// the diskful count is even and above one. Never partial.
-    Placed {
-        diskful: Vec<Chosen>,
-        tiebreaker: Option<String>,
-    },
-    /// Nothing to do: `existing` already satisfies `replicas`.
-    AlreadyPlaced,
-    /// Not enough nodes or capacity; `rejected` names every rejected pool
-    /// once with the first reason that rejected it, in declaration order of
-    /// Reason and input order of pools; `missing` counts the replicas still
-    /// wanted.
-    Insufficient {
-        missing: u32,
-        rejected: Vec<Rejected>,
-    },
+pub struct Insufficient {
+    pub missing: u32,
+    pub rejected: Vec<Rejected>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,7 +68,6 @@ pub enum Reason {
     WrongTier,
     NotThePinnedPool,
     NotThePinnedNode,
-    NodeAlreadyHolds,
     NoCapacity,
 }
 
@@ -128,20 +112,9 @@ pub fn fits(pool: &PoolView, size_bytes: u64) -> bool {
 
 /// Diskful placement: filter pools, order by free bytes descending then
 /// node then pool name, pick one pool per node until `replicas` are held.
-///
-/// The tiebreaker in `Placed` is chosen among nodes with at least one pool
-/// whose `node_ready` is true. Nodes without any pool are tiebreaker
-/// candidates only through a direct `tiebreaker()` call (the controller does
-/// that with the Node list).
-pub fn place(req: &Request, pools: &[PoolView]) -> Outcome {
-    let mut existing = req.existing.clone();
-    existing.sort();
-    existing.dedup();
+/// Never partial.
+pub fn place(req: &Request, pools: &[PoolView]) -> Result<Vec<Chosen>, Insufficient> {
     let wanted = usize::try_from(req.replicas).unwrap_or(usize::MAX);
-    if existing.len() >= wanted {
-        return Outcome::AlreadyPlaced;
-    }
-
     let mut rejected = Vec::new();
     let mut survivors = Vec::new();
     for pool in pools {
@@ -161,11 +134,10 @@ pub fn place(req: &Request, pools: &[PoolView]) -> Outcome {
             .then_with(|| a.name.cmp(&b.name))
     });
 
-    let missing = wanted - existing.len();
-    // Not with_capacity(missing): replicas is caller input and u32::MAX would abort.
+    // Not with_capacity(wanted): replicas is caller input and u32::MAX would abort.
     let mut diskful: Vec<Chosen> = Vec::new();
     for pool in survivors {
-        if diskful.len() == missing {
+        if diskful.len() == wanted {
             break;
         }
         if diskful.iter().any(|c| c.node == pool.node) {
@@ -176,34 +148,13 @@ pub fn place(req: &Request, pools: &[PoolView]) -> Outcome {
             pool: pool.name.clone(),
         });
     }
-    if diskful.len() < missing {
-        let short = u32::try_from(missing - diskful.len()).unwrap_or(u32::MAX);
-        return Outcome::Insufficient {
-            missing: short,
+    if diskful.len() < wanted {
+        return Err(Insufficient {
+            missing: u32::try_from(wanted - diskful.len()).unwrap_or(u32::MAX),
             rejected,
-        };
+        });
     }
-
-    let all: Vec<String> = existing
-        .into_iter()
-        .chain(diskful.iter().map(|c| c.node.clone()))
-        .collect();
-    let tiebreaker = if all.len() >= 2 && all.len().is_multiple_of(2) {
-        let mut ready: Vec<String> = pools
-            .iter()
-            .filter(|p| p.node_ready)
-            .map(|p| p.node.clone())
-            .collect();
-        ready.sort();
-        ready.dedup();
-        tiebreaker(&all, &ready, pools, &req.tier)
-    } else {
-        None
-    };
-    Outcome::Placed {
-        diskful,
-        tiebreaker,
-    }
+    Ok(diskful)
 }
 
 fn reject(req: &Request, pool: &PoolView) -> Option<Reason> {
@@ -217,8 +168,6 @@ fn reject(req: &Request, pool: &PoolView) -> Option<Reason> {
         Some(Reason::NotThePinnedPool)
     } else if req.node.as_ref().is_some_and(|n| *n != pool.node) {
         Some(Reason::NotThePinnedNode)
-    } else if req.existing.contains(&pool.node) {
-        Some(Reason::NodeAlreadyHolds)
     } else if !((req.holds_data && req.pool.is_some()) || fits(pool, req.size_bytes)) {
         Some(Reason::NoCapacity)
     } else {
