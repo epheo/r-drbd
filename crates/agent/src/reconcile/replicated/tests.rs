@@ -1058,6 +1058,70 @@ async fn initial_node_lost_during_the_grow_starts_as_source() {
     assert!(!seen(&x, "--clear-bitmap"));
 }
 
+/// n1 lost its reported LV; n2 is Inconsistent with a device of
+/// `peer_bytes`.
+fn lost_beside(peer_bytes: u64) -> (Volume, ReplicaStatus) {
+    let n1 = ReplicaStatus {
+        allocated_bytes: Some(LV2_KIB * 1024),
+        ..reported()
+    };
+    let n2 = ReplicaStatus {
+        allocated_bytes: Some(LV2_KIB * 1024),
+        size_bytes: Some(peer_bytes),
+        ..peer_entry("n2", false)
+    };
+    (
+        with_entries(restored(volume(2 * GIB)), vec![n1, n2.clone()]),
+        n2,
+    )
+}
+
+#[tokio::test]
+async fn restored_again_beside_a_grown_peer_grows_first_and_starts_as_source() {
+    let mut r = Rig::new(&up("Diskless", "Inconsistent"), up_host());
+    r.rec.drbd.init_wait = Duration::ZERO;
+    let x = r.x.clone();
+    let (vol, n2) = lost_beside(2 * GIB);
+    reads(&x, &[source_lv()]);
+    expect_restore(&x);
+    // Grown before create-md, so the metadata lands at the gross end.
+    x.expect(lvm::cmd::extend(VG, "pvc-1", LV2_KIB * 1024), ok(""));
+    expect_lvs(&x, &[source_lv(), lv(LV2_KIB)]);
+    r.expect_check();
+    expect_lv_tags(&x, &[("pvc-1", &[NEW, FROM])]);
+    expect_md(&x, &[NEW]);
+    up_plan(&x);
+    let w = r.pass(&[vol], &[source_snapshot()]).await;
+    let e = entry_of(&w);
+    assert_eq!(e.last_error, None);
+
+    // Up and Inconsistent: not at the snapshot's size, so the sync source.
+    r.feed(&["change device name:pvc-1 volume:0 disk:Inconsistent"]);
+    reads_again(&x, &[source_lv(), lv(LV2_KIB)]);
+    r.expect_sweep();
+    expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
+    dry(&x, "");
+    x.expect(argv::start_as_source("pvc-1"), ok(""));
+    let vol = with_entries(restored(volume(2 * GIB)), vec![e, n2]);
+    r.pass(&[vol], &[source_snapshot()]).await;
+    assert!(!seen(&x, "--clear-bitmap"));
+}
+
+#[tokio::test]
+async fn restored_again_without_a_grown_peer_stays_at_the_snapshot_size() {
+    let mut r = Rig::new(&up("Diskless", "Inconsistent"), up_host());
+    let x = r.x.clone();
+    let (vol, _) = lost_beside(NET_SECTORS * 512);
+    reads(&x, &[source_lv()]);
+    expect_restore(&x);
+    r.expect_check();
+    expect_lv_tags(&x, &[("pvc-1", &[NEW, FROM])]);
+    expect_md(&x, &[NEW]);
+    up_plan(&x);
+    r.pass(&[vol], &[source_snapshot()]).await;
+    assert!(!seen(&x, "lvextend"));
+}
+
 #[tokio::test]
 async fn a_stale_peer_entry_never_clears_the_bitmap() {
     // restoredFrom without a present entry and a device: written before

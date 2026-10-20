@@ -959,8 +959,8 @@ impl Reconciler {
             reads.created.insert(format!("{vg}/{lv}"));
         }
         let restoring = s.restoring();
-        let may_grow = s.may_grow(created);
         let r = row.ok_or_else(|| format!("LV {vg}/{lv} missing after create"))?;
+        let may_grow = s.may_grow(created) || s.regrows(rebuilt && created, r.size_bytes);
         let mut changed = false;
         if !r.active {
             changed = true;
@@ -1704,6 +1704,34 @@ impl Step<'_> {
         self.prev
             .and_then(|p| p.last_error.as_deref())
             .is_some_and(is_lost)
+    }
+
+    /// The initial node of a restore, restored again this pass after a
+    /// loss, beside a diskful peer whose device is larger than this LV
+    /// gives: at the snapshot's size the attach would be refused and
+    /// nothing grows first. Grown before its metadata, it starts as the
+    /// sync source (no longer at the snapshot's size, so never clear-bitmap).
+    fn regrows(&self, restored_again: bool, lv_bytes: u64) -> bool {
+        if !(restored_again && self.restoring() && self.initial_node()) {
+            return false;
+        }
+        let usable = drbd_config::usable_bytes(lv_bytes, model::keys::PEER_SLOTS);
+        let larger = self.vol.status.iter().flat_map(|st| &st.replicas).any(|e| {
+            e.node != self.mine.node
+                && self
+                    .a
+                    .replicas
+                    .iter()
+                    .any(|p| p.node == e.node && drbd::is_diskful(p))
+                && e.size_bytes.is_some_and(|b| b > usable)
+        });
+        if larger {
+            tracing::warn!(
+                volume = self.vol.name_any(),
+                "restored again beside a grown peer: growing before attach"
+            );
+        }
+        larger
     }
 
     /// A restore that has not made its first data yet.
