@@ -293,9 +293,11 @@ async fn guest_clean(lvm: &Lvm) {
 }
 
 /// A PV and a VG `vg` on `dev`, written with a config that sees only `dev`.
+/// A guest writes its label whatever the host's LVM config says, so the
+/// host's global_filter is opened up too.
 async fn guest_vg(dev: &str, vg: &str, scan_lvs: u8) {
     let config = format!(
-        "devices {{ use_devicesfile = 0 scan_lvs = {scan_lvs} filter = [ \"a|^{dev}$|\", \"r|.*|\" ] }} {NO_BACKUP}"
+        "devices {{ use_devicesfile = 0 scan_lvs = {scan_lvs} global_filter = [ \"a|.*|\" ] filter = [ \"a|^{dev}$|\", \"r|.*|\" ] }} {NO_BACKUP}"
     );
     for cmd in [
         vec!["pvcreate", "--config", &config, dev],
