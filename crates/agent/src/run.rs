@@ -46,8 +46,8 @@ pub enum Error {
     },
     #[error("kubernetes client: {0}")]
     Kube(#[from] kube::Error),
-    #[error("kubernetes config: {0}")]
-    KubeConfig(String),
+    #[error("kubernetes config")]
+    KubeConfig(#[source] kube::config::InferConfigError),
     #[error("watch caches: {0}")]
     Watch(String),
     #[error("csi server: {0}")]
@@ -74,7 +74,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 async fn clients() -> Result<(Client, Client), Error> {
     let config = kube::Config::infer()
         .await
-        .map_err(|e| Error::KubeConfig(e.to_string()))?;
+        .map_err(Error::KubeConfig)?;
     let watch = Client::try_from(config.clone())?;
     let mut writes = config;
     writes.connect_timeout = Some(CONNECT_TIMEOUT);
