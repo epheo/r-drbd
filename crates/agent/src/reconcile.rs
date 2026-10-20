@@ -12,7 +12,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::api::{Patch, PatchParams};
 use kube::{Api, Client, ResourceExt};
 use lvm::report::{Lv, Vg};
@@ -176,7 +175,7 @@ impl StatusWrite {
         else {
             return Event::default();
         };
-        let now = Time(k8s_openapi::jiff::Timestamp::now());
+        let now = model::time::now();
         Event {
             metadata: ObjectMeta {
                 generate_name: Some(format!("{name}.")),
@@ -559,7 +558,7 @@ impl Reconciler {
             tracing::warn!(pool = pool.name_any(), error = %e, "pool unavailable");
         }
         let current = pool.status.clone().unwrap_or_default();
-        let now = Time(k8s_openapi::jiff::Timestamp::now());
+        let now = model::time::now();
         let mut conditions = current.conditions.clone();
         condition::set(
             &mut conditions,

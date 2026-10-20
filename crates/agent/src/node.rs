@@ -7,7 +7,7 @@ use std::time::Duration;
 use drbd_config::Features;
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
 use k8s_openapi::api::core::v1::{Event, EventSource, Node, ObjectReference};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta, Time};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta};
 use k8s_openapi::jiff::Timestamp;
 use kube::api::{Patch, PatchParams, PostParams};
 use kube::{Api, Client};
@@ -165,12 +165,12 @@ pub fn event_repeat(count: i32, message: &str) -> serde_json::Value {
     json!({
         "count": count.saturating_add(1),
         "message": message,
-        "lastTimestamp": Time(Timestamp::now()),
+        "lastTimestamp": model::time::now(),
     })
 }
 
 pub fn node_event(node: &str, uid: Option<String>, reason: &str, message: &str) -> Event {
-    let now = Time(Timestamp::now());
+    let now = model::time::now();
     Event {
         metadata: ObjectMeta {
             name: Some(event_name(node, reason)),
