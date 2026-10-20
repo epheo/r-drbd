@@ -497,41 +497,72 @@ pub fn lease(node: &str, namespace: &str, now: Timestamp, started: Timestamp) ->
     }
 }
 
-/// Renews the Lease forever and applies the Node annotations until they
-/// stick; failures are logged and retried on the next tick, the controller
-/// decides what a stale Lease means.
+/// Bound on one Lease write: a renewal never blocks past the renew interval.
+pub const LEASE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Renews the Lease forever, and applies the Node annotations until they
+/// stick in a task of their own. Failures are logged and retried on the
+/// next tick, the controller decides what a stale Lease means.
 pub async fn heartbeat(client: Client, namespace: String, node: String, tools: Tools) {
-    let api = Api::<Lease>::namespaced(client.clone(), &namespace);
+    tokio::spawn(annotate_until_done(client.clone(), node.clone(), tools));
+    let api = Api::<Lease>::namespaced(client, &namespace);
     let params = PatchParams::apply(&keys::agent_field_manager(&node)).force();
-    let name = keys::agent_lease_name(&node);
-    let mut annotated = false;
     // Whole seconds: probe records carry the run as a Time, which keeps no
     // more, and the controller compares the two for equality. Fixed for
     // this process, so overlapping pods of one node alternate between two
     // runs instead of minting a new one per renewal.
     let started = model::time::now().0;
-    let mut tick = tokio::time::interval(Duration::from_secs(keys::LEASE_RENEW_SECS));
+    let every = Duration::from_secs(keys::LEASE_RENEW_SECS);
+    renew_loop(
+        every,
+        Timestamp::now,
+        || true,
+        |now| {
+            let lease = lease(&node, &namespace, now, started);
+            let (api, params) = (api.clone(), params.clone());
+            let name = keys::agent_lease_name(&node);
+            async move {
+                api.patch(&name, &params, &Patch::Apply(&lease))
+                    .await
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            }
+        },
+    )
+    .await;
+}
+
+/// One renewal per tick while `may_renew`, each built at its own attempt
+/// and cut at [`LEASE_WRITE_TIMEOUT`]; the next tick is the retry.
+pub async fn renew_loop<C, M, R, F>(every: Duration, clock: C, may_renew: M, renew: R)
+where
+    C: Fn() -> Timestamp,
+    M: Fn() -> bool,
+    R: Fn(Timestamp) -> F,
+    F: std::future::Future<Output = Result<(), String>>,
+{
+    let mut tick = tokio::time::interval(every);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        let lease = lease(&node, &namespace, Timestamp::now(), started);
-        let patch = Patch::Apply(&lease);
-        let renewed = crate::retry::with_backoff(
-            &name,
-            &crate::retry::BACKOFF,
-            crate::retry::retryable,
-            || api.patch(&name, &params, &patch),
-        )
-        .await;
-        match renewed {
-            Ok(_) => tracing::trace!(lease = name, "lease renewed"),
-            Err(e) => tracing::warn!(lease = name, error = %e, "lease renewal failed"),
+        if !may_renew() {
+            continue;
         }
-        if !annotated {
-            match annotate(&client, &node, &tools).await {
-                Ok(()) => annotated = true,
-                Err(e) => tracing::warn!(node, error = %e, "node annotation failed"),
-            }
+        match tokio::time::timeout(LEASE_WRITE_TIMEOUT, renew(clock())).await {
+            Ok(Ok(())) => tracing::trace!("lease renewed"),
+            Ok(Err(error)) => tracing::warn!(%error, "lease renewal failed"),
+            Err(_) => tracing::warn!(bound = ?LEASE_WRITE_TIMEOUT, "lease renewal timed out"),
+        }
+    }
+}
+
+async fn annotate_until_done(client: Client, node: String, tools: Tools) {
+    let mut tick = tokio::time::interval(Duration::from_secs(keys::LEASE_RENEW_SECS));
+    loop {
+        tick.tick().await;
+        match annotate(&client, &node, &tools).await {
+            Ok(()) => return,
+            Err(e) => tracing::warn!(node, error = %e, "node annotation failed"),
         }
     }
 }
@@ -805,6 +836,43 @@ mod tests {
                 ("r-drbd.io/drbd-kernel", "9.2.16".to_owned()),
             ]
         );
+    }
+
+    /// Each attempt carries its own renewTime, and a hung write is cut so
+    /// the next tick comes on time.
+    #[tokio::test(start_paused = true)]
+    async fn renewal_is_fresh_per_attempt_and_bounded() {
+        let base = tokio::time::Instant::now();
+        let clock = move || {
+            let secs = i64::try_from(base.elapsed().as_secs()).unwrap();
+            Timestamp::from_second(1_700_000_000 + secs).unwrap()
+        };
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = seen.clone();
+        let task = tokio::spawn(renew_loop(
+            Duration::from_secs(10),
+            clock,
+            || true,
+            move |now| {
+                let first = {
+                    let mut s = rec.lock().unwrap();
+                    s.push((base.elapsed(), now));
+                    s.len() == 1
+                };
+                async move {
+                    if first {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(())
+                }
+            },
+        ));
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        let s = seen.lock().unwrap().clone();
+        assert_eq!(s.len(), 2, "{s:?}");
+        assert_eq!(s[1].0, Duration::from_secs(10), "hung first attempt cut");
+        assert!(s[1].1 > s[0].1, "later renewTime");
+        task.abort();
     }
 
     #[test]
