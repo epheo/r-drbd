@@ -139,6 +139,47 @@ fn sectors(minor: u32) -> u64 {
         .unwrap()
 }
 
+/// What a sync must carry: zero blocks travel as discards, so only written
+/// data proves one.
+const PAYLOAD: u64 = 64 * MIB;
+
+/// Writes PAYLOAD of random data at the start of `res` through its device,
+/// Primary for the write only; returns its sha256 line.
+async fn write_payload(res: &str, minor: u32) -> String {
+    assert_eq!(sh(&["drbdsetup", "primary", res]).await.exit_code, Some(0));
+    let out = sh(&[
+        "sh",
+        "-c",
+        &format!(
+            "dd if=/dev/urandom of=/dev/drbd{minor} bs=1M count={} oflag=direct status=none && dd if=/dev/drbd{minor} bs=1M count={} iflag=direct status=none | sha256sum",
+            PAYLOAD / MIB,
+            PAYLOAD / MIB
+        ),
+    ])
+    .await;
+    assert_eq!(
+        sh(&["drbdsetup", "secondary", res]).await.exit_code,
+        Some(0)
+    );
+    assert_eq!(out.exit_code, Some(0), "{out:?}");
+    out.stdout
+}
+
+/// The sha256 line of PAYLOAD at the start of a backing LV, read directly:
+/// the data area starts at offset 0 under internal metadata.
+async fn payload_on(lv: &str) -> String {
+    sh(&[
+        "sh",
+        "-c",
+        &format!(
+            "dd if=/dev/{VG}/{lv} bs=1M count={} iflag=direct status=none | sha256sum",
+            PAYLOAD / MIB
+        ),
+    ])
+    .await
+    .stdout
+}
+
 /// KiB received and sent by resync and replication on every peer device.
 async fn traffic(res: &str) -> (u64, u64) {
     let out = sh(&["drbdsetup", "status", "--json", "--statistics", res]).await;
@@ -505,6 +546,7 @@ async fn drbd_late_peer_full_syncs() {
     let tb = traffic("rw-b").await;
     println!("b, started with a: (received, sent) {tb:?} KiB");
     assert_eq!(tb, (0, 0), "no sync between the two that started");
+    let written = write_payload("rw-a", A.minor).await;
     // b's path to a would clash with e's in this one kernel: b goes down.
     assert_eq!(sh(&["drbdsetup", "down", "rw-b"]).await.exit_code, Some(0));
     wait(&h.tracker, "b down", |t| t.resource("rw-b").is_none()).await;
@@ -514,10 +556,12 @@ async fn drbd_late_peer_full_syncs() {
     .await;
     let (received, _) = traffic("rw-e").await;
     println!(
-        "late peer received {received} KiB of a {} KiB volume",
-        size / 1024
+        "late peer received {received} KiB of a {} KiB volume, {} KiB written",
+        size / 1024,
+        PAYLOAD / 1024
     );
-    assert!(received * 1024 >= size, "full sync");
+    assert!(received * 1024 >= PAYLOAD, "full sync carries the data");
+    assert_eq!(payload_on("rw-e").await, written, "the late peer holds it");
     for m in [&mut *a, &mut *b, &mut *e] {
         delete(&h, m).await;
     }
@@ -890,6 +934,7 @@ async fn drbd_lost_lv_is_rebuilt_and_synced() {
         m.pass(&[pool(&h.node).await], &[]).await;
     }
     assert!(b.entry.as_ref().is_some_and(|e| e.present));
+    let written = write_payload("rw-a", A.minor).await;
 
     // b's LV vanishes behind the agent's back.
     assert_eq!(sh(&["drbdsetup", "down", "rw-b"]).await.exit_code, Some(0));
@@ -900,8 +945,12 @@ async fn drbd_lost_lv_is_rebuilt_and_synced() {
     })
     .await;
     let (received, _) = traffic("rw-b").await;
-    println!("rebuilt replica received {received} KiB");
-    assert!(received * 1024 >= size, "full sync");
+    println!(
+        "rebuilt replica received {received} KiB, {} KiB written",
+        PAYLOAD / 1024
+    );
+    assert!(received * 1024 >= PAYLOAD, "full sync carries the data");
+    assert_eq!(payload_on("rw-b").await, written, "the rebuilt LV holds it");
     assert_eq!(b.error(), None);
     for m in [&mut *a, &mut *b] {
         delete(&h, m).await;
@@ -960,6 +1009,7 @@ async fn drbd_attachment_then_promoted() {
     );
     println!("a slots with d diskless: {before:?}");
     assert!(!before.contains(&1));
+    let written = write_payload("rw-a", A.minor).await;
 
     for m in [&mut *a, &mut *d] {
         let r = m
@@ -989,9 +1039,13 @@ async fn drbd_attachment_then_promoted() {
         .stdout,
     );
     let (received, _) = traffic("rw-d").await;
-    println!("a slots after the promotion: {after:?}; d received {received} KiB");
+    println!(
+        "a slots after the promotion: {after:?}; d received {received} KiB, {} KiB written",
+        PAYLOAD / 1024
+    );
     assert!(after.contains(&1), "bitmap slot for the promoted peer");
-    assert!(received * 1024 >= size, "full sync");
+    assert!(received * 1024 >= PAYLOAD, "full sync carries the data");
+    assert_eq!(payload_on("rw-d").await, written, "the new disk holds it");
     for m in [&mut *a, &mut *d] {
         delete(&h, m).await;
     }
