@@ -126,10 +126,14 @@ pub fn valid_volume_name(name: &str) -> bool {
 }
 
 /// Bounds of every call but the watches: a half-open connection fails
-/// the call instead of stalling the pass, CSI or the Lease for good. The
-/// read timeout is a socket idle timeout, which a quiet watch would hit.
+/// the call instead of stalling the pass, CSI or the Lease for good.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// The read timeout is a socket idle timeout: a quiet watch idles up to
+/// the server's watch timeout (290 s at most), so the bound sits above it.
+/// It still ends a LIST hung on a half-open connection, which would
+/// otherwise freeze that store.
+const WATCH_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The controller's two kube clients.
 #[derive(Clone)]
@@ -150,10 +154,16 @@ impl Clients {
     pub fn new(config: kube::Config) -> Result<Self, Error> {
         let build = |c| Client::try_from(c).map_err(|e| Error::kube("building the kube client", e));
         Ok(Self {
-            watch: build(config.clone())?,
+            watch: build(watch_config(config.clone()))?,
             request: build(request_config(config))?,
         })
     }
+}
+
+fn watch_config(mut config: kube::Config) -> kube::Config {
+    config.connect_timeout = Some(CONNECT_TIMEOUT);
+    config.read_timeout = Some(WATCH_READ_TIMEOUT);
+    config
 }
 
 fn request_config(mut config: kube::Config) -> kube::Config {
@@ -557,8 +567,11 @@ where
 mod tests {
     use std::sync::Arc;
 
+    use std::time::Duration;
+
     use super::{
-        CONNECT_TIMEOUT, Memory, READ_TIMEOUT, request_config, valid_name, valid_volume_name,
+        CONNECT_TIMEOUT, Memory, READ_TIMEOUT, WATCH_READ_TIMEOUT, request_config, valid_name,
+        valid_volume_name, watch_config,
     };
     use crate::volume::Outcome;
     use model::keys::{MINOR_RANGE, PORT_RANGE};
@@ -628,12 +641,17 @@ mod tests {
     }
 
     #[test]
-    fn only_requests_time_out() {
-        let watch = kube::Config::new("https://127.0.0.1:6443".parse().expect("url"));
-        assert_eq!(watch.read_timeout, None, "kube default; a watch idles");
-        let request = request_config(watch);
+    fn every_call_times_out() {
+        let base = kube::Config::new("https://127.0.0.1:6443".parse().expect("url"));
+        assert_eq!(base.read_timeout, None, "kube default");
+        let request = request_config(base.clone());
         assert_eq!(request.connect_timeout, Some(CONNECT_TIMEOUT));
         assert_eq!(request.read_timeout, Some(READ_TIMEOUT));
+        let watch = watch_config(base);
+        assert_eq!(watch.connect_timeout, Some(CONNECT_TIMEOUT));
+        assert_eq!(watch.read_timeout, Some(WATCH_READ_TIMEOUT));
+        // Above the longest server-side watch timeout plus margin.
+        assert!(WATCH_READ_TIMEOUT > Duration::from_secs(295));
     }
 
     #[test]
