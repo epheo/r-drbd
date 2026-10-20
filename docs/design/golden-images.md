@@ -96,7 +96,7 @@ Not in this design (section 13): backing chains or qcow2, asynchronous replicati
 
 ### 6.2 Where a holder copy lives
 
-- The agent's successful Taking ack records `takenPool` (the Pool that holds the snapshot LV), `lvBytes` (its size) and `allocatedBytes` (its thin allocation). Every later ack copies the three forward unchanged.
+- The agent's successful Taking ack records `takenPool` (the Pool that holds the snapshot LV), `lvBytes` (its size) and `allocatedBytes` (its thin allocation). Every later ack copies the three forward unchanged, and `digest` and `digestBytes` once they exist.
 - After that ack, `takenPool` alone decides where the node's snapshot LV lives for restores, holder lookups and deletes; the replica's current Pool never does. Before that ack the local replica's Pool is used: the round is still taking.
 - A delete on a node without `takenPool` (a lost ack) searches the thin pools of the node's Pools for the exact LV name; an LV of that name outside a Pool's thin pool is an error, never removed.
 - The controller records `status.sourceReplicas` on the way into Taking: the source's replica count survives the source Volume.
@@ -136,6 +136,7 @@ Not in this design (section 13): backing chains or qcow2, asynchronous replicati
 - Snapshot status lost: the deletion timestamp still marks the retire; the next pass rewrites Retired and recounts.
 - An ack lost (status loss, or an API error after the lvcreate): no `takenPool`; a delete takes the search path; a restore on that node finds no holder copy and the replica falls back with `NoLocalCopy`.
 - A holder node down during Deleting: the finalizer waits for its ack.
+- Snapshot status lost on a Ready Snapshot: `copiesIdentical` reads absent; each holder that finds its snapshot LV in its Pools (by the delete path's search) acks `takenPool`, `lvBytes`, `allocatedBytes` and a fresh digest again, and the controller rewrites `copiesIdentical`; `sourceReplicas` comes back only from two or more rediscovered holders whose snapshot LVs carry DRBD metadata, else it stays absent and replicated restores of the image are refused; restores meanwhile wait within the digest bound.
 - The source Volume deleted and recreated under its name, maybe in another Pool: the uid differs, so it is ignored, and the old image's LVs are found and removed through `takenPool` on every holder.
 - A holder's snapshot LV lost by hand: restores on that node fall back; the delete acks not found.
 
@@ -190,7 +191,7 @@ Guards: only an LV with no metadata tag and no attached DRBD disk is ever zeroed
 
 ### 7.3 The proof of a copy replica
 
-A replica's entry reports `copyOf` (the Snapshot uid) and `zeroedFrom` (la_size, from the zeroed tag only, never the intent tag) while all hold: the from tag, the zeroed tag, the LV at G. The no-sync start requires the image's `copiesIdentical` to be true and, on a live read, every connected diskful peer proven with the same `zeroedFrom` as the initial node. Equal `zeroedFrom` is the property the start needs: the same image end and the same zero start everywhere; it also catches a holder snapshotted mid-resize.
+A replica's entry reports `copyOf` (the Snapshot uid) and `zeroedFrom` (la_size, from the zeroed tag only, never the intent tag) while all hold: the from tag, the zeroed tag, the LV at G. The no-sync start requires the image's `copiesIdentical` to be true and, on a live read, every assigned diskful peer connected and proven with the same `zeroedFrom` as the initial node. Equal `zeroedFrom` is the property the start needs: the same image end and the same zero start everywhere; it also catches a holder snapshotted mid-resize.
 
 A parser test on captured real dump-md output pins the fields: a value parsed wrong but inside the accepted range passes the checks, and only that test catches it.
 
@@ -199,7 +200,7 @@ A parser test on captured real dump-md output pins the fields: a value parsed wr
 - A peer becomes a fallback when its Pool has no local copy and no warm copy in progress (`NoLocalCopy`, `CopyNotUsable`), the lvcreate failed (`RestoreFailed`), a check failed (`ProofFailed`), or the Snapshot is gone or of another uid (`SnapshotNotFound`). After a restart the reason reads `Unknown`. The entry carries `fallback: <reason>`, derived every pass from the tags: an LV in its Pool with no from tag for this Volume and Snapshot. A missing field means unknown, never fallback.
 - None of these makes the initial node a fallback: its restore does not start, and the error names the cause.
 - Its LV: a new empty thin LV at G with `r-drbd.new`; a warm Volume's target at exactly `lvBytes`; after a failed check, every tag of this design except `r-drbd.new` is dropped and the LV extended to G; the full sync overwrites the content.
-- The marked entry is written before any other step of the replica.
+- The marked entry is written before any other step of the replica, for reporting: under the strict rule a connected unproven peer forces the sync source whatever its mark.
 - A fallback comes up like any replica: resource file, create-md at G, up; DRBD syncs it in full from an UpToDate peer, zero chunks as discards. It is never declared in sync: the no-sync start requires every assigned diskful peer connected and proven, so a fallback forces the sync source (7.5). One `RestoreFullSync` Event names the replica and its reason.
 
 ### 7.5 First data (initial node)
@@ -225,7 +226,7 @@ A parser test on captured real dump-md output pins the fields: a value parsed wr
 - Status lost: `copyOf`, `zeroedFrom`, `fallback` come back from the tags; preparation never touches an LV with a metadata tag; first data still refuses while any replica holds data.
 - Image copy lost after the lvcreate: the replica keeps its blocks (dm-thin refcounts); before: `NoLocalCopy`, or a new warm copy.
 - A peer down before the first data: the initial node waits 60 s, then starts as the sync source with the connected peers; the peer joins later, with checksums when it is a copy.
-- Snapshot status lost: the acks' `lvBytes` go with it, so a fallback sizes its LV without the floor; a too-small LV is refused by DRBD and the error shows.
+- Snapshot status lost: the acks' `lvBytes` go with it until the holders are rediscovered (6.7); meanwhile a fallback sizes its LV without the floor, and a too-small LV is refused by DRBD with the error shown.
 - The initial node down before the first data: nothing starts until it returns; moving the initial node is a later liveness item.
 
 ### 7.8 Snapshots of local volumes
@@ -467,7 +468,7 @@ Placement:
 
 ## 16. Documentation
 
-- snapshots.md and data-safety.md: a replicated restore starts at its requested size with no grow and no sync; the proof in plain words (each replica's copy is tagged at creation, the old metadata area is zeroed and flushed, the replicas agree on where the image ends); a replica that cannot use its copy starts empty, waits for the first data, and alone is copied in full; every later grow syncs; a warm copy as the third owner of an LV; deleting a VolumeSnapshot keeps the image while disks use it.
+- snapshots.md and data-safety.md: a replicated restore starts at its requested size with no grow and no sync; the proof in plain words (each replica's copy is tagged at creation, the old metadata area is zeroed and flushed, the replicas agree on where the image ends); a replica that cannot use its copy starts empty and is copied in full, and the copies then sync with checksums, so they stay thin; every later grow syncs; a warm copy as the third owner of an LV; deleting a VolumeSnapshot keeps the image while disks use it.
 - pools.md: no restore exemption; warm copies, their budget and eviction; retained bytes.
 - volumes.md: the `capacity` parameter.
 - operations.md: repairs and evictions from an image copy.
