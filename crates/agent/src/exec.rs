@@ -56,6 +56,13 @@ pub const MKFS_TIMEOUT: ExecMode = ExecMode::Timeout {
 /// drbd-utils, so the host needs only the kernel module.
 const IMAGE_TOOLS: [&str; 3] = ["drbdadm", "drbdsetup", "drbdmeta"];
 
+/// The prefix for [`TokioExec::new`] that runs each command in the mount
+/// namespace under `ns` (e.g. /proc/1/ns) through the host-exec role of the
+/// r-drbd binary `exe`.
+pub fn host_exec_prefix(exe: &str, ns: &str) -> Vec<String> {
+    argv(&[exe, "host-exec", ns, "--"])
+}
+
 #[derive(Debug, Clone)]
 pub struct TokioExec {
     prefix: Vec<String>,
@@ -80,8 +87,8 @@ impl Drop for Finishing {
 
 impl TokioExec {
     /// `prefix` goes in front of every argv at spawn time, e.g.
-    /// `[/proc/self/exe, host-exec, <ns>, --]` to run in the host mount
-    /// namespace. Logs and errors keep naming the original command.
+    /// [`host_exec_prefix`] to run in the host mount namespace.
+    /// Logs and errors keep naming the original command.
     pub fn new(prefix: Option<Vec<String>>) -> Self {
         Self {
             prefix: prefix.unwrap_or_default(),
@@ -549,6 +556,14 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(3));
         assert_eq!(out.exit_code, Some(0));
         assert_eq!(out.stdout, "hi\n");
+    }
+
+    #[test]
+    fn host_exec_prefix_shape() {
+        assert_eq!(
+            host_exec_prefix("/r-drbd", "/proc/1/ns"),
+            ["/r-drbd", "host-exec", "/proc/1/ns", "--"]
+        );
     }
 
     #[tokio::test]

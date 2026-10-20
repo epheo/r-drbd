@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use agent::drbd::{self, Notify};
 use agent::events2::Tracker;
-use agent::exec::TokioExec;
 use agent::reconcile::{DrbdEnv, Reconciler, StatusWrite};
 use agent::watch::Trigger;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
@@ -49,7 +48,7 @@ impl Drop for Host {
 }
 
 async fn start() -> Host {
-    let exec: Arc<dyn agent::Exec> = Arc::new(TokioExec::default());
+    let exec: Arc<dyn agent::Exec> = Arc::new(super::exec());
     let tools = agent::node::probe(exec.as_ref()).await;
     let features = tools.drbd().expect("DRBD tools and module on the host");
     println!("features: {features:?}");
@@ -925,7 +924,7 @@ impl Firewall {
             "table inet {FW_TABLE} {{\n chain input {{\n  type filter hook input priority -300; policy accept;\n  ip daddr {{ 127.0.0.1, 127.0.0.2 }} tcp dport {{ {}, {} }} reject with icmpx type admin-prohibited\n  ip daddr 127.0.0.3 tcp dport 11992 drop\n }}\n}}\n",
             A.port, B.port
         );
-        let mut child = std::process::Command::new("nft")
+        let mut child = super::host_command("nft")
             .args(["-f", "-"])
             .stdin(std::process::Stdio::piped())
             .spawn()
@@ -937,7 +936,7 @@ impl Firewall {
     }
 
     fn remove() {
-        let _ = std::process::Command::new("nft")
+        let _ = super::host_command("nft")
             .args(["delete", "table", "inet", FW_TABLE])
             .stderr(std::process::Stdio::null())
             .status();

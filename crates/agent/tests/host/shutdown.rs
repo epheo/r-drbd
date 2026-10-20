@@ -1,10 +1,9 @@
 //! The shutdown guard's host probes on a running host: read-only queries,
-//! nothing is demoted or signalled. `R_DRBD_HOST_EXEC=<r-drbd binary>`
-//! runs them through its host-exec, as the agent does in its pod.
+//! nothing is demoted or signalled. With `R_DRBD_HOST_NS` set they run
+//! through host-exec, as the agent does in its pod.
 
 use std::sync::Arc;
 
-use agent::exec::TokioExec;
 use agent::node;
 use agent::shutdown::{self, Answer, PodProbe, Verdict};
 use k8s_openapi::api::core::v1::Pod;
@@ -12,11 +11,7 @@ use k8s_openapi::api::core::v1::Pod;
 use super::enabled;
 
 fn exec() -> Arc<dyn agent::Exec> {
-    let prefix = std::env::var("R_DRBD_HOST_EXEC").ok().map(|bin| {
-        println!("through {bin} host-exec");
-        vec![bin, "host-exec".into(), "/proc/1/ns".into(), "--".into()]
-    });
-    Arc::new(TokioExec::new(prefix))
+    Arc::new(super::exec())
 }
 
 struct NoApi;
