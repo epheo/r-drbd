@@ -48,6 +48,10 @@ pub struct DrbdEnv {
     pub init_wait: Duration,
     /// First wait before a plan that came back is adjusted again.
     pub repeat_backoff: Duration,
+    /// This host's kernel node name, for its own `on` section: drbdadm
+    /// finds its host by uname, which may differ from the Kubernetes
+    /// node name. None uses the node name.
+    pub host_name: Option<String>,
 }
 
 impl DrbdEnv {
@@ -73,6 +77,7 @@ impl DrbdEnv {
             init_wait: Duration::from_secs(60),
             // One pass interval: a plan back on the next pass waits a pass.
             repeat_backoff: Duration::from_secs(30),
+            host_name: None,
         }
     }
 }
@@ -864,6 +869,7 @@ impl Reconciler {
     ) -> Result<(), String> {
         let inputs = FileInputs {
             node: &self.node,
+            host_name: self.drbd.host_name.as_deref().unwrap_or(&self.node),
             volume: name,
             assignment: s.a,
             backing: backing.map(|(p, _)| p),

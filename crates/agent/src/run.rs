@@ -20,7 +20,8 @@ const DRBD_INCLUDE_FILE: &str = "r-drbd.res";
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Kubernetes node name; also the DRBD host name and the CSI node id.
+    /// Kubernetes node name; also the CSI node id and the DRBD name peers
+    /// know this host by.
     pub node: String,
     /// Namespace of the heartbeat Lease.
     pub namespace: String,
@@ -118,8 +119,10 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
     }
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let inv = spawn_inventory(&cfg.node, &client, &exec, &stores, &stop_rx);
+    let mut drbd_env = DrbdEnv::new(features, cfg.res_dir.clone(), tracker.clone());
+    drbd_env.host_name = host_name();
     let reconciler = Reconciler::new(cfg.node.clone(), exec.clone())
-        .with_drbd(DrbdEnv::new(features, cfg.res_dir.clone(), tracker.clone()))
+        .with_drbd(drbd_env)
         .with_disks(inv.disks.clone())
         .with_disk_lock(inv.lock.clone())
         .with_live(Arc::new(KubeLiveVolumes::new(client.clone())));
@@ -197,6 +200,14 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
         e.abort();
     }
     result
+}
+
+/// The kernel node name (uname -n); the pod shares the host's with hostNetwork.
+fn host_name() -> Option<String> {
+    let name = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .inspect_err(|e| tracing::warn!(error = %e, "host name unreadable; using the node name"))
+        .ok()?;
+    Some(name.trim().to_owned()).filter(|n| !n.is_empty())
 }
 
 /// `drbdsetup events2` from the image (no host prefix) feeding the tracker.
