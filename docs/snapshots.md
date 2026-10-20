@@ -72,7 +72,9 @@ Rules:
 
 - A local restore (`replicas: 1`) uses one of the nodes holding the snapshot.
 - A replicated restore needs `replicas` equal to the number of nodes holding the snapshot.
-  The first node restores the snapshot; DRBD copies it in full to the other replicas, which start empty.
+  Every node holding the snapshot restores it from its own copy, so the restore is instant, shares blocks on every node and needs no sync.
+  The copies are identical because the snapshot was taken with IO suspended on every replica.
+- A replicated restore larger than its snapshot is copied in full from one node to the others, as is a replica that could not restore its copy.
 - The requested size may be larger than the snapshot; it may not be smaller.
 - Pins that point away from the snapshot's nodes or Pools fail the restore with reason `RestoreNodeConflict`.
 - The claim must still fit the scheduler's capacity check (see [Scheduling](volumes.md#scheduling)), although placement never charges a restore against capacity.
@@ -87,3 +89,4 @@ Snapshot it, then restore the snapshot.
 ## Deleting
 
 Deleting the VolumeSnapshot (deletion policy Delete) deletes the Snapshot, and each node removes its snapshot LV.
+A Snapshot that a restore still reads from stays until the restored volume is first Ready; a node holding a copy for that restore keeps it until then.
