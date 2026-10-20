@@ -104,19 +104,57 @@ rules:
 ";
 const AUDIT_LOG: &str = "audit.log";
 
+/// One of `MAX_PARALLEL` apiserver slots, released on drop: a panic part
+/// way through `Env::start` must not leave later tests waiting forever.
+struct Slot;
+
+impl Slot {
+    fn take() -> Self {
+        let mut n = SLOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *n >= MAX_PARALLEL {
+            n = FREED
+                .wait(n)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *n += 1;
+        Self
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut n = SLOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *n -= 1;
+        FREED.notify_one();
+    }
+}
+
+/// A child process killed on drop; a plain `Child` outlives the test.
+struct Killed(Child);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Fields drop in order: the processes stop before their directory goes
+/// and before the slot frees.
 pub struct Env {
+    apiserver: Killed,
+    etcd: Killed,
     pub dir: TempDir,
     pub kubeconfig: PathBuf,
-    etcd: Child,
-    apiserver: Child,
+    _slot: Slot,
 }
 
 impl Drop for Env {
     fn drop(&mut self) {
-        let _ = self.apiserver.kill();
-        let _ = self.etcd.kill();
-        let _ = self.apiserver.wait();
-        let _ = self.etcd.wait();
         if std::env::var_os("R_DRBD_KEEP_ENVTEST").is_some() {
             let path = self.dir.path().to_owned();
             eprintln!("envtest dir kept: {}", path.display());
@@ -125,43 +163,36 @@ impl Drop for Env {
                 TempDir::new().expect("tempdir"),
             ));
         }
-        let mut n = SLOTS.lock().expect("slots");
-        *n -= 1;
-        FREED.notify_one();
     }
 }
 
 impl Env {
     /// Starts etcd and kube-apiserver, installs the CRDs and the namespace.
     pub async fn start(assets: &Path) -> Self {
-        {
-            let mut n = SLOTS.lock().expect("slots");
-            while *n >= MAX_PARALLEL {
-                n = FREED.wait(n).expect("slots");
-            }
-            *n += 1;
-        }
+        let slot = Slot::take();
         let dir = tempfile::Builder::new()
             .prefix("r-drbd-envtest-")
             .tempdir()
             .expect("tempdir");
         let d = dir.path();
         let (client_port, peer_port, api_port) = (free_port(), free_port(), free_port());
-        let etcd = Command::new(assets.join("etcd"))
-            .args([
-                "--name=default".to_owned(),
-                format!("--data-dir={}", d.join("etcd").display()),
-                format!("--listen-client-urls=http://127.0.0.1:{client_port}"),
-                format!("--advertise-client-urls=http://127.0.0.1:{client_port}"),
-                format!("--listen-peer-urls=http://127.0.0.1:{peer_port}"),
-                format!("--initial-advertise-peer-urls=http://127.0.0.1:{peer_port}"),
-                format!("--initial-cluster=default=http://127.0.0.1:{peer_port}"),
-                "--unsafe-no-fsync=true".to_owned(),
-            ])
-            .stdout(log_file(d, "etcd.log"))
-            .stderr(log_file(d, "etcd.err"))
-            .spawn()
-            .expect("start etcd");
+        let etcd = Killed(
+            Command::new(assets.join("etcd"))
+                .args([
+                    "--name=default".to_owned(),
+                    format!("--data-dir={}", d.join("etcd").display()),
+                    format!("--listen-client-urls=http://127.0.0.1:{client_port}"),
+                    format!("--advertise-client-urls=http://127.0.0.1:{client_port}"),
+                    format!("--listen-peer-urls=http://127.0.0.1:{peer_port}"),
+                    format!("--initial-advertise-peer-urls=http://127.0.0.1:{peer_port}"),
+                    format!("--initial-cluster=default=http://127.0.0.1:{peer_port}"),
+                    "--unsafe-no-fsync=true".to_owned(),
+                ])
+                .stdout(log_file(d, "etcd.log"))
+                .stderr(log_file(d, "etcd.err"))
+                .spawn()
+                .expect("start etcd"),
+        );
 
         let key = d.join("sa.key");
         let status = Command::new("openssl")
@@ -179,31 +210,33 @@ impl Env {
         )
         .expect("token file");
         std::fs::write(d.join("audit-policy.yaml"), AUDIT_POLICY).expect("audit policy");
-        let apiserver = Command::new(assets.join("kube-apiserver"))
-            .args([
-                format!("--etcd-servers=http://127.0.0.1:{client_port}"),
-                format!("--secure-port={api_port}"),
-                "--bind-address=127.0.0.1".to_owned(),
-                "--advertise-address=127.0.0.1".to_owned(),
-                format!("--cert-dir={}", d.join("certs").display()),
-                "--service-account-issuer=https://kubernetes.default.svc".to_owned(),
-                format!("--service-account-key-file={}", key.display()),
-                format!("--service-account-signing-key-file={}", key.display()),
-                format!("--token-auth-file={}", d.join("tokens.csv").display()),
-                "--authorization-mode=AlwaysAllow".to_owned(),
-                "--service-cluster-ip-range=10.0.0.0/24".to_owned(),
-                "--disable-admission-plugins=ServiceAccount".to_owned(),
-                "--allow-privileged=true".to_owned(),
-                format!(
-                    "--audit-policy-file={}",
-                    d.join("audit-policy.yaml").display()
-                ),
-                format!("--audit-log-path={}", d.join(AUDIT_LOG).display()),
-            ])
-            .stdout(log_file(d, "apiserver.log"))
-            .stderr(log_file(d, "apiserver.err"))
-            .spawn()
-            .expect("start kube-apiserver");
+        let apiserver = Killed(
+            Command::new(assets.join("kube-apiserver"))
+                .args([
+                    format!("--etcd-servers=http://127.0.0.1:{client_port}"),
+                    format!("--secure-port={api_port}"),
+                    "--bind-address=127.0.0.1".to_owned(),
+                    "--advertise-address=127.0.0.1".to_owned(),
+                    format!("--cert-dir={}", d.join("certs").display()),
+                    "--service-account-issuer=https://kubernetes.default.svc".to_owned(),
+                    format!("--service-account-key-file={}", key.display()),
+                    format!("--service-account-signing-key-file={}", key.display()),
+                    format!("--token-auth-file={}", d.join("tokens.csv").display()),
+                    "--authorization-mode=AlwaysAllow".to_owned(),
+                    "--service-cluster-ip-range=10.0.0.0/24".to_owned(),
+                    "--disable-admission-plugins=ServiceAccount".to_owned(),
+                    "--allow-privileged=true".to_owned(),
+                    format!(
+                        "--audit-policy-file={}",
+                        d.join("audit-policy.yaml").display()
+                    ),
+                    format!("--audit-log-path={}", d.join(AUDIT_LOG).display()),
+                ])
+                .stdout(log_file(d, "apiserver.log"))
+                .stderr(log_file(d, "apiserver.err"))
+                .spawn()
+                .expect("start kube-apiserver"),
+        );
 
         let kubeconfig = d.join("kubeconfig");
         std::fs::write(
@@ -214,10 +247,11 @@ impl Env {
         )
         .expect("kubeconfig");
         let env = Self {
+            apiserver,
+            etcd,
             dir,
             kubeconfig,
-            etcd,
-            apiserver,
+            _slot: slot,
         };
         env.wait_up().await;
         env.install().await;
