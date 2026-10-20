@@ -284,6 +284,12 @@ pub struct ReplicaStatus {
     pub observed_generation: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// The source Snapshot this replica's backing LV was restored from,
+    /// while that Snapshot exists. The initial node starts a restore
+    /// without a sync only when every diskful replica reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 253))]
+    pub restored_from: Option<String>,
     /// Peers whose DRBD connection has stayed out of Connected for a while,
     /// with what a TCP connect to their DRBD port found.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

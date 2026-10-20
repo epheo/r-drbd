@@ -623,6 +623,7 @@ impl Reconciler {
                 .or_else(|| prev.and_then(|p| p.allocated_bytes)),
             observed_generation: prev.and_then(|p| p.observed_generation),
             last_error: None,
+            restored_from: None,
         };
         match self
             .drbd_apply(reads, pools, snapshots, &step, &mut facts)

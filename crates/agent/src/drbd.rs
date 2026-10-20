@@ -543,6 +543,8 @@ pub struct Facts {
     pub allocated_bytes: Option<u64>,
     pub observed_generation: Option<i64>,
     pub last_error: Option<String>,
+    /// The source Snapshot the backing LV provably came from.
+    pub restored_from: Option<String>,
 }
 
 /// This node's status entry for a DRBD volume. `sectors` is the sysfs
@@ -572,6 +574,7 @@ pub fn entry(
         size_bytes,
         observed_generation: facts.observed_generation,
         last_error: facts.last_error.clone(),
+        restored_from: facts.restored_from.clone(),
         unreachable_peers: Vec::new(),
     }
 }
