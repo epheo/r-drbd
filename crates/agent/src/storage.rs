@@ -453,6 +453,15 @@ pub fn host_scan_warning(
 /// replaces it lives in `drbd::md_tag`.
 pub const NEW_TAG: &str = "r-drbd.new";
 
+pub const FROM_TAG_PREFIX: &str = "r-drbd.from.";
+
+/// Set by the lvcreate that restores a DRBD backing LV from a snapshot
+/// and kept for the LV's life: the on-disk proof that its data is that
+/// snapshot's, which lets a restore start without a sync.
+pub fn from_tag(snapshot_uid: &str) -> String {
+    format!("{FROM_TAG_PREFIX}{snapshot_uid}")
+}
+
 /// Pool capacity from one lvs read of the VG.
 pub fn pool_capacity(lvs: &[Lv], thin: &str) -> Result<PoolCapacity, String> {
     let pool = lvs

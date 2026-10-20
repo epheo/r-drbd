@@ -711,6 +711,13 @@ impl Reconciler {
             self.sweep_slots(s, &name, &b.row.path).await;
         }
 
+        let restored = match &backing {
+            Some((b, _, place)) => {
+                self.restored_from(reads, snapshots, s, place, &b.row.name)
+                    .await?
+            }
+            None => None,
+        };
         if let Some((b, _, place)) = &backing
             && let Err(e) = self.ensure_metadata(reads, s, place, b).await
         {
@@ -726,6 +733,7 @@ impl Reconciler {
             }
             return Err(e);
         }
+        facts.restored_from.clone_from(&restored);
 
         if let Some(r) = s.res
             && r.suspended_by_user()
@@ -824,9 +832,10 @@ impl Reconciler {
     /// this pass created it (a restore of a smaller snapshot).
     /// A lost LV is rebuilt empty once the volume is initialized: its peers
     /// hold the data, and a restore would bring back older data. Before
-    /// that, the initial node of a restore always restores, a rebuild too:
-    /// nobody else holds the data, and an empty copy would become the
-    /// source.
+    /// that, every diskful replica of a restore restores from its own copy
+    /// of the snapshot, a rebuild too: the copies are identical, so the
+    /// first data needs no sync, and an empty copy on the initial node
+    /// would become the source.
     async fn ensure_drbd_lv(
         &self,
         reads: &mut Reads,
@@ -848,10 +857,7 @@ impl Reconciler {
         let extent = reads.vg(&self.lvm, vg).await?.extent_bytes;
         let desired = storage::desired_bytes(gross_bytes(vol), extent);
         let rebuilt = row.is_none() && lost_after_report(prev);
-        // Only the initial node's copy of a restore is ever read: the
-        // others full-sync from it, so they start empty.
-        let restore =
-            row.is_none() && vol.spec.source.is_some() && s.initial_node() && !s.initialized();
+        let restore = row.is_none() && vol.spec.source.is_some() && !s.initialized();
         if row.is_none() {
             let created = if restore {
                 if rebuilt {
@@ -929,6 +935,35 @@ impl Reconciler {
             rebuilt,
             restored: restore,
         })
+    }
+
+    /// The source Snapshot's name while the volume is not initialized, this
+    /// replica's LV carries the from tag and that Snapshot still exists with
+    /// the uid in the tag. Read from LVM each pass, never remembered.
+    async fn restored_from(
+        &self,
+        reads: &mut Reads,
+        snapshots: &[Arc<Snapshot>],
+        s: &Step<'_>,
+        place: &Place,
+        lv: &str,
+    ) -> Result<Option<String>, String> {
+        let Some(src) = &s.vol.spec.source else {
+            return Ok(None);
+        };
+        if s.initialized() {
+            return Ok(None);
+        }
+        let Some(uid) = snapshots
+            .iter()
+            .find(|x| x.name_any() == src.snapshot)
+            .and_then(|x| x.metadata.uid.as_deref())
+        else {
+            return Ok(None);
+        };
+        let tag = storage::from_tag(uid);
+        let tags = reads.tags(&self.lvm, &place.vg, lv).await?;
+        Ok(tags.contains(&tag).then(|| src.snapshot.clone()))
     }
 
     /// Ownership comes from the LV's tags only:
