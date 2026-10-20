@@ -1608,3 +1608,44 @@ async fn peer_unreachable_while_provisioning() {
     // The reboot's short False was inside the grace: one Warning only.
     assert_eq!(events_of(&client, "rep", "PeerUnreachable").await.len(), 1);
 }
+
+/// A holder whose Node is gone took its snapshot LV with it; one whose
+/// agent is only stale may come back holding it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_delete_skips_a_gone_holder() {
+    let assets = require_envtest!();
+    let (_env, client, _cfg, _ctl) = setup(&assets).await;
+    cluster(&client).await;
+    let auto: Vec<_> = ["n1", "n2", "n3"]
+        .iter()
+        .map(|n| FakeAgent::new(&client, n).spawn_auto())
+        .collect();
+    create_volume(&client, "src", volume_spec(GIB, 2, "fast")).await;
+    volume_where(&client, "src", |v| phase_of(v) == VolumePhase::Ready).await;
+    create_snapshot(&client, "snap", "src").await;
+    snap_in(&client, "snap", SnapshotPhase::Ready).await;
+    for a in auto {
+        a.abort();
+    }
+    Api::<model::Snapshot>::all(client.clone())
+        .delete("snap", &DeleteParams::default())
+        .await
+        .expect("delete snapshot");
+    snap_in(&client, "snap", SnapshotPhase::Deleting).await;
+    FakeAgent::new(&client, "n1")
+        .ack("snap", SnapshotPhase::Deleting, true, Some("p1"))
+        .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        support::get_snapshot(&client, "snap").await.is_some(),
+        "released while n2 may hold its LV"
+    );
+    support::delete_node(&client, "n2").await;
+    support::eventually(Duration::from_secs(20), || async {
+        support::get_snapshot(&client, "snap")
+            .await
+            .is_none()
+            .then_some(())
+    })
+    .await;
+}
