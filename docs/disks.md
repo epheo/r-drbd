@@ -26,7 +26,7 @@ Writes, only for a Pool with `devices`, only on paths it lists, only after the c
 
 Never:
 
-- `--yes`, `--force` or `-ff` on any LVM command; LVM's own refusal of a used disk stays in force;
+- `--yes` on any command in this table, or `--force` or `-ff` on any LVM command; LVM's own refusal of a used disk stays in force;
 - `wipefs -a`, `pvcreate` on its own, `vgreduce`, `pvmove`;
 - any command on a VG without the Pool's tag, beyond reports;
 - any write on a disk only NodeDisks knows about: the inventory reads.
