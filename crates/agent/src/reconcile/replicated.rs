@@ -1039,7 +1039,8 @@ impl Reconciler {
         desired: u64,
     ) -> (Result<(), String>, bool) {
         let vg = place.vg.as_str();
-        let created = if s.initial_node() || source.is_some_and(self.drbd.copies_identical) {
+        let identical = source.is_some_and(self.drbd.copies_identical);
+        let created = if s.initial_node() || identical {
             self.create_lv(rows, source, place, s.vol, lv, desired)
                 .await
         } else {
@@ -1047,12 +1048,13 @@ impl Reconciler {
         };
         match created {
             Err(e) if !s.initial_node() => {
-                tracing::warn!(
-                    lv,
-                    vg,
-                    error = %e,
-                    "cannot restore this node's copy: empty LV, full sync from the initial node"
-                );
+                let why = "cannot restore this node's copy: empty LV, full sync from the initial node";
+                // Until digests prove copies, every restore takes this path.
+                if identical {
+                    tracing::warn!(lv, vg, error = %e, "{why}");
+                } else {
+                    tracing::info!(lv, vg, error = %e, "{why}");
+                }
                 let r = self
                     .lvm
                     .create(vg, &place.thin, lv, desired, &[storage::NEW_TAG])
