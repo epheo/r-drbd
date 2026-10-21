@@ -119,16 +119,12 @@ fn lv_time() -> Time {
     Time(k8s_openapi::jiff::Timestamp::from_second(LV_TIME).unwrap())
 }
 
-/// The tag reads around a restore of `lv` from `source`, the LV of
-/// Snapshot `snapshot`: the source carries its tag, the copy none.
+/// A restore of `lv` from `source`, the LV of Snapshot `snapshot`, after
+/// the read of the tag that makes it the snapshot's copy.
 fn expect_restore(x: &ScriptedExec, source: &str, snapshot: &str, lv: &str) {
     let tag = snap_tag(snapshot);
     x.expect(lvm::cmd::lv_tags(VG), ok(&tags_out(&[(source, &[&tag])])));
     x.expect(lvm::cmd::restore(VG, source, lv, &[]), ok(""));
-    x.expect(
-        lvm::cmd::lv_tags(VG),
-        ok(&tags_out(&[(source, &[&tag]), (lv, &[])])),
-    );
 }
 
 fn taken_ack(phase: SnapshotPhase, pool: &str) -> SnapshotAck {
@@ -569,32 +565,6 @@ async fn a_restore_reads_only_a_copy_with_its_snapshots_tag() {
             Some("snapshot LV vg1/pvc-1+snap-1 has no tag of this snapshot: not its copy")
         );
     }
-
-    // A snap tag the copy inherited goes in one lvchange.
-    let x = Arc::new(ScriptedExec::new());
-    let snap_lv = lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive);
-    let tag = snap_tag("snap-1");
-    reads(&x, std::slice::from_ref(&snap_lv));
-    x.expect(
-        lvm::cmd::lv_tags(VG),
-        ok(&tags_out(&[("pvc-1+snap-1", &[&tag])])),
-    );
-    x.expect(lvm::cmd::restore(VG, "pvc-1+snap-1", "pvc-2", &[]), ok(""));
-    x.expect(
-        lvm::cmd::lv_tags(VG),
-        ok(&tags_out(&[("pvc-1+snap-1", &[&tag]), ("pvc-2", &[&tag])])),
-    );
-    x.expect(lvm::cmd::change_tags(VG, "pvc-2", &[], &[&tag]), ok(""));
-    expect_lvs(&x, &[snap_lv, lv_row("pvc-2", GIB_KIB, St::Active)]);
-    let mut v = volume("pvc-2", GIB, 1);
-    v.spec.source = Some(source("snap-1"));
-    let w = run(
-        &x,
-        vec![v],
-        vec![snapshot("snap-1", "pvc-1", SnapshotPhase::Ready)],
-    )
-    .await;
-    assert!(volume_writes(&w)[0].1.present);
 }
 
 #[tokio::test]

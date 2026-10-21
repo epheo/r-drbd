@@ -408,7 +408,6 @@ pub fn parse_tags(json: &str) -> Result<HashMap<String, Vec<String>>, ReportErro
         .collect())
 }
 
-/// Tags and creation time per LV name.
 pub fn parse_tagged(json: &str) -> Result<HashMap<String, Tagged>, ReportError> {
     let d: Doc<LvSection<RawTags>> = doc("lvs", json)?;
     Ok(d.report

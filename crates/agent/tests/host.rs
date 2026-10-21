@@ -634,6 +634,11 @@ async fn reconcile_decision_table() {
     println!("restore: {e:?}");
     assert!(e.present && e.last_error.is_none());
     assert_eq!(e.size_bytes, Some(3 * GIB));
+    let tags = &lvm().tagged(VG).await.unwrap()["rw-l-r2"].tags;
+    assert!(
+        !tags.iter().any(|t| agent::storage::is_snap_tag(t)),
+        "a restore never carries the snap tag: {tags:?}"
+    );
 
     let mut del1 = grown.clone();
     let mut del2 = v2.clone();

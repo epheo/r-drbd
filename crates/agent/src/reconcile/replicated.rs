@@ -124,7 +124,6 @@ fn holds_freeze(s: &Snapshot) -> bool {
         }
 }
 
-/// A Snapshot that lost its status or is finding its copies again.
 fn rebuilding(s: &Snapshot) -> bool {
     s.status_lost() || s.status.as_ref().and_then(|st| st.phase) == Some(SnapshotPhase::Discovering)
 }

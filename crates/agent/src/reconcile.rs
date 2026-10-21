@@ -1074,25 +1074,10 @@ impl Reconciler {
             ));
         }
         tracing::info!(lv, source, vg, "restoring volume LV from snapshot");
+        // LVM copies no tags to a thin snapshot, so the copy never carries
+        // the snap tag; the host suite checks it.
         self.lvm
             .restore(vg, &source, lv, tags)
-            .await
-            .map_err(|e| e.to_string())?;
-        // LVM copies no tags to a thin snapshot; a copy must never pass
-        // for the snapshot itself if one ever does.
-        let tagged = self.lvm.tags(vg).await.map_err(|e| e.to_string())?;
-        let inherited: Vec<&str> = tagged
-            .get(lv)
-            .into_iter()
-            .flatten()
-            .filter(|t| storage::is_snap_tag(t))
-            .map(String::as_str)
-            .collect();
-        if inherited.is_empty() {
-            return Ok(());
-        }
-        self.lvm
-            .change_tags(vg, lv, &[], &inherited)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2051,7 +2036,6 @@ fn snap_tag_of(snap: &Snapshot) -> Result<storage::SnapTag, String> {
     }
 }
 
-/// What an LV's snap tags say about Snapshot `uid`.
 enum SnapTags {
     /// Taken before tags existed.
     None,

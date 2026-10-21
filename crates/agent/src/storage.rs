@@ -96,7 +96,6 @@ impl Lvm {
         report::parse_tags(&out).map_err(|e| CmdError::new("lvs", e.to_string()))
     }
 
-    /// Tags and creation time of every LV of `vg`.
     pub async fn tagged(&self, vg: &str) -> Result<HashMap<String, Tagged>, CmdError> {
         let out = self.report(&cmd::lv_tags(vg)).await?;
         report::parse_tagged(&out).map_err(|e| CmdError::new("lvs", e.to_string()))
@@ -494,7 +493,6 @@ pub fn snap_tag(snapshot_uid: &str, size_bytes: u64, source_replicas: u32) -> St
     format!("{SNAP_TAG_PREFIX}{snapshot_uid}.{size_bytes}.{source_replicas}")
 }
 
-/// What a snap tag records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapTag {
     pub uid: String,

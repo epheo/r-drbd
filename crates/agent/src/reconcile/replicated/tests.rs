@@ -430,10 +430,6 @@ fn expect_restore(x: &ScriptedExec) {
         lvm::cmd::restore(VG, "pvc-0+snap-1", "pvc-1", &[NEW, FROM]),
         ok(""),
     );
-    expect_lv_tags(
-        x,
-        &[("pvc-0+snap-1", &[SOURCE_TAG]), ("pvc-1", &[NEW, FROM])],
-    );
     expect_lvs(x, &[source_lv(), lv(LV_KIB)]);
 }
 

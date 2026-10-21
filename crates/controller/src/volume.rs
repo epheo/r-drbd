@@ -1311,7 +1311,6 @@ async fn lost_live(ctx: &Ctx<'_>, v: &Volume) -> bool {
     }
 }
 
-/// `snap` is the Snapshot the source names by uid, and Lost.
 fn lost_source(src: &model::VolumeSource, snap: Option<&Snapshot>) -> bool {
     snap.is_some_and(|s| {
         src.is(s) && s.status.as_ref().and_then(|st| st.phase) == Some(SnapshotPhase::Lost)

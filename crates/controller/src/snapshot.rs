@@ -714,7 +714,6 @@ pub fn owes_answer(s: &Snapshot, node: &str, pools: &[String]) -> bool {
     })
 }
 
-/// What the answers of a discovery decide.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Discovery {
     /// Nodes asked that have not answered for their current Pools: an
