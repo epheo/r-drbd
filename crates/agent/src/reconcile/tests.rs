@@ -1332,6 +1332,29 @@ async fn a_failed_discovery_search_is_no_answer() {
     );
 }
 
+/// A search that keeps failing warns once per error, not on every pass.
+#[tokio::test]
+async fn a_failing_search_warns_once_per_error() {
+    let mut failed = snapshot("snap-1", "pvc-1", SnapshotPhase::Failed);
+    failed.status.as_mut().unwrap().acks.clear();
+    for (snap, what) in [
+        (discovering("snap-1"), "discovery search failed"),
+        (failed, "copy of a failed snapshot not removed"),
+    ] {
+        let x = Arc::new(ScriptedExec::new());
+        let mut r = Reconciler::new(NODE, x.clone());
+        let snaps = [Arc::new(snap)];
+        let (logs, _g) = crate::logs::capture();
+        for _ in 0..2 {
+            reads(&x, &[foreign_row("pvc-1+snap-1", "")]);
+            expect_tags(&x, &[("pvc-1+snap-1", &[&snap_tag("snap-1")])]);
+            r.pass(&[pool()], &[], &snaps).await;
+        }
+        x.assert_done();
+        assert_eq!(logs.find("WARN", what).len(), 1, "{:?}", logs.lines());
+    }
+}
+
 /// Once the phase leaves Discovering a not-found answer goes; a found
 /// one is a holder ack and stays.
 #[tokio::test]

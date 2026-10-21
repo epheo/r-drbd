@@ -433,6 +433,8 @@ pub struct Reconciler {
     /// Every Pool of this node by name, usable or not: what a discovery
     /// answer names as searched.
     pool_names: Vec<String>,
+    /// Per Snapshot uid, the step and error last logged at warn.
+    snapshot_warnings: HashMap<String, (&'static str, String)>,
 }
 
 /// Where a pass sends its writes as each step ends, so statuses trail the
@@ -485,6 +487,7 @@ impl Reconciler {
             orphan_suspects: HashSet::new(),
             orphans_reported: HashSet::new(),
             pool_names: Vec::new(),
+            snapshot_warnings: HashMap::new(),
         }
     }
 
@@ -656,6 +659,8 @@ impl Reconciler {
             }
         }
 
+        self.snapshot_warnings
+            .retain(|uid, _| snaps.iter().any(|s| s.metadata.uid.as_ref() == Some(uid)));
         self.digests.schedule(std::mem::take(&mut self.digest_jobs));
         self.log_orphans(&mut reads, &pools, &vols, &snaps).await;
         writes.append(&mut self.events);
@@ -1210,7 +1215,7 @@ impl Reconciler {
     /// took part and holds no LV of that name.
     #[allow(clippy::too_many_arguments)]
     async fn delete_snapshot(
-        &self,
+        &mut self,
         reads: &mut Reads,
         pools: &[&Pool],
         vols: &[&Volume],
@@ -1245,9 +1250,30 @@ impl Reconciler {
             Ok(None) => related.then(|| ack(&self.node, phase, taken, Ok(()))),
             Err(e) if related => Some(ack(&self.node, phase, taken, Err(e))),
             Err(e) => {
-                tracing::warn!(snapshot = snap.name_any(), error = %e, "snapshot LV search failed");
+                self.warn_once(snap, "snapshot LV search failed", e);
                 None
             }
+        }
+    }
+
+    /// Logs a failed snapshot step at warn once per change of its error,
+    /// then at debug: a search that keeps failing says the same each pass.
+    fn warn_once(&mut self, snap: &Snapshot, what: &'static str, error: String) {
+        let name = snap.name_any();
+        let uid = snap.metadata.uid.clone().unwrap_or_default();
+        let now = (what, error);
+        if self.snapshot_warnings.get(&uid) == Some(&now) {
+            tracing::debug!(snapshot = name, error = now.1, "{what}");
+        } else {
+            tracing::warn!(snapshot = name, error = now.1, "{what}");
+            self.snapshot_warnings.insert(uid, now);
+        }
+    }
+
+    /// The step went through: its next failure is news again.
+    fn warn_cleared(&mut self, snap: &Snapshot) {
+        if let Some(uid) = &snap.metadata.uid {
+            self.snapshot_warnings.remove(uid);
         }
     }
 
@@ -1306,7 +1332,7 @@ impl Reconciler {
     /// out of a discovery say, may hold a copy: one found by its uid tag is
     /// acked again, so restores and deletes find it through takenPool.
     async fn rediscover(
-        &self,
+        &mut self,
         reads: &mut Reads,
         pools: &[&Pool],
         snap: &Snapshot,
@@ -1316,6 +1342,7 @@ impl Reconciler {
         let uid = snap.metadata.uid.as_deref()?;
         match self.find_own_lv(reads, pools, lv, uid).await {
             Ok(Some(own)) => {
+                self.warn_cleared(snap);
                 tracing::info!(
                     snapshot = name,
                     lv,
@@ -1324,9 +1351,12 @@ impl Reconciler {
                 );
                 Some(ack(&self.node, SnapshotPhase::Taking, own.taken(), Ok(())))
             }
-            Ok(None) => None,
+            Ok(None) => {
+                self.warn_cleared(snap);
+                None
+            }
             Err(e) => {
-                tracing::warn!(snapshot = name, error = %e, "snapshot LV search failed");
+                self.warn_once(snap, "snapshot LV search failed", e);
                 None
             }
         }
@@ -1340,7 +1370,7 @@ impl Reconciler {
     /// answer: its ack says why and is not ok. A node without a Pool is not
     /// asked.
     async fn discovery_answer(
-        &self,
+        &mut self,
         reads: &mut Reads,
         pools: &[&Pool],
         snap: &Snapshot,
@@ -1364,7 +1394,11 @@ impl Reconciler {
             phase_since: since,
             ..SnapshotAck::new(&self.node, SnapshotPhase::Discovering)
         };
-        let ack = match self.find_own_lv(reads, pools, lv, uid).await {
+        let found = self.find_own_lv(reads, pools, lv, uid).await;
+        if found.is_ok() {
+            self.warn_cleared(snap);
+        }
+        let ack = match found {
             Ok(Some(own)) => {
                 tracing::info!(
                     snapshot = snap.name_any(),
@@ -1385,7 +1419,7 @@ impl Reconciler {
                 ..asked
             },
             Err(e) => {
-                tracing::warn!(snapshot = snap.name_any(), error = %e, "discovery search failed");
+                self.warn_once(snap, "discovery search failed", e.clone());
                 SnapshotAck {
                     error: Some(e),
                     ..asked
@@ -1399,7 +1433,7 @@ impl Reconciler {
     /// would pass for an image after a status loss: each node removes an
     /// LV with its uid tag, on every pass, whether or not it took part.
     async fn remove_failed_copy(
-        &self,
+        &mut self,
         reads: &mut Reads,
         pools: &[&Pool],
         snap: &Snapshot,
@@ -1413,8 +1447,9 @@ impl Reconciler {
             Ok(None) => Ok(()),
             Err(e) => Err(e),
         };
-        if let Err(e) = res {
-            tracing::warn!(snapshot = snap.name_any(), error = %e, "copy of a failed snapshot not removed");
+        match res {
+            Ok(()) => self.warn_cleared(snap),
+            Err(e) => self.warn_once(snap, "copy of a failed snapshot not removed", e),
         }
     }
 
