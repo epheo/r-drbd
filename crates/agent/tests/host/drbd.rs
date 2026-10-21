@@ -336,7 +336,10 @@ fn group_with(
                     attachments: vec![],
                     access_mode: model::AccessMode::default(),
                     evict: vec![],
-                    source: source.map(|s| VolumeSource { snapshot: s.into() }),
+                    source: source.map(|s| VolumeSource {
+                        snapshot: s.into(),
+                        snapshot_uid: Some(format!("uid-{s}")),
+                    }),
                     resolve: None,
                     assignment: Some(Assignment {
                         replicas,
@@ -679,6 +682,7 @@ async fn restore_case(h: &Host, factor: u64, max_received: Option<u64>) {
         "rw-snap",
         SnapshotSpec {
             volume: "rw-src".into(),
+            volume_uid: Some("uid-rw-src".into()),
         },
     );
     snap.metadata.uid = Some("uid-rw-snap".into());
@@ -868,6 +872,7 @@ async fn drbd_snapshot_rounds_under_a_writer() {
                 &format!("rw-s{i}"),
                 SnapshotSpec {
                     volume: m.res.into(),
+                    volume_uid: Some(format!("uid-{}", m.res)),
                 },
             );
             s.metadata.uid = Some(format!("uid-{}-s{i}", m.res));
@@ -1027,6 +1032,7 @@ async fn drbd_replicated_lifecycle() {
             "rw-s",
             SnapshotSpec {
                 volume: "rw-a".into(),
+                volume_uid: Some("uid-rw-a".into()),
             },
         );
         s.status = Some(SnapshotStatus {

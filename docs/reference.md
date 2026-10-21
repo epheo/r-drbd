@@ -49,10 +49,11 @@ Spec:
 | `node` | string | Pin one diskful replica to this node |
 | `accessMode` | ReadWriteOnce, ReadWriteMany | Immutable; ReadWriteMany needs replicas 2 or 3 |
 | `attachments` | []string | Nodes the device is published to; managed by the CSI driver |
-| `evict` | []string | Nodes whose replica must move; see [Operations](operations.md) |
+| `evict` | []string | Nodes whose replica must move, 32 at most; see [Operations](operations.md) |
 | `source.snapshot` | string | Snapshot to restore from; immutable |
+| `source.snapshotUid` | string | That Snapshot's uid, written by the CSI driver; immutable. A Snapshot of the name with another uid counts as absent; a source without a uid restores nothing |
 | `resolve.survivor` | string | Split brain resolution; cleared when done |
-| `assignment` | object | Written by the controller: replicas with node, pool, node id, port and role (diskful, diskless, tiebreaker), DRBD minor and secret. Do not edit |
+| `assignment` | object | Written by the controller: replicas with node, pool, node id, port and role (diskful, diskless, tiebreaker), DRBD minor and secret. Do not edit: an entry keeps its node id and port, a diskful one its role and pool, and a diskful one leaves only through `evict` |
 
 Status:
 
@@ -84,6 +85,7 @@ A snapshot over the limit ends Failed before any IO is suspended.
 | Field | Notes |
 |---|---|
 | `spec.volume` | Source Volume; immutable |
+| `spec.volumeUid` | That Volume's uid, written by the CSI driver; immutable. A Volume of the name with another uid counts as absent; a Snapshot without a uid takes no round |
 | `status.phase` | Pending, Suspending, Taking, Ready, Failed, Deleting |
 | `status.sizeBytes` | Volume size at snapshot time |
 | `status.fileSystem` | Inherited by restores |
@@ -150,6 +152,7 @@ Volume `Ready`:
 | `InvalidName` | The Volume name is not a valid LV name |
 | `SnapshotNotReady` | Restore waits for its snapshot |
 | `SnapshotFailed` | Restore source has no node holding it |
+| `SnapshotUidMismatch` | The Snapshot of that name has another uid (waits), or the source has no uid (fails) |
 | `UnsupportedRestore` | Replica count differs from the snapshot's node count |
 | `RestoreNodeConflict` | Pins point away from the snapshot |
 | `InvalidSurvivor` | `spec.resolve.survivor` holds no diskful replica |

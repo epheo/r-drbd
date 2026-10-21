@@ -17,7 +17,7 @@ use k8s_openapi::api::core::v1::Event;
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams};
 use kube::{Api, Client};
 use model::condition::{self, types};
-use model::{ReplicaStatus, Role, SnapshotPhase, Volume, VolumePhase, VolumeSource};
+use model::{ReplicaStatus, Role, SnapshotPhase, Volume, VolumePhase};
 use serde_json::json;
 
 use support::{
@@ -716,9 +716,7 @@ async fn replicated_restore_from_acks() {
     // full size, so the restore waits.
     support::pool_capacity(&client, "p2", "n2", 100 * GIB, 0).await;
     let mut spec = volume_spec(GIB, 2, "fast");
-    spec.source = Some(VolumeSource {
-        snapshot: "snap".into(),
-    });
+    spec.source = Some(support::snapshot_source(&client, "snap").await);
     create_volume(&client, "restored", spec.clone()).await;
     let r = volume_where(&client, "restored", |v| {
         cond(v, "Ready").is_some_and(|c| c.reason == "Insufficient")
@@ -796,9 +794,7 @@ async fn snapshot_outlives_an_uninitialized_restore() {
     }
 
     let mut spec = volume_spec(GIB, 2, "fast");
-    spec.source = Some(VolumeSource {
-        snapshot: "snap".into(),
-    });
+    spec.source = Some(support::snapshot_source(&client, "snap").await);
     create_volume(&client, "restored", spec).await;
     volume_where(&client, "restored", |v| v.spec.assignment.is_some()).await;
     Api::<model::Snapshot>::all(client.clone())
@@ -860,9 +856,7 @@ async fn larger_restore_is_ready_only_at_the_full_size() {
     }
 
     let mut spec = volume_spec(2 * GIB, 2, "fast");
-    spec.source = Some(VolumeSource {
-        snapshot: "snap".into(),
-    });
+    spec.source = Some(support::snapshot_source(&client, "snap").await);
     create_volume(&client, "restored", spec).await;
     volume_where(&client, "restored", |v| v.spec.assignment.is_some()).await;
     let agents = ["n1", "n2", "n3"].map(|n| FakeAgent::new(&client, n));

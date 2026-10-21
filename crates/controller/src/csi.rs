@@ -563,6 +563,7 @@ impl Csi {
                 }
                 Some(VolumeSource {
                     snapshot: id.to_owned(),
+                    snapshot_uid: snap.metadata.uid.clone(),
                 })
             }
             Some(SourceType::Volume(_)) => {
@@ -684,10 +685,8 @@ impl Csi {
             .volumes()
             .get_opt(source)
             .await
-            .map_err(|e| kube_status("reading volume", &e))?;
-        if volume.is_none() {
-            return Err(Status::not_found(format!("volume {source} not found")));
-        }
+            .map_err(|e| kube_status("reading volume", &e))?
+            .ok_or_else(|| Status::not_found(format!("volume {source} not found")))?;
         let obj = Snapshot {
             metadata: ObjectMeta {
                 name: Some(name.to_owned()),
@@ -695,6 +694,7 @@ impl Csi {
             },
             spec: SnapshotSpec {
                 volume: source.to_owned(),
+                volume_uid: volume.metadata.uid,
             },
             status: None,
         };

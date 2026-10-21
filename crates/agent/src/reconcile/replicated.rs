@@ -1752,7 +1752,7 @@ impl Reconciler {
         let rounds: Vec<&Snapshot> = snaps
             .iter()
             .copied()
-            .filter(|s| s.spec.volume == name && in_round(s))
+            .filter(|s| s.is_of(vol) && in_round(s))
             .collect();
         let after = model::snapshot::RESUME_AFTER;
         if !rounds.is_empty() && now.duration_since(since) < after {

@@ -5,10 +5,10 @@ mod support;
 use std::time::Duration;
 
 use controller::volume::Outcome;
-use kube::api::{DeleteParams, Patch, PatchParams};
+use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
 use kube::{Api, Client};
 use model::keys::{FINALIZER_POOL, MINOR_RANGE, PORT_RANGE};
-use model::{Pool, Role, Snapshot, SnapshotPhase, Volume, VolumePhase, VolumeSource};
+use model::{Pool, Role, Snapshot, SnapshotPhase, Volume, VolumePhase};
 use serde_json::json;
 use support::{
     Env, FakeAgent, GIB, Running, create_snapshot, create_volume, get_pool, get_snapshot,
@@ -484,9 +484,7 @@ async fn snapshot_local_and_restore() {
     // holds it Pending, never on the emptier n2 that lacks the snapshot.
     support::pool_capacity(&client, "p1", "n1", 100 * GIB, 0).await;
     let mut spec = volume_spec(GIB, 1, "fast");
-    spec.source = Some(VolumeSource {
-        snapshot: "snap1".into(),
-    });
+    spec.source = Some(support::snapshot_source(&client, "snap1").await);
     create_volume(&client, "restored", spec).await;
     let r = volume_where(&client, "restored", |v| {
         ready_reason(v).as_deref() == Some("Insufficient")
@@ -529,15 +527,34 @@ async fn snapshot_local_and_restore() {
     assert_eq!(owners, [model::keys::FS_FIELD_MANAGER]);
 
     let mut spec = volume_spec(GIB, 2, "fast");
-    spec.source = Some(VolumeSource {
-        snapshot: "snap1".into(),
-    });
+    spec.source = Some(support::snapshot_source(&client, "snap1").await);
     create_volume(&client, "restored-rep", spec).await;
     let r = volume_where(&client, "restored-rep", |v| {
         phase_of(v) == VolumePhase::Failed
     })
     .await;
     assert_eq!(ready_reason(&r).as_deref(), Some("UnsupportedRestore"));
+
+    // A source naming another uid waits; one without a uid fails.
+    let mut spec = volume_spec(GIB, 1, "fast");
+    spec.source = Some(model::VolumeSource {
+        snapshot: "snap1".into(),
+        snapshot_uid: Some("uid-old".into()),
+    });
+    create_volume(&client, "restored-stale", spec.clone()).await;
+    spec.source.as_mut().unwrap().snapshot_uid = None;
+    create_volume(&client, "restored-legacy", spec).await;
+    for (name, phase) in [
+        ("restored-stale", VolumePhase::Pending),
+        ("restored-legacy", VolumePhase::Failed),
+    ] {
+        let r = volume_where(&client, name, |v| {
+            ready_reason(v).as_deref() == Some("SnapshotUidMismatch")
+        })
+        .await;
+        assert_eq!(phase_of(&r), phase, "{name}");
+        assert!(r.spec.assignment.is_none(), "{name}");
+    }
 
     // A restore that never made its first data would hold the Snapshot.
     a1.ready("restored").await;
@@ -776,6 +793,33 @@ async fn snapshot_waits_for_volume() {
     })
     .await;
     assert_eq!(snap_phase(&s), SnapshotPhase::Pending);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_of_another_volume_uid_never_starts() {
+    let assets = require_envtest!();
+    let (_env, client, _ctl) = setup(&assets, |_| {}).await;
+    node(&client, "n1", true).await;
+    pool(&client, "p1", "n1", "fast", 100 * GIB).await;
+    let agent = FakeAgent::new(&client, "n1");
+    ready_local(&client, &agent, "vol", GIB).await;
+    let api: Api<Snapshot> = Api::all(client.clone());
+    for (name, uid) in [("stale", Some("uid-old")), ("legacy", None)] {
+        let spec = model::SnapshotSpec {
+            volume: "vol".into(),
+            volume_uid: uid.map(Into::into),
+        };
+        api.create(&PostParams::default(), &Snapshot::new(name, spec))
+            .await
+            .unwrap();
+        let s = snapshot_where(&client, name, |s| {
+            s.status.as_ref().is_some_and(|st| st.last_error.is_some())
+        })
+        .await;
+        assert_eq!(snap_phase(&s), SnapshotPhase::Pending, "{name}");
+        let error = s.status.unwrap().last_error.unwrap();
+        assert_eq!(error, "volume vol not found", "{name}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -450,7 +450,7 @@ async fn reconcile(
 ) -> Option<Duration> {
     let name = s.name_any();
     let current = Owned::current(s);
-    let volume = ctx.stores.volume(&s.spec.volume);
+    let volume = ctx.stores.volume(&s.spec.volume).filter(|v| s.is_of(v));
     let assignment = volume
         .as_deref()
         .and_then(|v| memory.assignment(v).cloned());
@@ -461,7 +461,7 @@ async fn reconcile(
         .map(|r| r.node.clone())
         .collect();
     if s.metadata.deletion_timestamp.is_some() {
-        let restoring = restores.get(&name).map(String::as_str);
+        let restoring = s.uid().and_then(|u| restores.get(&u)).map(String::as_str);
         let exists = |n: &str| ctx.stores.node(n).is_some();
         delete(api, s, current, &diskful, restoring, &exists).await;
         return None;
@@ -711,19 +711,18 @@ async fn apply_step(
     }
 }
 
-/// Snapshot name to one placed restore from it without its first data yet.
+/// Snapshot uid to one placed restore from it without its first data yet.
 /// Its holders still need their copy: a lost LV is restored again until
 /// initializedAt, and a replica without a copy turns the restore into a
 /// full sync. Built once per pass.
 pub fn restoring_from(volumes: &[std::sync::Arc<Volume>]) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for v in volumes {
-        let Some(snapshot) = v.restoring() else {
+        let Some(uid) = v.restoring().and_then(|s| s.snapshot_uid.as_ref()) else {
             continue;
         };
         if v.spec.assignment.is_some() && v.metadata.deletion_timestamp.is_none() {
-            out.entry(snapshot.to_owned())
-                .or_insert_with(|| v.name_any());
+            out.entry(uid.clone()).or_insert_with(|| v.name_any());
         }
     }
     out
@@ -1263,16 +1262,20 @@ mod tests {
         let restore = |name: &str, from: &str| {
             let spec: model::VolumeSpec = serde_json::from_value(json!({
                 "sizeBytes": 1, "tier": "t", "replicas": 2,
-                "source": { "snapshot": from },
+                "source": { "snapshot": "snap", "snapshotUid": from },
                 "assignment": { "replicas": [] },
             }))
             .unwrap();
             Volume::new(name, spec)
         };
-        let v = restore("v", "snap");
+        let v = restore("v", "u1");
         let held = restoring_from(&[Arc::new(v.clone())]);
-        assert_eq!(held.get("snap").map(String::as_str), Some("v"));
-        assert_eq!(held.get("other"), None);
+        assert_eq!(held.get("u1").map(String::as_str), Some("v"));
+        assert_eq!(held.get("snap"), None);
+        assert_eq!(held.get("u2"), None);
+        // Without a uid it binds no Snapshot, so it holds none.
+        let mut legacy = v.clone();
+        legacy.spec.source.as_mut().unwrap().snapshot_uid = None;
         let mut init = v.clone();
         init.status = Some(VolumeStatus {
             initialized_at: Some(Time(Timestamp::now())),
@@ -1282,7 +1285,7 @@ mod tests {
         unplaced.spec.assignment = None;
         let mut deleting = v;
         deleting.metadata.deletion_timestamp = Some(Time(Timestamp::now()));
-        for x in [init, unplaced, deleting] {
+        for x in [legacy, init, unplaced, deleting] {
             assert!(restoring_from(&[Arc::new(x)]).is_empty());
         }
     }
