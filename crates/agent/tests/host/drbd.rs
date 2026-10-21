@@ -1017,7 +1017,8 @@ async fn drbd_replicated_lifecycle() {
         file
     );
 
-    let snap = |phase| {
+    // Each phase sees this node's last ack, as the Snapshot status keeps it.
+    let snap = |phase, acks: Vec<model::SnapshotAck>| {
         let mut s = Snapshot::new(
             "rw-s",
             SnapshotSpec {
@@ -1027,21 +1028,26 @@ async fn drbd_replicated_lifecycle() {
         );
         s.status = Some(SnapshotStatus {
             phase,
+            acks,
             ..SnapshotStatus::default()
         });
         Arc::new(s)
     };
+    let mut acks = Vec::new();
     for phase in [
         SnapshotPhase::Suspending,
         SnapshotPhase::Taking,
         SnapshotPhase::Ready,
         SnapshotPhase::Deleting,
     ] {
-        let w = a.pass(&pools, &[snap(phase)]).await;
+        let w = a.pass(&pools, &[snap(phase, acks.clone())]).await;
         let ack = w.iter().find_map(|w| match w {
             StatusWrite::Snapshot { ack, .. } => Some(ack.clone()),
             _ => None,
         });
+        if let Some(x) = &ack {
+            acks = vec![x.clone()];
+        }
         println!("{phase:?}: {ack:?}");
         // Ready: the agent resumes on its own and has nothing to report.
         assert_eq!(ack.is_none(), phase == SnapshotPhase::Ready, "{ack:?}");
