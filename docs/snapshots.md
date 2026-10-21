@@ -70,8 +70,12 @@ While a round runs, volume expansion is refused (the call is retried) and no rep
 A failed take is a failure: the Snapshot never turns Ready without a backing LV on every node.
 A snapshot of a volume that is being deleted, or that stays missing for 30 s, fails.
 On a Failed Snapshot every node with a Pool removes an LV tagged with its uid, whether or not it took part.
+A Failed Snapshot is deleted one hour after it failed.
 
-An LV of the snapshot LV's name that does not carry this Snapshot's uid (an LV left by an older Snapshot of the same name, say) is never adopted: the round fails, the LV stays untouched, and a Warning Event `SnapshotLvConflict` names it.
+After a failed round the volume's next snapshot waits in Pending 30 s, doubling per failure in a row up to 10 minutes; a Ready snapshot resets the wait.
+A node that never answered a failed round holds the next one until its agent renews its Lease.
+
+An LV of the snapshot LV's name that does not carry this Snapshot's uid (an LV left by an older Snapshot of the same name, say) is never adopted: the round fails before that node suspends IO, the LV stays untouched, and a Warning Event `SnapshotLvConflict` names it.
 A retry under the same name fails the same way while that LV is there.
 
 ## Restoring

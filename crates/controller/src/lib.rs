@@ -53,6 +53,9 @@ pub struct Config {
     pub lease_stale: Duration,
     /// PeerUnreachable False this long before its Normal Event.
     pub peer_clear_grace: Duration,
+    /// The wait before a volume's next snapshot round after a failed one;
+    /// it doubles per failure in a row.
+    pub round_backoff: Duration,
 }
 
 impl Config {
@@ -70,6 +73,7 @@ impl Config {
             ready_timeout: Duration::from_secs(30),
             lease_stale: store::LEASE_STALE,
             peer_clear_grace: volume::PEER_CLEAR_GRACE,
+            round_backoff: snapshot::BACKOFF_FIRST,
         }
     }
 }
@@ -273,6 +277,10 @@ pub(crate) struct Memory {
     /// Per Pool uid: the Snapshots its deletion last said, in an Event, it
     /// waits for.
     pub(crate) pool_waits: HashMap<String, Vec<String>>,
+    /// Per Volume uid: its snapshot rounds failed since the last Ready one.
+    /// Memory outlives the CSI replace of a Failed Snapshot, which deletes
+    /// it; a restart allows one early round.
+    pub(crate) round_failures: HashMap<String, snapshot::Failures>,
 }
 
 impl Memory {
@@ -442,6 +450,9 @@ async fn pass(ctx: &Ctx<'_>, memory: &mut Memory) -> Option<Duration> {
         .retain(|uid, _| seen.contains_key(uid));
     memory.probes.retain(|uid, _| seen.contains_key(uid));
     memory.probe_wait.retain(|uid| seen.contains_key(uid));
+    memory
+        .round_failures
+        .retain(|uid, _| seen.contains_key(uid));
     report_duplicates(ctx, memory).await;
     volume::reconcile_all(ctx, memory).await;
     pool::reconcile_all(ctx, memory).await;

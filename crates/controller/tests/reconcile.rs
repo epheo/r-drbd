@@ -868,6 +868,62 @@ async fn snapshot_ack_failure() {
     .await;
 }
 
+/// A Failed Snapshot nobody retries goes an hour after it failed, through
+/// the usual delete: the node that reached Taking acks the removal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_snapshot_is_deleted_an_hour_later() {
+    let assets = require_envtest!();
+    let (_env, client, _ctl) = setup(&assets, |_| {}).await;
+    node(&client, "n1", true).await;
+    pool(&client, "p1", "n1", "fast", 100 * GIB).await;
+    let agent = FakeAgent::new(&client, "n1");
+    ready_local(&client, &agent, "vol", GIB).await;
+    create_snapshot(&client, "snap", "vol").await;
+    snapshot_where(&client, "snap", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Taking)
+    })
+    .await;
+    agent.ack("snap", SnapshotPhase::Taking, false, None).await;
+    snapshot_where(&client, "snap", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Failed)
+    })
+    .await;
+
+    // It failed an hour ago, less 5 s.
+    let kept = controller::snapshot::FAILED_KEPT;
+    let ago = k8s_openapi::jiff::Timestamp::now()
+        .checked_sub(kept.saturating_sub(Duration::from_secs(5)))
+        .unwrap();
+    let ago = k8s_openapi::jiff::Timestamp::from_second(ago.as_second()).unwrap();
+    Api::<Snapshot>::all(client.clone())
+        .patch_status(
+            "snap",
+            &PatchParams::default(),
+            &Patch::Merge(&json!({ "status": { "phaseSince": ago.to_string() } })),
+        )
+        .await
+        .expect("phaseSince");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let s = get_snapshot(&client, "snap").await.unwrap();
+    assert!(s.metadata.deletion_timestamp.is_none());
+    let started = tokio::time::Instant::now();
+    snapshot_where(&client, "snap", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Deleting)
+    })
+    .await;
+    assert!(started.elapsed() < Duration::from_secs(12));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        get_snapshot(&client, "snap").await.is_some(),
+        "n1 acks first"
+    );
+    agent.ack("snap", SnapshotPhase::Deleting, true, None).await;
+    support::eventually(Duration::from_secs(20), || async {
+        get_snapshot(&client, "snap").await.is_none().then_some(())
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_take_timeout() {
     let assets = require_envtest!();

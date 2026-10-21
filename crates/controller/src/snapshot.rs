@@ -7,11 +7,11 @@
 //! resumes on its own (model::snapshot holds the bounds).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use k8s_openapi::jiff::Timestamp;
-use kube::api::{ListParams, Patch, PatchParams};
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams, Preconditions};
 use kube::{Api, ResourceExt};
 use model::condition::{self, Condition, FALSE, TRUE, types};
 use model::keys::FINALIZER_SNAPSHOT;
@@ -25,6 +25,41 @@ use crate::{Ctx, Memory, apply_status_at, has_finalizer, set_finalizer, valid_na
 
 /// How long a Pending Snapshot waits for a Volume missing from the store.
 pub const VOLUME_GRACE: Duration = crate::RESYNC;
+/// The wait before a volume's next round after a failed one.
+pub const BACKOFF_FIRST: Duration = Duration::from_secs(30);
+/// The longest wait between two rounds of a volume, however many failed.
+pub const BACKOFF_MAX: Duration = Duration::from_secs(600);
+/// How long a Failed Snapshot stays before the controller deletes it.
+pub const FAILED_KEPT: Duration = Duration::from_secs(3600);
+/// A held round whose node must renew its agent Lease looks again after
+/// this: a renewal of a fresh Lease wakes no pass.
+const RENEWAL_WAIT: Duration = Duration::from_secs(model::keys::LEASE_RENEW_SECS + 1);
+
+/// A volume's snapshot rounds failed since its last Ready round.
+#[derive(Debug, Clone)]
+pub struct Failures {
+    /// When the last one failed, on this process's clock.
+    pub at: Instant,
+    pub count: u32,
+    /// The nodes that never acked the last one.
+    pub silent: Vec<String>,
+}
+
+impl Failures {
+    /// The wait after the last failure: `first`, doubled per failure in a
+    /// row after the first, at most BACKOFF_MAX.
+    pub fn backoff(&self, first: Duration) -> Duration {
+        let doublings = self.count.saturating_sub(1).min(16);
+        first.saturating_mul(1 << doublings).min(BACKOFF_MAX)
+    }
+
+    /// A node that never acked the last round holds the next one until its
+    /// agent renews its Lease after the failure: the Lease outlives the
+    /// suspend bound, so a dead agent still looks fresh to the retry.
+    pub fn awaits_renewal(&self, node: &str, renewed: Option<Instant>) -> bool {
+        self.silent.iter().any(|n| n == node) && renewed.is_none_or(|t| t <= self.at)
+    }
+}
 
 /// Inputs of one state machine step.
 #[derive(Debug)]
@@ -40,6 +75,9 @@ pub struct Round<'a> {
     pub stale: &'a [String],
     /// Another Snapshot of the volume whose round runs.
     pub other_round: Option<&'a str>,
+    /// Rounds failed in a row on the volume and the wait after the last,
+    /// while it runs.
+    pub backoff: Option<(u32, Duration)>,
     /// Time spent in the current phase, from status.phaseSince.
     pub phase_for: Option<Duration>,
     pub take_timeout: Duration,
@@ -69,15 +107,29 @@ pub enum Step {
     Go {
         phase: SnapshotPhase,
         error: Option<String>,
+        /// The nodes that never acked, when the bound failed the round.
+        silent: Vec<String>,
     },
 }
 
 fn go(phase: SnapshotPhase, error: Option<String>) -> Step {
-    Step::Go { phase, error }
+    Step::Go {
+        phase,
+        error,
+        silent: Vec::new(),
+    }
 }
 
 fn failed(error: String) -> Step {
     go(SnapshotPhase::Failed, Some(error))
+}
+
+fn timed_out(error: String, silent: &[&str]) -> Step {
+    Step::Go {
+        phase: SnapshotPhase::Failed,
+        error: Some(error),
+        silent: silent.iter().map(|n| (*n).to_owned()).collect(),
+    }
 }
 
 /// The phase machine, pure.
@@ -108,6 +160,12 @@ pub fn start_blocker(r: &Round<'_>) -> Option<String> {
     if let Some(other) = r.other_round {
         return Some(format!(
             "snapshot {other} of the same volume is in its round"
+        ));
+    }
+    if let Some((count, wait)) = r.backoff {
+        return Some(format!(
+            "{count} failed round(s) in a row: the next waits {} s",
+            wait.as_secs()
         ));
     }
     if !r.replicated {
@@ -184,22 +242,20 @@ fn suspending(r: &Round<'_>) -> Step {
     if !errors.is_empty() {
         return failed(format!("Suspending failed on {}", errors.join("; ")));
     }
+    let missing: Vec<&str> = listed
+        .iter()
+        .filter(|n| !r.ack(n).is_some_and(|a| a.phase == P::Suspending && a.ok))
+        .copied()
+        .collect();
     if r.phase_for.is_some_and(|d| d >= r.suspend_timeout) {
-        let missing: Vec<&str> = listed
-            .iter()
-            .filter(|n| !r.ack(n).is_some_and(|a| a.phase == P::Suspending && a.ok))
-            .copied()
-            .collect();
-        return failed(format!(
+        let error = format!(
             "suspend not acknowledged within {} s by {}",
             r.suspend_timeout.as_secs(),
             missing.join(", ")
-        ));
+        );
+        return timed_out(error, &missing);
     }
-    if !listed
-        .iter()
-        .all(|n| r.ack(n).is_some_and(|a| a.phase == P::Suspending && a.ok))
-    {
+    if !missing.is_empty() {
         return Step::Stay;
     }
     let entries = r
@@ -249,19 +305,25 @@ fn taking(r: &Round<'_>) -> Step {
     if !errors.is_empty() {
         return failed(format!("Taking failed on {}", errors.join("; ")));
     }
-    let taken = asked.iter().all(|x| {
-        r.ack(&x.node).is_some_and(|a| {
-            a.phase == P::Taking && a.ok && (x.role != Role::Diskful || a.taken_pool.is_some())
+    let missing: Vec<&str> = asked
+        .iter()
+        .filter(|x| {
+            !r.ack(&x.node).is_some_and(|a| {
+                a.phase == P::Taking && a.ok && (x.role != Role::Diskful || a.taken_pool.is_some())
+            })
         })
-    });
-    if taken {
+        .map(|x| x.node.as_str())
+        .collect();
+    if missing.is_empty() {
         return go(P::Ready, None);
     }
     if r.phase_for.is_some_and(|d| d >= r.take_timeout) {
-        return failed(format!(
-            "take not acknowledged by every node within {} s",
-            r.take_timeout.as_secs()
-        ));
+        let error = format!(
+            "take not acknowledged within {} s by {}",
+            r.take_timeout.as_secs(),
+            missing.join(", ")
+        );
+        return timed_out(error, &missing);
     }
     Step::Stay
 }
@@ -427,6 +489,11 @@ async fn write(api: &Api<Snapshot>, s: &Snapshot, mut wanted: Owned) -> bool {
     let Some(phase) = wanted.phase else {
         return false;
     };
+    // Every path into a phase starts its clock: the round bounds and the
+    // Failed expiry count from it.
+    if s.status.as_ref().and_then(|st| st.phase) != Some(phase) {
+        wanted.phase_since = Some(crate::now());
+    }
     let existing = s
         .status
         .as_ref()
@@ -540,12 +607,12 @@ async fn reconcile(
         record_proof(ctx, api, s, current).await;
         return None;
     }
-    // Unknown: a phase another version wrote. Left as it is, like Failed
-    // and Lost: rewriting it could fail a newer version's good snapshot.
-    if matches!(
-        phase,
-        SnapshotPhase::Failed | SnapshotPhase::Lost | SnapshotPhase::Unknown
-    ) {
+    if phase == SnapshotPhase::Failed {
+        return expire(api, s, current).await;
+    }
+    // Unknown: a phase another version wrote. Left as it is, like Lost:
+    // rewriting it could fail a newer version's good snapshot.
+    if matches!(phase, SnapshotPhase::Lost | SnapshotPhase::Unknown) {
         return None;
     }
     if !valid_name(&name) {
@@ -600,7 +667,7 @@ async fn reconcile(
         write(api, s, wanted).await;
         return bound(ctx, phase);
     }
-    step(ctx, api, s, v, &a, phase, current).await
+    step(ctx, memory, api, s, v, &a, phase, current).await
 }
 
 /// The first status comes before the finalizer, so no version of the
@@ -615,6 +682,46 @@ async fn first_status(api: &Api<Snapshot>, s: &Snapshot, current: Owned) {
     } else {
         set_finalizer(api, s, FINALIZER_SNAPSHOT, true).await;
     }
+}
+
+/// The time left before a Snapshot that failed at `since` is deleted.
+pub fn failed_left(since: &Time, now: Timestamp) -> Duration {
+    let elapsed = Duration::try_from(now.duration_since(since.0)).unwrap_or_default();
+    FAILED_KEPT.saturating_sub(elapsed)
+}
+
+/// Deletes a Failed Snapshot FAILED_KEPT after it failed; returns the time
+/// left. The sidecar deletes only a snapshot whose CreateSnapshot once
+/// succeeded: it has no handle for one whose VolumeSnapshot went first.
+async fn expire(api: &Api<Snapshot>, s: &Snapshot, current: Owned) -> Option<Duration> {
+    let Some(since) = &current.phase_since else {
+        // Failed by an older controller: the clock starts now.
+        let wanted = Owned {
+            phase_since: Some(crate::now()),
+            ..current
+        };
+        write(api, s, wanted).await;
+        return Some(FAILED_KEPT);
+    };
+    let left = failed_left(since, Timestamp::now());
+    if !left.is_zero() {
+        return Some(left);
+    }
+    let name = s.name_any();
+    // A CSI retry may have replaced it under the same name meanwhile.
+    let dp = DeleteParams {
+        preconditions: Some(Preconditions {
+            uid: s.uid(),
+            resource_version: None,
+        }),
+        ..DeleteParams::default()
+    };
+    match api.delete(&name, &dp).await {
+        Ok(_) => info!(snapshot = name, "failed snapshot deleted"),
+        Err(kube::Error::Api(e)) if e.is_conflict() || e.is_not_found() => {}
+        Err(e) => warn!(snapshot = name, error = %e, "deleting the failed snapshot failed"),
+    }
+    None
 }
 
 async fn fail(api: &Api<Snapshot>, s: &Snapshot, current: Owned, error: String) {
@@ -848,7 +955,6 @@ async fn discover(
                 size_bytes: Some(size_bytes),
                 source_replicas: Some(source_replicas),
                 created_at,
-                phase_since: Some(crate::now()),
                 last_error: None,
                 reason: None,
                 ..current
@@ -859,7 +965,6 @@ async fn discover(
         Discovery::Lost { reason, message } => {
             let wanted = Owned {
                 phase: Some(SnapshotPhase::Lost),
-                phase_since: Some(crate::now()),
                 last_error: Some(message.clone()),
                 reason: Some(reason),
                 ..current
@@ -961,8 +1066,10 @@ fn lv_name_problem(
 }
 
 /// One state machine step for a snapshot whose volume is placed.
+#[allow(clippy::too_many_arguments)]
 async fn step(
     ctx: &Ctx<'_>,
+    memory: &mut Memory,
     api: &Api<Snapshot>,
     s: &Snapshot,
     v: &Volume,
@@ -979,13 +1086,31 @@ async fn step(
         .as_ref()
         .map(|st| st.acks.as_slice())
         .unwrap_or_default();
+    let failures = v.uid().and_then(|u| memory.round_failures.get(&u));
+    let silent =
+        |n: &str| failures.is_some_and(|f| f.awaits_renewal(n, ctx.stores.agent_renewed_at(n)));
     let stale: Vec<String> = a
         .replicas
         .iter()
-        .filter(|r| !ctx.stores.agent_fresh(&r.node))
+        .filter(|r| !ctx.stores.agent_fresh(&r.node) || silent(&r.node))
         .map(|r| r.node.clone())
         .collect();
+    // A node gone stale wakes a pass when it comes back; one still fresh
+    // renews without a wake.
+    let renewal = a
+        .replicas
+        .iter()
+        .any(|r| silent(&r.node) && ctx.stores.agent_fresh(&r.node));
+    let backoff = failures.and_then(|f| {
+        let wait = f.backoff(ctx.cfg.round_backoff);
+        let left = (f.at + wait).saturating_duration_since(Instant::now());
+        (!left.is_zero()).then_some((f.count, wait, left))
+    });
     let other = crate::volume::snapshot_in_progress(ctx.stores, &s.spec.volume);
+    let other_left = other
+        .as_deref()
+        .and_then(|n| ctx.stores.snapshot(n))
+        .and_then(|o| crate::volume::lost_freeze_left(&o, Timestamp::now()));
     let round = Round {
         phase,
         replicated: v.spec.replicas >= 2,
@@ -994,6 +1119,7 @@ async fn step(
         acks,
         stale: &stale,
         other_round: other.as_deref(),
+        backoff: backoff.map(|(count, wait, _)| (count, wait)),
         phase_for,
         take_timeout: ctx.cfg.take_timeout,
         suspend_timeout: ctx.cfg.suspend_timeout,
@@ -1010,7 +1136,20 @@ async fn step(
             Err(e) => step = Step::Hold(format!("reading snapshots: {e}")),
         }
     }
-    apply_step(ctx, api, s, v, phase, current, phase_for, step).await
+    // A held round looks again when a timed hold ends, not on the resync.
+    let wake = match step {
+        Step::Hold(_) => [
+            backoff.map(|(_, _, left)| left),
+            other_left,
+            renewal.then_some(RENEWAL_WAIT),
+        ]
+        .into_iter()
+        .flatten()
+        .min(),
+        _ => None,
+    };
+    let left = apply_step(ctx, memory, api, s, v, phase, current, phase_for, step).await;
+    left.or(wake)
 }
 
 /// Another Snapshot of the volume in its round, as the API server has it.
@@ -1047,6 +1186,7 @@ pub fn restore_size(v: &Volume) -> u64 {
 #[allow(clippy::too_many_arguments)]
 async fn apply_step(
     ctx: &Ctx<'_>,
+    memory: &mut Memory,
     api: &Api<Snapshot>,
     s: &Snapshot,
     v: &Volume,
@@ -1075,9 +1215,12 @@ async fn apply_step(
             write(api, s, wanted).await;
             None
         }
-        Step::Go { phase, error } => {
+        Step::Go {
+            phase,
+            error,
+            silent,
+        } => {
             let mut wanted = current;
-            wanted.phase_since = Some(crate::now());
             if from == SnapshotPhase::Pending {
                 wanted.last_error = None;
             }
@@ -1097,7 +1240,19 @@ async fn apply_step(
             }
             info!(snapshot = name, ?from, to = ?phase, error = ?wanted.last_error, "snapshot round");
             wanted.phase = Some(phase);
-            write(api, s, wanted).await;
+            if write(api, s, wanted).await
+                && let Some(uid) = v.uid()
+            {
+                if phase == SnapshotPhase::Ready {
+                    memory.round_failures.remove(&uid);
+                } else if phase == SnapshotPhase::Failed {
+                    let count = memory.round_failures.get(&uid).map_or(0, |f| f.count) + 1;
+                    let at = Instant::now();
+                    memory
+                        .round_failures
+                        .insert(uid, Failures { at, count, silent });
+                }
+            }
             bound(ctx, phase)
         }
     }
@@ -1267,6 +1422,7 @@ mod tests {
         acks: Vec<SnapshotAck>,
         stale: Vec<String>,
         other: Option<&'static str>,
+        backoff: Option<(u32, Duration)>,
         phase_for: Duration,
     }
 
@@ -1280,6 +1436,7 @@ mod tests {
                 acks: acks.to_vec(),
                 stale: vec![],
                 other: None,
+                backoff: None,
                 phase_for: Duration::ZERO,
             }
         }
@@ -1300,6 +1457,7 @@ mod tests {
                 acks: &self.acks,
                 stale: &self.stale,
                 other_round: self.other,
+                backoff: self.backoff,
                 phase_for: Some(self.phase_for),
                 take_timeout: model::snapshot::TAKE_BOUND,
                 suspend_timeout: model::snapshot::SUSPEND_BOUND,
@@ -1322,6 +1480,7 @@ mod tests {
         let Step::Go {
             phase: P::Failed,
             error: Some(e),
+            ..
         } = step
         else {
             panic!("expected Failed with {needle}, got {step:?}");
@@ -1345,6 +1504,11 @@ mod tests {
                 "not Ready",
             ),
             ("other round", |c| c.other = Some("s0"), "snapshot s0"),
+            (
+                "failed rounds",
+                |c| c.backoff = Some((2, Duration::from_secs(60))),
+                "2 failed round(s) in a row: the next waits 60 s",
+            ),
             (
                 "stale agent",
                 |c| c.stale = vec!["n3".into()],
@@ -1425,6 +1589,65 @@ mod tests {
         assert_eq!(c.next(), go(P::Taking, None));
         c.other = Some("s0");
         held(&c.next(), "snapshot s0");
+        c.other = None;
+        c.backoff = Some((1, BACKOFF_FIRST));
+        held(&c.next(), "the next waits 30 s");
+    }
+
+    #[test]
+    fn a_failed_snapshot_goes_an_hour_after_it_failed() {
+        let since = Time(Timestamp::from_second(1_000_000).unwrap());
+        let at = |secs: i64| Timestamp::from_second(1_000_000 + secs).unwrap();
+        assert_eq!(failed_left(&since, at(0)), FAILED_KEPT);
+        assert_eq!(failed_left(&since, at(3599)), Duration::from_secs(1));
+        assert_eq!(failed_left(&since, at(3600)), Duration::ZERO);
+        assert_eq!(failed_left(&since, at(-5)), FAILED_KEPT, "a clock behind");
+    }
+
+    #[test]
+    fn the_wait_after_failed_rounds_doubles_up_to_its_cap() {
+        let s = Duration::from_secs;
+        let waits: Vec<u64> = (1..=8)
+            .map(|count| {
+                let f = Failures {
+                    at: Instant::now(),
+                    count,
+                    silent: vec![],
+                };
+                f.backoff(BACKOFF_FIRST).as_secs()
+            })
+            .collect();
+        assert_eq!(waits, [30, 60, 120, 240, 480, 600, 600, 600]);
+        let many = Failures {
+            at: Instant::now(),
+            count: u32::MAX,
+            silent: vec![],
+        };
+        assert_eq!(many.backoff(BACKOFF_FIRST), BACKOFF_MAX);
+        assert_eq!(many.backoff(s(0)), s(0), "no wait configured");
+    }
+
+    #[test]
+    fn a_silent_node_answers_again_only_after_a_later_renewal() {
+        let at = Instant::now();
+        let f = Failures {
+            at,
+            count: 1,
+            silent: vec!["n3".into()],
+        };
+        let before = at.checked_sub(Duration::from_secs(5));
+        assert!(f.awaits_renewal("n3", None));
+        assert!(f.awaits_renewal("n3", before), "renewed before the failure");
+        assert!(f.awaits_renewal("n3", Some(at)));
+        assert!(!f.awaits_renewal("n3", Some(at + Duration::from_millis(1))));
+        assert!(!f.awaits_renewal("n1", None), "it acked");
+    }
+
+    fn silent_of(step: &Step) -> Vec<&str> {
+        let Step::Go { silent, .. } = step else {
+            panic!("expected Go, got {step:?}");
+        };
+        silent.iter().map(String::as_str).collect()
     }
 
     #[test]
@@ -1471,10 +1694,21 @@ mod tests {
         assert_eq!(c.next(), go(P::Taking, None));
         c.phase_for = model::snapshot::SUSPEND_BOUND;
         failed_with(&c.next(), "within 30 s");
+        assert_eq!(silent_of(&c.next()), Vec::<&str>::new(), "all acked");
         let mut c = Case::new(P::Suspending, &all[..2]);
         c.phase_for = model::snapshot::SUSPEND_BOUND;
         let step = c.next();
         failed_with(&step, "by n3");
+        assert_eq!(silent_of(&step), ["n3"]);
+        // A failed ack is an answer: the round fails at once, nobody silent.
+        let bad = [
+            ack("n1", P::Suspending, true),
+            ack("n2", P::Suspending, false),
+        ];
+        assert_eq!(
+            silent_of(&Case::new(P::Suspending, &bad).next()),
+            Vec::<&str>::new()
+        );
         let Step::Go { error: Some(e), .. } = step else {
             unreachable!()
         };
@@ -1525,7 +1759,8 @@ mod tests {
         c.assignment = assignment(&[("n4", Role::Diskless)]);
         assert_eq!(c.next(), Step::Stay);
         c.phase_for = model::snapshot::TAKE_BOUND;
-        failed_with(&c.next(), "within 120 s");
+        failed_with(&c.next(), "within 120 s by n4");
+        assert_eq!(silent_of(&c.next()), ["n4"]);
         let bad = [
             ack("n1", P::Taking, true),
             ack("n2", P::Taking, false),

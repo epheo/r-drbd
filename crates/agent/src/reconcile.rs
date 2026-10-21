@@ -1152,16 +1152,16 @@ impl Reconciler {
                 Some(SnapshotPhase::Suspending) => {
                     if let Some(v) = replicated {
                         self.my_replica(v)?;
-                        // Backstop to the controller's admission check: an
-                        // LV name LVM refuses here would fail in Taking,
-                        // with IO already suspended on every replica.
-                        let refused = replica
-                            .is_some()
-                            .then(|| self.place(pools, replica_pool.as_deref()))
-                            .and_then(|place| {
-                                let place = place.ok()?;
-                                lvm::names::check_new_lv(&place.vg, &lv).err()
-                            });
+                        let first = prev
+                            .as_ref()
+                            .is_none_or(|a| a.phase != SnapshotPhase::Suspending);
+                        let refused = match replica {
+                            Some(_) if first => {
+                                let pool = replica_pool.as_deref();
+                                self.suspend_refusal(reads, pools, snap, pool, &lv).await
+                            }
+                            _ => None,
+                        };
                         let res = self.suspend_step(v, snap, prev.as_ref(), refused).await?;
                         ack(&self.node, SnapshotPhase::Suspending, taken, res)
                     } else {
@@ -1498,6 +1498,42 @@ impl Reconciler {
         Ok(hits.pop())
     }
 
+    /// Why this diskful replica refuses to suspend for the round: its take
+    /// would fail, with IO already suspended on every replica. An LV name
+    /// LVM refuses backstops the controller's admission check.
+    async fn suspend_refusal(
+        &mut self,
+        reads: &mut Reads,
+        pools: &[&Pool],
+        snap: &Snapshot,
+        pool: Option<&str>,
+        lv: &str,
+    ) -> Option<String> {
+        let place = self.place(pools, pool).ok()?;
+        if let Err(e) = lvm::names::check_new_lv(&place.vg, lv) {
+            return Some(e);
+        }
+        let uid = snap.metadata.uid.as_deref()?;
+        match self.foreign_lv(reads, &place, lv, uid).await {
+            Ok(None) => None,
+            Ok(Some(why)) => {
+                self.lv_conflict(snap, why.clone());
+                Some(why)
+            }
+            Err(e) => Some(e),
+        }
+    }
+
+    fn lv_conflict(&mut self, snap: &Snapshot, message: String) {
+        self.events.push(StatusWrite::Event {
+            kind: "Snapshot",
+            name: snap.name_any(),
+            uid: snap.metadata.uid.clone(),
+            reason: SNAPSHOT_LV_CONFLICT.into(),
+            message,
+        });
+    }
+
     /// Suspending on a replicated volume; None leaves the ack as it is.
     async fn suspend_step(
         &mut self,
@@ -1569,13 +1605,7 @@ impl Reconciler {
             Err(e) => ack(&self.node, SnapshotPhase::Taking, taken, Err(e)),
         };
         if conflict && prev != Some(&a) {
-            self.events.push(StatusWrite::Event {
-                kind: "Snapshot",
-                name: snap.name_any(),
-                uid: snap.metadata.uid.clone(),
-                reason: SNAPSHOT_LV_CONFLICT.into(),
-                message: a.error.clone().unwrap_or_default(),
-            });
+            self.lv_conflict(snap, a.error.clone().unwrap_or_default());
         }
         a
     }

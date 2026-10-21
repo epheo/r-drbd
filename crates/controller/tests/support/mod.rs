@@ -412,6 +412,8 @@ pub fn config(env: &Env, identity: &str) -> controller::Config {
     let mut cfg =
         controller::Config::new(NAMESPACE, format!("unix://{}", sock.display()), identity);
     cfg.ready_timeout = Duration::from_secs(20);
+    // Most tests fail rounds back to back; the backoff tests set it.
+    cfg.round_backoff = Duration::ZERO;
     cfg
 }
 

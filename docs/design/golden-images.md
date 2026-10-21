@@ -165,6 +165,10 @@ Freeze and failure:
 - A Failed Snapshot is never restored, and a partial copy left behind would pass for an image after a status loss.
 - A node down from the failure until a later status loss keeps its partial copy; it is still a consistent image of the round.
 - Only a round writes Failed; discovery ends in Ready or Lost, and neither removes a copy.
+- A node that never acked a failed round counts as unreachable for the volume's next round until its agent renews its Lease after the failure: the Lease outlives the suspend bound.
+- After a failed round the volume's next round waits 30 s, doubling per failure in a row up to 10 minutes; a Ready round resets it. Controller memory: a restart allows one early round.
+- An agent refuses the suspend with `SnapshotLvConflict` when an LV of the snapshot LV's name lacks this uid's tag, so a conflict fails the round before any freeze on that node.
+- The controller deletes a Failed Snapshot one hour after it failed, and the delete follows 6.3: a VolumeSnapshot deleted before CreateSnapshot succeeded leaves the sidecar no handle to delete it.
 
 Detecting a lost status:
 - `phase` has no default: absent reads as absent, never as Pending.
@@ -522,7 +526,7 @@ Status recovery:
 - Its Node object deleted changes nothing; its Pool deleted ends the wait without its copy.
 - A live agent's Pool deletion waits until that node answered.
 - Every copy removed by hand: Lost with `SnapshotLost`, no round; CreateSnapshot answers FailedPrecondition and never replaces it.
-- An LV of the snapshot's name with another uid or no tag: the take fails the round with `SnapshotLvConflict` and leaves it untouched; the orphan report names it.
+- An LV of the snapshot's name with another uid or no tag: the round fails with `SnapshotLvConflict` before that node suspends and leaves it untouched; the orphan report names it.
 - A round failed at Taking, one Taking ack lost: the LVs it took are gone on every node, including the one without an ack.
 - A Lost Snapshot keeps its LVs until deleted.
 - A status cleared on a deleting Snapshot: discovery finishes, then every copy is removed and the finalizer goes.
