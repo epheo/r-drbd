@@ -190,7 +190,14 @@ async fn lvm_lifecycle() {
     lvm.extend(VG, "rw-l-a1", 2 * GIB).await.unwrap();
     let e = lvm.extend(VG, "rw-l-a1", GIB).await.unwrap_err();
     println!("shrink refused: {e}");
-    lvm.snapshot(VG, "rw-l-a1", "rw-l-a1+snap").await.unwrap();
+    let tag = agent::storage::snap_tag("0b6f4a3e-2c1d-4e5f-8a9b-0c1d2e3f4a5b", 2 * GIB, 2);
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    lvm.snapshot(VG, "rw-l-a1", "rw-l-a1+snap", &[&tag])
+        .await
+        .unwrap();
     lvm.restore(VG, "rw-l-a1+snap", "rw-l-a2", &["rw-l.t2"])
         .await
         .unwrap();
@@ -206,9 +213,19 @@ async fn lvm_lifecycle() {
     let a2 = row(&rows, "rw-l-a2").unwrap();
     assert!(a2.active, "a restore is active on return");
     assert_eq!(lv_field("rw-l-a2", "lv_permissions").await, "writeable");
-    let tags = lvm.tags(VG).await.unwrap();
-    assert!(tags["rw-l-a1+snap"].is_empty(), "snapshots copy no tags");
-    assert_eq!(tags["rw-l-a2"], ["rw-l.t2"]);
+    // The snap tag from the snapshot's own lvcreate, none of its origin's;
+    // a restore copies none of its snapshot's.
+    let tagged = lvm.tagged(VG).await.unwrap();
+    assert_eq!(tagged["rw-l-a1+snap"].tags, std::slice::from_ref(&tag));
+    assert_eq!(tagged["rw-l-a2"].tags, ["rw-l.t2"]);
+    // lv_time in unix seconds, as the report config asks.
+    let created = tagged["rw-l-a1+snap"].created.unwrap();
+    let created = u64::try_from(created).unwrap();
+    assert!(
+        (before.saturating_sub(5)..before + 600).contains(&created),
+        "{created} vs {before}"
+    );
+    assert!(tagged["rw-l-a1"].created.unwrap() <= tagged["rw-l-a1+snap"].created.unwrap());
     lvm.change_tags(VG, "rw-l-a2", &["rw-l.t3"], &["rw-l.t2"])
         .await
         .unwrap();
@@ -426,6 +443,7 @@ fn pool() -> Arc<Pool> {
         },
     );
     p.metadata.generation = Some(1);
+    p.metadata.uid = Some("uid-test-host-pool".into());
     Arc::new(p)
 }
 
@@ -516,7 +534,9 @@ async fn reconcile_decision_table() {
     );
     snap.metadata.uid = Some("uid-snapshot-test-host".into());
     snap.status = Some(SnapshotStatus {
-        phase: SnapshotPhase::Taking,
+        phase: Some(SnapshotPhase::Taking),
+        size_bytes: Some(2 * GIB),
+        source_replicas: Some(1),
         ..SnapshotStatus::default()
     });
     let w = rec
@@ -535,6 +555,70 @@ async fn reconcile_decision_table() {
         .unwrap();
     println!("take: {ack:?}");
     assert!(ack.ok);
+    let tag = agent::storage::snap_tag("uid-snapshot-test-host", 2 * GIB, 1);
+    let tagged = lvm().tagged(VG).await.unwrap();
+    let lv = &tagged["rw-l-r1+snapshot-test-host"];
+    assert_eq!(
+        lv.tags,
+        std::slice::from_ref(&tag),
+        "tagged by its lvcreate"
+    );
+    let created = lv
+        .created
+        .map(|s| k8s_openapi::jiff::Timestamp::from_second(s).unwrap());
+    assert_eq!(ack.lv_created_at.as_ref().map(|t| t.0), created);
+
+    // Status lost: the copy is found again by its uid tag alone.
+    let snap_ack = |w: &[StatusWrite]| {
+        w.iter().find_map(|w| match w {
+            StatusWrite::Snapshot { ack, .. } => Some(ack.clone()),
+            _ => None,
+        })
+    };
+    let lost = |uid: &str, phase: SnapshotPhase| {
+        let mut s = snap.clone();
+        s.metadata.uid = Some(uid.into());
+        s.status = Some(SnapshotStatus {
+            phase: Some(phase),
+            size_bytes: Some(2 * GIB),
+            source_replicas: Some(1),
+            ..SnapshotStatus::default()
+        });
+        Arc::new(s)
+    };
+    let vols = [Arc::new(grown.clone())];
+    let found = lost("uid-snapshot-test-host", SnapshotPhase::Discovering);
+    let w = rec.pass(&pools, &vols, &[found]).await;
+    let found = snap_ack(&w).unwrap();
+    println!("discovery: {found:?}");
+    assert_eq!((found.found, found.ok), (Some(true), true));
+    assert_eq!(found.taken_pool.as_deref(), Some("test-host-pool"));
+    assert_eq!(found.searched_pools, ["uid-test-host-pool"]);
+    assert_eq!(
+        (found.tag_size_bytes, found.tag_source_replicas),
+        (Some(2 * GIB), Some(1))
+    );
+    assert_eq!(found.lv_created_at, ack.lv_created_at);
+    // A Snapshot of the same name with another uid finds nothing, and its
+    // take fails with the LV untouched.
+    let other = lost("uid-other-test-host", SnapshotPhase::Discovering);
+    let w = rec.pass(&pools, &vols, &[other]).await;
+    assert_eq!(snap_ack(&w).unwrap().found, Some(false));
+    let other = lost("uid-other-test-host", SnapshotPhase::Taking);
+    let w = rec.pass(&pools, &vols, &[other]).await;
+    let refused = snap_ack(&w).unwrap();
+    println!("conflict: {refused:?}");
+    assert!(!refused.ok && refused.taken_pool.is_none());
+    assert!(
+        refused
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("carries tag r-drbd.snap.uid-snapshot-test-host."),
+        "{refused:?}"
+    );
+    let tagged = lvm().tagged(VG).await.unwrap();
+    assert_eq!(tagged["rw-l-r1+snapshot-test-host"].tags, [tag]);
     // The restore finds the copy through the ack's takenPool.
     snap.status.as_mut().unwrap().acks = vec![ack];
 
@@ -550,6 +634,11 @@ async fn reconcile_decision_table() {
     println!("restore: {e:?}");
     assert!(e.present && e.last_error.is_none());
     assert_eq!(e.size_bytes, Some(3 * GIB));
+    let tags = &lvm().tagged(VG).await.unwrap()["rw-l-r2"].tags;
+    assert!(
+        !tags.iter().any(|t| agent::storage::is_snap_tag(t)),
+        "a restore never carries the snap tag: {tags:?}"
+    );
 
     let mut del1 = grown.clone();
     let mut del2 = v2.clone();
@@ -954,7 +1043,7 @@ async fn restored_xfs_mounts_next_to_its_source() {
     host_command("sync").status().unwrap();
 
     // Snapshot of a mounted file system: dirty log, same UUID as the source.
-    lvm.snapshot(VG, src, snap).await.unwrap();
+    lvm.snapshot(VG, src, snap, &[]).await.unwrap();
     lvm.restore(VG, snap, copy, &[]).await.unwrap();
     let copy_dev = format!("/dev/{VG}/{copy}");
     let before = fs_uuid(&copy_dev);

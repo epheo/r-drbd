@@ -20,12 +20,17 @@ These are the guarantees.
   A rebuilt replica never claims to hold data it does not have.
 - A restore whose snapshot LV is missing fails; it never creates an empty volume in its place.
 - A snapshot that failed on any node ends Failed; it is never reported Ready.
+- A Snapshot whose status is lost is rebuilt from the tags of its snapshot LVs, never taken again: new data never appears under a snapshot that may have been seen ready.
+  With no copy left, or copies that disagree, it is Lost and refuses restores.
 
 ## LVM
 
 - r-drbd touches only LVs inside the thin pool of a Pool.
   An LV with the expected name elsewhere in the VG is an error, never resized or removed.
 - A volume or snapshot LV is removed only when its Volume or Snapshot is deleted, or when the agent created it in the same pass and it never held data.
+  A snapshot LV also goes when its Snapshot Failed: a partial copy is never an image.
+- Every snapshot LV carries its Snapshot's uid in a tag from the lvcreate that made it.
+  Only an LV with that tag is adopted, restored from or searched for; one with a snap tag of another uid, or one that does not parse, is never adopted or removed.
 - Before removal the agent reads the LV report and waits while the LV is open; lvremove itself refuses an LV in use.
 - That lvremove passes `--yes`: it answers LVM's prompt for an active LV, not the in-use refusal.
 - The DRBD metadata on an LV belongs to the Volume and node named in an LVM tag on that LV.

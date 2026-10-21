@@ -61,13 +61,21 @@ pub fn parse_host_setting(stdout: &str) -> Option<String> {
 /// The `--config` value of every lvm command.
 pub const CONFIG: &str = concat!("devices { ", device_rules!(), " }");
 
+/// [`CONFIG`] for [`lv_tags`]: lv_time in unix seconds, not a local time
+/// with a zone.
+pub const TAG_CONFIG: &str = concat!(
+    "devices { ",
+    device_rules!(),
+    r#" } report { time_format = "%s" }"#
+);
+
 /// The line LVM prints on hosts with a devices file because of our filter.
 pub const FILTER_IGNORED_NOTICE: &str =
     "Please remove the lvm.conf filter, it is ignored with the devices file.";
 
 /// Fields of the LV report: what the reconciler and the pool probe read.
 pub const LV_FIELDS: &str = "lv_name,lv_path,lv_size,segtype,pool_lv,lv_active_locally,lv_device_open,zero,data_percent,chunk_size,metadata_percent,lv_health_status";
-pub const TAG_FIELDS: &str = "lv_name,lv_tags";
+pub const TAG_FIELDS: &str = "lv_name,lv_tags,lv_time";
 pub const VG_FIELDS: &str = "vg_name,vg_extent_size";
 /// Every VG of the host, for a Pool built from devices.
 pub const VG_ALL_FIELDS: &str =
@@ -80,7 +88,16 @@ fn lvm<S: AsRef<str>>(program: &str, options: &[S], target: String) -> Vec<Strin
 }
 
 fn lvm_n<S: AsRef<str>, T: AsRef<str>>(program: &str, options: &[S], targets: &[T]) -> Vec<String> {
-    let mut v = vec![program.to_owned(), "--config".to_owned(), CONFIG.to_owned()];
+    lvm_with(CONFIG, program, options, targets)
+}
+
+fn lvm_with<S: AsRef<str>, T: AsRef<str>>(
+    config: &str,
+    program: &str,
+    options: &[S],
+    targets: &[T],
+) -> Vec<String> {
+    let mut v = vec![program.to_owned(), "--config".to_owned(), config.to_owned()];
     v.extend(options.iter().map(|o| o.as_ref().to_owned()));
     v.extend(targets.iter().map(|t| t.as_ref().to_owned()));
     v
@@ -90,7 +107,12 @@ fn lvm_n<S: AsRef<str>, T: AsRef<str>>(program: &str, options: &[S], targets: &[
 /// `--binary` gives 0 or 1 for two-valued fields instead of words.
 /// No target reports every object the host's LVM sees.
 fn report_n(program: &str, fields: &str, target: Option<&str>) -> Vec<String> {
-    lvm_n(
+    report_with(CONFIG, program, fields, target)
+}
+
+fn report_with(config: &str, program: &str, fields: &str, target: Option<&str>) -> Vec<String> {
+    lvm_with(
+        config,
         program,
         &[
             "--reportformat",
@@ -114,9 +136,10 @@ pub fn lvs(vg: &str) -> Vec<String> {
     report("lvs", LV_FIELDS, vg)
 }
 
-/// Tags are read only when a decision needs them, apart from [`lvs`].
+/// Tags and creation times are read only when a decision needs them,
+/// apart from [`lvs`].
 pub fn lv_tags(vg: &str) -> Vec<String> {
-    report("lvs", TAG_FIELDS, vg)
+    report_with(TAG_CONFIG, "lvs", TAG_FIELDS, Some(vg))
 }
 
 pub fn vgs(vg: &str) -> Vec<String> {
@@ -171,10 +194,9 @@ pub fn create_thin(vg: &str, pool: &str, lv: &str, bytes: u64, tags: &[&str]) ->
 /// - activation skip: never activated, so no device node exists for udev,
 ///   blkid or a guest's LVM to open; set here, not left to the host default.
 /// - read-only: the data a restore copies never changes.
-pub fn snapshot(vg: &str, origin: &str, snap: &str) -> Vec<String> {
-    lvm(
-        "lvcreate",
-        &[
+pub fn snapshot(vg: &str, origin: &str, snap: &str, tags: &[&str]) -> Vec<String> {
+    let opts = with_tags(
+        [
             "--snapshot",
             "--setactivationskip",
             "y",
@@ -182,9 +204,12 @@ pub fn snapshot(vg: &str, origin: &str, snap: &str) -> Vec<String> {
             "r",
             "--name",
             snap,
-        ],
-        format!("{vg}/{origin}"),
-    )
+        ]
+        .map(str::to_owned)
+        .to_vec(),
+        tags,
+    );
+    lvm("lvcreate", &opts, format!("{vg}/{origin}"))
 }
 
 /// A writable thin snapshot of a snapshot LV, active once lvcreate returns.

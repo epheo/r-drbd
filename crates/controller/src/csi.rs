@@ -518,12 +518,7 @@ impl Csi {
             None => None,
             Some(SourceType::Snapshot(s)) => {
                 let id = required(&s.snapshot_id, "snapshot_id")?;
-                let snap = self
-                    .snapshots()
-                    .get_opt(id)
-                    .await
-                    .map_err(|e| kube_status("reading snapshot", &e))?
-                    .ok_or_else(|| Status::not_found(format!("snapshot {id} not found")))?;
+                let snap = self.resolve_snapshot(id).await?;
                 let snap_size = snap.status.as_ref().and_then(|s| s.size_bytes).unwrap_or(0);
                 if limit.is_some_and(|l| snap_size > l) {
                     return Err(Status::out_of_range(format!(
@@ -573,6 +568,46 @@ impl Csi {
             }
         };
         Ok((source, size, holder_node))
+    }
+
+    /// The live Snapshot a restore reads: never a Lost one or one taken
+    /// before snapshot LV tags, and never one still rebuilding its status,
+    /// whose size is unknown until its copies answered; that one is waited
+    /// for like a Volume not Ready yet.
+    async fn resolve_snapshot(&self, id: &str) -> Result<Snapshot, Status> {
+        let read = || async {
+            let snap = self
+                .snapshots()
+                .get_opt(id)
+                .await
+                .map_err(|e| kube_status("reading snapshot", &e))?
+                .ok_or_else(|| Status::not_found(format!("snapshot {id} not found")))?;
+            if let Some(e) = lost(id, &snap) {
+                return Err(e);
+            }
+            match crate::volume::taken_before_tags(&snap) {
+                Some(why) => Err(Status::failed_precondition(why)),
+                None => Ok(snap),
+            }
+        };
+        let snap = read().await?;
+        if !rebuilding(&snap) {
+            return Ok(snap);
+        }
+        let uid = snap.metadata.uid.clone();
+        wait::until(&self.stores, self.cfg.ready_timeout, |s| {
+            s.snapshot(id)
+                .filter(|x| x.metadata.uid != uid || !rebuilding(x))
+                .map(|_| ())
+        })
+        .await;
+        let snap = read().await?;
+        if rebuilding(&snap) {
+            return Err(Status::deadline_exceeded(format!(
+                "snapshot {id} is rebuilding its status from its copies"
+            )));
+        }
+        Ok(snap)
     }
 
     /// Waits until the store and the API no longer have the Volume.
@@ -1109,14 +1144,18 @@ impl Controller for Csi {
                 snap.spec.volume
             )));
         }
+        if let Some(e) = lost(&name, &snap) {
+            return Err(e);
+        }
         // A failed attempt is not reused: replace it, one new attempt per
         // call. So is one in a phase this version does not know: no round
         // ever ends it.
-        if snap
-            .status
-            .as_ref()
-            .is_some_and(|s| matches!(s.phase, SnapshotPhase::Failed | SnapshotPhase::Unknown))
-        {
+        if snap.status.as_ref().is_some_and(|s| {
+            matches!(
+                s.phase,
+                Some(SnapshotPhase::Failed | SnapshotPhase::Unknown)
+            )
+        }) {
             info!(snapshot = name, "replacing the failed snapshot");
             match self
                 .snapshots()
@@ -1133,10 +1172,14 @@ impl Controller for Csi {
         let uid = snap.metadata.uid.clone();
         let ready = wait::until(&self.stores, self.cfg.ready_timeout, |s| {
             let snap = s.snapshot(&name).filter(|x| x.metadata.uid == uid)?;
+            if let Some(e) = lost(&name, &snap) {
+                return Some(Err(e));
+            }
             let st = snap.status.as_ref()?;
             match st.phase {
-                SnapshotPhase::Ready => Some(Ok(snap.clone())),
-                SnapshotPhase::Failed | SnapshotPhase::Unknown => {
+                // Ready without its size lost its status: not ready.
+                Some(SnapshotPhase::Ready) if st.size_bytes.is_some() => Some(Ok(snap.clone())),
+                Some(SnapshotPhase::Failed | SnapshotPhase::Unknown) => {
                     Some(Err(Status::internal(format!(
                         "snapshot {name} failed: {}",
                         st.last_error.as_deref().unwrap_or("unknown error")
@@ -1297,6 +1340,25 @@ type Outcome = Result<Arc<Volume>, (Status, Option<(String, i64)>)>;
 
 /// (node, pool) pins of a PVC.
 type Pins = (Option<String>, Option<String>);
+
+/// A Lost Snapshot never turns Ready again by itself and is never
+/// replaced: the user takes a new snapshot under another name.
+fn lost(name: &str, snap: &Snapshot) -> Option<Status> {
+    let st = snap.status.as_ref()?;
+    (st.phase == Some(SnapshotPhase::Lost)).then(|| {
+        let reason = condition::get(&st.conditions, condition::types::READY)
+            .map_or(crate::snapshot::SNAPSHOT_LOST, |c| c.reason.as_str());
+        Status::failed_precondition(format!(
+            "snapshot {name} is lost ({reason}): {}; take a new snapshot under another name",
+            st.last_error.as_deref().unwrap_or_default()
+        ))
+    })
+}
+
+fn rebuilding(snap: &Snapshot) -> bool {
+    snap.status_lost()
+        || snap.status.as_ref().and_then(|st| st.phase) == Some(SnapshotPhase::Discovering)
+}
 
 /// What one Volume read tells CreateVolume: Ok once Ready or Degraded at
 /// least at the requested size, an error when it can never be, None to

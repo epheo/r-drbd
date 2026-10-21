@@ -26,6 +26,7 @@ Install the external-snapshotter CRDs and snapshot controller first.
         persistentVolumeClaimName: demo
 
 The CSI driver creates a Snapshot object; `kubectl get snapshots` shows its volume, phase and size.
+A CreateSnapshot retry under the same name replaces a Failed Snapshot with a new attempt, answers not ready while a lost status is being rebuilt, and refuses a Lost Snapshot with FailedPrecondition: take a new snapshot under another name (see [Operations](operations.md#a-lost-snapshot-status)).
 
 A snapshot of a replicated volume waits in Pending, saying why in `lastError`, until:
 
@@ -42,7 +43,9 @@ Then:
 
 1. Every replica suspends IO, diskless and tiebreaker included, within 30 s; the Primary acks once none of its writes is still on its way to a disk or a peer.
 2. Every diskful node creates a thin snapshot of its LV, and every other replica confirms its IO is still suspended, within 2 minutes.
+   The lvcreate tags the snapshot LV `r-drbd.snap.<snapshot uid>.<size bytes>.<source replicas>`.
 3. The snapshot is Ready, or Failed with the reason; every replica resumes IO on its own when it sees the round end.
+   `createdAt` is the creation time of the earliest copy.
 
 Each node's copy is crash-consistent.
 The copies of one snapshot can still differ: a page rewritten while it is written out can reach each node's disk in another version.
@@ -59,12 +62,17 @@ Each node keeps its own deadlines, on its own clock:
 - it resumes IO 4 minutes after its own suspend, even when the controller or the API server is gone; the snapshot then fails unless every copy was already taken.
 
 So IO stays frozen about 4 minutes at most.
+A node resumes before its deadline only when the Snapshot whose round froze its IO reaches a phase past the round; one whose phase vanished keeps IO frozen up to the deadline, so every copy of a round is taken inside one freeze.
 A node that is no longer suspended when it should be (a reboot, a resume on its deadline) fails the snapshot.
 A replica attached during the round never suspended, so it fails the snapshot too.
 While a round runs, volume expansion is refused (the call is retried) and no replica grows.
 
 A failed take is a failure: the Snapshot never turns Ready without a backing LV on every node.
 A snapshot of a volume that is being deleted, or that stays missing for 30 s, fails.
+On a Failed Snapshot every node with a Pool removes an LV tagged with its uid, whether or not it took part.
+
+An LV of the snapshot LV's name that does not carry this Snapshot's uid (an LV left by an older Snapshot of the same name, say) is never adopted: the round fails, the LV stays untouched, and a Warning Event `SnapshotLvConflict` names it.
+A retry under the same name fails the same way while that LV is there.
 
 ## Restoring
 
@@ -89,6 +97,8 @@ It always lands in the Pools that hold the snapshot.
 
 Rules:
 
+- A copy is restored only when its LV carries the Snapshot's uid tag: a snapshot taken before these tags existed is no longer restorable, and its restore fails saying so (CreateVolume answers FailedPrecondition; a restore already placed fails with reason `UnsupportedRestore`).
+  A restored LV never keeps the snapshot's tag.
 - A local restore (`replicas: 1`) uses one of the nodes holding the snapshot, preferring one whose agent is alive; the new volume is a writable thin snapshot of the snapshot LV, so it is instant and shares blocks.
 - A replicated restore needs `replicas` equal to the number of nodes holding the snapshot.
   With `copiesIdentical` true every replica restores its own copy, a thin snapshot, and nothing syncs.
@@ -96,7 +106,9 @@ Rules:
   While the digests are pending each replica restores its copy and the first node waits for them up to 2 minutes; past that it is the sync source and the others are copied in full.
   The volume is Ready, and its claim usable, once any sync ends.
 - A holder whose node is down, whose agent is stale or whose Pool is not Available keeps the restore Pending, reason `Insufficient`, naming it.
-- A Ready snapshot whose acks lost their `takenPool` keeps the restore Pending, reason `SnapshotNotReady`, until each holder finds its LV again and acks it.
+- A Ready snapshot with fewer holders than its source had replicas (an ack lost) has every node without an ack search for its LV by the uid tag and ack a copy it finds.
+- A snapshot rebuilding a lost status (phase `Discovering`) is waited for: CreateVolume writes nothing until its size is known again, and the replicas of a restore already placed wait for their copies rather than start empty.
+  A Lost one is refused: CreateVolume answers FailedPrecondition, and a restore already placed fails with reason `SnapshotLost`.
 - A replicated restore larger than its snapshot starts at the snapshot's size, then grows online; the new area syncs, zero blocks as discards.
   The claim is usable once the volume is Ready at the requested size.
 - A full thin pool for an empty replica stays an error.
@@ -116,8 +128,9 @@ Snapshot it, then restore the snapshot.
 ## Deleting
 
 Deleting the VolumeSnapshot (deletion policy Delete) deletes the Snapshot, and each node removes its snapshot LV.
-Each node removes it from the Pool it was taken in (`takenPool`), even after its replica moved to another Pool.
-A node without that record searches the thin pools of its Pools for the LV; an LV of that name outside them is an error, never removed.
+Each node removes it from the Pool it was taken in (`takenPool`), even after its replica moved to another Pool: the LV of that name with this Snapshot's uid tag, or with no snap tag (taken before tags existed), never one with a snap tag of another uid or one that does not parse.
+A node without that record searches the thin pools of its Pools for the LV with this Snapshot's uid tag; such an LV outside them is an error, never removed.
+A Snapshot rebuilding a lost status finishes that first; then, Ready or Lost, it removes the copies its discovery found.
 A Snapshot waits for the restores from it that are not yet initialized: it stays until each restored volume is first Ready, and a node holding a copy for such a restore keeps it until then.
 A restore that cannot start says why in its Ready condition, for example "LV <vg>/<lv> is not this restore's copy of snapshot <name>; delete the claim and restore again".
 Deleting a stuck claim removes its LVs and releases the Snapshot.

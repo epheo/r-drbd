@@ -481,11 +481,26 @@ impl Reconciler {
         out
     }
 
-    /// The Events of [`Self::device_events`] for `pool` did not reach the
-    /// API: forget them so the next pass sends them again.
-    pub(crate) fn events_unsent(&mut self, pool: &str) {
+    /// The Events of `unsent` did not reach the API. A Pool's are made
+    /// again from state once forgotten; a Snapshot's come from a step that
+    /// may never run again, so they wait for the next pass as they are.
+    pub(crate) fn events_unsent(&mut self, unsent: Vec<StatusWrite>) {
+        for w in unsent {
+            match &w {
+                StatusWrite::Event {
+                    kind: "Snapshot", ..
+                } => self.events.push(w),
+                StatusWrite::Event { name, .. } => self.pool_events_unsent(name),
+                _ => {}
+            }
+        }
+    }
+
+    fn pool_events_unsent(&mut self, pool: &str) {
         self.device_events.remove(pool);
         self.pool_notes.remove(pool);
+        let lvs = format!("{pool}/");
+        self.orphans_reported.retain(|k| !k.starts_with(&lvs));
     }
 
     /// One Warning Event per path that cannot join a built Pool, when its
@@ -501,6 +516,7 @@ impl Reconciler {
         if out.note != self.pool_notes.get(&name).cloned() {
             if let Some(n) = &out.note {
                 out.events.push(StatusWrite::Event {
+                    kind: "Pool",
                     name: name.clone(),
                     uid: pool.metadata.uid.clone(),
                     reason: "PoolNotGrown".into(),
@@ -525,6 +541,7 @@ impl Reconciler {
             .collect();
         if !new.is_empty() {
             out.events.push(StatusWrite::Event {
+                kind: "Pool",
                 name: name.clone(),
                 uid: pool.metadata.uid.clone(),
                 reason: "DeviceNotUsable".into(),

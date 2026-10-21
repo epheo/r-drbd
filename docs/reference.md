@@ -29,7 +29,7 @@ Group `r-drbd.io/v1alpha1`, cluster scoped.
 
 Device `state`: `Member`, `Blank`, `NotEmpty`, `Busy`, `NotADisk`, `Missing` (see [Pools](pools.md#what-the-agent-checks)).
 
-Finalizer `r-drbd.io/pool` holds deletion while `status.volumes` is not empty, and under `reclaimPolicy: Delete` until `Released` is True.
+Finalizer `r-drbd.io/pool` holds deletion while `status.volumes` is not empty, while a Snapshot's holder ack names the Pool, while its node owes a `Discovering` Snapshot its answer (unless its agent is stale or its search fails), and under `reclaimPolicy: Delete` until `Released` is True.
 
 ## Volume
 
@@ -86,14 +86,14 @@ A snapshot over the limit ends Failed before any IO is suspended.
 |---|---|
 | `spec.volume` | Source Volume; immutable |
 | `spec.volumeUid` | That Volume's uid, written by the CSI driver; immutable. A Volume of the name with another uid counts as absent; a Snapshot without a uid takes no round |
-| `status.phase` | Pending, Suspending, Taking, Ready, Failed, Deleting |
+| `status.phase` | Pending, Suspending, Taking, Ready, Failed, Deleting; Discovering and Lost after a status loss (see [Operations](operations.md#a-lost-snapshot-status)). No default: absent until the controller's first status, which it writes before its finalizer |
 | `status.sizeBytes` | Volume size at snapshot time |
 | `status.fileSystem` | Inherited by restores |
-| `status.createdAt` | When the snapshot was taken |
+| `status.createdAt` | When the earliest holder's snapshot LV was created |
 | `status.phaseSince` | When the current phase began |
 | `status.sourceReplicas` | The source Volume's replicas, written on the way into Taking |
 | `status.copiesIdentical` | Written once every holder acked a digest: true when all match. Absent while pending |
-| `status.acks[]` | Per node: `node`, `phase`, `ok`, `error`, and from its successful take `takenPool`, `lvBytes`, `allocatedBytes`; after Ready, `digest` (hex sha256 over the sha256 of each 4 MiB chunk) and `digestBytes` (the range, the DRBD device size from the copy's metadata). Every later ack copies them |
+| `status.acks[]` | Per node: `node`, `phase`, `ok`, `error`, and from its successful take `takenPool`, `lvBytes`, `allocatedBytes`, `lvCreatedAt` (when LVM created the snapshot LV), `tagSizeBytes` and `tagSourceReplicas` (what the take wrote in the LV's tag; a holder ack without them is no holder copy); after Ready, `digest` (hex sha256 over the sha256 of each 4 MiB chunk) and `digestBytes` (the range, the DRBD device size from the copy's metadata). Every later ack copies them. A `Discovering` answer: `searchedPools` (the uid of every Pool of the node), `phaseSince` (the `phaseSince` of the discovery it answers; an answer to an earlier one counts for nothing), `found`, and for a copy found `takenPool`, `lvBytes`, `lvCreatedAt`, `tagSizeBytes` and `tagSourceReplicas` (what its tag records); a found answer is a holder ack from then on, the others go once the phase moves on |
 | `status.lastError` | Why it waits in Pending, or why it failed |
 | `status.conditions` | `Ready` |
 | `status.observedGeneration` | Spec generation the controller last wrote status for |
@@ -155,7 +155,8 @@ Volume `Ready`:
 | `SnapshotNotReady` | Restore waits for its snapshot |
 | `SnapshotFailed` | Restore source has no node holding it |
 | `SnapshotUidMismatch` | The Snapshot of that name has another uid (waits), or the source has no uid (fails) |
-| `UnsupportedRestore` | Replica count differs from the snapshot's node count |
+| `SnapshotLost` | The Snapshot is Lost, confirmed on a live read (fails) |
+| `UnsupportedRestore` | Replica count differs from the snapshot's node count, or the snapshot was taken before snapshot LV tags |
 | `RestoreNodeConflict` | Pins point away from the snapshot |
 | `InvalidSurvivor` | `spec.resolve.survivor` holds no diskful replica |
 | `ResolveWithoutSplitBrain` | `spec.resolve` is set but there is no split brain; the status of `Ready` is kept; remove `spec.resolve` |
@@ -179,17 +180,17 @@ Volume `PeerUnreachable`:
 | `NotListening` | The probe was refused: nothing listens at that address and port, or a firewall answers with a TCP reset |
 | `Unknown` | The port answers but DRBD does not connect, or the probe failed |
 
-Snapshot `Ready`: True with reason `Ready`; False with the phase as reason (`Pending`, `Suspending`, `Taking`, ..., `Failed`, `Deleting`) and `lastError` as message.
+Snapshot `Ready`: True with reason `Ready`; False with the phase as reason (`Pending`, `Suspending`, `Taking`, ..., `Failed`, `Deleting`, `Discovering`) and `lastError` as message; `DiscoveryIncomplete` once a discovery waited 10 minutes for a node, named in the message; Lost with `SnapshotLost` (no copy found) or `TagsDisagree` (the copies' tags differ).
 
 Pool `Available`: `ThinPoolReady`, `ThinPoolUnavailable`, `ZeroingDisabled`, `InvalidName`, `LvmUnsupported` (host LVM older than 2.03.03); devices mode also `DeviceNotEmpty`, `DeviceBusy`, `DeviceMissing`, `NotADisk`, `VolumeGroupNotOwned`, `Building` (a build step failed, named in the message; a failed growth step keeps the Pool Available and puts the error in the message).
 
 Pool `Released`: `Removed` (True: thin pool, VG and PV labels removed), `RemoveBlocked` (False: something else is in the VG, the VG is not the Pool's, or it misses a PV; nothing removed), `RemoveFailed` (False: an LVM command failed, retried on the next pass).
 
-Pool Events: `DeviceNotUsable` (Warning: an appended path is not blank and stays out of the pool), `PoolNotGrown` (Warning: a growth step failed, or the metadata maximum leaves VG space out of the pool).
+Pool Events: `DeviceNotUsable` (Warning: an appended path is not blank and stays out of the pool), `PoolNotGrown` (Warning: a growth step failed, or the metadata maximum leaves VG space out of the pool), `ImageOrphanLv` (Warning, once per LV: a snapshot LV whose tag names a uid no Snapshot has or does not parse, or with no tag and named by no ack; left alone), `DeletionWaitsForDiscovery` (Warning, once per change: a deleting Pool waits for its node's answer to the discovery of the Snapshots named).
 
 Volume Events: `Evicted`, `EvictionBlocked`, `SplitBrainResolved`, `PeerUnreachable` (Warning), `PeersReachable`, `AttachmentFailed` (Warning, once per distinct message), `StatusApplyFailed` (Warning, once per error kind until an apply succeeds), `DuplicateAssignment` (Warning on each holder of a minor or port held twice; never rewritten).
 
-Snapshot Events: `ImageCopiesDiffer` (Warning, once when `copiesIdentical` is written false; names each holder's digest).
+Snapshot Events: `ImageCopiesDiffer` (Warning, once when `copiesIdentical` is written false; names each holder's digest), `SnapshotLvConflict` (Warning, from a node's agent: an LV of the snapshot LV's name without this Snapshot's uid tag; the round fails and the LV stays), `ImageDiscoveryIncomplete` (Warning, once when a discovery has waited 10 minutes; names the silent nodes), `ImageLost` (Warning, once when a discovery ends Lost).
 
 ## CSI driver
 
@@ -246,6 +247,7 @@ Other environment:
 | DRBD minors | 50000 to 99999 |
 | DRBD resource name, LV name | Volume name |
 | Snapshot LV name | `<volume>+<snapshot>` |
+| Snapshot LV tag | `r-drbd.snap.<snapshot uid>.<size bytes>.<source replicas>`, set by the lvcreate |
 | Resource files | `/var/lib/r-drbd/<volume>.res` |
 | Include file | `/etc/drbd.d/r-drbd.res` |
 | CSI socket | `/var/lib/kubelet/plugins/r-drbd.io/csi.sock` |

@@ -29,6 +29,7 @@ pub mod reason {
     pub const SNAPSHOT_NOT_READY: &str = "SnapshotNotReady";
     pub const SNAPSHOT_FAILED: &str = "SnapshotFailed";
     pub const SNAPSHOT_UID_MISMATCH: &str = "SnapshotUidMismatch";
+    pub const SNAPSHOT_LOST: &str = "SnapshotLost";
     pub const ALLOCATION_FAILED: &str = "AllocationFailed";
     /// AttachmentFailed True, and its Warning Event.
     pub const ATTACHMENT_FAILED: &str = "AttachmentFailed";
@@ -1280,6 +1281,9 @@ async fn reconcile(
             .await;
         }
         Placement::Fail(c) => {
+            if c.reason == reason::SNAPSHOT_LOST && !lost_live(ctx, v).await {
+                return;
+            }
             write(
                 memory,
                 api,
@@ -1289,6 +1293,28 @@ async fn reconcile(
             .await;
         }
     }
+}
+
+/// The restore's Snapshot is Lost on a live read: the store may lag a
+/// phase cleared by hand to start a new discovery.
+async fn lost_live(ctx: &Ctx<'_>, v: &Volume) -> bool {
+    let Some(src) = &v.spec.source else {
+        return false;
+    };
+    let api: Api<Snapshot> = Api::all(ctx.client.clone());
+    match api.get_opt(&src.snapshot).await {
+        Ok(s) => lost_source(src, s.as_ref()),
+        Err(e) => {
+            warn!(volume = v.name_any(), error = %e, "reading the restore's snapshot failed");
+            false
+        }
+    }
+}
+
+fn lost_source(src: &model::VolumeSource, snap: Option<&Snapshot>) -> bool {
+    snap.is_some_and(|s| {
+        src.is(s) && s.status.as_ref().and_then(|st| st.phase) == Some(SnapshotPhase::Lost)
+    })
 }
 
 /// Converges the diskless entries of a DRBD volume to spec.attachments;
@@ -1378,10 +1404,25 @@ async fn attach_report(
 /// A snapshot round runs in Suspending and Taking. Pending is not one:
 /// it waits for a Ready volume, which may need the very move it would block.
 pub fn round_running(s: &Snapshot) -> bool {
-    matches!(
-        s.status.as_ref().map(|st| st.phase),
-        Some(SnapshotPhase::Suspending | SnapshotPhase::Taking)
-    )
+    round_running_at(s, k8s_openapi::jiff::Timestamp::now())
+}
+
+/// A status lost mid round counts as one until every agent's own resume
+/// deadline passed: their freeze may still hold for it, and only the
+/// agents know which round suspended them.
+pub fn round_running_at(s: &Snapshot, now: k8s_openapi::jiff::Timestamp) -> bool {
+    let st = s.status.as_ref();
+    match st.and_then(|st| st.phase) {
+        Some(SnapshotPhase::Suspending | SnapshotPhase::Taking) => true,
+        Some(SnapshotPhase::Discovering) => {
+            let bound = model::snapshot::RESUME_AFTER + model::snapshot::CLOCK_MARGIN;
+            st.and_then(|st| st.phase_since.as_ref()).is_none_or(|t| {
+                std::time::Duration::try_from(now.duration_since(t.0)).unwrap_or_default() < bound
+            })
+        }
+        None => s.status_lost(),
+        Some(_) => false,
+    }
 }
 
 /// The first Snapshot of `volume` by name whose round runs.
@@ -1830,12 +1871,13 @@ enum Placement {
     Fail(Cond),
 }
 
-/// Every (node, takenPool) holding the snapshot LV, by node name.
+/// Every (node, takenPool) holding a copy of the snapshot, by node name.
 pub fn snapshot_holders(snap: &Snapshot) -> Vec<(String, String)> {
     let mut holders: Vec<(String, String)> = snap
         .status
         .iter()
         .flat_map(|s| &s.acks)
+        .filter(|a| a.holder_copy())
         .filter_map(|a| a.taken_pool.clone().map(|p| (a.node.clone(), p)))
         .collect();
     holders.sort();
@@ -1843,7 +1885,19 @@ pub fn snapshot_holders(snap: &Snapshot) -> Vec<(String, String)> {
     holders
 }
 
-/// The Snapshot a restore reads, once Ready.
+/// Why a Ready Snapshot can never be restored: no holder ack carries the
+/// tag values, so it was taken before snapshot LV tags.
+pub fn taken_before_tags(snap: &Snapshot) -> Option<String> {
+    let st = snap.status.as_ref()?;
+    (st.phase == Some(SnapshotPhase::Ready) && !st.acks.iter().any(model::SnapshotAck::holder_copy))
+        .then(|| {
+            format!(
+                "snapshot {} was taken before snapshot LV tags: no copy of it is proven its own, so it cannot be restored",
+                snap.name_any()
+            )
+        })
+}
+
 /// The store's Snapshot of the source's name, if it is the one the source
 /// names by uid. A source without a uid was written before uids were
 /// recorded and never binds. Another uid waits: the store may lag behind
@@ -1873,6 +1927,7 @@ fn bound_snapshot<'a>(
     }
 }
 
+/// The Snapshot a restore reads, once Ready.
 fn ready_snapshot<'a>(snap: Option<&'a Snapshot>, wanted: &str) -> Result<&'a Snapshot, Placement> {
     let Some(snap) = snap else {
         return Err(Placement::Wait(Cond::new(
@@ -1881,11 +1936,34 @@ fn ready_snapshot<'a>(snap: Option<&'a Snapshot>, wanted: &str) -> Result<&'a Sn
             format!("snapshot {wanted} not found"),
         )));
     };
+    // Its acks may be stale until the discovery ran.
+    if snap.status_lost() {
+        return Err(Placement::Wait(Cond::new(
+            FALSE,
+            reason::SNAPSHOT_NOT_READY,
+            format!("snapshot {wanted} lost its status: waiting for its discovery"),
+        )));
+    }
+    if let Some(why) = taken_before_tags(snap) {
+        return Err(Placement::Fail(Cond::new(
+            FALSE,
+            reason::UNSUPPORTED_RESTORE,
+            why,
+        )));
+    }
     let status = snap.status.clone().unwrap_or_default();
     match status.phase {
-        SnapshotPhase::Ready => Ok(snap),
+        Some(SnapshotPhase::Ready) => Ok(snap),
+        Some(SnapshotPhase::Lost) => Err(Placement::Fail(Cond::new(
+            FALSE,
+            reason::SNAPSHOT_LOST,
+            format!(
+                "snapshot {wanted} is lost: {}",
+                status.last_error.unwrap_or_default()
+            ),
+        ))),
         // Unknown: written by another version; no round ever ends it.
-        SnapshotPhase::Failed | SnapshotPhase::Unknown => Err(Placement::Fail(Cond::new(
+        Some(SnapshotPhase::Failed | SnapshotPhase::Unknown) => Err(Placement::Fail(Cond::new(
             FALSE,
             reason::SNAPSHOT_FAILED,
             format!(
@@ -1896,7 +1974,10 @@ fn ready_snapshot<'a>(snap: Option<&'a Snapshot>, wanted: &str) -> Result<&'a Sn
         p => Err(Placement::Wait(Cond::new(
             FALSE,
             reason::SNAPSHOT_NOT_READY,
-            format!("snapshot {wanted} is {p:?}"),
+            match p {
+                Some(p) => format!("snapshot {wanted} is {p:?}"),
+                None => format!("snapshot {wanted} has no phase yet"),
+            },
         ))),
     }
 }
@@ -1914,15 +1995,6 @@ fn restore_holders(
 ) -> Result<Vec<placer::Chosen>, Placement> {
     let snap = ready_snapshot(snap, wanted)?;
     let mut holders = snapshot_holders(snap);
-    // Ready without one: acks lost or written before takenPool existed;
-    // the agents find their copies again and re-ack.
-    if holders.is_empty() {
-        return Err(Placement::Wait(Cond::new(
-            FALSE,
-            reason::SNAPSHOT_NOT_READY,
-            format!("snapshot {wanted}: no holder acked where its copy lives yet"),
-        )));
-    }
     holders.retain(|(n, _)| exists(n));
     if holders.is_empty() {
         return Err(Placement::Fail(Cond::new(
@@ -3190,6 +3262,8 @@ mod tests {
     fn snapshot_rounds_that_block_eviction() {
         let mut snap = Snapshot::new("s", spec_of("v"));
         assert!(!round_running(&snap), "no status yet");
+        snap.metadata.finalizers = Some(vec![model::keys::FINALIZER_SNAPSHOT.into()]);
+        assert!(round_running(&snap), "status lost: maybe mid round");
         for (phase, running) in [
             (SnapshotPhase::Pending, false),
             (SnapshotPhase::Suspending, true),
@@ -3199,11 +3273,36 @@ mod tests {
             (SnapshotPhase::Deleting, false),
         ] {
             snap.status = Some(model::SnapshotStatus {
-                phase,
+                phase: Some(phase),
                 ..model::SnapshotStatus::default()
             });
             assert_eq!(round_running(&snap), running, "{phase:?}");
         }
+    }
+
+    /// A discovery may have started mid round: it counts as one until
+    /// every agent's own deadline passed.
+    #[test]
+    fn a_fresh_discovery_counts_as_a_round_until_the_freeze_bound() {
+        let since = k8s_openapi::jiff::Timestamp::from_second(1_000_000).unwrap();
+        let mut snap = Snapshot::new("s", spec_of("v"));
+        snap.status = Some(model::SnapshotStatus {
+            phase: Some(SnapshotPhase::Discovering),
+            phase_since: Some(Time(since)),
+            ..model::SnapshotStatus::default()
+        });
+        let bound = model::snapshot::RESUME_AFTER + model::snapshot::CLOCK_MARGIN;
+        let at = |d: std::time::Duration| {
+            since + k8s_openapi::jiff::SignedDuration::try_from(d).unwrap()
+        };
+        assert!(round_running_at(&snap, at(std::time::Duration::ZERO)));
+        assert!(round_running_at(
+            &snap,
+            at(bound.saturating_sub(std::time::Duration::from_secs(1)))
+        ));
+        assert!(!round_running_at(&snap, at(bound)));
+        snap.status.as_mut().unwrap().phase_since = None;
+        assert!(round_running_at(&snap, at(bound)), "no start yet");
     }
 
     #[test]
@@ -3263,26 +3362,95 @@ mod tests {
     }
 
     #[test]
+    fn a_restore_of_a_lost_image_fails_one_still_discovering_waits() {
+        let mut snap = Snapshot::new("s", spec_of("v"));
+        snap.status = Some(model::SnapshotStatus {
+            phase: Some(SnapshotPhase::Lost),
+            last_error: Some("no copy on any node with a Pool".into()),
+            ..model::SnapshotStatus::default()
+        });
+        let Err(Placement::Fail(c)) = ready_snapshot(Some(&snap), "s") else {
+            panic!("a Lost image fails its restore");
+        };
+        assert_eq!(c.reason, reason::SNAPSHOT_LOST);
+        assert!(c.message.contains("no copy"), "{}", c.message);
+        snap.status.as_mut().unwrap().phase = Some(SnapshotPhase::Discovering);
+        let Err(Placement::Wait(c)) = ready_snapshot(Some(&snap), "s") else {
+            panic!("a discovery is waited for");
+        };
+        assert_eq!(c.reason, reason::SNAPSHOT_NOT_READY);
+        // Ready without its size lost its status: waited for, never used.
+        let st = snap.status.as_mut().unwrap();
+        st.phase = Some(SnapshotPhase::Ready);
+        st.acks = vec![holder_ack("n1", SnapshotPhase::Taking, "p1")];
+        let Err(Placement::Wait(c)) = ready_snapshot(Some(&snap), "s") else {
+            panic!("a lost status is waited for");
+        };
+        assert_eq!(c.reason, reason::SNAPSHOT_NOT_READY);
+        snap.status.as_mut().unwrap().size_bytes = Some(G);
+        assert!(ready_snapshot(Some(&snap), "s").is_ok());
+    }
+
+    /// The live read decides a Lost restore: only the Snapshot of the
+    /// source's uid, still Lost.
+    #[test]
+    fn a_restore_fails_on_a_live_read_of_its_snapshot_still_lost() {
+        let mut snap = Snapshot::new("s", spec_of("v"));
+        snap.metadata.uid = Some("uid-s".into());
+        snap.status = Some(model::SnapshotStatus {
+            phase: Some(SnapshotPhase::Lost),
+            ..model::SnapshotStatus::default()
+        });
+        let src = model::VolumeSource {
+            snapshot: "s".into(),
+            snapshot_uid: Some("uid-s".into()),
+        };
+        assert!(lost_source(&src, Some(&snap)));
+        assert!(!lost_source(&src, None), "gone");
+        let other = model::VolumeSource {
+            snapshot_uid: Some("uid-other".into()),
+            ..src.clone()
+        };
+        assert!(!lost_source(&other, Some(&snap)), "another uid");
+        // The phase cleared by hand: a new discovery, no failure.
+        snap.status.as_mut().unwrap().phase = None;
+        assert!(!lost_source(&src, Some(&snap)));
+    }
+
+    /// The ack of a holder copy in `pool`, with the tag values of its take.
+    fn holder_ack(node: &str, phase: SnapshotPhase, pool: &str) -> model::SnapshotAck {
+        model::SnapshotAck {
+            taken_pool: Some(pool.into()),
+            tag_size_bytes: Some(G),
+            tag_source_replicas: Some(2),
+            ok: true,
+            ..model::SnapshotAck::new(node, phase)
+        }
+    }
+
+    #[test]
     fn holders_from_acks() {
-        let ack = |node: &str, ok: bool, pool: Option<&str>| model::SnapshotAck {
-            node: node.into(),
-            phase: SnapshotPhase::Taking,
-            taken_pool: pool.map(str::to_owned),
-            lv_bytes: None,
-            allocated_bytes: None,
-            digest: None,
-            digest_bytes: None,
-            ok,
-            error: None,
+        let failed = model::SnapshotAck {
+            ok: false,
+            ..holder_ack("n3", SnapshotPhase::Taking, "p3")
+        };
+        let before_tags = model::SnapshotAck {
+            tag_size_bytes: None,
+            tag_source_replicas: None,
+            ..holder_ack("n5", SnapshotPhase::Taking, "p5")
         };
         let mut snap = Snapshot::new("s", spec_of("v"));
         snap.status = Some(model::SnapshotStatus {
             acks: vec![
-                ack("n2", true, Some("p2")),
-                ack("n1", true, Some("p1")),
+                holder_ack("n2", SnapshotPhase::Taking, "p2"),
+                holder_ack("n1", SnapshotPhase::Taking, "p1"),
                 // A later failed ack still says where the copy lives.
-                ack("n3", false, Some("p3")),
-                ack("n4", true, None),
+                failed,
+                model::SnapshotAck {
+                    ok: true,
+                    ..model::SnapshotAck::new("n4", SnapshotPhase::Taking)
+                },
+                before_tags,
             ],
             ..model::SnapshotStatus::default()
         });
@@ -3301,18 +3469,8 @@ mod tests {
         // Its acks carry a phase this version removed; the copies are there.
         let mut snap = Snapshot::new("s", spec_of("v"));
         snap.status = Some(model::SnapshotStatus {
-            phase: SnapshotPhase::Ready,
-            acks: vec![model::SnapshotAck {
-                node: "n1".into(),
-                phase: SnapshotPhase::Unknown,
-                taken_pool: Some("p1".into()),
-                lv_bytes: None,
-                allocated_bytes: None,
-                digest: None,
-                digest_bytes: None,
-                ok: true,
-                error: None,
-            }],
+            phase: Some(SnapshotPhase::Ready),
+            acks: vec![holder_ack("n1", SnapshotPhase::Unknown, "p1")],
             ..model::SnapshotStatus::default()
         });
         assert_eq!(
@@ -3322,21 +3480,11 @@ mod tests {
     }
 
     fn restore_case(replicas: u32, size: u64) -> (Volume, Snapshot, Vec<placer::PoolView>) {
-        let ack = |node: &str, pool: &str| model::SnapshotAck {
-            node: node.into(),
-            phase: SnapshotPhase::Ready,
-            taken_pool: Some(pool.into()),
-            lv_bytes: None,
-            allocated_bytes: None,
-            digest: None,
-            digest_bytes: None,
-            ok: true,
-            error: None,
-        };
+        let ack = |node: &str, pool: &str| holder_ack(node, SnapshotPhase::Ready, pool);
         let mut snap = Snapshot::new("s", spec_of("v"));
         snap.metadata.uid = Some("uid-s".into());
         snap.status = Some(model::SnapshotStatus {
-            phase: SnapshotPhase::Ready,
+            phase: Some(SnapshotPhase::Ready),
             size_bytes: Some(10 * G),
             acks: vec![ack("n1", "p1"), ack("n2", "p2")],
             ..model::SnapshotStatus::default()
@@ -3469,16 +3617,29 @@ mod tests {
     }
 
     #[test]
-    fn a_ready_snapshot_without_taken_pools_waits_for_them() {
-        let (v, mut snap, views) = restore_case(2, 10 * G);
-        for a in &mut snap.status.as_mut().unwrap().acks {
-            a.taken_pool = None;
+    fn a_snapshot_taken_before_tags_is_refused() {
+        type Edit = fn(&mut model::SnapshotAck);
+        let edits: [Edit; 2] = [
+            |a| {
+                a.tag_size_bytes = None;
+                a.tag_source_replicas = None;
+            },
+            |a| a.taken_pool = None,
+        ];
+        for edit in edits {
+            let (v, mut snap, views) = restore_case(2, 10 * G);
+            snap.status.as_mut().unwrap().acks.iter_mut().for_each(edit);
+            let Err(Placement::Fail(c)) = restore_holders(&v, Some(&snap), "s", &views, &|_| true)
+            else {
+                panic!("never restorable");
+            };
+            assert_eq!(c.reason, reason::UNSUPPORTED_RESTORE);
+            assert!(
+                c.message.contains("before snapshot LV tags"),
+                "{}",
+                c.message
+            );
         }
-        let Err(Placement::Wait(c)) = restore_holders(&v, Some(&snap), "s", &views, &|_| true)
-        else {
-            panic!("must wait for the holders to ack again");
-        };
-        assert_eq!(c.reason, reason::SNAPSHOT_NOT_READY);
     }
 
     #[test]

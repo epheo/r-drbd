@@ -37,6 +37,11 @@ const OWN: &str = "r-drbd.md.uid-1.0";
 const SNAP_UID: &str = "snap-uid-1";
 /// The restore's proof that an LV came from snap-1.
 const FROM: &str = "r-drbd.from.uid-1.snap-uid-1";
+/// The snap tag of the restore source, snap-1 of pvc-0.
+const SOURCE_TAG: &str = "r-drbd.snap.snap-uid-1.1073741824.2";
+/// The uid and snap tag of snap-1 of pvc-1, the round of these tests.
+const ROUND_UID: &str = "round-uid-1";
+const ROUND_TAG: &str = "r-drbd.snap.round-uid-1.1073741824.2";
 const ALL: Features = Features {
     tiebreaker: true,
     discard_granularity: true,
@@ -382,15 +387,9 @@ fn source_snapshot() -> Snapshot {
     st.copies_identical = Some(false);
     st.acks = ["n1", "n2"]
         .map(|n| SnapshotAck {
-            node: n.into(),
-            phase: SnapshotPhase::Taking,
             taken_pool: Some(format!("pool-{n}")),
-            lv_bytes: None,
-            allocated_bytes: None,
-            digest: None,
-            digest_bytes: None,
             ok: true,
-            error: None,
+            ..SnapshotAck::new(n, SnapshotPhase::Taking)
         })
         .to_vec();
     s
@@ -426,11 +425,17 @@ fn peer_entry(node: &str, restored: bool) -> ReplicaStatus {
 /// The restore lvcreate of pvc-1 from this node's copy, with both tags,
 /// then the fresh read.
 fn expect_restore(x: &ScriptedExec) {
+    expect_source_tags(x);
     x.expect(
         lvm::cmd::restore(VG, "pvc-0+snap-1", "pvc-1", &[NEW, FROM]),
         ok(""),
     );
     expect_lvs(x, &[source_lv(), lv(LV_KIB)]);
+}
+
+/// The source copy carries its Snapshot's tag, read before a restore.
+fn expect_source_tags(x: &ScriptedExec) {
+    expect_lv_tags(x, &[("pvc-0+snap-1", &[SOURCE_TAG])]);
 }
 
 fn empty_create() -> Vec<String> {
@@ -454,8 +459,11 @@ fn snapshot(phase: SnapshotPhase) -> Snapshot {
             volume_uid: Some(UID.into()),
         },
     );
+    s.metadata.uid = Some(ROUND_UID.into());
     s.status = Some(SnapshotStatus {
-        phase,
+        phase: Some(phase),
+        size_bytes: Some(GIB),
+        source_replicas: Some(2),
         ..SnapshotStatus::default()
     });
     s
@@ -1080,6 +1088,10 @@ async fn restored_from_on_n2(
         expect_lv_tags(&x, &[("pvc-1", tags)]);
     }
     dry(&x, "");
+    if snaps.is_empty() {
+        // The orphan scan reads the tag of a snapshot LV no ack names.
+        expect_source_tags(&x);
+    }
     let w = r.pass_pools(&[pool_on("n2")], &[vol], snaps).await;
     entry_of(&w)
 }
@@ -1212,27 +1224,24 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
     let x = r.x.clone();
     reads(&x, &[source_lv()]);
     expect_create(&x, &[source_lv()]);
+    // The orphan scan reads the tag of a snapshot LV no ack here names.
+    expect_source_tags(&x);
     let e = n2_restore_pass(&mut r, &[]).await;
     assert_eq!((e.last_error, e.restored_from), (None, None));
 
     // The snapshot LV lives in another pool.
     let mut snap = source_snapshot();
     snap.status.as_mut().unwrap().acks = vec![SnapshotAck {
-        node: "n2".into(),
-        phase: SnapshotPhase::Ready,
         taken_pool: Some("pool-elsewhere".into()),
-        lv_bytes: None,
-        allocated_bytes: None,
-        digest: None,
-        digest_bytes: None,
         ok: true,
-        error: None,
+        ..SnapshotAck::new("n2", SnapshotPhase::Ready)
     }];
     let mut r = Rig::on("n2", &[], FakeHost::default());
     r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     reads(&x, &[source_lv()]);
     expect_create(&x, &[source_lv()]);
+    expect_source_tags(&x);
     let e = n2_restore_pass(&mut r, &[snap]).await;
     assert_eq!(e.last_error, None);
 
@@ -1241,6 +1250,7 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
     r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     reads(&x, &[source_lv()]);
+    expect_source_tags(&x);
     x.expect(
         lvm::cmd::restore(VG, "pvc-0+snap-1", "pvc-1", &[NEW, FROM]),
         code(5, "", "lvcreate failed"),
@@ -1261,6 +1271,27 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
     let err = e.last_error.unwrap();
     assert!(err.contains("the empty LV failed too"), "{err}");
     assert!(!seen(&x, "drbdadm"));
+}
+
+/// A source rebuilding its status has no acks yet: the peer waits for it,
+/// never an empty LV in place of its copy.
+#[tokio::test]
+async fn restore_peer_waits_while_its_source_is_discovering() {
+    let mut snap = source_snapshot();
+    let st = snap.status.as_mut().unwrap();
+    st.phase = Some(SnapshotPhase::Discovering);
+    st.acks.clear();
+    let mut r = Rig::on("n2", &[], FakeHost::default());
+    r.rec.drbd.copies_identical = proven;
+    let x = r.x.clone();
+    reads(&x, &[source_lv()]);
+    // Then the discovery finds this node's copy by its tag.
+    expect_lvs(&x, &[source_lv()]);
+    expect_source_tags(&x);
+    let e = n2_restore_pass(&mut r, &[snap]).await;
+    let err = e.last_error.unwrap();
+    assert!(err.contains("rebuilding its status"), "{err}");
+    assert!(!seen(&x, "lvcreate"));
 }
 
 /// Holder copies that differ, whichever version took them: one copy, the
@@ -1683,15 +1714,9 @@ async fn a_failed_proof_read_fails_the_pass_and_starts_nothing() {
 async fn snapshot_lv_is_kept_while_a_restore_here_is_not_initialized() {
     let mut snap = deleting(source_snapshot());
     snap.status.as_mut().unwrap().acks = vec![SnapshotAck {
-        node: NODE.into(),
-        phase: SnapshotPhase::Ready,
         taken_pool: Some(POOL.into()),
-        lv_bytes: None,
-        allocated_bytes: None,
-        digest: None,
-        digest_bytes: None,
         ok: true,
-        error: None,
+        ..SnapshotAck::new(NODE, SnapshotPhase::Ready)
     }];
     let mut r = Rig::new(&healthy(), up_host());
     let x = r.x.clone();
@@ -1718,6 +1743,7 @@ async fn snapshot_lv_is_kept_while_a_restore_here_is_not_initialized() {
     // Initialized: the copy goes.
     reads_again(&x, &[source_lv(), lv(LV_KIB)]);
     dry(&x, "");
+    expect_source_tags(&x);
     expect_lvs(&x, &[source_lv(), lv(LV_KIB)]);
     x.expect(lvm::cmd::remove(VG, "pvc-0+snap-1"), ok(""));
     expect_lvs(&x, &[lv(LV_KIB)]);
@@ -2283,15 +2309,13 @@ async fn only_the_lowest_node_id_resizes() {
 fn round_ack(phase: SnapshotPhase, ok: bool) -> SnapshotAck {
     let taken = phase == SnapshotPhase::Taking && ok;
     SnapshotAck {
-        node: NODE.into(),
-        phase,
         taken_pool: taken.then(|| POOL.into()),
         lv_bytes: taken.then_some(LV_KIB * 1024),
         allocated_bytes: taken.then_some(0),
-        digest: None,
-        digest_bytes: None,
+        tag_size_bytes: taken.then_some(GIB),
+        tag_source_replicas: taken.then_some(2),
         ok,
-        error: None,
+        ..SnapshotAck::new(NODE, phase)
     }
 }
 
@@ -2321,12 +2345,16 @@ async fn suspend_pass(r: &mut Rig) {
 
 fn expect_take(x: &ScriptedExec) {
     expect_lv_tags(x, &[("pvc-1", &[OWN])]);
-    x.expect(lvm::cmd::snapshot(VG, "pvc-1", "pvc-1+snap-1"), ok(""));
+    x.expect(
+        lvm::cmd::snapshot(VG, "pvc-1", "pvc-1+snap-1", &[ROUND_TAG]),
+        ok(""),
+    );
     expect_change(x, "pvc-1+snap-1", &[], &[OWN]);
     expect_lvs(
         x,
         &[lv(LV_KIB), lv_row("pvc-1+snap-1", LV_KIB, St::Inactive)],
     );
+    expect_lv_tags(x, &[("pvc-1", &[OWN]), ("pvc-1+snap-1", &[ROUND_TAG])]);
 }
 
 #[tokio::test]
@@ -2432,6 +2460,73 @@ async fn resume_on_the_local_deadline_without_a_controller() {
     assert_eq!(times(&r.x, "suspend-io"), 1);
 }
 
+/// A status lost mid round, or being rebuilt, keeps IO frozen to the
+/// agent's own deadline; any other phase ends the freeze at once.
+#[tokio::test(start_paused = true)]
+async fn a_lost_status_keeps_the_freeze_to_the_deadline() {
+    for phase in [None, Some(SnapshotPhase::Discovering)] {
+        let mut r = Rig::new(&healthy(), up_host());
+        suspend_pass(&mut r).await;
+        let mut s = snapshot(SnapshotPhase::Suspending);
+        s.status.as_mut().unwrap().phase = phase;
+        s.metadata.finalizers = Some(vec![model::keys::FINALIZER_SNAPSHOT.into()]);
+        let lost = [s];
+        tokio::time::advance(model::snapshot::RESUME_AFTER.saturating_sub(Duration::from_secs(1)))
+            .await;
+        // Only a discovery answer, never a failed round ack.
+        let outside = |w: &[StatusWrite]| {
+            acks(w)
+                .iter()
+                .all(|a| a.phase == SnapshotPhase::Discovering && a.ok)
+        };
+        reads_again(&r.x, &[lv(LV_KIB)]);
+        dry(&r.x, "");
+        assert!(outside(&r.pass(&[volume(GIB)], &lost).await));
+        assert!(!seen(&r.x, "resume-io"), "{phase:?}");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        reads_again(&r.x, &[lv(LV_KIB)]);
+        r.x.expect(argv::resume_io("pvc-1"), ok(""));
+        dry(&r.x, "");
+        let w = r.pass(&[volume(GIB)], &lost).await;
+        assert!(outside(&w), "no failed ack outside a round");
+    }
+    for phase in [
+        SnapshotPhase::Ready,
+        SnapshotPhase::Failed,
+        SnapshotPhase::Lost,
+        SnapshotPhase::Pending,
+    ] {
+        let mut r = Rig::new(&healthy(), up_host());
+        suspend_pass(&mut r).await;
+        reads_again(&r.x, &[lv(LV_KIB)]);
+        r.x.expect(argv::resume_io("pvc-1"), ok(""));
+        dry(&r.x, "");
+        r.pass(&[volume(GIB)], &[snapshot(phase)]).await;
+    }
+}
+
+/// Only the Snapshot whose round suspended IO holds it: another one of
+/// the volume, lost or rebuilding, never stretches the freeze.
+#[tokio::test]
+async fn another_snapshot_rebuilding_never_holds_the_freeze() {
+    for phase in [None, Some(SnapshotPhase::Discovering)] {
+        let mut r = Rig::new(&healthy(), up_host());
+        suspend_pass(&mut r).await;
+        let mut other = snapshot(SnapshotPhase::Suspending);
+        other.metadata.name = Some("snap-0".into());
+        other.metadata.uid = Some("other-uid".into());
+        other.metadata.finalizers = Some(vec![model::keys::FINALIZER_SNAPSHOT.into()]);
+        other.status.as_mut().unwrap().phase = phase;
+        let done = acked(SnapshotPhase::Ready, round_ack(SnapshotPhase::Taking, true));
+        reads_again(&r.x, &[lv(LV_KIB)]);
+        r.x.expect(argv::resume_io("pvc-1"), ok(""));
+        dry(&r.x, "");
+        r.pass(&[volume(GIB)], &[other, done]).await;
+        assert!(seen(&r.x, "resume-io"), "{phase:?}");
+        assert_eq!(r.rec.next_deadline(), None);
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_restart_forgets_the_suspend_and_never_takes() {
     let mut sus = healthy();
@@ -2519,30 +2614,16 @@ async fn diskless_replica_keeps_its_freeze_through_taking() {
         ]
     };
     let mine = SnapshotAck {
-        node: "n3".into(),
-        phase: SnapshotPhase::Suspending,
-        taken_pool: None,
-        lv_bytes: None,
-        allocated_bytes: None,
-        digest: None,
-        digest_bytes: None,
         ok: true,
-        error: None,
+        ..SnapshotAck::new("n3", SnapshotPhase::Suspending)
     };
     let taking = acked(SnapshotPhase::Taking, mine);
     let mut r = Rig::on("n3", &lines("user"), FakeHost::default());
     r.expect_check();
     let w = r.pass(&[volume(GIB)], std::slice::from_ref(&taking)).await;
     let frozen = SnapshotAck {
-        node: "n3".into(),
-        phase: SnapshotPhase::Taking,
-        taken_pool: None,
-        lv_bytes: None,
-        allocated_bytes: None,
-        digest: None,
-        digest_bytes: None,
         ok: true,
-        error: None,
+        ..SnapshotAck::new("n3", SnapshotPhase::Taking)
     };
     assert_eq!(
         acks(&w),
@@ -3134,7 +3215,10 @@ async fn a_snapshot_in_an_unknown_phase_is_no_round() {
         }
     }))
     .unwrap();
-    assert_eq!(old.status.as_ref().unwrap().phase, SnapshotPhase::Unknown);
+    assert_eq!(
+        old.status.as_ref().unwrap().phase,
+        Some(SnapshotPhase::Unknown)
+    );
     let mut sus = healthy();
     sus[0] = "exists resource name:pvc-1 role:Secondary suspended:user".into();
     let mut r = Rig::new(&sus, up_host());

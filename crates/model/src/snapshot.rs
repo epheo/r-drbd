@@ -49,13 +49,26 @@ impl Snapshot {
             && self.spec.volume_uid.is_some()
             && self.spec.volume_uid == vol.metadata.uid
     }
+
+    /// Its status was lost, whole or in part: the finalizer without a
+    /// phase (the controller writes the first status before its
+    /// finalizer), or Ready without the size every Ready has.
+    pub fn status_lost(&self) -> bool {
+        let st = self.status.as_ref();
+        match st.and_then(|st| st.phase) {
+            None => kube::ResourceExt::finalizers(self)
+                .iter()
+                .any(|f| f == crate::keys::FINALIZER_SNAPSHOT),
+            Some(SnapshotPhase::Ready) => st.is_some_and(|st| st.size_bytes.is_none()),
+            Some(_) => false,
+        }
+    }
 }
 
-#[derive(JsonSchema, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(JsonSchema, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotPhase {
     /// Waiting for the volume to be Ready, in sync and connected everywhere,
     /// every agent reachable, and no other round on the volume.
-    #[default]
     Pending,
     /// Every replica suspends DRBD IO; SUSPEND_BOUND.
     Suspending,
@@ -65,6 +78,13 @@ pub enum SnapshotPhase {
     Failed,
     /// Agents remove the snapshot LVs.
     Deleting,
+    /// The status was lost: every node with a Pool searches its Pools for
+    /// this Snapshot's LV by its uid tag. Ready or Lost follows, never a
+    /// round.
+    Discovering,
+    /// The status was lost and no copy was found, or the copies' tags
+    /// disagree. Never restored, never taken again; the copies stay.
+    Lost,
     /// Any other value: one an older or newer version wrote, still stored.
     /// It decodes so one object never stops a watch; no round runs on it
     /// and it is never written back.
@@ -76,8 +96,11 @@ pub enum SnapshotPhase {
 #[derive(KubeSchema, Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotStatus {
-    #[serde(default)]
-    pub phase: SnapshotPhase,
+    /// No default: absent reads as absent, never as Pending. The controller
+    /// writes the first status before its finalizer, so the finalizer
+    /// without a phase means a lost status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<SnapshotPhase>,
     #[serde(default)]
     #[x_kube(merge_strategy = ListMerge::Map(vec!["type".into()]))]
     pub conditions: Vec<Condition>,
@@ -137,6 +160,9 @@ pub const DIGEST_CHUNK: usize = 4 << 20;
 /// Agent: how long a restore's first data waits for pending digests
 /// before it starts as the sync source.
 pub const DIGEST_WAIT: Duration = Duration::from_secs(120);
+/// Controller: a discovery still waiting for some node after this long
+/// says so in its Ready condition, and keeps waiting.
+pub const DISCOVERY_SILENT: Duration = Duration::from_secs(600);
 
 /// The last phase a node completed, and whether it succeeded.
 /// `takenPool`, `lvBytes` and `allocatedBytes` come from the successful
@@ -160,6 +186,30 @@ pub struct SnapshotAck {
     /// Thin data mapped by the snapshot LV at the take.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allocated_bytes: Option<u64>,
+    /// When LVM created the snapshot LV; createdAt is the earliest holder's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lv_created_at: Option<Time>,
+    /// Discovering: whether the node found the snapshot LV by its uid tag.
+    /// A found ack is a holder ack from then on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub found: Option<bool>,
+    /// Discovering: the uid of every Pool of the node, searched. The
+    /// answer counts only while these are the node's Pools; one recreated
+    /// under its name is another.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub searched_pools: Vec<String>,
+    /// Discovering: the phaseSince of the discovery answered. An answer
+    /// to an earlier discovery, written from a lagging cache after the
+    /// acks were cleared, counts for nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_since: Option<Time>,
+    /// The size the snapshot LV's tag records, as the take wrote it or a
+    /// discovery found it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_size_bytes: Option<u64>,
+    /// The source replicas the snapshot LV's tag records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_source_replicas: Option<u32>,
     /// Hex sha256 over the sha256 of each 4 MiB chunk of the snapshot LV
     /// over [0, digestBytes), written once after Ready.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -173,4 +223,36 @@ pub struct SnapshotAck {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+impl SnapshotAck {
+    /// A failed ack of `phase` that records nothing else yet.
+    pub fn new(node: impl Into<String>, phase: SnapshotPhase) -> Self {
+        Self {
+            node: node.into(),
+            phase,
+            taken_pool: None,
+            lv_bytes: None,
+            allocated_bytes: None,
+            lv_created_at: None,
+            found: None,
+            searched_pools: Vec::new(),
+            phase_since: None,
+            tag_size_bytes: None,
+            tag_source_replicas: None,
+            digest: None,
+            digest_bytes: None,
+            ok: false,
+            error: None,
+        }
+    }
+
+    /// Names a holder copy: takenPool and the tag values. A holder ack
+    /// without them was written before snapshot LV tags, and nothing
+    /// proves its LV is this Snapshot's copy.
+    pub fn holder_copy(&self) -> bool {
+        self.taken_pool.is_some()
+            && self.tag_size_bytes.is_some()
+            && self.tag_source_replicas.is_some()
+    }
 }

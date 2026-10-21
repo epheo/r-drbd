@@ -661,7 +661,10 @@ async fn restore_case(h: &Host, factor: u64, max_received: Option<u64>) {
         &format!("dd if=/dev/urandom of=/dev/{VG}/rw-src bs=1M count=4 oflag=direct status=none && dd if=/dev/{VG}/rw-src bs=1M count=4 iflag=direct status=none | sha256sum"),
     ])
     .await;
-    l.snapshot(VG, "rw-src", "rw-src+rw-snap").await.unwrap();
+    let tag = agent::storage::snap_tag("uid-rw-snap", source_size, 2);
+    l.snapshot(VG, "rw-src", "rw-src+rw-snap", &[&tag])
+        .await
+        .unwrap();
     let mut snap = Snapshot::new(
         "rw-snap",
         SnapshotSpec {
@@ -672,20 +675,14 @@ async fn restore_case(h: &Host, factor: u64, max_received: Option<u64>) {
     snap.metadata.uid = Some("uid-rw-snap".into());
     // Every member is this host: one ack stands for each holder.
     snap.status = Some(SnapshotStatus {
-        phase: SnapshotPhase::Ready,
+        phase: Some(SnapshotPhase::Ready),
         size_bytes: Some(source_size),
         source_replicas: Some(2),
         copies_identical: Some(max_received.is_some()),
         acks: vec![model::SnapshotAck {
-            node: h.node.clone(),
-            phase: SnapshotPhase::Taking,
             taken_pool: Some("test-host-pool".into()),
-            lv_bytes: None,
-            allocated_bytes: None,
-            digest: None,
-            digest_bytes: None,
             ok: true,
-            error: None,
+            ..model::SnapshotAck::new(&h.node, SnapshotPhase::Taking)
         }],
         ..SnapshotStatus::default()
     });
@@ -867,7 +864,9 @@ async fn drbd_snapshot_rounds_under_a_writer() {
             );
             s.metadata.uid = Some(format!("uid-{}-s{i}", m.res));
             s.status = Some(SnapshotStatus {
-                phase,
+                phase: Some(phase),
+                size_bytes: Some(size),
+                source_replicas: Some(2),
                 ..SnapshotStatus::default()
             });
             Arc::new(s)
@@ -1026,9 +1025,12 @@ async fn drbd_replicated_lifecycle() {
                 volume_uid: Some("uid-rw-a".into()),
             },
         );
+        s.metadata.uid = Some("uid-rw-s".into());
         s.status = Some(SnapshotStatus {
-            phase,
+            phase: Some(phase),
             acks,
+            size_bytes: Some(GIB),
+            source_replicas: Some(2),
             ..SnapshotStatus::default()
         });
         Arc::new(s)
@@ -1490,7 +1492,7 @@ async fn drbd_snapshot_digests() {
     write_payload("rw-a", A.minor).await;
     let l = lvm();
     for r in ["rw-a", "rw-b"] {
-        l.snapshot(VG, r, &format!("{r}+dg")).await.unwrap();
+        l.snapshot(VG, r, &format!("{r}+dg"), &[]).await.unwrap();
     }
     let hasher = LvHasher::new(h.exec.clone());
     let first = hasher.digest(VG, "rw-a+dg").await.unwrap();
@@ -1565,7 +1567,7 @@ async fn drbd_snapshot_digests() {
     l.create(VG, super::THIN, "rw-e", 8 * MIB, &[])
         .await
         .unwrap();
-    l.snapshot(VG, "rw-e", "rw-e+dg").await.unwrap();
+    l.snapshot(VG, "rw-e", "rw-e+dg", &[]).await.unwrap();
     let e = hasher.digest(VG, "rw-e+dg").await.unwrap_err();
     println!("without metadata: {e}");
     assert!(!lv_active("rw-e+dg").await);
