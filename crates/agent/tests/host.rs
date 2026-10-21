@@ -1178,3 +1178,6 @@ mod drbd;
 
 #[path = "host/shutdown.rs"]
 mod shutdown;
+
+#[path = "host/measure.rs"]
+mod measure;
