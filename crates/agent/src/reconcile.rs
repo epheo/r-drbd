@@ -554,6 +554,13 @@ impl Reconciler {
             .filter(|p| invalid_name(p).is_some())
             .map(|p| p.name_any())
             .collect();
+        // Not searched for snapshot LVs either: not finding one there
+        // proves nothing.
+        if let Some(e) = &self.lvm_unsupported {
+            for p in &pools {
+                self.unready_pools.insert(p.name_any(), e.clone());
+            }
+        }
         pools.retain(|p| {
             invalid_name(p).is_none()
                 && self.lvm_unsupported.is_none()
@@ -967,17 +974,24 @@ impl Reconciler {
         tags: &[&str],
     ) -> Result<(), String> {
         let snapshot = snap.name_any();
-        if let Some(pool) = snap
+        match snap
             .status
             .as_ref()
             .and_then(|s| s.acks.iter().find(|a| a.node == self.node))
-            .and_then(|a| a.pool.as_deref())
-            && pool != place.pool
+            .and_then(|a| a.taken_pool.as_deref())
         {
-            return Err(format!(
-                "source snapshot {snapshot} lives in pool {pool}, volume assigned to {}",
-                place.pool
-            ));
+            Some(pool) if pool == place.pool => {}
+            Some(pool) => {
+                return Err(format!(
+                    "source snapshot {snapshot} lives in pool {pool}, volume assigned to {}",
+                    place.pool
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "source snapshot {snapshot} has no copy acked on this node"
+                ));
+            }
         }
         let source = lvm::names::snapshot_lv(&snap.spec.volume, &snapshot);
         if find_in_pool(rows, &source, &place.thin)?.is_none() {
@@ -1008,6 +1022,7 @@ impl Reconciler {
         let name = snap.name_any();
         let status = snap.status.clone().unwrap_or_default();
         let prev = status.acks.iter().find(|a| a.node == self.node).cloned();
+        let taken = Taken::of(prev.as_ref());
         let vol = vols.iter().find(|v| snap.is_of(v));
         let replica = vol.and_then(|v| self.local_replica(v));
         let replicated = vol.filter(|v| v.spec.replicas >= 2);
@@ -1016,32 +1031,23 @@ impl Reconciler {
         }
         let deleting =
             snap.metadata.deletion_timestamp.is_some() || status.phase == SnapshotPhase::Deleting;
-        let pool_name = replica
-            .and_then(|r| r.pool.clone())
-            .or_else(|| prev.as_ref().and_then(|a| a.pool.clone()));
+        // Before its take the round works in the replica's Pool.
+        let replica_pool = replica.and_then(|r| r.pool.clone());
         let lv = lvm::names::snapshot_lv(&snap.spec.volume, &name);
 
         let ack = if deleting {
-            pool_name.as_ref()?;
-            let restoring = vols
-                .iter()
-                .find(|v| self.restores_here_from(v, snap))
-                .map(|v| v.name_any());
-            let res = match (restoring, self.place(pools, pool_name.as_deref())) {
-                (Some(v), _) => Err(format!(
-                    "kept: volume {v} restores from it here and is not initialized yet"
-                )),
-                (None, Ok(place)) => self.remove_snapshot(reads, &place, &lv).await,
-                (None, Err(e)) => Err(e),
-            };
-            ack(&self.node, SnapshotPhase::Deleting, pool_name, res)
+            let related = prev.is_some() || replica.is_some();
+            self.delete_snapshot(reads, pools, vols, snap, &lv, taken, related)
+                .await?
         } else {
             match status.phase {
                 SnapshotPhase::Taking => match (replica, replicated) {
+                    // Taken: the LV and its ack stay as they are.
+                    (Some(_), _) if taken.pool.is_some() => return None,
                     (Some(_), _) => {
                         let vol = vol?;
                         let origin = lvm::names::volume_lv(&snap.spec.volume);
-                        let res = match self.place(pools, pool_name.as_deref()) {
+                        let res = match self.place(pools, replica_pool.as_deref()) {
                             Ok(place) => {
                                 let origin_kind = match replicated {
                                     Some(_) => Origin::Drbd(
@@ -1054,7 +1060,10 @@ impl Reconciler {
                             }
                             Err(e) => Err(e),
                         };
-                        ack(&self.node, SnapshotPhase::Taking, pool_name, res)
+                        match res {
+                            Ok(t) => ack(&self.node, SnapshotPhase::Taking, t, Ok(())),
+                            Err(e) => ack(&self.node, SnapshotPhase::Taking, taken, Err(e)),
+                        }
                     }
                     // Diskless or tiebreaker: no copy; its ack says its IO
                     // is still suspended, and Ready waits for it.
@@ -1066,7 +1075,7 @@ impl Reconciler {
                             Err("IO is not suspended here: resumed, or restarted, mid round"
                                 .to_owned())
                         };
-                        ack(&self.node, SnapshotPhase::Taking, pool_name, res)
+                        ack(&self.node, SnapshotPhase::Taking, taken, res)
                     }
                     (None, None) => return None,
                 },
@@ -1078,22 +1087,25 @@ impl Reconciler {
                         // with IO already suspended on every replica.
                         let refused = replica
                             .is_some()
-                            .then(|| self.place(pools, pool_name.as_deref()))
+                            .then(|| self.place(pools, replica_pool.as_deref()))
                             .and_then(|place| {
                                 let place = place.ok()?;
                                 lvm::names::check_new_lv(&place.vg, &lv).err()
                             });
                         let res = self.suspend_step(v, prev.as_ref(), refused).await?;
-                        ack(&self.node, SnapshotPhase::Suspending, pool_name, res)
+                        ack(&self.node, SnapshotPhase::Suspending, taken, res)
                     } else {
                         replica?;
                         ack(
                             &self.node,
                             SnapshotPhase::Suspending,
-                            pool_name,
+                            taken,
                             Err(NO_DRBD_LOCAL.to_owned()),
                         )
                     }
+                }
+                SnapshotPhase::Ready if taken.pool.is_none() && holder_missing(&status) => {
+                    self.rediscover(reads, pools, &name, &lv).await?
                 }
                 _ => return None,
             }
@@ -1102,6 +1114,134 @@ impl Reconciler {
             tracing::warn!(snapshot = name, error = %e, "snapshot step failed");
         }
         (prev.as_ref() != Some(&ack)).then_some(StatusWrite::Snapshot { name, ack })
+    }
+
+    /// The Deleting ack, None when this node has nothing to say: it never
+    /// took part and holds no LV of that name.
+    #[allow(clippy::too_many_arguments)]
+    async fn delete_snapshot(
+        &self,
+        reads: &mut Reads,
+        pools: &[&Pool],
+        vols: &[&Volume],
+        snap: &Snapshot,
+        lv: &str,
+        taken: Taken,
+        related: bool,
+    ) -> Option<SnapshotAck> {
+        let phase = SnapshotPhase::Deleting;
+        if let Some(v) = vols.iter().find(|v| self.restores_here_from(v, snap)) {
+            let e = format!(
+                "kept: volume {} restores from it here and is not initialized yet",
+                v.name_any()
+            );
+            return Some(ack(&self.node, phase, taken, Err(e)));
+        }
+        if taken.pool.is_some() {
+            let res = match self.place(pools, taken.pool.as_deref()) {
+                Ok(place) => self.remove_snapshot(reads, &place, lv).await,
+                Err(e) => Err(e),
+            };
+            return Some(ack(&self.node, phase, taken, res));
+        }
+        // Without takenPool the ack was lost, or never written: the LV, if
+        // any, is wherever the search finds it.
+        match self.search_snapshot(reads, pools, lv).await {
+            Ok(Some((place, found))) => {
+                let res = self.remove_snapshot(reads, &place, lv).await;
+                Some(ack(&self.node, phase, found, res))
+            }
+            Ok(None) => related.then(|| ack(&self.node, phase, taken, Ok(()))),
+            Err(e) if related => Some(ack(&self.node, phase, taken, Err(e))),
+            Err(e) => {
+                tracing::warn!(snapshot = snap.name_any(), error = %e, "snapshot LV search failed");
+                None
+            }
+        }
+    }
+
+    /// A Ready Snapshot's LV found here without an ack that says where:
+    /// acked again, so restores and deletes find it through takenPool.
+    async fn rediscover(
+        &self,
+        reads: &mut Reads,
+        pools: &[&Pool],
+        name: &str,
+        lv: &str,
+    ) -> Option<SnapshotAck> {
+        match self.search_snapshot(reads, pools, lv).await {
+            Ok(Some((place, found))) => {
+                tracing::info!(
+                    snapshot = name,
+                    pool = place.pool,
+                    "snapshot LV found without its ack: acking where it lives"
+                );
+                Some(ack(&self.node, SnapshotPhase::Taking, found, Ok(())))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(snapshot = name, error = %e, "snapshot LV search failed");
+                None
+            }
+        }
+    }
+
+    /// The LV of that exact name in the thin pool of one of this node's
+    /// Pools. One of that name elsewhere in their VGs is not ours: an
+    /// error, never removed. A Pool that cannot be read is an error too:
+    /// the LV may be there.
+    async fn search_snapshot(
+        &self,
+        reads: &mut Reads,
+        pools: &[&Pool],
+        lv: &str,
+    ) -> Result<Option<(Place, Taken)>, String> {
+        if let Some(p) = self
+            .invalid_pools
+            .iter()
+            .chain(self.unready_pools.keys())
+            .next()
+        {
+            return Err(format!("pool {p} cannot be searched: not ready"));
+        }
+        let mut hits: Vec<(Place, Lv)> = Vec::new();
+        for p in pools {
+            let rows = reads.lvs(&self.lvm, &p.spec.vg).await?;
+            let Some(r) = rows.iter().find(|r| r.name == lv) else {
+                continue;
+            };
+            let in_a_pool = |q: &&Pool| {
+                q.spec.vg == p.spec.vg && r.pool.as_deref() == Some(q.spec.thin_pool.as_str())
+            };
+            if !pools.iter().any(in_a_pool) {
+                return Err(format!(
+                    "LV {}/{lv} exists outside the thin pools of this node's Pools",
+                    p.spec.vg
+                ));
+            }
+            if r.pool.as_deref() == Some(p.spec.thin_pool.as_str())
+                && hits.iter().all(|(h, _)| h.vg != p.spec.vg)
+            {
+                hits.push((self.place(pools, Some(&p.name_any()))?, r.clone()));
+            }
+        }
+        if hits.len() > 1 {
+            let at: Vec<&str> = hits.iter().map(|(h, _)| h.pool.as_str()).collect();
+            return Err(format!(
+                "LV {lv} found in more than one Pool: {}",
+                at.join(", ")
+            ));
+        }
+        Ok(hits.pop().map(|(place, row)| {
+            let found = Taken {
+                pool: Some(place.pool.clone()),
+                lv_bytes: Some(row.size_bytes),
+                // An inactive snapshot reports no allocation, and its origin
+                // has moved on since the take.
+                allocated_bytes: None,
+            };
+            (place, found)
+        }))
     }
 
     /// Suspending on a replicated volume; None leaves the ack as it is.
@@ -1133,7 +1273,31 @@ impl Reconciler {
         })
     }
 
+    /// Takes the snapshot LV, or finds it taken; returns what its ack
+    /// records.
     async fn take_snapshot(
+        &self,
+        reads: &mut Reads,
+        place: &Place,
+        origin: &str,
+        lv: &str,
+        kind: Origin,
+    ) -> Result<Taken, String> {
+        self.take_lv(reads, place, origin, lv, kind).await?;
+        let rows = reads.lvs(&self.lvm, &place.vg).await?;
+        let row = find_in_pool(&rows, lv, &place.thin)?
+            .ok_or_else(|| format!("snapshot LV {}/{lv} missing after its take", place.vg))?;
+        Ok(Taken {
+            pool: Some(place.pool.clone()),
+            lv_bytes: Some(row.size_bytes),
+            // The snapshot is never active, so lvs gives it no allocation;
+            // at the take it maps exactly what its origin maps.
+            allocated_bytes: find_in_pool(&rows, origin, &place.thin)?
+                .and_then(lvm::report::thin_used_bytes),
+        })
+    }
+
+    async fn take_lv(
         &self,
         reads: &mut Reads,
         place: &Place,
@@ -1362,19 +1526,50 @@ fn find_in_pool<'a>(rows: &'a [Lv], name: &str, thin: &str) -> Result<Option<&'a
     }
 }
 
-fn ack(
-    node: &str,
-    phase: SnapshotPhase,
+/// Where this node's snapshot LV lives, as its successful Taking ack
+/// recorded it; every later ack carries it unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Taken {
     pool: Option<String>,
-    res: Result<(), String>,
-) -> SnapshotAck {
+    lv_bytes: Option<u64>,
+    allocated_bytes: Option<u64>,
+}
+
+impl Taken {
+    fn of(prev: Option<&SnapshotAck>) -> Self {
+        prev.map_or_else(Self::default, |a| Self {
+            pool: a.taken_pool.clone(),
+            lv_bytes: a.lv_bytes,
+            allocated_bytes: a.allocated_bytes,
+        })
+    }
+}
+
+fn ack(node: &str, phase: SnapshotPhase, taken: Taken, res: Result<(), String>) -> SnapshotAck {
     SnapshotAck {
         node: node.to_owned(),
         phase,
-        pool,
+        taken_pool: taken.pool,
+        lv_bytes: taken.lv_bytes,
+        allocated_bytes: taken.allocated_bytes,
         ok: res.is_ok(),
         error: res.err(),
     }
+}
+
+/// Fewer acks with takenPool than the source had replicas, or no record
+/// of them: a holder may have lost its ack. Bounds the search to such
+/// Snapshots, so an LV of that name on another node is never adopted
+/// beside a complete set.
+fn holder_missing(status: &model::SnapshotStatus) -> bool {
+    let holders = status
+        .acks
+        .iter()
+        .filter(|a| a.taken_pool.is_some())
+        .count();
+    status
+        .source_replicas
+        .is_none_or(|n| holders < usize::try_from(n).unwrap_or(usize::MAX))
 }
 
 /// The Snapshot a volume restores from, when it exists with the uid the source names.

@@ -1830,15 +1830,13 @@ enum Placement {
     Fail(Cond),
 }
 
-/// Every (node, pool) holding the snapshot LV, by node name: acks that
-/// succeeded and name a pool (set at Taking and carried by later acks).
+/// Every (node, takenPool) holding the snapshot LV, by node name.
 pub fn snapshot_holders(snap: &Snapshot) -> Vec<(String, String)> {
     let mut holders: Vec<(String, String)> = snap
         .status
         .iter()
         .flat_map(|s| &s.acks)
-        .filter(|a| a.ok)
-        .filter_map(|a| a.pool.clone().map(|p| (a.node.clone(), p)))
+        .filter_map(|a| a.taken_pool.clone().map(|p| (a.node.clone(), p)))
         .collect();
     holders.sort();
     holders.dedup_by(|a, b| a.0 == b.0);
@@ -1916,6 +1914,15 @@ fn restore_holders(
 ) -> Result<Vec<placer::Chosen>, Placement> {
     let snap = ready_snapshot(snap, wanted)?;
     let mut holders = snapshot_holders(snap);
+    // Ready without one: acks lost or written before takenPool existed;
+    // the agents find their copies again and re-ack.
+    if holders.is_empty() {
+        return Err(Placement::Wait(Cond::new(
+            FALSE,
+            reason::SNAPSHOT_NOT_READY,
+            format!("snapshot {wanted}: no holder acked where its copy lives yet"),
+        )));
+    }
     holders.retain(|(n, _)| exists(n));
     if holders.is_empty() {
         return Err(Placement::Fail(Cond::new(
@@ -3260,7 +3267,9 @@ mod tests {
         let ack = |node: &str, ok: bool, pool: Option<&str>| model::SnapshotAck {
             node: node.into(),
             phase: SnapshotPhase::Taking,
-            pool: pool.map(str::to_owned),
+            taken_pool: pool.map(str::to_owned),
+            lv_bytes: None,
+            allocated_bytes: None,
             ok,
             error: None,
         };
@@ -3269,6 +3278,7 @@ mod tests {
             acks: vec![
                 ack("n2", true, Some("p2")),
                 ack("n1", true, Some("p1")),
+                // A later failed ack still says where the copy lives.
                 ack("n3", false, Some("p3")),
                 ack("n4", true, None),
             ],
@@ -3278,7 +3288,8 @@ mod tests {
             snapshot_holders(&snap),
             [
                 ("n1".to_owned(), "p1".to_owned()),
-                ("n2".to_owned(), "p2".to_owned())
+                ("n2".to_owned(), "p2".to_owned()),
+                ("n3".to_owned(), "p3".to_owned())
             ]
         );
     }
@@ -3292,7 +3303,9 @@ mod tests {
             acks: vec![model::SnapshotAck {
                 node: "n1".into(),
                 phase: SnapshotPhase::Unknown,
-                pool: Some("p1".into()),
+                taken_pool: Some("p1".into()),
+                lv_bytes: None,
+                allocated_bytes: None,
                 ok: true,
                 error: None,
             }],
@@ -3308,7 +3321,9 @@ mod tests {
         let ack = |node: &str, pool: &str| model::SnapshotAck {
             node: node.into(),
             phase: SnapshotPhase::Ready,
-            pool: Some(pool.into()),
+            taken_pool: Some(pool.into()),
+            lv_bytes: None,
+            allocated_bytes: None,
             ok: true,
             error: None,
         };
@@ -3445,6 +3460,19 @@ mod tests {
         let (v, snap, views) = restore_case(2, 10 * G);
         let why = holders_of(restore_holders(&v, Some(&snap), "s", &views, &not_n1)).unwrap_err();
         assert_eq!(why, "snapshot holders 1, replicas 2");
+    }
+
+    #[test]
+    fn a_ready_snapshot_without_taken_pools_waits_for_them() {
+        let (v, mut snap, views) = restore_case(2, 10 * G);
+        for a in &mut snap.status.as_mut().unwrap().acks {
+            a.taken_pool = None;
+        }
+        let Err(Placement::Wait(c)) = restore_holders(&v, Some(&snap), "s", &views, &|_| true)
+        else {
+            panic!("must wait for the holders to ack again");
+        };
+        assert_eq!(c.reason, reason::SNAPSHOT_NOT_READY);
     }
 
     #[test]

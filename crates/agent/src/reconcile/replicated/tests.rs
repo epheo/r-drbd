@@ -371,7 +371,9 @@ fn source_snapshot() -> Snapshot {
         .map(|n| SnapshotAck {
             node: n.into(),
             phase: SnapshotPhase::Taking,
-            pool: Some(format!("pool-{n}")),
+            taken_pool: Some(format!("pool-{n}")),
+            lv_bytes: None,
+            allocated_bytes: None,
             ok: true,
             error: None,
         })
@@ -1092,7 +1094,9 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
     snap.status.as_mut().unwrap().acks = vec![SnapshotAck {
         node: "n2".into(),
         phase: SnapshotPhase::Ready,
-        pool: Some("pool-elsewhere".into()),
+        taken_pool: Some("pool-elsewhere".into()),
+        lv_bytes: None,
+        allocated_bytes: None,
         ok: true,
         error: None,
     }];
@@ -1553,7 +1557,9 @@ async fn snapshot_lv_is_kept_while_a_restore_here_is_not_initialized() {
     snap.status.as_mut().unwrap().acks = vec![SnapshotAck {
         node: NODE.into(),
         phase: SnapshotPhase::Ready,
-        pool: Some(POOL.into()),
+        taken_pool: Some(POOL.into()),
+        lv_bytes: None,
+        allocated_bytes: None,
         ok: true,
         error: None,
     }];
@@ -2142,11 +2148,16 @@ async fn only_the_lowest_node_id_resizes() {
     assert!(!seen(&x, "resize"));
 }
 
+/// A successful take records where the LV lives, its size and the
+/// origin's allocation; no other ack of the round names a Pool.
 fn round_ack(phase: SnapshotPhase, ok: bool) -> SnapshotAck {
+    let taken = phase == SnapshotPhase::Taking && ok;
     SnapshotAck {
         node: NODE.into(),
         phase,
-        pool: Some(POOL.into()),
+        taken_pool: taken.then(|| POOL.into()),
+        lv_bytes: taken.then_some(LV_KIB * 1024),
+        allocated_bytes: taken.then_some(0),
         ok,
         error: None,
     }
@@ -2378,7 +2389,9 @@ async fn diskless_replica_keeps_its_freeze_through_taking() {
     let mine = SnapshotAck {
         node: "n3".into(),
         phase: SnapshotPhase::Suspending,
-        pool: None,
+        taken_pool: None,
+        lv_bytes: None,
+        allocated_bytes: None,
         ok: true,
         error: None,
     };
@@ -2389,7 +2402,9 @@ async fn diskless_replica_keeps_its_freeze_through_taking() {
     let frozen = SnapshotAck {
         node: "n3".into(),
         phase: SnapshotPhase::Taking,
-        pool: None,
+        taken_pool: None,
+        lv_bytes: None,
+        allocated_bytes: None,
         ok: true,
         error: None,
     };
@@ -2441,7 +2456,7 @@ async fn diskless_replica_suspends_and_acks_without_pool() {
         .pass(&[volume(GIB)], &[snapshot(SnapshotPhase::Suspending)])
         .await;
     let a = acks(&w);
-    assert_eq!((a[0].ok, a[0].pool.as_deref()), (true, None));
+    assert_eq!((a[0].ok, a[0].taken_pool.as_deref()), (true, None));
 }
 
 /// `drbdsetup status --json --statistics` of pvc-1: the disk's

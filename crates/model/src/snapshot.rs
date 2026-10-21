@@ -129,18 +129,27 @@ pub const RESUME_AFTER: Duration = Duration::from_secs(240);
 /// Clock skew between controller runs that read one phaseSince.
 pub const CLOCK_MARGIN: Duration = Duration::from_secs(30);
 
-/// The last phase a node completed, and whether it succeeded. `pool` is
-/// where the snapshot LV lives, so restore and delete still find it after
-/// the Volume is gone.
+/// The last phase a node completed, and whether it succeeded.
+/// `takenPool`, `lvBytes` and `allocatedBytes` come from the successful
+/// Taking ack and every later ack copies them unchanged: the replica may
+/// move to another Pool, the snapshot LV never does.
 #[derive(KubeSchema, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotAck {
     #[schemars(length(min = 1, max = 253))]
     pub node: String,
     pub phase: SnapshotPhase,
+    /// The Pool holding this node's snapshot LV; restores, holder lookups
+    /// and deletes read it, never the replica's current Pool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 253))]
-    pub pool: Option<String>,
+    pub taken_pool: Option<String>,
+    /// Size of the snapshot LV.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lv_bytes: Option<u64>,
+    /// Thin data mapped by the snapshot LV at the take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocated_bytes: Option<u64>,
     #[serde(default)]
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

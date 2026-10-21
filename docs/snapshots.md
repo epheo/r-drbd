@@ -91,6 +91,7 @@ Rules:
   The first node restores its copy, a thin snapshot; every other replica starts empty and is copied in full from it.
   The volume is Ready, and its claim usable, once that sync ends.
 - A holder whose node is down, whose agent is stale or whose Pool is not Available keeps the restore Pending, reason `Insufficient`, naming it.
+- A Ready snapshot whose acks lost their `takenPool` keeps the restore Pending, reason `SnapshotNotReady`, until each holder finds its LV again and acks it.
 - A replicated restore larger than its snapshot starts at the snapshot's size, then grows online; the new area syncs, zero blocks as discards.
   The claim is usable once the volume is Ready at the requested size.
 - A full thin pool for an empty replica stays an error.
@@ -110,6 +111,8 @@ Snapshot it, then restore the snapshot.
 ## Deleting
 
 Deleting the VolumeSnapshot (deletion policy Delete) deletes the Snapshot, and each node removes its snapshot LV.
+Each node removes it from the Pool it was taken in (`takenPool`), even after its replica moved to another Pool.
+A node without that record searches the thin pools of its Pools for the LV; an LV of that name outside them is an error, never removed.
 A Snapshot waits for the restores from it that are not yet initialized: it stays until each restored volume is first Ready, and a node holding a copy for such a restore keeps it until then.
 A restore that cannot start says why in its Ready condition, for example "LV <vg>/<lv> is not this restore's copy of snapshot <name>; delete the claim and restore again".
 Deleting a stuck claim removes its LVs and releases the Snapshot.

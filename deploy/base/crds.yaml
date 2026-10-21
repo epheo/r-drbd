@@ -1084,11 +1084,25 @@
                         "default": [],
                         "description": "One entry per replica of the assignment, diskless ones included,\nwritten by that node's agent.",
                         "items": {
-                          "description": "The last phase a node completed, and whether it succeeded. `pool` is\nwhere the snapshot LV lives, so restore and delete still find it after\nthe Volume is gone.",
+                          "description": "The last phase a node completed, and whether it succeeded.\n`takenPool`, `lvBytes` and `allocatedBytes` come from the successful\nTaking ack and every later ack copies them unchanged: the replica may\nmove to another Pool, the snapshot LV never does.",
                           "properties": {
+                            "allocatedBytes": {
+                              "description": "Thin data mapped by the snapshot LV at the take.",
+                              "format": "uint64",
+                              "minimum": 0.0,
+                              "nullable": true,
+                              "type": "integer"
+                            },
                             "error": {
                               "nullable": true,
                               "type": "string"
+                            },
+                            "lvBytes": {
+                              "description": "Size of the snapshot LV.",
+                              "format": "uint64",
+                              "minimum": 0.0,
+                              "nullable": true,
+                              "type": "integer"
                             },
                             "node": {
                               "maxLength": 253,
@@ -1110,7 +1124,8 @@
                               ],
                               "type": "string"
                             },
-                            "pool": {
+                            "takenPool": {
+                              "description": "The Pool holding this node's snapshot LV; restores, holder lookups\nand deletes read it, never the replica's current Pool.",
                               "maxLength": 253,
                               "nullable": true,
                               "type": "string"

@@ -251,7 +251,7 @@ fn taking(r: &Round<'_>) -> Step {
     }
     let taken = asked.iter().all(|x| {
         r.ack(&x.node).is_some_and(|a| {
-            a.phase == P::Taking && a.ok && (x.role != Role::Diskful || a.pool.is_some())
+            a.phase == P::Taking && a.ok && (x.role != Role::Diskful || a.taken_pool.is_some())
         })
     });
     if taken {
@@ -266,13 +266,21 @@ fn taking(r: &Round<'_>) -> Step {
     Step::Stay
 }
 
-/// Nodes that may hold a snapshot LV: the agent set a pool when it took
-/// it, or it already works on the delete, plus every diskful node once
-/// the round reached Taking (`diskful` is empty before), since a node may
-/// have created the LV without getting to write its ack.
-pub fn holders(acks: &[SnapshotAck], diskful: &[String]) -> BTreeSet<String> {
+/// Nodes that may hold a snapshot LV: the agent acked its takenPool, or
+/// it already works on the delete. Once the round reached Taking, also
+/// every diskful node, since a node may have created the LV without
+/// getting to write its ack; and while no ack names a takenPool (all
+/// lost, or written before acks named it), every node that acked: each
+/// finds its LV, if any, by search.
+pub fn holders(acks: &[SnapshotAck], reached_taking: bool, diskful: &[String]) -> BTreeSet<String> {
+    let none_taken = acks.iter().all(|a| a.taken_pool.is_none());
+    let diskful = if reached_taking { diskful } else { &[] };
     acks.iter()
-        .filter(|a| a.pool.is_some() || a.phase == SnapshotPhase::Deleting)
+        .filter(|a| {
+            a.taken_pool.is_some()
+                || a.phase == SnapshotPhase::Deleting
+                || (reached_taking && none_taken)
+        })
         .map(|a| a.node.clone())
         .chain(diskful.iter().cloned())
         .collect()
@@ -756,7 +764,7 @@ async fn delete(
     // sizeBytes is written on the way into Taking.
     let reached_taking = current.size_bytes.is_some()
         || matches!(current.phase, SnapshotPhase::Taking | SnapshotPhase::Ready);
-    let mut held = holders(acks, if reached_taking { diskful } else { &[] });
+    let mut held = holders(acks, reached_taking, diskful);
     held.retain(|n| exists(n));
     if let Some(v) = restoring {
         debug!(
@@ -792,7 +800,9 @@ mod tests {
         SnapshotAck {
             node: node.into(),
             phase,
-            pool: (phase == P::Taking).then(|| format!("p-{node}")),
+            taken_pool: (phase == P::Taking).then(|| format!("p-{node}")),
+            lv_bytes: None,
+            allocated_bytes: None,
             ok,
             error: (!ok).then(|| "boom".into()),
         }
@@ -1096,7 +1106,7 @@ mod tests {
     /// A diskless or tiebreaker Taking ack: IO still suspended there.
     fn frozen(node: &str) -> SnapshotAck {
         let mut a = ack(node, P::Taking, true);
-        a.pool = None;
+        a.taken_pool = None;
         a
     }
 
@@ -1106,7 +1116,7 @@ mod tests {
         let c = Case::new(P::Taking, &[sus("n1"), sus("n2"), sus("n3")]);
         assert_eq!(c.next(), Step::Stay);
         let mut no_pool = ack("n2", P::Taking, true);
-        no_pool.pool = None;
+        no_pool.taken_pool = None;
         let c = Case::new(
             P::Taking,
             &[ack("n1", P::Taking, true), no_pool, frozen("n3")],
@@ -1241,24 +1251,28 @@ mod tests {
     #[test]
     fn holders_for_delete() {
         let mut a = ack("n1", P::Taking, true);
-        a.pool = Some("p1".into());
+        a.taken_pool = Some("p1".into());
         let b = ack("n2", P::Suspending, true);
         let c = ack("n3", P::Deleting, false);
         let acks = [a, b, c];
-        let h = holders(&acks, &[]);
+        let names = |h: BTreeSet<String>| h.into_iter().collect::<Vec<_>>();
         assert_eq!(
-            h.iter().map(String::as_str).collect::<Vec<_>>(),
+            names(holders(&acks, false, &["n4".to_owned()])),
             ["n1", "n3"]
         );
-        assert!(!deleted_everywhere(&acks, &h));
+        assert!(!deleted_everywhere(&acks, &holders(&acks, false, &[])));
         // After Taking, a diskful node without any ack still holds.
-        let h = holders(&acks, &["n4".to_owned()]);
-        assert!(h.contains("n4"));
+        let h = holders(&acks, true, &["n4".to_owned()]);
+        assert_eq!(names(h), ["n1", "n3", "n4"]);
+        // No ack names a takenPool: any node that acked may hold one.
+        let lost = [ack("n2", P::Suspending, true), ack("n3", P::Deleting, true)];
+        assert_eq!(names(holders(&lost, true, &[])), ["n2", "n3"]);
+        assert_eq!(names(holders(&lost, false, &[])), ["n3"]);
         let done = [ack("n1", P::Deleting, true), ack("n3", P::Deleting, true)];
-        assert!(deleted_everywhere(&done, &holders(&done, &[])));
+        assert!(deleted_everywhere(&done, &holders(&done, false, &[])));
         assert!(!deleted_everywhere(
             &done,
-            &holders(&done, &["n4".to_owned()])
+            &holders(&done, true, &["n4".to_owned()])
         ));
     }
 

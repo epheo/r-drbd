@@ -129,7 +129,7 @@ pub(crate) async fn reconcile_all(ctx: &Ctx<'_>, memory: &Memory) {
     let snapshot_held: HashSet<(&str, &str)> = snapshots
         .iter()
         .flat_map(|s| s.status.iter().flat_map(|st| &st.acks))
-        .filter_map(|a| a.pool.as_deref().map(|p| (a.node.as_str(), p)))
+        .filter_map(|a| a.taken_pool.as_deref().map(|p| (a.node.as_str(), p)))
         .collect();
     for pool in Stores::sorted(&ctx.stores.pools) {
         let name = pool.name_any();

@@ -806,8 +806,9 @@ async fn snapshot_outlives_an_uninitialized_restore() {
     })
     .await;
     let agents = ["n1", "n2", "n3"].map(|n| FakeAgent::new(&client, n));
-    for a in &agents[..2] {
-        a.ack("snap", SnapshotPhase::Deleting, true, None).await;
+    // Each holder copies its takenPool forward, like the agent.
+    for (a, p) in agents[..2].iter().zip(["p1", "p2"]) {
+        a.ack("snap", SnapshotPhase::Deleting, true, Some(p)).await;
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(
@@ -884,8 +885,9 @@ async fn larger_restore_is_ready_only_at_the_full_size() {
         support::snap_phase(s) == SnapshotPhase::Deleting
     })
     .await;
-    for a in &agents[..2] {
-        a.ack("snap", SnapshotPhase::Deleting, true, None).await;
+    // Each holder copies its takenPool forward, like the agent.
+    for (a, p) in agents[..2].iter().zip(["p1", "p2"]) {
+        a.ack("snap", SnapshotPhase::Deleting, true, Some(p)).await;
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(

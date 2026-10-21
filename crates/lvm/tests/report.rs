@@ -68,6 +68,9 @@ fn lvs_rows() {
     // 250 GiB at 25.50 percent used.
     assert_eq!(report::thin_free_bytes(pool), Some(199_984_414_720));
     assert_eq!(report::thin_free_bytes(snap), None);
+    assert_eq!(report::thin_used_bytes(&rows[0]), Some(0));
+    // An inactive snapshot reports no allocation.
+    assert_eq!(report::thin_used_bytes(snap), None);
 }
 
 fn with_field(field: &str, value: &str) -> String {
@@ -127,6 +130,12 @@ fn percent_forms() {
     assert_eq!(free("100.00"), Some(0));
     // Some locales print a decimal comma.
     assert_eq!(free("12,5"), Some(875_000));
+    let rows = report::parse_lvs(&with_field("data_percent", "12,5")).unwrap();
+    let used = report::thin_used_bytes(&Lv {
+        size_bytes: 1_000_000,
+        ..rows[0].clone()
+    });
+    assert_eq!(used, Some(125_000));
     assert_eq!(free("33.333"), Some(666_670));
     assert_eq!(free("7"), Some(930_000));
     for bad in ["-1", ".5", "1.2.3", "1e2", "0.0000000001"] {
