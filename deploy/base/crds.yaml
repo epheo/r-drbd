@@ -1150,6 +1150,12 @@
                               ],
                               "type": "string"
                             },
+                            "phaseSince": {
+                              "description": "Discovering: the phaseSince of the discovery answered. An answer\nto an earlier discovery, written from a lagging cache after the\nacks were cleared, counts for nothing.",
+                              "format": "date-time",
+                              "nullable": true,
+                              "type": "string"
+                            },
                             "searchedPools": {
                               "description": "Discovering: every Pool of the node, searched. The answer counts\nonly while these are the node's Pools.",
                               "items": {

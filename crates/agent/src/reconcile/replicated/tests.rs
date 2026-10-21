@@ -387,20 +387,9 @@ fn source_snapshot() -> Snapshot {
     st.copies_identical = Some(false);
     st.acks = ["n1", "n2"]
         .map(|n| SnapshotAck {
-            node: n.into(),
-            phase: SnapshotPhase::Taking,
             taken_pool: Some(format!("pool-{n}")),
-            lv_bytes: None,
-            allocated_bytes: None,
-            lv_created_at: None,
-            found: None,
-            searched_pools: Vec::new(),
-            tag_size_bytes: None,
-            tag_source_replicas: None,
-            digest: None,
-            digest_bytes: None,
             ok: true,
-            error: None,
+            ..SnapshotAck::new(n, SnapshotPhase::Taking)
         })
         .to_vec();
     s
@@ -1247,20 +1236,9 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
     // The snapshot LV lives in another pool.
     let mut snap = source_snapshot();
     snap.status.as_mut().unwrap().acks = vec![SnapshotAck {
-        node: "n2".into(),
-        phase: SnapshotPhase::Ready,
         taken_pool: Some("pool-elsewhere".into()),
-        lv_bytes: None,
-        allocated_bytes: None,
-        lv_created_at: None,
-        found: None,
-        searched_pools: Vec::new(),
-        tag_size_bytes: None,
-        tag_source_replicas: None,
-        digest: None,
-        digest_bytes: None,
         ok: true,
-        error: None,
+        ..SnapshotAck::new("n2", SnapshotPhase::Ready)
     }];
     let mut r = Rig::on("n2", &[], FakeHost::default());
     r.rec.drbd.copies_identical = proven;
@@ -1719,20 +1697,9 @@ async fn a_failed_proof_read_fails_the_pass_and_starts_nothing() {
 async fn snapshot_lv_is_kept_while_a_restore_here_is_not_initialized() {
     let mut snap = deleting(source_snapshot());
     snap.status.as_mut().unwrap().acks = vec![SnapshotAck {
-        node: NODE.into(),
-        phase: SnapshotPhase::Ready,
         taken_pool: Some(POOL.into()),
-        lv_bytes: None,
-        allocated_bytes: None,
-        lv_created_at: None,
-        found: None,
-        searched_pools: Vec::new(),
-        tag_size_bytes: None,
-        tag_source_replicas: None,
-        digest: None,
-        digest_bytes: None,
         ok: true,
-        error: None,
+        ..SnapshotAck::new(NODE, SnapshotPhase::Ready)
     }];
     let mut r = Rig::new(&healthy(), up_host());
     let x = r.x.clone();
@@ -2630,40 +2597,16 @@ async fn diskless_replica_keeps_its_freeze_through_taking() {
         ]
     };
     let mine = SnapshotAck {
-        node: "n3".into(),
-        phase: SnapshotPhase::Suspending,
-        taken_pool: None,
-        lv_bytes: None,
-        allocated_bytes: None,
-        lv_created_at: None,
-        found: None,
-        searched_pools: Vec::new(),
-        tag_size_bytes: None,
-        tag_source_replicas: None,
-        digest: None,
-        digest_bytes: None,
         ok: true,
-        error: None,
+        ..SnapshotAck::new("n3", SnapshotPhase::Suspending)
     };
     let taking = acked(SnapshotPhase::Taking, mine);
     let mut r = Rig::on("n3", &lines("user"), FakeHost::default());
     r.expect_check();
     let w = r.pass(&[volume(GIB)], std::slice::from_ref(&taking)).await;
     let frozen = SnapshotAck {
-        node: "n3".into(),
-        phase: SnapshotPhase::Taking,
-        taken_pool: None,
-        lv_bytes: None,
-        allocated_bytes: None,
-        lv_created_at: None,
-        found: None,
-        searched_pools: Vec::new(),
-        tag_size_bytes: None,
-        tag_source_replicas: None,
-        digest: None,
-        digest_bytes: None,
         ok: true,
-        error: None,
+        ..SnapshotAck::new("n3", SnapshotPhase::Taking)
     };
     assert_eq!(
         acks(&w),

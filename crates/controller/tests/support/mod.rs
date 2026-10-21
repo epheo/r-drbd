@@ -783,7 +783,9 @@ impl FakeAgent {
         let mine = status.acks.iter().find(|a| a.node == self.node);
         if searched.is_empty()
             || mine.is_some_and(|a| {
-                a.phase == SnapshotPhase::Discovering && a.searched_pools == searched
+                a.phase == SnapshotPhase::Discovering
+                    && a.searched_pools == searched
+                    && a.phase_since == status.phase_since
             })
         {
             return Ok(());
@@ -796,6 +798,7 @@ impl FakeAgent {
         let ack = SnapshotAck {
             found: Some(copy.is_some()),
             searched_pools: searched,
+            phase_since: status.phase_since.clone(),
             taken_pool: copy.as_ref().map(|c| c.pool.clone()),
             tag_size_bytes: copy.as_ref().and_then(|c| c.size_bytes),
             tag_source_replicas: copy.as_ref().and_then(|c| c.source_replicas),

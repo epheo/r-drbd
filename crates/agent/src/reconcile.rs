@@ -1326,7 +1326,8 @@ impl Reconciler {
     /// This node's answer to a discovery, None when the one it gave
     /// stands: it searched the thin pools of all its Pools for the
     /// Snapshot's LV by its uid tag. An answer holds only for the Pools it
-    /// names, so a changed Pool set searches again. A failed search is no
+    /// names and the discovery whose phaseSince it echoes, so a changed
+    /// Pool set or a new discovery searches again. A failed search is no
     /// answer: its ack says why and is not ok. A node without a Pool is not
     /// asked.
     async fn discovery_answer(
@@ -1338,8 +1339,12 @@ impl Reconciler {
         prev: Option<&SnapshotAck>,
     ) -> Option<SnapshotAck> {
         let searched = &self.pool_names;
+        let since = snap.status.as_ref().and_then(|st| st.phase_since.clone());
         let stands = |a: &SnapshotAck| {
-            a.phase == SnapshotPhase::Discovering && a.ok && a.searched_pools == *searched
+            a.phase == SnapshotPhase::Discovering
+                && a.ok
+                && a.searched_pools == *searched
+                && a.phase_since == since
         };
         if searched.is_empty() || prev.is_some_and(stands) {
             return None;
@@ -1347,6 +1352,7 @@ impl Reconciler {
         let uid = snap.metadata.uid.as_deref()?;
         let asked = SnapshotAck {
             searched_pools: searched.clone(),
+            phase_since: since,
             ..SnapshotAck::new(&self.node, SnapshotPhase::Discovering)
         };
         let ack = match self.find_own_lv(reads, pools, lv, uid).await {
@@ -1360,6 +1366,7 @@ impl Reconciler {
                 SnapshotAck {
                     found: Some(true),
                     searched_pools: asked.searched_pools,
+                    phase_since: asked.phase_since,
                     ..ack(&self.node, SnapshotPhase::Discovering, own.taken(), Ok(()))
                 }
             }

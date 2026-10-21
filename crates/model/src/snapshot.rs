@@ -197,6 +197,11 @@ pub struct SnapshotAck {
     /// only while these are the node's Pools.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub searched_pools: Vec<String>,
+    /// Discovering: the phaseSince of the discovery answered. An answer
+    /// to an earlier discovery, written from a lagging cache after the
+    /// acks were cleared, counts for nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_since: Option<Time>,
     /// The size the snapshot LV's tag records, as the take wrote it or a
     /// discovery found it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -231,6 +236,7 @@ impl SnapshotAck {
             lv_created_at: None,
             found: None,
             searched_pools: Vec::new(),
+            phase_since: None,
             tag_size_bytes: None,
             tag_source_replicas: None,
             digest: None,

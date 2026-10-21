@@ -922,20 +922,9 @@ async fn snapshot_deleting_after_volume_is_gone() {
     let mut s = deleting(snapshot("snap-1", "pvc-1", SnapshotPhase::Ready));
     if let Some(st) = s.status.as_mut() {
         st.acks.push(SnapshotAck {
-            node: NODE.into(),
-            phase: SnapshotPhase::Taking,
             taken_pool: Some(POOL.into()),
-            lv_bytes: None,
-            allocated_bytes: None,
-            lv_created_at: None,
-            found: None,
-            searched_pools: Vec::new(),
-            tag_size_bytes: None,
-            tag_source_replicas: None,
-            digest: None,
-            digest_bytes: None,
             ok: true,
-            error: None,
+            ..SnapshotAck::new(NODE, SnapshotPhase::Taking)
         });
     }
     let w = run(&x, vec![], vec![s]).await;
@@ -1197,7 +1186,13 @@ fn discovering(name: &str) -> Snapshot {
     let mut s = snapshot(name, "pvc-1", SnapshotPhase::Discovering);
     let st = s.status.as_mut().unwrap();
     (st.size_bytes, st.source_replicas) = (None, None);
+    st.phase_since = Some(discovery_since(1));
     s
+}
+
+/// The phaseSince of a discovery of these tests; its answers echo it.
+fn discovery_since(n: i64) -> Time {
+    Time(k8s_openapi::jiff::Timestamp::from_second(LV_TIME + n).unwrap())
 }
 
 fn answers(writes: &[StatusWrite]) -> Vec<SnapshotAck> {
@@ -1219,6 +1214,7 @@ async fn a_discovery_is_answered_by_the_uid_tag() {
     let found = SnapshotAck {
         found: Some(true),
         searched_pools: vec![POOL.into()],
+        phase_since: Some(discovery_since(1)),
         taken_pool: Some(POOL.into()),
         lv_bytes: Some(GIB),
         lv_created_at: Some(lv_time()),
@@ -1234,6 +1230,7 @@ async fn a_discovery_is_answered_by_the_uid_tag() {
     let not_found = SnapshotAck {
         found: Some(false),
         searched_pools: vec![POOL.into()],
+        phase_since: Some(discovery_since(1)),
         ok: true,
         ..SnapshotAck::new(NODE, SnapshotPhase::Discovering)
     };
@@ -1262,6 +1259,14 @@ async fn a_discovery_is_answered_by_the_uid_tag() {
     s.status.as_mut().unwrap().acks = vec![found];
     let w = run(&x, vec![], vec![s.clone()]).await;
     assert_eq!(answers(&w), []);
+
+    // A new discovery: the old answer stands for nothing, searched again.
+    let x = Arc::new(ScriptedExec::new());
+    reads(&x, &[]);
+    let mut again = s.clone();
+    again.status.as_mut().unwrap().phase_since = Some(discovery_since(2));
+    let w = run(&x, vec![], vec![again]).await;
+    assert_eq!(answers(&w)[0].phase_since, Some(discovery_since(2)));
 
     // Another Pool on the node: searched again, both named.
     let x = Arc::new(ScriptedExec::new());
@@ -1573,20 +1578,9 @@ async fn snapshot_deleting_is_kept_only_for_its_own_uid() {
     let mut s = deleting(snapshot("snap-1", "pvc-1", SnapshotPhase::Ready));
     if let Some(st) = s.status.as_mut() {
         st.acks.push(SnapshotAck {
-            node: NODE.into(),
-            phase: SnapshotPhase::Taking,
             taken_pool: Some(POOL.into()),
-            lv_bytes: None,
-            allocated_bytes: None,
-            lv_created_at: None,
-            found: None,
-            searched_pools: Vec::new(),
-            tag_size_bytes: None,
-            tag_source_replicas: None,
-            digest: None,
-            digest_bytes: None,
             ok: true,
-            error: None,
+            ..SnapshotAck::new(NODE, SnapshotPhase::Taking)
         });
     }
     let restore = |uid: &str| {

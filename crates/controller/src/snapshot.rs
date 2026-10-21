@@ -698,13 +698,17 @@ pub fn pools_by_node(pools: &[std::sync::Arc<model::Pool>]) -> BTreeMap<String, 
 /// answer. A failed search is no answer but owes nothing more: deleting a
 /// Pool is then the way to give up on that node's copies.
 pub fn owes_answer(s: &Snapshot, node: &str, pools: &[String]) -> bool {
-    let st = s.status.as_ref();
-    if st.and_then(|st| st.phase) != Some(SnapshotPhase::Discovering) {
+    let Some(st) = s.status.as_ref() else {
+        return false;
+    };
+    if st.phase != Some(SnapshotPhase::Discovering) {
         return false;
     }
-    let ack = st.and_then(|st| st.acks.iter().find(|a| a.node == node));
+    let ack = st.acks.iter().find(|a| a.node == node);
     !ack.is_some_and(|a| {
-        a.phase == SnapshotPhase::Discovering && (!a.ok || a.searched_pools == pools)
+        a.phase == SnapshotPhase::Discovering
+            && a.phase_since == st.phase_since
+            && (!a.ok || a.searched_pools == pools)
     })
 }
 
@@ -725,9 +729,14 @@ pub enum Discovery {
     },
 }
 
-/// The decision, pure: only once every node with a Pool answered for its
-/// current Pools; a failed search is no answer.
-pub fn discovery(acks: &[SnapshotAck], pools: &BTreeMap<String, Vec<String>>) -> Discovery {
+/// The decision, pure: only once every node with a Pool answered this
+/// discovery, started at `since`, for its current Pools; a failed search
+/// is no answer.
+pub fn discovery(
+    acks: &[SnapshotAck],
+    since: Option<&Time>,
+    pools: &BTreeMap<String, Vec<String>>,
+) -> Discovery {
     let mut silent = Vec::new();
     let mut found = Vec::new();
     for (node, names) in pools {
@@ -735,6 +744,7 @@ pub fn discovery(acks: &[SnapshotAck], pools: &BTreeMap<String, Vec<String>>) ->
             a.node == *node
                 && a.phase == SnapshotPhase::Discovering
                 && a.ok
+                && a.phase_since.as_ref() == since
                 && a.searched_pools == *names
         });
         match answer {
@@ -805,7 +815,7 @@ async fn discover(
         .as_ref()
         .map(|st| st.acks.as_slice())
         .unwrap_or_default();
-    match discovery(acks, pools) {
+    match discovery(acks, Some(since), pools) {
         Discovery::Waiting(silent) => {
             let message = format!("waiting for the answer of {}", silent.join(", "));
             let bound = model::snapshot::DISCOVERY_SILENT;
@@ -1168,20 +1178,10 @@ mod tests {
 
     fn ack(node: &str, phase: P, ok: bool) -> SnapshotAck {
         SnapshotAck {
-            node: node.into(),
-            phase,
             taken_pool: (phase == P::Taking).then(|| format!("p-{node}")),
-            lv_bytes: None,
-            allocated_bytes: None,
-            lv_created_at: None,
-            found: None,
-            searched_pools: Vec::new(),
-            tag_size_bytes: None,
-            tag_source_replicas: None,
-            digest: None,
-            digest_bytes: None,
             ok,
             error: (!ok).then(|| "boom".into()),
+            ..SnapshotAck::new(node, phase)
         }
     }
 
@@ -1802,6 +1802,11 @@ mod tests {
         }
     }
 
+    /// When the discovery of these tests began.
+    fn since() -> Time {
+        Time(Timestamp::from_second(1_000).unwrap())
+    }
+
     /// A Discovering answer of `node` for `pools`, found when `tag` is
     /// (size, replicas, LV time).
     fn answer(node: &str, pools: &[&str], tag: Option<(u64, u32, i64)>) -> SnapshotAck {
@@ -1809,6 +1814,7 @@ mod tests {
         SnapshotAck {
             found: Some(tag.is_some()),
             searched_pools: pools.iter().map(|p| (*p).to_owned()).collect(),
+            phase_since: Some(since()),
             taken_pool: tag.and(pool),
             tag_size_bytes: tag.map(|t| t.0),
             tag_source_replicas: tag.map(|t| t.1),
@@ -1832,26 +1838,39 @@ mod tests {
         let a2 = answer("n2", &["p2", "p3"], Some((GI, 2, 10)));
         let a3 = answer("n3", &["p4"], None);
         assert_eq!(
-            discovery(&[a1.clone(), a2.clone()], &pools),
+            discovery(&[a1.clone(), a2.clone()], Some(&since()), &pools),
             Discovery::Waiting(vec!["n3".into()])
         );
         // An answer for an older Pool set is no answer.
         let stale = answer("n2", &["p2"], Some((GI, 2, 10)));
         assert_eq!(
-            discovery(&[a1.clone(), stale, a3.clone()], &pools),
+            discovery(&[a1.clone(), stale, a3.clone()], Some(&since()), &pools),
             Discovery::Waiting(vec!["n2".into()])
+        );
+        // Nor is one to an earlier discovery, from a lagging cache.
+        let earlier = SnapshotAck {
+            phase_since: Some(Time(Timestamp::from_second(1).unwrap())),
+            ..a3.clone()
+        };
+        assert_eq!(
+            discovery(&[a1.clone(), a2.clone(), earlier], Some(&since()), &pools),
+            Discovery::Waiting(vec!["n3".into()])
         );
         // A failed search is no answer either.
         let mut failed = a3.clone();
         failed.ok = false;
         failed.error = Some("vg unreadable".into());
         assert_eq!(
-            discovery(&[a1.clone(), a2.clone(), failed], &pools),
+            discovery(&[a1.clone(), a2.clone(), failed], Some(&since()), &pools),
             Discovery::Waiting(vec!["n3".into()])
         );
         // Ready from the tags, created at the earliest copy.
         assert_eq!(
-            discovery(&[a1.clone(), a2.clone(), a3.clone()], &pools),
+            discovery(
+                &[a1.clone(), a2.clone(), a3.clone()],
+                Some(&since()),
+                &pools
+            ),
             Discovery::Ready {
                 size_bytes: GI,
                 source_replicas: 2,
@@ -1861,7 +1880,11 @@ mod tests {
         // A node without a Pool is not asked; its ack counts for nothing.
         let gone = answer("n9", &["p9"], Some((2 * GI, 3, 1)));
         assert!(matches!(
-            discovery(&[a1.clone(), a2.clone(), a3.clone(), gone], &pools),
+            discovery(
+                &[a1.clone(), a2.clone(), a3.clone(), gone],
+                Some(&since()),
+                &pools
+            ),
             Discovery::Ready { size_bytes: GI, .. }
         ));
     }
@@ -1870,7 +1893,7 @@ mod tests {
     fn a_discovery_without_agreeing_copies_is_lost() {
         let pools = asked(&[("n1", &["p1"]), ("n2", &["p2"])]);
         let none = [answer("n1", &["p1"], None), answer("n2", &["p2"], None)];
-        let Discovery::Lost { reason, .. } = discovery(&none, &pools) else {
+        let Discovery::Lost { reason, .. } = discovery(&none, Some(&since()), &pools) else {
             panic!("no copy");
         };
         assert_eq!(reason, SNAPSHOT_LOST);
@@ -1878,7 +1901,7 @@ mod tests {
             answer("n1", &["p1"], Some((GI, 2, 1))),
             answer("n2", &["p2"], Some((2 * GI, 2, 1))),
         ];
-        let Discovery::Lost { reason, message } = discovery(&differ, &pools) else {
+        let Discovery::Lost { reason, message } = discovery(&differ, Some(&since()), &pools) else {
             panic!("tags disagree");
         };
         assert_eq!(reason, TAGS_DISAGREE);
@@ -1888,7 +1911,7 @@ mod tests {
         );
         // No node with a Pool at all: nothing can hold a copy.
         assert!(matches!(
-            discovery(&[], &BTreeMap::new()),
+            discovery(&[], Some(&since()), &BTreeMap::new()),
             Discovery::Lost {
                 reason: SNAPSHOT_LOST,
                 ..
@@ -1908,6 +1931,7 @@ mod tests {
         let pools = ["p1".to_owned(), "p2".to_owned()];
         s.status = Some(model::SnapshotStatus {
             phase: Some(P::Discovering),
+            phase_since: Some(since()),
             ..model::SnapshotStatus::default()
         });
         assert!(owes_answer(&s, "n1", &pools), "silent");
@@ -1916,6 +1940,9 @@ mod tests {
         assert!(owes_answer(&s, "n1", &pools), "an older Pool set");
         s.status.as_mut().unwrap().acks = vec![answer("n1", &["p1", "p2"], None)];
         assert!(!owes_answer(&s, "n1", &pools));
+        s.status.as_mut().unwrap().phase_since = Some(Time(Timestamp::from_second(2).unwrap()));
+        assert!(owes_answer(&s, "n1", &pools), "an earlier discovery");
+        s.status.as_mut().unwrap().phase_since = Some(since());
         // A failed search owes nothing more: the Pool may go.
         let mut failed = answer("n1", &["p1"], None);
         failed.ok = false;

@@ -680,20 +680,9 @@ async fn restore_case(h: &Host, factor: u64, max_received: Option<u64>) {
         source_replicas: Some(2),
         copies_identical: Some(max_received.is_some()),
         acks: vec![model::SnapshotAck {
-            node: h.node.clone(),
-            phase: SnapshotPhase::Taking,
             taken_pool: Some("test-host-pool".into()),
-            lv_bytes: None,
-            allocated_bytes: None,
-            lv_created_at: None,
-            found: None,
-            searched_pools: Vec::new(),
-            tag_size_bytes: None,
-            tag_source_replicas: None,
-            digest: None,
-            digest_bytes: None,
             ok: true,
-            error: None,
+            ..model::SnapshotAck::new(&h.node, SnapshotPhase::Taking)
         }],
         ..SnapshotStatus::default()
     });
