@@ -1120,7 +1120,6 @@ impl FakeAgent {
                     let pool = mine.and_then(|a| a.taken_pool.clone());
                     self.ack(&name, phase, true, pool.as_deref()).await;
                 }
-
                 _ => {}
             }
         }

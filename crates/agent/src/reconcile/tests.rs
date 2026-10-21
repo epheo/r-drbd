@@ -1186,7 +1186,6 @@ async fn ready_snapshot_lv_is_rediscovered() {
         ..taken_ack(SnapshotPhase::Taking, POOL)
     }];
     assert_eq!(snapshot_acks(&run(&x, vec![], vec![snap]).await), vec![]);
-
     // Only by its uid tag: untagged, or another Snapshot's, it is no copy.
     let other = storage::snap_tag("uid-other", GIB, 1);
     for tags in [vec![], vec![other.as_str()]] {

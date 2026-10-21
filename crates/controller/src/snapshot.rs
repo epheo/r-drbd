@@ -548,7 +548,6 @@ async fn reconcile(
     ) {
         return None;
     }
-
     if !valid_name(&name) {
         let error = format!("name must match {}", model::keys::NAME_PATTERN);
         fail(api, s, current, error).await;

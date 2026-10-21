@@ -1274,7 +1274,6 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
         lvm::cmd::restore(VG, "pvc-0+snap-1", "pvc-1", &[NEW, FROM]),
         code(5, "", "lvcreate failed"),
     );
-
     expect_create(&x, &[source_lv()]);
     let e = n2_restore_pass(&mut r, &[source_snapshot()]).await;
     assert_eq!(e.last_error, None);
@@ -2506,7 +2505,6 @@ async fn a_lost_status_keeps_the_freeze_to_the_deadline() {
         let w = r.pass(&[volume(GIB)], &lost).await;
         assert!(outside(&w), "no failed ack outside a round");
     }
-
     for phase in [
         SnapshotPhase::Ready,
         SnapshotPhase::Failed,

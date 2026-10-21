@@ -1169,7 +1169,6 @@ impl Reconciler {
                 Some(SnapshotPhase::Ready) if prev.is_none() && holder_missing(&status) => {
                     self.rediscover(reads, pools, snap, &lv).await?
                 }
-
                 Some(SnapshotPhase::Ready)
                     if taken.pool.is_some() && taken.digest.is_none() && wants_digest(&status) =>
                 {
