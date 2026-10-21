@@ -400,6 +400,8 @@ fn phase_reason(p: SnapshotPhase) -> &'static str {
         SnapshotPhase::Ready => "Ready",
         SnapshotPhase::Failed => "Failed",
         SnapshotPhase::Deleting => "Deleting",
+        SnapshotPhase::Discovering => "Discovering",
+        SnapshotPhase::Lost => "Lost",
         SnapshotPhase::Unknown => "Unknown",
     }
 }
@@ -519,9 +521,15 @@ async fn reconcile(
         record_proof(ctx, api, s, current).await;
         return None;
     }
-    // Unknown: a phase another version wrote. Left as it is, like Failed:
-    // rewriting it could fail a newer version's good snapshot.
-    if matches!(phase, SnapshotPhase::Failed | SnapshotPhase::Unknown) {
+    // Unknown: a phase another version wrote. Left as it is, like Failed
+    // and Lost: rewriting it could fail a newer version's good snapshot.
+    if matches!(
+        phase,
+        SnapshotPhase::Failed
+            | SnapshotPhase::Lost
+            | SnapshotPhase::Discovering
+            | SnapshotPhase::Unknown
+    ) {
         return None;
     }
     if !valid_name(&name) {

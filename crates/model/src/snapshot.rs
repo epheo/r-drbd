@@ -64,6 +64,13 @@ pub enum SnapshotPhase {
     Failed,
     /// Agents remove the snapshot LVs.
     Deleting,
+    /// The status was lost: every node with a Pool searches its Pools for
+    /// this Snapshot's LV by its uid tag. Ready or Lost follows, never a
+    /// round.
+    Discovering,
+    /// The status was lost and no copy was found, or the copies' tags
+    /// disagree. Never restored, never taken again; the copies stay.
+    Lost,
     /// Any other value: one an older or newer version wrote, still stored.
     /// It decodes so one object never stops a watch; no round runs on it
     /// and it is never written back.

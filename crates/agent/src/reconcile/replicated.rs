@@ -109,6 +109,20 @@ pub(super) fn in_round(s: &Snapshot) -> bool {
         })
 }
 
+/// A Snapshot that keeps a suspend of its volume until the agent's own
+/// deadline: one in its round, or whose status vanished or is being
+/// rebuilt. Never resumed because a phase vanished, so every copy of a
+/// round is taken inside one freeze.
+fn holds_freeze(s: &Snapshot) -> bool {
+    s.metadata.deletion_timestamp.is_none()
+        && s.status.as_ref().and_then(|st| st.phase).is_none_or(|p| {
+            matches!(
+                p,
+                SnapshotPhase::Suspending | SnapshotPhase::Taking | SnapshotPhase::Discovering
+            )
+        })
+}
+
 pub(super) fn snapshot_round_active(snapshots: &[Arc<Snapshot>], volume: &str) -> bool {
     snapshots
         .iter()
@@ -1761,10 +1775,11 @@ impl Reconciler {
         self.tracked(volume).is_some_and(|r| r.suspended_by_user())
     }
 
-    /// Ends a user IO suspend nobody needs: no round of the volume runs, or
-    /// this agent's own deadline passed, whatever the controller says. A
-    /// round still running then gets a failed ack, best effort; safety does
-    /// not rest on it, since every take ends before the deadline.
+    /// Ends a user IO suspend nobody needs: no Snapshot of the volume holds
+    /// it, or this agent's own deadline passed, whatever the controller
+    /// says. A round still running then gets a failed ack, best effort;
+    /// safety does not rest on it, since every take ends before the
+    /// deadline.
     pub(super) async fn freeze(&mut self, vol: &Volume, snaps: &[&Snapshot]) -> Vec<StatusWrite> {
         let name = vol.name_any();
         if vol.spec.replicas < 2 || !self.drbd_available() {
@@ -1785,16 +1800,16 @@ impl Reconciler {
                 mine: false,
             })
             .since;
-        let rounds: Vec<&Snapshot> = snaps
+        let holding: Vec<&Snapshot> = snaps
             .iter()
             .copied()
-            .filter(|s| s.is_of(vol) && in_round(s))
+            .filter(|s| s.is_of(vol) && holds_freeze(s))
             .collect();
         let after = model::snapshot::RESUME_AFTER;
-        if !rounds.is_empty() && now.duration_since(since) < after {
+        if !holding.is_empty() && now.duration_since(since) < after {
             return Vec::new();
         }
-        if rounds.is_empty() {
+        if holding.is_empty() {
             tracing::info!(
                 volume = name,
                 "IO suspended without a snapshot round: resuming"
@@ -1811,8 +1826,9 @@ impl Reconciler {
         }
         self.freezes.remove(&name);
         let error = format!("IO resumed here {} s after its suspend", after.as_secs());
-        rounds
+        holding
             .into_iter()
+            .filter(|s| in_round(s))
             .filter_map(|s| {
                 let status = s.status.as_ref()?;
                 let prev = status.acks.iter().find(|a| a.node == self.node);

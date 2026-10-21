@@ -2460,6 +2460,44 @@ async fn resume_on_the_local_deadline_without_a_controller() {
     assert_eq!(times(&r.x, "suspend-io"), 1);
 }
 
+/// A status lost mid round, or being rebuilt, keeps IO frozen to the
+/// agent's own deadline; any other phase ends the freeze at once.
+#[tokio::test(start_paused = true)]
+async fn a_lost_status_keeps_the_freeze_to_the_deadline() {
+    for phase in [None, Some(SnapshotPhase::Discovering)] {
+        let mut r = Rig::new(&healthy(), up_host());
+        suspend_pass(&mut r).await;
+        let mut s = snapshot(SnapshotPhase::Suspending);
+        s.status.as_mut().unwrap().phase = phase;
+        let lost = [s];
+        tokio::time::advance(model::snapshot::RESUME_AFTER.saturating_sub(Duration::from_secs(1)))
+            .await;
+        reads_again(&r.x, &[lv(LV_KIB)]);
+        dry(&r.x, "");
+        assert_eq!(acks(&r.pass(&[volume(GIB)], &lost).await), vec![]);
+        assert!(!seen(&r.x, "resume-io"), "{phase:?}");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        reads_again(&r.x, &[lv(LV_KIB)]);
+        r.x.expect(argv::resume_io("pvc-1"), ok(""));
+        dry(&r.x, "");
+        let w = r.pass(&[volume(GIB)], &lost).await;
+        assert_eq!(acks(&w), vec![], "no failed ack outside a round");
+    }
+    for phase in [
+        SnapshotPhase::Ready,
+        SnapshotPhase::Failed,
+        SnapshotPhase::Lost,
+        SnapshotPhase::Pending,
+    ] {
+        let mut r = Rig::new(&healthy(), up_host());
+        suspend_pass(&mut r).await;
+        reads_again(&r.x, &[lv(LV_KIB)]);
+        r.x.expect(argv::resume_io("pvc-1"), ok(""));
+        dry(&r.x, "");
+        r.pass(&[volume(GIB)], &[snapshot(phase)]).await;
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_restart_forgets_the_suspend_and_never_takes() {
     let mut sus = healthy();

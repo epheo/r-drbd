@@ -1139,7 +1139,9 @@
                                 "Pending",
                                 "Suspending",
                                 "Taking",
-                                "Deleting"
+                                "Deleting",
+                                "Discovering",
+                                "Lost"
                               ],
                               "type": "string"
                             },
@@ -1243,7 +1245,9 @@
                           "Pending",
                           "Suspending",
                           "Taking",
-                          "Deleting"
+                          "Deleting",
+                          "Discovering",
+                          "Lost"
                         ],
                         "nullable": true,
                         "type": "string"
