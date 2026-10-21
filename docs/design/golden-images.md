@@ -102,7 +102,7 @@ Not in this design (section 13): backing chains or qcow2, asynchronous replicati
 - The agent's successful Taking ack records `takenPool` (the Pool that holds the snapshot LV), `lvBytes` (its size) and `allocatedBytes` (its thin allocation). Every later ack copies the three forward unchanged, and `digest` and `digestBytes` once they exist.
 - After that ack, `takenPool` alone decides where the node's snapshot LV lives for restores, holder lookups and deletes; the replica's current Pool never does. Before that ack the local replica's Pool is used: the round is still taking.
 - A delete on a node without `takenPool` (a lost ack) searches the thin pools of the node's Pools for the exact LV name; an LV of that name outside a Pool's thin pool is an error, never removed.
-- Through `takenPool` the delete removes the LV of the exact name: the node took it.
+- Through `takenPool` the delete removes the LV of the exact name with this uid's tag or with no snap tag (taken before tags existed), never another uid's.
 - The search path removes only an LV with this Snapshot's uid tag; one with another uid is not this Snapshot's and stays.
 - The controller records `status.sourceReplicas` on the way into Taking: the source's replica count survives the source Volume.
 
@@ -110,7 +110,7 @@ Not in this design (section 13): backing chains or qcow2, asynchronous replicati
 
 - DeleteSnapshot deletes the Snapshot object and returns success once it carries a deletion timestamp. It never waits for LV removal: with retention that wait could last months and the snapshot controller would retry forever.
 - On each pass for a Snapshot with a deletion timestamp:
-  1. Phase not yet Retired or Deleting: write phase `Retired`, Ready False with reason `Retired`, one `ImageRetired` Event.
+  1. Phase `Discovering`: wait for its outcome (6.7). Phase not yet Retired or Deleting: write phase `Retired`, Ready False with reason `Retired`, one `ImageRetired` Event.
   2. List Volumes live (a linearizable read); count references: any Volume object, whatever its phase or deletion timestamp, with `purpose: Disk` and this uid in `spec.source.snapshotUid`; write `status.referencingDisks`. On every other pass the controller keeps `status.referencingDisks` current from its cache, for visibility; only the release decision recounts from a live list.
   3. Above zero: stay Retired; the next pass comes from Volume events.
   4. Zero: phase `Deleting`; the holders remove their snapshot LVs; the finalizer goes when every holder acked.
@@ -121,14 +121,15 @@ Not in this design (section 13): backing chains or qcow2, asynchronous replicati
 
 ### 6.4 A Volume whose image is gone
 
-- A Volume with a source, no first data and no assignment, whose Snapshot is Retired, deleting or gone: one live GET confirms it, then phase Failed with reason `SnapshotRetired`; never placed. A uid that differs gives `SnapshotUidMismatch`.
+- A Volume with a source, no first data and no assignment, whose Snapshot is Retired, Lost, deleting or gone: one live GET confirms it, then phase Failed with reason `SnapshotRetired`; never placed. A uid that differs gives `SnapshotUidMismatch`; a Lost Snapshot gives `SnapshotLost`.
 - It stays a reference until deleted, and `referencingDisks` shows why.
 
 ### 6.5 Orphan report
 
 - Each agent reports, once per LV, an LV in its Pools whose from, seed, zeroing or zeroed tag names a Volume uid that no Volume has: Event `ImageOrphanLv` on the Pool, naming the LV and the tag.
 - Warm-tagged LVs are skipped: they belong to their Pool and are evicted by tag.
-- The same report covers a snapshot LV whose snapshot tag names a uid that no Snapshot has, for example after objects were restored from a backup with new uids.
+- The same report covers a snapshot LV whose snap tag names a uid that no Snapshot has, for example after objects were restored from a backup with new uids.
+- And an untagged snapshot LV that no Snapshot's ack names.
 - Only after the caches synced and only for LVs older than one pass. Nothing is removed or retagged.
 
 ### 6.6 Images without their source
@@ -145,59 +146,73 @@ Not in this design (section 13): backing chains or qcow2, asynchronous replicati
 - A holder's snapshot LV lost by hand: restores on that node fall back; the delete acks not found.
 
 Snapshot LV tags:
-- The take creates the snapshot LV with the tag `r-drbd.snap.<snapshot uid>.<size bytes>.<source replicas>` in the same lvcreate: the Snapshot's `sizeBytes` and `sourceReplicas`, both known on the way into Taking.
+- The take creates the snapshot LV with the tag `r-drbd.snap.<snapshot uid>.<size bytes>.<source replicas>` in the same lvcreate.
+- The size and replica count are the Snapshot's `sizeBytes` and `sourceReplicas`, both known on the way into Taking.
 - The take adopts an existing LV of the name only when it carries this uid.
-- An LV of the name without the tag or with another uid fails the round and stays untouched; a CSI retry under the same name fails the same way, with an Event each time, and the orphan report names the LV.
+- An LV of the name without the tag or with another uid fails the round and stays untouched, with one `SnapshotLvConflict` Event.
+- A CSI retry under the same name fails the same way; the orphan report names the LV.
 - A restore or warm copy cut from a snapshot LV drops the snap tag.
-- `createdAt` is the earliest holder's LV creation time, in a normal round too, so a rebuilt status equals the lost one.
-- Snapshot LVs from before tags existed are not holder copies: such snapshots are no longer restorable, and their delete still removes them through each node's own `takenPool` ack.
+- Every Taking ack carries the LV's creation time; `createdAt` is the earliest holder's, so a rebuilt status equals the lost one.
+- Snapshot LVs from before tags existed are not holder copies: such snapshots are no longer restorable.
 
 Freeze and failure:
-- An agent that suspended IO for a round resumes on a phase past Taking or on its own clock bound, never because the round's status vanished: every copy of the round is then taken inside one freeze.
-- A round that ends Failed: every diskful node of the round searches its Pools for an LV with this uid tag and removes it, whether or not its Taking ack landed. A Failed Snapshot is never restored, and a partial copy left behind would pass for an image after a status loss.
-- Only a round writes Failed; discovery ends in Ready or Lost, so its outcome never removes a copy.
+- An agent that suspended IO for a round resumes on Ready, Failed or its own clock bound, never because the round's status vanished or turned `Discovering`.
+- So every copy of a round is taken inside one freeze.
+- The cost: a status lost mid-round keeps IO frozen up to the clock bound.
+- On a Failed Snapshot, every node with a Pool removes an LV with this uid tag, on any pass, whether or not it took part.
+- A Failed Snapshot is never restored, and a partial copy left behind would pass for an image after a status loss.
+- A node down from the failure until a later status loss keeps its partial copy; it is still a consistent image of the round.
+- Only a round writes Failed; discovery ends in Ready or Lost, and neither removes a copy.
 
 Detecting a lost status:
 - `phase` has no default: absent reads as absent, never as Pending.
 - The controller writes the first status (phase Pending) before it adds its finalizer, so no version of the object has the finalizer without a phase.
-- A Snapshot with the finalizer and no phase has lost its status, whole or in part (acks kept, phase gone); the controller writes phase `Discovering`, with or without a deletion timestamp.
+- A Snapshot with the finalizer and no phase has lost its status, whole or in part.
+- So has one in Ready, Retired or Deleting without `sizeBytes`, which is written on the way into Taking.
+- The controller then writes phase `Discovering` with an empty ack list, so no old ack acts as a holder or holds a Pool.
 - A new Snapshot never looks like one, so it pays nothing.
+- A Snapshot created with the finalizer already set looks like one and ends Lost.
 
 Discovery:
 - The nodes asked are the nodes with a Pool object, not only the source's nodes: in the main case (6.6) the source Volume is gone and its nodes are unknown.
 - Each agent searches the thin pools of its node's Pools for the exact LV name with this uid tag; it filters by the tag before any other check.
-- It answers with an ack of phase `Discovering`: `found` false, or the copy's `takenPool`, `lvBytes`, the tag's size and replica count, and the LV's creation time.
-- Only `Discovering` acks count; a search error is no answer; a node whose Pool set changes answers again.
+- It answers with an ack of phase `Discovering` naming the Pools it searched.
+- A found ack carries `takenPool`, `lvBytes`, the tag's size and replica count, and the LV's creation time.
+- A search error is no answer.
+- An answer counts only while its Pools are the node's current Pool set; a node whose Pool set changes answers again.
 - `allocatedBytes` is not rebuilt: an inactive snapshot LV reports no allocation, and 8.1 falls back to S.
 - The controller decides only when every asked node has answered: an agent that is down could hold a copy.
 - After 10 minutes in `Discovering`, Ready False with reason `DiscoveryIncomplete` and one `ImageDiscoveryIncomplete` Event naming the silent nodes; it keeps waiting.
 - Deleting a silent node's Pool is the explicit give-up on that node's copies; deleting its Node object is not.
-- A Pool's deletion waits while a Snapshot is `Discovering` and the Pool's agent is live; the Pool of a dead node can be deleted.
+- A Pool's deletion waits until its node has answered every `Discovering` Snapshot, unless its agent is stale or its search fails.
 - A round never runs on a Snapshot in `Discovering`, so old copies never mix with fresh ones of another moment.
+- CreateSnapshot answers not ready while `Discovering`; CreateVolume and placement wait.
 
 Outcome:
 - One or more copies whose tags agree: phase Ready, with `sizeBytes`, `sourceReplicas` and `createdAt` rebuilt from the tags and LV times.
-- The digests then rebuild `copiesIdentical` (6.8).
+- The found acks are the holder acks from then on; the digests rebuild `copiesIdentical` (6.8).
 - Fewer holders than `sourceReplicas`: replicated restores of the image are refused with `UnsupportedRestore` until fallback replicas (7.4) ship; then they fall back and sync.
 - Copies whose tags disagree: phase `Lost` with reason `TagsDisagree`; the copies stay.
-- No copy on any asked node: phase `Lost` with reason `SnapshotLost` and one `ImageLost` Event; never a new round. The user takes a new snapshot.
-- A Lost Snapshot never restores; its delete searches like a `Discovering` one.
+- No copy on any asked node: phase `Lost` with reason `SnapshotLost`; never a new round.
+- Both give one `ImageLost` Event.
+- CreateSnapshot answers FailedPrecondition with the reason and never replaces a Lost Snapshot: the user takes a new snapshot under another name.
+- CreateVolume refuses a Lost image, and a placed restore of one fails with the reason.
+- A copy that comes back later (a Pool recreated, a node returned): clearing the phase by hand starts a new discovery.
 - `fileSystem` is not rebuilt: a restore never makes a new file system, and an empty device is refused at stage.
-- Each agent drops its `Discovering` ack once the phase leaves `Discovering`.
+- Each agent drops its not-found ack once the phase leaves `Discovering`; found acks stay.
 
-Deleting a Snapshot in `Discovering` or `Lost`:
-- The deletion timestamp still marks the retire: the next pass rewrites Retired and recounts (6.3).
-- The holder set is unknown, so the finalizer stays until every node with a Pool object has searched for this uid tag and acked: removed, or none found.
-- An LV of the name with another uid is not this Snapshot's: the delete acks none found and leaves it to the orphan report.
-- After 10 minutes, the same `DiscoveryIncomplete` condition and Event.
+Deleting:
+- A Snapshot in `Discovering` with a deletion timestamp finishes its discovery first, then follows 6.3 with the found acks as its holders.
+- A Lost Snapshot follows 6.3 the same way.
 
 Lost acks on a Ready Snapshot:
 - A node excluded from a discovery (its Pool deleted, then recreated) may hold a copy without an ack.
-- A Ready Snapshot with fewer holder acks than `sourceReplicas` asks the nodes without an ack to search; a copy found is acked again; a restore on such a node meanwhile falls back with `NoLocalCopy`.
+- A Ready Snapshot with fewer holder acks than `sourceReplicas` asks the nodes without an ack to search; a copy found is acked again.
+- A restore on such a node meanwhile falls back with `NoLocalCopy`.
 
 Backups:
 - An API-level restore of Snapshot objects gives them new uids, so the uid tags never match.
-- Restored with finalizers: the outcome is Lost with orphan Events.
+- Restored with finalizers: the outcome is Lost.
 - Restored without finalizers: the object is a new snapshot, and with its source alive a round takes today's data under the old name.
 - So r-drbd.io Snapshots are kept out of backups; a VolumeSnapshot backed up by a tool that copies data is the supported path.
 - Re-binding by hand: retag the LVs with the new uid, then clear the status.
@@ -379,7 +394,7 @@ The eviction's placement ranks Pools with a copy first, then by room; a Pool wit
 
 ### 10.1 CreateVolume
 
-1. Resolve the Snapshot; answer NotFound for a Retired or deleting one, with no Volume written; refuse a single-replica source with `UnsupportedRestore`.
+1. Resolve the Snapshot; answer NotFound for a Retired or deleting one and FailedPrecondition for a Lost one, with no Volume written; a `Discovering` one waits like one not yet Ready; refuse a single-replica source with `UnsupportedRestore`.
 2. Size: the request, at least S; the disk starts at its full size.
 3. First-replica node: the PVC pin if set; else the scheduler's node (`preferred[0]` under WaitForFirstConsumer) for an image-based replicated volume or a local one; else none.
 4. Write the Volume with the source name and uid, then re-read the Snapshot live (6.3).
@@ -426,7 +441,7 @@ Volume:
 - Ready reasons `WaitingForImageCopy`, `SnapshotRetired`, `SnapshotUidMismatch`; `UnsupportedRestore` also covers a single-replica source.
 
 Snapshot:
-- `spec.volumeUid` (controller, immutable); phase `Retired` with Ready reason `Retired`; `phase` without a default; phase `Discovering` with Ready reason `DiscoveryIncomplete`; phase `Lost` with Ready reasons `SnapshotLost` and `TagsDisagree`; the first status written before the finalizer; ack phase `Discovering` with `found`, `takenPool`, `lvBytes`, `tagSizeBytes`, `tagSourceReplicas`, `lvCreatedAt`; `status.referencingDisks`; `status.sourceReplicas`; `status.acks[].takenPool`, `lvBytes`, `allocatedBytes` (agent, written once, copied forward); `status.acks[].digest` and `digestBytes` (holders, written once after Ready); `status.copiesIdentical` (controller, written once).
+- `spec.volumeUid` (controller, immutable); phase `Retired` with Ready reason `Retired`; `phase` without a default; phase `Discovering` with Ready reason `DiscoveryIncomplete`; phase `Lost` with Ready reasons `SnapshotLost` and `TagsDisagree`; the first status written before the finalizer; ack phase `Discovering` with `found`, `searchedPools`, `takenPool`, `lvBytes`, `tagSizeBytes`, `tagSourceReplicas`, `lvCreatedAt`; `lvCreatedAt` on every Taking ack; `status.referencingDisks`; `status.sourceReplicas`; `status.acks[].takenPool`, `lvBytes`, `allocatedBytes` (agent, written once, copied forward); `status.acks[].digest` and `digestBytes` (holders, written once after Ready); `status.copiesIdentical` (controller, written once).
 - Annotation `r-drbd.io/lineage` (manager or admin). A manager finds the Snapshot from a VolumeSnapshot through the VolumeSnapshotContent's snapshot handle, which is the Snapshot name.
 
 Pool:
@@ -436,7 +451,7 @@ StorageClass parameters: `capacity` (`cluster`, `node`). Agent settings: `R_DRBD
 
 LV tags (next to the existing `r-drbd.new`, `r-drbd.md.<volume uid>.<node id>`, `r-drbd.from.<volume uid>.<snapshot uid>`): `r-drbd.snap.<snapshot uid>.<size bytes>.<source replicas>` on every snapshot LV, `r-drbd.zeroing.<volume uid>.<la bytes>`, `r-drbd.zeroed.<volume uid>.<la bytes>`, `r-drbd.seed.<volume uid>.<snapshot uid>`, `r-drbd.warm.<snapshot uid>`, `r-drbd.idle.<unix seconds>`. Any path that makes an LV new again, or leaves it behind, drops every tag of this design except the warm tag. Uids are 36-character UUIDs.
 
-Events: `RestoreFullSync`, `MetadataSizeDiffers`, `ReplicaSeeded`, `ReplicaFullSync`, `PlacedOffSchedulerNode` (Volume); `ImageRetired`, `ImageCopiesDiffer`, `ImageDiscoveryIncomplete`, `ImageLost`, `ImageWarming`, `ImageWarmed`, `ImageWarmFailed`, `ImageWarmRefused` (Snapshot); `ImageOrphanLv`, `ImageEvicted` (Pool); `ImageLabelsCapped` (Node). One per transition; the per-replica ones once per replica at its check.
+Events: `RestoreFullSync`, `MetadataSizeDiffers`, `ReplicaSeeded`, `ReplicaFullSync`, `PlacedOffSchedulerNode` (Volume); `ImageRetired`, `ImageCopiesDiffer`, `ImageDiscoveryIncomplete`, `ImageLost`, `SnapshotLvConflict`, `ImageWarming`, `ImageWarmed`, `ImageWarmFailed`, `ImageWarmRefused` (Snapshot); `ImageOrphanLv`, `ImageEvicted` (Pool); `ImageLabelsCapped` (Node). One per transition; the per-replica ones once per replica at its check.
 
 Constants: copy digest chunk 4 MiB; digest wait bound 2 min; warm eviction grace 24 h; minimum idle before an over-budget eviction 10 min; warm Volume progress bound 10 min; seed connect bound 10 min; `csums-alg` sha256 on joining connections; `verify-alg` sha256 everywhere; image label cap 32 per node.
 
@@ -458,7 +473,7 @@ RBAC: the agent patches Nodes and creates Events; the controller creates, patche
 12. A restored claim is usable only after every replica's first sync. In the designed steady state every replica is a proven copy and the claim is immediate anyway; the early form would add a Degraded-from-birth state whose quorum behaviour is unmeasured, and it can become a class parameter later.
 13. Holder copies are proven identical by a content digest, not assumed from the round or from a quiet window. Under live buffered writes a page can reach the local disk and the peer in two versions, and a writer that dies first leaves the split for good; a quiet window bounds only the host's writeback. The digest costs one read of the allocated bytes per holder and catches every cause.
 14. No fallback isolation: a replica without a copy comes up like any other, and the no-sync start runs only when every assigned replica is connected and proven; otherwise the initial node is the sync source with checksums on every copy connection. Isolation with a relaxed start rule was the alternative; the strict rule is race-free without a gate, and a forced start no longer thickens proven replicas, so isolation would only save them a checksum read pass.
-15. A lost Snapshot status is rebuilt from tags on the snapshot LVs, detected by a finalizer without a status, and never answered with a new round. A label on the Snapshot would be a second, editable record that can disagree with the disks; a new round would put new data under a VolumeSnapshot the user may have seen ready, and could mix old copies with fresh ones.
+15. A lost Snapshot status is rebuilt from tags on the snapshot LVs, detected by a finalizer without a phase, and never answered with a new round. A label on the Snapshot would be a second, editable record that can disagree with the disks; a new round would put new data under a VolumeSnapshot the user may have seen ready, and could mix old copies with fresh ones.
 
 ## 13. Not in this design
 
@@ -501,13 +516,15 @@ Preconditions:
 Status recovery:
 - A Ready Snapshot whose status is cleared, with its source Volume deleted and with it present: Ready again with the same holders, `sizeBytes`, `sourceReplicas`, `createdAt` and `copiesIdentical`; no round, no IO suspended; a restore matches the data at the take.
 - Only the phase removed, acks kept: the same outcome, never a round.
-- One holder's agent stopped: `Discovering` until it returns, `DiscoveryIncomplete` after 10 minutes, never a round; its Node object deleted changes nothing; its Pool deleted ends the wait without its copy.
-- A live agent's Pool deletion during `Discovering` waits.
-- Every copy removed by hand: Lost with `SnapshotLost`, no round.
-- An LV of the snapshot's name with another uid or no tag: the take fails the round and leaves it untouched; the orphan report names an LV whose uid has no Snapshot.
+- One holder's agent stopped: `Discovering` until it returns, `DiscoveryIncomplete` after 10 minutes, never a round.
+- Its Node object deleted changes nothing; its Pool deleted ends the wait without its copy.
+- A live agent's Pool deletion waits until that node answered.
+- Every copy removed by hand: Lost with `SnapshotLost`, no round; CreateSnapshot answers FailedPrecondition and never replaces it.
+- An LV of the snapshot's name with another uid or no tag: the take fails the round with `SnapshotLvConflict` and leaves it untouched; the orphan report names it.
 - A round failed at Taking, one Taking ack lost: the LVs it took are gone on every node, including the one without an ack.
 - A Lost Snapshot keeps its LVs until deleted.
-- A delete in `Discovering`, and after a cleared status: every copy gone, the finalizer removed only after every node with a Pool searched; a same-name LV of another uid stays and is reported.
+- A status cleared on a deleting Snapshot: discovery finishes, then every copy is removed and the finalizer goes.
+- A same-name LV of another uid survives any delete and is reported.
 - Snapshot objects restored from a backup with finalizers: Lost, with orphan Events.
 - A snapshot taken before tags existed: refused as an image, and its delete removes its LVs.
 
@@ -551,6 +568,6 @@ Placement:
 - pools.md: no restore exemption; warm copies, their budget and eviction; retained bytes.
 - volumes.md: the `capacity` parameter.
 - operations.md: repairs and evictions from an image copy.
-- operations.md: a lost Snapshot status recovers from the snapshot LVs; r-drbd.io Snapshots stay out of backups; re-binding a restored Snapshot by hand.
+- operations.md: a lost Snapshot status recovers from the snapshot LVs; clearing the phase by hand starts a new discovery; r-drbd.io Snapshots stay out of backups; re-binding a restored Snapshot by hand.
 - reference.md: every field, Event and reason of section 11.
 - A new KubeVirt guide: the VM StorageClass (WaitForFirstConsumer, ReadWriteMany block), the VolumeSnapshotClass, the CDI StorageProfile settings (snapshot clone, snapshot source format), golden images imported through the replicated class, the replica-node contract and the manual affinity form, thin pool metadata sizing for snapshot-heavy pools, overcommit guidance with alerting on free bytes.
