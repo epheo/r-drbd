@@ -13,4 +13,4 @@ resources:
 # deploy/dev follows :latest instead.
 images:
   - name: ghcr.io/epheo/r-drbd
-    newTag: sha-2553c41
+    newTag: sha-33dc051
