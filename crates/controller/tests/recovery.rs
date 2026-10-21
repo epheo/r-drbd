@@ -470,3 +470,111 @@ async fn a_discovery_starts_on_the_version_read() {
     let nodes: BTreeSet<&str> = st.acks.iter().map(|a| a.node.as_str()).collect();
     assert_eq!(nodes, BTreeSet::from(["n1"]));
 }
+
+fn restore_request(name: &str) -> csi::v1::CreateVolumeRequest {
+    use csi::v1::volume_capability::access_mode::Mode;
+    use csi::v1::volume_capability::{AccessMode, AccessType, MountVolume};
+    use csi::v1::volume_content_source::{SnapshotSource, Type};
+    csi::v1::CreateVolumeRequest {
+        name: name.into(),
+        capacity_range: Some(csi::v1::CapacityRange {
+            required_bytes: i64::try_from(GIB).unwrap(),
+            limit_bytes: 0,
+        }),
+        volume_capabilities: vec![csi::v1::VolumeCapability {
+            access_mode: Some(AccessMode {
+                mode: Mode::SingleNodeWriter.into(),
+            }),
+            access_type: Some(AccessType::Mount(MountVolume::default())),
+        }],
+        parameters: [("tier", "fast"), ("replicas", "2")]
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .into(),
+        volume_content_source: Some(csi::v1::VolumeContentSource {
+            r#type: Some(Type::Snapshot(SnapshotSource {
+                snapshot_id: "snap".into(),
+            })),
+        }),
+        ..csi::v1::CreateVolumeRequest::default()
+    }
+}
+
+/// CreateSnapshot answers not ready while Discovering and refuses a Lost
+/// Snapshot without replacing it; CreateVolume waits on a discovery and
+/// refuses a Lost image; a placed restore of one fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn csi_and_placement_wait_on_a_discovery_and_refuse_a_lost_image() {
+    use csi::tonic::{Code, Request};
+    use csi::v1::controller_server::Controller;
+    let assets = require_envtest!();
+    support::init_tracing();
+    let env = Env::start(&assets).await;
+    let client = env.client().await;
+    let mut cfg = support::config(&env, "ctl");
+    let _ctl = support::spawn(env.clients().await, cfg.clone());
+    let agents = cluster(&client).await;
+    let auto: Vec<_> = agents.iter().cloned().map(FakeAgent::spawn_auto).collect();
+    let (stores, watchers) = controller::store::start(
+        client.clone(),
+        support::NAMESPACE,
+        controller::store::LEASE_STALE,
+    );
+    let _watchers = tokio::spawn(watchers);
+    stores.wait_ready().await.unwrap();
+    cfg.ready_timeout = Duration::from_secs(3);
+    let svc = controller::csi::Csi::new(client.clone(), stores, cfg);
+    let snap = ready_snapshot(&client).await;
+    let take = || csi::v1::CreateSnapshotRequest {
+        name: "snap".into(),
+        source_volume_id: "src".into(),
+        ..csi::v1::CreateSnapshotRequest::default()
+    };
+
+    auto[2].abort();
+    clear(&client, json!(null)).await;
+    snapshot_where(&client, "snap", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Discovering)
+    })
+    .await;
+    let r = svc.create_snapshot(Request::new(take())).await.unwrap();
+    assert!(!r.into_inner().snapshot.unwrap().ready_to_use);
+    let e = svc
+        .create_volume(Request::new(restore_request("waits")))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), Code::DeadlineExceeded, "{e}");
+    assert!(support::get_volume(&client, "waits").await.is_none());
+
+    // n3 back: the copies found before make it Ready; with them gone, a
+    // new discovery ends Lost.
+    let _back = agents[2].clone().spawn_auto();
+    snapshot_where(&client, "snap", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Ready)
+    })
+    .await;
+    for a in &agents {
+        a.copies.lock().unwrap().clear();
+    }
+    clear(&client, json!({ "phase": null })).await;
+    snapshot_where(&client, "snap", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Lost)
+    })
+    .await;
+    let e = svc.create_snapshot(Request::new(take())).await.unwrap_err();
+    assert_eq!(e.code(), Code::FailedPrecondition, "{e}");
+    assert!(e.message().contains("SnapshotLost"), "{e}");
+    let now = get_snapshot(&client, "snap").await.unwrap();
+    assert_eq!(now.metadata.uid, snap.metadata.uid, "never replaced");
+    let e = svc
+        .create_volume(Request::new(restore_request("refused")))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), Code::FailedPrecondition, "{e}");
+    assert!(support::get_volume(&client, "refused").await.is_none());
+
+    let mut spec = volume_spec(GIB, 2, "fast");
+    spec.source = Some(support::snapshot_source(&client, "snap").await);
+    create_volume(&client, "placed", spec).await;
+    let v = volume_where(&client, "placed", |v| phase_of(v) == VolumePhase::Failed).await;
+    assert_eq!(support::ready_reason(&v).as_deref(), Some("SnapshotLost"));
+}

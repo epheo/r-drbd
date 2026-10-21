@@ -29,6 +29,7 @@ pub mod reason {
     pub const SNAPSHOT_NOT_READY: &str = "SnapshotNotReady";
     pub const SNAPSHOT_FAILED: &str = "SnapshotFailed";
     pub const SNAPSHOT_UID_MISMATCH: &str = "SnapshotUidMismatch";
+    pub const SNAPSHOT_LOST: &str = "SnapshotLost";
     pub const ALLOCATION_FAILED: &str = "AllocationFailed";
     /// AttachmentFailed True, and its Warning Event.
     pub const ATTACHMENT_FAILED: &str = "AttachmentFailed";
@@ -1280,6 +1281,9 @@ async fn reconcile(
             .await;
         }
         Placement::Fail(c) => {
+            if c.reason == reason::SNAPSHOT_LOST && !lost_live(ctx, v).await {
+                return;
+            }
             write(
                 memory,
                 api,
@@ -1287,6 +1291,23 @@ async fn reconcile(
                 Owned::wanted(v, VolumePhase::Failed, &[(types::READY, &c)], None),
             )
             .await;
+        }
+    }
+}
+
+/// The restore's Snapshot is Lost on a live read: the store may lag a
+/// phase cleared by hand to start a new discovery.
+async fn lost_live(ctx: &Ctx<'_>, v: &Volume) -> bool {
+    let Some(src) = &v.spec.source else {
+        return false;
+    };
+    let api: Api<Snapshot> = Api::all(ctx.client.clone());
+    match api.get_opt(&src.snapshot).await {
+        Ok(Some(s)) => src.is(&s) && s.status.and_then(|st| st.phase) == Some(SnapshotPhase::Lost),
+        Ok(None) => false,
+        Err(e) => {
+            warn!(volume = v.name_any(), error = %e, "reading the restore's snapshot failed");
+            false
         }
     }
 }
@@ -1884,6 +1905,14 @@ fn ready_snapshot<'a>(snap: Option<&'a Snapshot>, wanted: &str) -> Result<&'a Sn
     let status = snap.status.clone().unwrap_or_default();
     match status.phase {
         Some(SnapshotPhase::Ready) => Ok(snap),
+        Some(SnapshotPhase::Lost) => Err(Placement::Fail(Cond::new(
+            FALSE,
+            reason::SNAPSHOT_LOST,
+            format!(
+                "snapshot {wanted} is lost: {}",
+                status.last_error.unwrap_or_default()
+            ),
+        ))),
         // Unknown: written by another version; no round ever ends it.
         Some(SnapshotPhase::Failed | SnapshotPhase::Unknown) => Err(Placement::Fail(Cond::new(
             FALSE,
@@ -3263,6 +3292,26 @@ mod tests {
         assert_eq!(s.phase, VolumePhase::Ready);
         assert_eq!(s.degraded.status, FALSE);
         assert_eq!(s.primary, None);
+    }
+
+    #[test]
+    fn a_restore_of_a_lost_image_fails_one_still_discovering_waits() {
+        let mut snap = Snapshot::new("s", spec_of("v"));
+        snap.status = Some(model::SnapshotStatus {
+            phase: Some(SnapshotPhase::Lost),
+            last_error: Some("no copy on any node with a Pool".into()),
+            ..model::SnapshotStatus::default()
+        });
+        let Err(Placement::Fail(c)) = ready_snapshot(Some(&snap), "s") else {
+            panic!("a Lost image fails its restore");
+        };
+        assert_eq!(c.reason, reason::SNAPSHOT_LOST);
+        assert!(c.message.contains("no copy"), "{}", c.message);
+        snap.status.as_mut().unwrap().phase = Some(SnapshotPhase::Discovering);
+        let Err(Placement::Wait(c)) = ready_snapshot(Some(&snap), "s") else {
+            panic!("a discovery is waited for");
+        };
+        assert_eq!(c.reason, reason::SNAPSHOT_NOT_READY);
     }
 
     #[test]
