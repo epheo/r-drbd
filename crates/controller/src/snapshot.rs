@@ -707,6 +707,20 @@ pub fn pools_by_node(pools: &[std::sync::Arc<model::Pool>]) -> BTreeMap<String, 
     out
 }
 
+/// Whether `node`, with Pools `pools`, still owes the discovery of `s` an
+/// answer. A failed search is no answer but owes nothing more: deleting a
+/// Pool is then the way to give up on that node's copies.
+pub fn owes_answer(s: &Snapshot, node: &str, pools: &[String]) -> bool {
+    let st = s.status.as_ref();
+    if st.and_then(|st| st.phase) != Some(SnapshotPhase::Discovering) {
+        return false;
+    }
+    let ack = st.and_then(|st| st.acks.iter().find(|a| a.node == node));
+    !ack.is_some_and(|a| {
+        a.phase == SnapshotPhase::Discovering && (!a.ok || a.searched_pools == pools)
+    })
+}
+
 /// What the answers of a discovery decide.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Discovery {
@@ -1891,6 +1905,37 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_node_owes_a_discovery_its_answer_for_its_current_pools() {
+        let mut s = Snapshot::new(
+            "s",
+            model::SnapshotSpec {
+                volume: "v".into(),
+                volume_uid: Some("u".into()),
+            },
+        );
+        let pools = ["p1".to_owned(), "p2".to_owned()];
+        s.status = Some(model::SnapshotStatus {
+            phase: Some(P::Discovering),
+            ..model::SnapshotStatus::default()
+        });
+        assert!(owes_answer(&s, "n1", &pools), "silent");
+        let acks = &mut s.status.as_mut().unwrap().acks;
+        acks.push(answer("n1", &["p1"], None));
+        assert!(owes_answer(&s, "n1", &pools), "an older Pool set");
+        s.status.as_mut().unwrap().acks = vec![answer("n1", &["p1", "p2"], None)];
+        assert!(!owes_answer(&s, "n1", &pools));
+        // A failed search owes nothing more: the Pool may go.
+        let mut failed = answer("n1", &["p1"], None);
+        failed.ok = false;
+        s.status.as_mut().unwrap().acks = vec![failed];
+        assert!(!owes_answer(&s, "n1", &pools));
+        // Only a discovery asks.
+        s.status.as_mut().unwrap().acks.clear();
+        s.status.as_mut().unwrap().phase = Some(P::Ready);
+        assert!(!owes_answer(&s, "n1", &pools));
     }
 
     #[test]

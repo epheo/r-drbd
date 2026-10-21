@@ -131,7 +131,18 @@ pub(crate) async fn reconcile_all(ctx: &Ctx<'_>, memory: &Memory) {
         .flat_map(|s| s.status.iter().flat_map(|st| &st.acks))
         .filter_map(|a| a.taken_pool.as_deref().map(|p| (a.node.as_str(), p)))
         .collect();
-    for pool in Stores::sorted(&ctx.stores.pools) {
+    let pools = Stores::sorted(&ctx.stores.pools);
+    let by_node = crate::snapshot::pools_by_node(&pools);
+    // A live agent's copies in a Pool count until its node answered every
+    // discovery: the Pool's deletion would give them up unasked.
+    let owes = |node: &str| {
+        let names = by_node.get(node).map(Vec::as_slice).unwrap_or_default();
+        ctx.stores.agent_fresh(node)
+            && snapshots
+                .iter()
+                .any(|s| crate::snapshot::owes_answer(s, node, names))
+    };
+    for pool in pools {
         let name = pool.name_any();
         let wanted: Vec<String> = usage
             .get(&(pool.spec.node.clone(), name.clone()))
@@ -147,7 +158,8 @@ pub(crate) async fn reconcile_all(ctx: &Ctx<'_>, memory: &Memory) {
                 continue;
             }
             let held = pinned.contains(name.as_str())
-                || snapshot_held.contains(&(pool.spec.node.as_str(), name.as_str()));
+                || snapshot_held.contains(&(pool.spec.node.as_str(), name.as_str()))
+                || owes(&pool.spec.node);
             if wanted.is_empty() && current.is_empty() && !held && released(&pool) {
                 set_finalizer(&api, pool.as_ref(), FINALIZER_POOL, false).await;
                 continue;

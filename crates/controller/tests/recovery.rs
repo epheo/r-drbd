@@ -240,12 +240,80 @@ async fn a_silent_node_holds_the_discovery() {
     );
 
     // The agent back: it answers, and the status is whole again.
-    let _back = agents[2].clone().spawn_auto();
+    let back = agents[2].clone().spawn_auto();
     let s = snapshot_where(&client, "snap", |s| {
         snap_phase(s) == Some(SnapshotPhase::Ready)
     })
     .await;
     assert_eq!(holders(&s).len(), 2);
+
+    // Silent again, its agent still live: its Pool's deletion waits.
+    back.abort();
+    clear(&client, json!(null)).await;
+    snapshot_where(&client, "snap", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Discovering)
+            && s.status
+                .as_ref()
+                .and_then(|st| st.last_error.as_deref())
+                .is_some_and(|e| e.ends_with("n3"))
+    })
+    .await;
+    Api::<model::Pool>::all(client.clone())
+        .delete("p-n3", &DeleteParams::default())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(support::get_pool(&client, "p-n3").await.is_some(), "held");
+    // Its agent stale: deleting the Pool gives up on its copies, and the
+    // discovery decides without that node.
+    support::delete_agent_lease(&client, "n3").await;
+    support::eventually(Duration::from_secs(20), || async {
+        support::get_pool(&client, "p-n3")
+            .await
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    let s = snapshot_where(&client, "snap", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Ready)
+    })
+    .await;
+    assert_eq!(holders(&s).len(), 2);
+}
+
+/// A live agent's Pool deletion waits for its answer, not longer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pool_goes_once_its_node_answered() {
+    let assets = require_envtest!();
+    let (_env, client, _ctl) = setup(&assets).await;
+    let agents = cluster(&client).await;
+    let auto: Vec<_> = agents.iter().cloned().map(FakeAgent::spawn_auto).collect();
+    ready_snapshot(&client).await;
+    auto[2].abort();
+    clear(&client, json!(null)).await;
+    snapshot_where(&client, "snap", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Discovering)
+    })
+    .await;
+    Api::<model::Pool>::all(client.clone())
+        .delete("p-n3", &DeleteParams::default())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(support::get_pool(&client, "p-n3").await.is_some(), "held");
+    let s = get_snapshot(&client, "snap").await.unwrap();
+    agents[2].answer(&s).await.unwrap();
+    support::eventually(Duration::from_secs(20), || async {
+        support::get_pool(&client, "p-n3")
+            .await
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    snapshot_where(&client, "snap", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Ready)
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
