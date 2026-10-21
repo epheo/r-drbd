@@ -171,7 +171,8 @@ const REPEAT_MAX: Duration = Duration::from_secs(600);
 enum Resize {
     NotNeeded,
     Done,
-    /// This node resizes once every diskful peer has grown its LV.
+    /// This node resizes once every diskful peer has grown its LV and no
+    /// resync runs.
     Waiting,
 }
 
@@ -1038,7 +1039,8 @@ impl Reconciler {
         desired: u64,
     ) -> (Result<(), String>, bool) {
         let vg = place.vg.as_str();
-        let created = if s.initial_node() || source.is_some_and(self.drbd.copies_identical) {
+        let identical = source.is_some_and(self.drbd.copies_identical);
+        let created = if s.initial_node() || identical {
             self.create_lv(rows, source, place, s.vol, lv, desired)
                 .await
         } else {
@@ -1046,12 +1048,13 @@ impl Reconciler {
         };
         match created {
             Err(e) if !s.initial_node() => {
-                tracing::warn!(
-                    lv,
-                    vg,
-                    error = %e,
-                    "cannot restore this node's copy: empty LV, full sync from the initial node"
-                );
+                let why = "cannot restore this node's copy: empty LV, full sync from the initial node";
+                // Until digests prove copies, every restore takes this path.
+                if identical {
+                    tracing::warn!(lv, vg, error = %e, "{why}");
+                } else {
+                    tracing::info!(lv, vg, error = %e, "{why}");
+                }
                 let r = self
                     .lvm
                     .create(vg, &place.thin, lv, desired, &[storage::NEW_TAG])
@@ -1483,7 +1486,8 @@ impl Reconciler {
     }
 
     /// Only the diskful replica with the lowest node id resizes, once every
-    /// diskful peer reports an LV of the new gross size and is connected:
+    /// diskful peer reports an LV of the new gross size and is connected
+    /// with no resync running:
     /// DRBD grows only to what every connected peer can hold, and a peer
     /// away during the resize would have to catch up on the size later.
     async fn resize_step(&self, s: &Step<'_>, r: &Resource) -> Result<Resize, String> {
@@ -1520,7 +1524,13 @@ impl Reconciler {
                 .connections
                 .get(&x.node)
                 .is_some_and(|c| c.state == "Connected");
-            grown && connected
+            // DRBD refuses a resize during a resync; its end is an events2
+            // change, which runs the next pass.
+            let in_sync = r
+                .peer_devices
+                .get(&(x.node.clone(), VOLUME))
+                .is_some_and(|p| p.replication.as_deref() == Some("Established"));
+            grown && connected && in_sync
         });
         let up_to_date = r
             .devices
@@ -1530,16 +1540,8 @@ impl Reconciler {
             return Ok(Resize::Waiting);
         }
         let name = s.vol.name_any();
-        // A restore grows from its snapshot's size: the new area holds each
-        // node's old metadata, which differs, so it syncs.
-        let synced = s.restoring();
-        tracing::info!(volume = name, from = current, synced, "growing DRBD device");
-        let argv = if synced {
-            argv::resize_synced(&name)
-        } else {
-            argv::resize(&name)
-        };
-        self.drbd_cmd(&argv, DRBD_TIMEOUT).await?;
+        tracing::info!(volume = name, from = current, "growing DRBD device");
+        self.drbd_cmd(&argv::resize(&name), DRBD_TIMEOUT).await?;
         Ok(Resize::Done)
     }
 

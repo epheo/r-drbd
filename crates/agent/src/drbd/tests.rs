@@ -21,7 +21,7 @@ fn command_lines() {
         j(argv::start_as_source("r")),
         "drbdadm new-current-uuid --force-resync r/0"
     );
-    assert_eq!(j(argv::resize("r")), "drbdadm resize --assume-clean r/0");
+    assert_eq!(j(argv::resize("r")), "drbdadm resize r/0");
     assert_eq!(j(argv::del_peer("r", 2)), "drbdsetup del-peer r 2");
     assert_eq!(j(argv::forget_peer("r", 2)), "drbdsetup forget-peer r 2");
     assert_eq!(
