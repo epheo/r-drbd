@@ -163,12 +163,18 @@ fn tags() {
     assert_eq!(t["a+s"].tags, ["r-drbd.snap.u.1.2"]);
     assert_eq!(t["a+s"].created, Some(1_792_043_145));
     assert_eq!(t["thin"].created, None);
-    // Without our time format LVM prints a local time.
+    // Without our time format LVM prints a local time: no time for that
+    // LV, its tags and every other LV's still read.
     let local = r#"{"report": [{"lv": [
-        {"lv_name":"a", "lv_tags":"", "lv_time":"2026-10-15 05:45:45 +0000"}
+        {"lv_name":"a", "lv_tags":"t", "lv_time":"2026-10-15 05:45:45 +0000"},
+        {"lv_name":"b", "lv_tags":"", "lv_time":"1792043145"}
     ]}]}"#;
-    let e = report::parse_tagged(local).unwrap_err().to_string();
-    assert!(e.contains("lv_time"), "{e}");
+    let t = report::parse_tagged(local).unwrap();
+    assert_eq!(
+        (t["a"].tags.as_slice(), t["a"].created),
+        (&["t".to_owned()][..], None)
+    );
+    assert_eq!(t["b"].created, Some(1_792_043_145));
 }
 
 #[test]
