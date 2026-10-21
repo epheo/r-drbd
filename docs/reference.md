@@ -91,7 +91,8 @@ A snapshot over the limit ends Failed before any IO is suspended.
 | `status.fileSystem` | Inherited by restores |
 | `status.createdAt` | When the snapshot was taken |
 | `status.phaseSince` | When the current phase began |
-| `status.acks[]` | Per node: `node`, `phase`, `pool`, `ok`, `error` |
+| `status.sourceReplicas` | The source Volume's replicas, written on the way into Taking |
+| `status.acks[]` | Per node: `node`, `phase`, `ok`, `error`, and from its successful take `takenPool`, `lvBytes`, `allocatedBytes`, copied by every later ack |
 | `status.lastError` | Why it waits in Pending, or why it failed |
 | `status.conditions` | `Ready` |
 | `status.observedGeneration` | Spec generation the controller last wrote status for |

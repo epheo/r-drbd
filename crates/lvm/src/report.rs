@@ -118,6 +118,15 @@ pub fn thin_free_bytes(pool: &Lv) -> Option<u64> {
     u64::try_from(free).ok()
 }
 
+/// Mapped bytes of an active thin LV: its size times its used share,
+/// rounded down. `None` while it is inactive, like a snapshot with
+/// activation skip.
+pub fn thin_used_bytes(lv: &Lv) -> Option<u64> {
+    let used = lv.data_used?;
+    let used = u128::from(lv.size_bytes) * u128::from(used.digits) / u128::from(used.whole());
+    u64::try_from(used).ok()
+}
+
 /// A report that is not what the command was asked to print.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReportError {

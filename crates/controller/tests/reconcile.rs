@@ -475,6 +475,7 @@ async fn snapshot_local_and_restore() {
     let st = s.status.unwrap();
     assert_eq!(st.size_bytes, Some(GIB));
     assert_eq!(st.file_system.as_deref(), Some("xfs"));
+    assert_eq!(st.source_replicas, Some(1));
     a1.ack("snap1", SnapshotPhase::Taking, true, Some("p1"))
         .await;
     let s = snapshot_where(&client, "snap1", |s| snap_phase(s) == SnapshotPhase::Ready).await;
@@ -629,7 +630,8 @@ async fn snapshot_replicated_rounds() {
     agents[2]
         .ack("rs", SnapshotPhase::Suspending, true, None)
         .await;
-    snapshot_where(&client, "rs", |s| snap_phase(s) == SnapshotPhase::Taking).await;
+    let s = snapshot_where(&client, "rs", |s| snap_phase(s) == SnapshotPhase::Taking).await;
+    assert_eq!(s.status.unwrap().source_replicas, Some(2));
     agents[0]
         .ack("rs", SnapshotPhase::Taking, true, Some("p1"))
         .await;

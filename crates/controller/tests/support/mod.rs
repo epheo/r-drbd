@@ -881,7 +881,9 @@ impl FakeAgent {
         let ack = SnapshotAck {
             node: self.node.clone(),
             phase,
-            pool: pool.map(str::to_owned),
+            taken_pool: pool.map(str::to_owned),
+            lv_bytes: None,
+            allocated_bytes: None,
             ok,
             error: (!ok).then(|| format!("fake failure on {}", self.node)),
         };
@@ -967,7 +969,7 @@ impl FakeAgent {
             let name = s.name_any();
             match status.phase {
                 SnapshotPhase::Suspending if member => {
-                    let pool = mine.and_then(|a| a.pool.clone());
+                    let pool = mine.and_then(|a| a.taken_pool.clone());
                     self.ack(&name, status.phase, true, pool.as_deref()).await;
                 }
                 // Diskless and tiebreaker ack with IO still suspended.
@@ -975,8 +977,9 @@ impl FakeAgent {
                     self.ack(&name, status.phase, true, my_pool.as_deref())
                         .await;
                 }
-                SnapshotPhase::Deleting if mine.is_some_and(|a| a.pool.is_some()) => {
-                    let pool = mine.and_then(|a| a.pool.clone());
+                // Like the agent: any node of the round answers the delete.
+                SnapshotPhase::Deleting if mine.is_some() => {
+                    let pool = mine.and_then(|a| a.taken_pool.clone());
                     self.ack(&name, status.phase, true, pool.as_deref()).await;
                 }
                 _ => {}

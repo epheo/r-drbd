@@ -18,13 +18,17 @@ const GIB: u64 = 1 << 30;
 const GIB_KIB: u64 = 1 << 20;
 
 fn pool() -> Arc<Pool> {
+    pool_in(POOL, VG, THIN)
+}
+
+fn pool_in(name: &str, vg: &str, thin: &str) -> Arc<Pool> {
     let mut p = Pool::new(
-        POOL,
+        name,
         PoolSpec {
             node: NODE.into(),
             tier: "test".into(),
-            vg: VG.into(),
-            thin_pool: THIN.into(),
+            vg: vg.into(),
+            thin_pool: thin.into(),
             overcommit_percent: model::DEFAULT_OVERCOMMIT_PERCENT,
             reserve_percent: model::DEFAULT_RESERVE_PERCENT,
             devices: None,
@@ -78,11 +82,29 @@ fn snapshot(name: &str, volume: &str, phase: SnapshotPhase) -> Snapshot {
         },
     );
     s.metadata.uid = Some(format!("uid-{name}"));
+    // Ready: this node took its copy in POOL.
+    let acks = (phase == SnapshotPhase::Ready)
+        .then(|| taken_ack(SnapshotPhase::Taking, POOL))
+        .into_iter()
+        .collect();
     s.status = Some(SnapshotStatus {
         phase,
+        acks,
         ..SnapshotStatus::default()
     });
     s
+}
+
+fn taken_ack(phase: SnapshotPhase, pool: &str) -> SnapshotAck {
+    SnapshotAck {
+        node: NODE.into(),
+        phase,
+        taken_pool: Some(pool.into()),
+        lv_bytes: Some(GIB),
+        allocated_bytes: Some(GIB / 4),
+        ok: true,
+        error: None,
+    }
 }
 
 fn source(snapshot: &str) -> VolumeSource {
@@ -136,10 +158,19 @@ fn snapshot_acks(writes: &[StatusWrite]) -> Vec<(String, SnapshotAck)> {
 }
 
 async fn run(x: &Arc<ScriptedExec>, vols: Vec<Volume>, snaps: Vec<Snapshot>) -> Vec<StatusWrite> {
+    run_in(x, &[pool()], vols, snaps).await
+}
+
+async fn run_in(
+    x: &Arc<ScriptedExec>,
+    pools: &[Arc<Pool>],
+    vols: Vec<Volume>,
+    snaps: Vec<Snapshot>,
+) -> Vec<StatusWrite> {
     let mut r = Reconciler::new(NODE, x.clone());
     let vols: Vec<Arc<Volume>> = vols.into_iter().map(Arc::new).collect();
     let snaps: Vec<Arc<Snapshot>> = snaps.into_iter().map(Arc::new).collect();
-    let w = r.pass(&[pool()], &vols, &snaps).await;
+    let w = r.pass(pools, &vols, &snaps).await;
     x.assert_done();
     w
 }
@@ -632,13 +663,9 @@ async fn snapshot_taking() {
     let x = Arc::new(ScriptedExec::new());
     reads(&x, &[lv_row("pvc-1", GIB_KIB, St::Active)]);
     x.expect(lvm::cmd::snapshot(VG, "pvc-1", "pvc-1+snap-1"), ok(""));
-    expect_lvs(
-        &x,
-        &[
-            lv_row("pvc-1", GIB_KIB, St::Active),
-            lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive),
-        ],
-    );
+    let origin = lv_row("pvc-1", GIB_KIB, St::Active)
+        .replace(r#""data_percent":"0.00""#, r#""data_percent":"25.00""#);
+    expect_lvs(&x, &[origin, lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
     let w = run(
         &x,
         vec![volume("pvc-1", GIB, 1)],
@@ -647,16 +674,7 @@ async fn snapshot_taking() {
     .await;
     assert_eq!(
         snapshot_acks(&w),
-        vec![(
-            "snap-1".into(),
-            SnapshotAck {
-                node: NODE.into(),
-                phase: SnapshotPhase::Taking,
-                pool: Some(POOL.into()),
-                ok: true,
-                error: None,
-            }
-        )]
+        vec![("snap-1".into(), taken_ack(SnapshotPhase::Taking, POOL))]
     );
 }
 
@@ -676,7 +694,13 @@ async fn snapshot_taking_existing_lv_is_adopted() {
         vec![snapshot("snap-1", "pvc-1", SnapshotPhase::Taking)],
     )
     .await;
-    assert!(snapshot_acks(&w)[0].1.ok);
+    // A take whose ack was lost acks it on the retry.
+    let (_, a) = &snapshot_acks(&w)[0];
+    assert!(a.ok);
+    assert_eq!(
+        (a.taken_pool.as_deref(), a.lv_bytes),
+        (Some(POOL), Some(GIB))
+    );
 }
 
 #[tokio::test]
@@ -692,7 +716,9 @@ async fn snapshot_deleting_after_volume_is_gone() {
         st.acks.push(SnapshotAck {
             node: NODE.into(),
             phase: SnapshotPhase::Taking,
-            pool: Some(POOL.into()),
+            taken_pool: Some(POOL.into()),
+            lv_bytes: None,
+            allocated_bytes: None,
             ok: true,
             error: None,
         });
@@ -701,6 +727,126 @@ async fn snapshot_deleting_after_volume_is_gone() {
     let acks = snapshot_acks(&w);
     assert_eq!(acks[0].1.phase, SnapshotPhase::Deleting);
     assert!(acks[0].1.ok);
+}
+
+/// The replica moved to another Pool on this node after the take: the
+/// delete still goes where takenPool says, and the ack carries it.
+#[tokio::test]
+async fn snapshot_delete_follows_taken_pool_after_a_pool_move() {
+    let x = Arc::new(ScriptedExec::new());
+    let thin2 = pool_row().replace(r#""lv_name":"thin""#, r#""lv_name":"thin2""#);
+    let rows = [
+        thin2,
+        lv_in("pvc-1", GIB_KIB, "thin2", St::Active),
+        lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive),
+    ];
+    reads(&x, &rows);
+    expect_lvs(&x, &rows);
+    x.expect(lvm::cmd::remove(VG, "pvc-1+snap-1"), ok(""));
+    expect_lvs(&x, &rows[..2]);
+    let mut v = volume("pvc-1", GIB, 1);
+    if let Some(a) = v.spec.assignment.as_mut() {
+        a.replicas[0].pool = Some("pool-n1b".into());
+    }
+    let snap = deleting(snapshot("snap-1", "pvc-1", SnapshotPhase::Ready));
+    let pools = [pool(), pool_in("pool-n1b", VG, "thin2")];
+    let w = run_in(&x, &pools, vec![v], vec![snap]).await;
+    assert_eq!(
+        snapshot_acks(&w),
+        vec![("snap-1".into(), taken_ack(SnapshotPhase::Deleting, POOL))]
+    );
+}
+
+/// The vgs report of another VG.
+fn expect_vgs_of(x: &ScriptedExec, vg: &str) {
+    let out = vgs_out().replace(&format!(r#""{VG}""#), &format!(r#""{vg}""#));
+    x.expect(lvm::cmd::vgs(vg), ok(&out));
+}
+
+/// No takenPool (a lost ack): the delete searches every Pool of the node
+/// and acks the Pool it found the LV in.
+#[tokio::test]
+async fn snapshot_delete_without_taken_pool_searches_the_pools() {
+    let x = Arc::new(ScriptedExec::new());
+    let snap_lv = lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive);
+    let with_lv = lvs_out(std::slice::from_ref(&snap_lv));
+    reads(&x, &[]);
+    x.expect(lvm::cmd::lvs("vg2"), ok(&with_lv));
+    expect_vgs_of(&x, "vg2");
+    x.expect(lvm::cmd::lvs("vg2"), ok(&with_lv));
+    x.expect(lvm::cmd::remove("vg2", "pvc-1+snap-1"), ok(""));
+    x.expect(lvm::cmd::lvs("vg2"), ok(&lvs_out(&[])));
+    let pools = [pool(), pool_in("pool-n1b", "vg2", THIN)];
+    let snap = snapshot("snap-1", "pvc-1", SnapshotPhase::Deleting);
+    let w = run_in(&x, &pools, vec![], vec![snap]).await;
+    let (_, a) = &snapshot_acks(&w)[0];
+    assert!(a.ok, "{a:?}");
+    assert_eq!(a.phase, SnapshotPhase::Deleting);
+    assert_eq!(a.taken_pool.as_deref(), Some("pool-n1b"));
+    assert_eq!(a.lv_bytes, Some(GIB));
+}
+
+/// A node of the round without a Pool, a tiebreaker say, holds nothing:
+/// its Deleting ack is ok at once.
+#[tokio::test]
+async fn snapshot_delete_on_a_node_without_pools_is_ok() {
+    let x = Arc::new(ScriptedExec::new());
+    let mut snap = snapshot("snap-1", "pvc-1", SnapshotPhase::Deleting);
+    snap.status.as_mut().unwrap().acks = vec![SnapshotAck {
+        taken_pool: None,
+        lv_bytes: None,
+        allocated_bytes: None,
+        ..taken_ack(SnapshotPhase::Taking, POOL)
+    }];
+    let w = run_in(&x, &[], vec![], vec![snap]).await;
+    let (_, a) = &snapshot_acks(&w)[0];
+    assert_eq!(
+        (a.phase, a.ok, a.taken_pool.as_deref()),
+        (SnapshotPhase::Deleting, true, None)
+    );
+}
+
+/// A Ready Snapshot whose status lost this node's ack, or one taken
+/// before acks named their Pool: the LV found again is acked again.
+#[tokio::test]
+async fn ready_snapshot_lv_is_rediscovered() {
+    let legacy = SnapshotAck {
+        taken_pool: None,
+        lv_bytes: None,
+        allocated_bytes: None,
+        ..taken_ack(SnapshotPhase::Taking, POOL)
+    };
+    for acks in [vec![], vec![legacy]] {
+        let x = Arc::new(ScriptedExec::new());
+        reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
+        let mut snap = snapshot("snap-1", "pvc-1", SnapshotPhase::Ready);
+        snap.status.as_mut().unwrap().acks = acks;
+        let w = run(&x, vec![], vec![snap]).await;
+        let want = SnapshotAck {
+            allocated_bytes: None,
+            ..taken_ack(SnapshotPhase::Taking, POOL)
+        };
+        assert_eq!(snapshot_acks(&w), vec![("snap-1".into(), want)]);
+    }
+}
+
+/// Every holder the source had acked: an LV of that name here is no copy
+/// of this Snapshot, and nothing is acked.
+#[tokio::test]
+async fn a_complete_holder_set_is_never_extended() {
+    let x = Arc::new(ScriptedExec::new());
+    reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
+    let mut snap = snapshot("snap-1", "pvc-1", SnapshotPhase::Ready);
+    let st = snap.status.as_mut().unwrap();
+    st.source_replicas = Some(2);
+    st.acks = ["n2", "n3"]
+        .map(|n| SnapshotAck {
+            node: n.into(),
+            ..taken_ack(SnapshotPhase::Taking, "p")
+        })
+        .to_vec();
+    let w = run(&x, vec![], vec![snap]).await;
+    assert_eq!(snapshot_acks(&w), vec![]);
 }
 
 #[tokio::test]
@@ -766,7 +912,9 @@ async fn snapshot_deleting_is_kept_only_for_its_own_uid() {
         st.acks.push(SnapshotAck {
             node: NODE.into(),
             phase: SnapshotPhase::Taking,
-            pool: Some(POOL.into()),
+            taken_pool: Some(POOL.into()),
+            lv_bytes: None,
+            allocated_bytes: None,
             ok: true,
             error: None,
         });
@@ -909,7 +1057,23 @@ async fn foreign_snapshot_lv_is_never_removed() {
     .await;
     let (_, a) = &snapshot_acks(&w)[0];
     assert!(!a.ok);
+    assert_eq!(
+        a.error.as_deref(),
+        Some("LV vg1/pvc-1+snap-1 exists outside the thin pools of this node's Pools")
+    );
+    assert_eq!(a.taken_pool, None);
+
+    // With takenPool: only that Pool's thin pool counts.
+    let x = Arc::new(ScriptedExec::new());
+    reads(&x, &[foreign_row("pvc-1+snap-1", "otherthin")]);
+    let mut snap = snapshot("snap-1", "pvc-1", SnapshotPhase::Deleting);
+    if let Some(st) = snap.status.as_mut() {
+        st.acks = vec![taken_ack(SnapshotPhase::Taking, POOL)];
+    }
+    let w = run(&x, vec![], vec![snap]).await;
+    let (_, a) = &snapshot_acks(&w)[0];
     assert_eq!(a.error.as_deref(), Some("LV exists outside thin pool thin"));
+    assert_eq!(a.taken_pool.as_deref(), Some(POOL));
 }
 
 #[tokio::test]
@@ -942,13 +1106,7 @@ async fn restore_across_pools_is_an_error() {
     v.spec.source = Some(source("snap-1"));
     let mut snap = snapshot("snap-1", "pvc-1", SnapshotPhase::Ready);
     if let Some(st) = snap.status.as_mut() {
-        st.acks.push(SnapshotAck {
-            node: NODE.into(),
-            phase: SnapshotPhase::Taking,
-            pool: Some("pool-elsewhere".into()),
-            ok: true,
-            error: None,
-        });
+        st.acks = vec![taken_ack(SnapshotPhase::Taking, "pool-elsewhere")];
     }
     let w = run(&x, vec![v], vec![snap]).await;
     let (_, e) = &volume_writes(&w)[0];

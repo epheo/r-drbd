@@ -1788,7 +1788,7 @@ impl Reconciler {
                 let ack = super::ack(
                     &self.node,
                     status.phase,
-                    prev.and_then(|a| a.pool.clone()),
+                    super::Taken::of(prev),
                     Err(error.clone()),
                 );
                 (prev != Some(&ack)).then(|| StatusWrite::Snapshot {
