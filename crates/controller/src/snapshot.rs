@@ -520,7 +520,7 @@ async fn reconcile(
         }
         return None;
     }
-    if status_lost(s) {
+    if s.status_lost() {
         start_discovery(api, s).await;
         return None;
     }
@@ -636,18 +636,6 @@ pub const TAGS_DISAGREE: &str = "TagsDisagree";
 pub const IMAGE_DISCOVERY_INCOMPLETE: &str = "ImageDiscoveryIncomplete";
 /// Warning Event: a discovery ended Lost.
 pub const IMAGE_LOST: &str = "ImageLost";
-
-/// The status was lost, whole or in part: the finalizer without a phase
-/// (the first status comes before the finalizer), or Ready without the
-/// size every Ready has.
-pub fn status_lost(s: &Snapshot) -> bool {
-    let st = s.status.as_ref();
-    match st.and_then(|st| st.phase) {
-        None => true,
-        Some(SnapshotPhase::Ready) => st.is_some_and(|st| st.size_bytes.is_none()),
-        Some(_) => false,
-    }
-}
 
 /// Starts a discovery: phase Discovering and no ack, in one merge patch
 /// on the version read, so no old ack acts as a holder or holds a Pool. An
@@ -1798,17 +1786,19 @@ mod tests {
                 volume_uid: Some("u".into()),
             },
         );
-        assert!(status_lost(&s), "no status at all");
+        assert!(!s.status_lost(), "new: no finalizer yet");
+        s.metadata.finalizers = Some(vec![FINALIZER_SNAPSHOT.into()]);
+        assert!(s.status_lost(), "no status at all");
         s.status = Some(model::SnapshotStatus::default());
-        assert!(status_lost(&s), "no phase");
+        assert!(s.status_lost(), "no phase");
         s.status = Some(status(vec![], Some(2)));
-        assert!(status_lost(&s), "Ready without sizeBytes");
+        assert!(s.status_lost(), "Ready without sizeBytes");
         s.status.as_mut().unwrap().size_bytes = Some(GI);
-        assert!(!status_lost(&s));
+        assert!(!s.status_lost());
         for phase in [P::Pending, P::Taking, P::Lost, P::Discovering, P::Failed] {
             s.status.as_mut().unwrap().phase = Some(phase);
             s.status.as_mut().unwrap().size_bytes = None;
-            assert!(!status_lost(&s), "{phase:?}");
+            assert!(!s.status_lost(), "{phase:?}");
         }
     }
 

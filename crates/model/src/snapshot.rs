@@ -49,6 +49,20 @@ impl Snapshot {
             && self.spec.volume_uid.is_some()
             && self.spec.volume_uid == vol.metadata.uid
     }
+
+    /// Its status was lost, whole or in part: the finalizer without a
+    /// phase (the controller writes the first status before its
+    /// finalizer), or Ready without the size every Ready has.
+    pub fn status_lost(&self) -> bool {
+        let st = self.status.as_ref();
+        match st.and_then(|st| st.phase) {
+            None => kube::ResourceExt::finalizers(self)
+                .iter()
+                .any(|f| f == crate::keys::FINALIZER_SNAPSHOT),
+            Some(SnapshotPhase::Ready) => st.is_some_and(|st| st.size_bytes.is_none()),
+            Some(_) => false,
+        }
+    }
 }
 
 #[derive(JsonSchema, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]

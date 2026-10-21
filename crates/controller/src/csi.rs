@@ -1353,7 +1353,7 @@ fn lost(name: &str, snap: &Snapshot) -> Option<Status> {
 
 /// A Snapshot whose status is lost or being rebuilt from its copies.
 fn rebuilding(snap: &Snapshot) -> bool {
-    crate::snapshot::status_lost(snap)
+    snap.status_lost()
         || snap.status.as_ref().and_then(|st| st.phase) == Some(SnapshotPhase::Discovering)
 }
 
