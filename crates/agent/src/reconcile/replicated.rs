@@ -49,8 +49,10 @@ pub struct DrbdEnv {
     /// First wait before a plan that came back is adjusted again.
     pub repeat_backoff: Duration,
     /// Whether a snapshot's holder copies are proven identical, which
-    /// alone allows a restore without a sync.
-    pub copies_identical: fn(&Snapshot) -> bool,
+    /// alone allows a restore without a sync; None while pending.
+    pub copies_identical: fn(&Snapshot) -> Option<bool>,
+    /// How long the initial node of a restore waits for pending digests.
+    pub digest_wait: Duration,
     /// How long a suspended Primary waits for its writes in flight to
     /// land before it acks; well inside the suspend bound.
     pub drain_wait: Duration,
@@ -76,6 +78,7 @@ impl DrbdEnv {
             down_wait: Duration::from_secs(5),
             drain_wait: Duration::from_secs(10),
             copies_identical,
+            digest_wait: model::snapshot::DIGEST_WAIT,
             // A resync finishing on a fresh small volume takes seconds;
             // a longer one leaves the adjust to the next pass.
             adjust_retry: vec![Duration::from_secs(1), Duration::from_secs(3)],
@@ -109,13 +112,11 @@ pub(super) fn snapshot_round_active(snapshots: &[Arc<Snapshot>], volume: &str) -
         .any(|s| s.spec.volume == volume && in_round(s))
 }
 
-/// The holder copies of `snap` hold the same bytes. Never assumed: a page
-/// rewritten during writeback reaches each disk in another version, so
-/// only matching content digests can prove it, and none exist yet. Until
-/// then every replicated restore starts from the initial node's copy and
-/// the others sync in full from it.
-fn copies_identical(_snap: &Snapshot) -> bool {
-    false
+/// The holder copies of `snap` hold the same bytes, as the controller
+/// wrote from every holder's digest. Never assumed: a page rewritten
+/// during writeback reaches each disk in another version.
+fn copies_identical(snap: &Snapshot) -> Option<bool> {
+    snap.status.as_ref()?.copies_identical
 }
 
 /// Disk states that hold data a just-created replica must not override.
@@ -859,7 +860,7 @@ impl Reconciler {
 
         if diskful {
             let lost = *rebuilt || s.prev_lost() || self.rebuilt_seen.contains(&name);
-            let identical = source.is_some_and(self.drbd.copies_identical);
+            let identical = source.and_then(self.drbd.copies_identical);
             self.first_data(s, &name, lost, copy.as_ref(), identical)
                 .await?;
         }
@@ -916,9 +917,9 @@ impl Reconciler {
     /// A lost LV is rebuilt empty once the volume is initialized: its peers
     /// hold the data, and a restore would bring back older data. Before
     /// that, every diskful replica of a restore restores from its own copy
-    /// of the snapshot, a rebuild too: the copies are identical, so the
-    /// first data needs no sync, and an empty copy on the initial node
-    /// would become the source.
+    /// of the snapshot, a rebuild too: copies proven identical need no
+    /// first sync, and an empty copy on the initial node would become the
+    /// source.
     async fn ensure_drbd_lv(
         &self,
         reads: &mut Reads,
@@ -1039,18 +1040,19 @@ impl Reconciler {
         desired: u64,
     ) -> (Result<(), String>, bool) {
         let vg = place.vg.as_str();
-        let identical = source.is_some_and(self.drbd.copies_identical);
-        let created = if s.initial_node() || identical {
+        let identical = source.and_then(self.drbd.copies_identical);
+        // Pending digests may still prove the copies: a peer restores its
+        // own, and a full sync overwrites it if the start is not clean.
+        let created = if s.initial_node() || identical != Some(false) {
             self.create_lv(rows, source, place, s.vol, lv, desired)
                 .await
         } else {
-            Err("the snapshot's copies may differ: only the initial node's is used".to_owned())
+            Err("the snapshot's copies differ: only the initial node's is used".to_owned())
         };
         match created {
             Err(e) if !s.initial_node() => {
                 let why = "cannot restore this node's copy: empty LV, full sync from the initial node";
-                // Until digests prove copies, every restore takes this path.
-                if identical {
+                if identical == Some(true) {
                     tracing::warn!(lv, vg, error = %e, "{why}");
                 } else {
                     tracing::info!(lv, vg, error = %e, "{why}");
@@ -1270,6 +1272,10 @@ impl Reconciler {
     /// old metadata in the data area. A node whose LV is not this restore's
     /// copy never starts it.
     ///
+    /// `identical`: the snapshot's copiesIdentical. Only true clears the
+    /// bitmap; false starts as the sync source at once; pending is waited
+    /// for up to `digest_wait`, beside the wait for the peers.
+    ///
     /// `lost`: this replica was rebuilt. A rebuilt replica may still take
     /// the all-connected path (nobody holds data then), never the timeout
     /// path: a second clear-bitmap beside data made by the first would
@@ -1280,7 +1286,7 @@ impl Reconciler {
         name: &str,
         lost: bool,
         copy: Option<&Copy>,
-        identical: bool,
+        identical: Option<bool>,
     ) -> Result<(), String> {
         if s.initialized() || !s.initial_node() {
             self.init_started.remove(name);
@@ -1322,11 +1328,11 @@ impl Reconciler {
             ));
         }
         let at_snapshot_size = copy.is_some_and(|c| c.at_size);
-        // Copies that may differ prove nothing: the peers sync from here.
-        let proving = source.filter(|_| at_snapshot_size && identical);
+        // Copies that differ prove nothing: the peers sync from here.
+        let proving = source.filter(|_| at_snapshot_size && identical != Some(false));
         let cached = s.vol.status.as_ref().map_or(&[][..], |st| &st.replicas);
         let mut waiting = unready_peers(s, r, &self.node, proving, cached);
-        if proving.is_some() && waiting.is_empty() {
+        if proving.is_some() && identical == Some(true) && waiting.is_empty() {
             let Some(live) = self.live_unready(s, r, proving).await else {
                 return Ok(());
             };
@@ -1337,12 +1343,10 @@ impl Reconciler {
             .entry(name.to_owned())
             .or_insert(None)
             .get_or_insert_with(tokio::time::Instant::now);
-        if !waiting.is_empty() && since.elapsed() < self.drbd.init_wait {
-            tracing::info!(
-                volume = name,
-                ?waiting,
-                "waiting for diskful peers before the first data"
-            );
+        // Copies that differ sync whoever connects: no peer to wait for.
+        let differ = source.is_some() && identical == Some(false);
+        let peers = if differ { &[][..] } else { &waiting[..] };
+        if self.first_data_waits(name, since, proving.is_some() && identical.is_none(), peers) {
             return Ok(());
         }
         if !waiting.is_empty()
@@ -1356,8 +1360,9 @@ impl Reconciler {
             );
             return Ok(());
         }
-        if source.is_some() && (!identical || !at_snapshot_size || !waiting.is_empty()) {
-            log_source_start(name, &waiting, at_snapshot_size);
+        if source.is_some() && (identical != Some(true) || !at_snapshot_size || !waiting.is_empty())
+        {
+            log_source_start(name, &waiting, at_snapshot_size, identical);
             self.drbd_cmd(&argv::start_as_source(name), DRBD_TIMEOUT)
                 .await?;
             self.init_started.remove(name);
@@ -1379,6 +1384,34 @@ impl Reconciler {
             .await?;
         self.init_started.remove(name);
         Ok(())
+    }
+
+    /// Pending digests and unready peers each hold the first data within
+    /// their bound; both run from `since`, so the wait is the longer one.
+    fn first_data_waits(
+        &self,
+        name: &str,
+        since: tokio::time::Instant,
+        digests_pending: bool,
+        peers: &[&str],
+    ) -> bool {
+        let waited = since.elapsed();
+        if digests_pending && waited < self.drbd.digest_wait {
+            tracing::info!(
+                volume = name,
+                "waiting for the snapshot's digests before the first data"
+            );
+            return true;
+        }
+        if !peers.is_empty() && waited < self.drbd.init_wait {
+            tracing::info!(
+                volume = name,
+                waiting = ?peers,
+                "waiting for diskful peers before the first data"
+            );
+            return true;
+        }
+        false
     }
 
     /// Connections to peers no longer in the assignment.
@@ -1981,12 +2014,14 @@ impl Step<'_> {
 #[cfg(test)]
 mod tests;
 
-/// Until digests prove copies, every restore starts as the sync source;
-/// only a lost peer or a size mismatch deserves a warning.
-fn log_source_start(name: &str, waiting: &[&str], at_snapshot_size: bool) {
+/// Differing copies are a known cause; digests still pending past their
+/// bound, a lost peer or a size mismatch deserve a warning.
+fn log_source_start(name: &str, waiting: &[&str], at_snapshot_size: bool, identical: Option<bool>) {
     let why = "source here, others full-sync";
-    if at_snapshot_size && waiting.is_empty() {
-        tracing::info!(volume = name, "copies unproven: {why}");
+    if at_snapshot_size && waiting.is_empty() && identical == Some(false) {
+        tracing::info!(volume = name, "snapshot copies differ: {why}");
+    } else if at_snapshot_size && waiting.is_empty() {
+        tracing::warn!(volume = name, "snapshot digests still pending: {why}");
     } else {
         tracing::warn!(
             volume = name,

@@ -284,19 +284,6 @@ fn group(
     hidden: &[(usize, usize)],
     source: Option<&str>,
 ) -> Vec<Member> {
-    group_with(h, size, specs, hidden, source, None)
-}
-
-/// `group`, with `identical` deciding whether a snapshot's copies are
-/// proven identical, in place of the agent's own rule.
-fn group_with(
-    h: &Host,
-    size: u64,
-    specs: &[Spec],
-    hidden: &[(usize, usize)],
-    source: Option<&str>,
-    identical: Option<fn(&Snapshot) -> bool>,
-) -> Vec<Member> {
     let addr = |me: usize, j: usize| -> std::net::IpAddr {
         if hidden.contains(&(me, j)) {
             format!("127.0.0.{}", 10 + me).parse().unwrap()
@@ -353,9 +340,6 @@ fn group_with(
             vol.metadata.uid = Some(format!("uid-{}", s.res));
             let mut env = DrbdEnv::new(Some(h.features), RES_DIR, h.tracker.clone());
             env.init_wait = Duration::from_secs(3);
-            if let Some(f) = identical {
-                env.copies_identical = f;
-            }
             let live = Arc::new(MemberLive::default());
             let mut rec = Reconciler::new(h.node.clone(), h.exec.clone())
                 .with_drbd(env)
@@ -629,9 +613,9 @@ async fn drbd_no_start_without_quorum() {
     delete(&h, a).await;
 }
 
-/// A replicated restore as it runs today: no holder copies are proven
-/// identical, so the initial node restores its copy and the peer syncs in
-/// full from it; the copies verify equal.
+/// A replicated restore of holder copies that differ: the initial node
+/// restores its copy and the peer syncs in full from it; the copies
+/// verify equal.
 #[tokio::test]
 #[ignore = "needs root, DRBD 9 and the test VG"]
 async fn drbd_restore_syncs_from_one_copy() {
@@ -686,22 +670,28 @@ async fn restore_case(h: &Host, factor: u64, max_received: Option<u64>) {
         },
     );
     snap.metadata.uid = Some("uid-rw-snap".into());
+    // Every member is this host: one ack stands for each holder.
     snap.status = Some(SnapshotStatus {
         phase: SnapshotPhase::Ready,
         size_bytes: Some(source_size),
+        source_replicas: Some(2),
+        copies_identical: Some(max_received.is_some()),
+        acks: vec![model::SnapshotAck {
+            node: h.node.clone(),
+            phase: SnapshotPhase::Taking,
+            taken_pool: Some("test-host-pool".into()),
+            lv_bytes: None,
+            allocated_bytes: None,
+            digest: None,
+            digest_bytes: None,
+            ok: true,
+            error: None,
+        }],
         ..SnapshotStatus::default()
     });
     let snaps = [Arc::new(snap)];
     let pools = [pool(&h.node).await];
-    let identical: fn(&Snapshot) -> bool = |_| true;
-    let mut g = group_with(
-        h,
-        size,
-        &[A, B],
-        &[],
-        Some("rw-snap"),
-        max_received.map(|_| identical),
-    );
+    let mut g = group(h, size, &[A, B], &[], Some("rw-snap"));
     let mut proven = [false, false];
     let mut done = false;
     for _ in 0..120 {
