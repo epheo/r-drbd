@@ -9,6 +9,7 @@ use model::condition::{self, types};
 use model::keys::FINALIZER_POOL;
 use model::{Pool, ReclaimPolicy, Role, Volume};
 use serde_json::json;
+use tracing::info;
 
 use crate::store::Stores;
 use crate::{Ctx, Memory, apply_status, has_finalizer, set_finalizer};
@@ -115,7 +116,7 @@ fn released(p: &Pool) -> bool {
             .is_some_and(|s| condition::is_true(&s.conditions, types::RELEASED))
 }
 
-pub(crate) async fn reconcile_all(ctx: &Ctx<'_>, memory: &Memory) {
+pub(crate) async fn reconcile_all(ctx: &Ctx<'_>, memory: &mut Memory) {
     let api: Api<Pool> = Api::all(ctx.client.clone());
     let volumes = Stores::sorted(&ctx.stores.volumes);
     let usage = usage(&volumes, memory);
@@ -133,14 +134,21 @@ pub(crate) async fn reconcile_all(ctx: &Ctx<'_>, memory: &Memory) {
         .collect();
     let pools = Stores::sorted(&ctx.stores.pools);
     let by_node = crate::snapshot::pools_by_node(&pools);
+    memory
+        .pool_waits
+        .retain(|uid, _| pools.iter().any(|p| p.metadata.uid.as_ref() == Some(uid)));
     // A live agent's copies in a Pool count until its node answered every
     // discovery: the Pool's deletion would give them up unasked.
-    let owes = |node: &str| {
-        let names = by_node.get(node).map(Vec::as_slice).unwrap_or_default();
-        ctx.stores.agent_fresh(node)
-            && snapshots
-                .iter()
-                .any(|s| crate::snapshot::owes_answer(s, node, names))
+    let owed = |node: &str| -> Vec<String> {
+        let uids = by_node.get(node).map(Vec::as_slice).unwrap_or_default();
+        if !ctx.stores.agent_fresh(node) {
+            return Vec::new();
+        }
+        snapshots
+            .iter()
+            .filter(|s| crate::snapshot::owes_answer(s, node, uids))
+            .map(|s| s.name_any())
+            .collect()
     };
     for pool in pools {
         let name = pool.name_any();
@@ -157,9 +165,11 @@ pub(crate) async fn reconcile_all(ctx: &Ctx<'_>, memory: &Memory) {
             if !has_finalizer(pool.as_ref(), FINALIZER_POOL) {
                 continue;
             }
+            let waits = owed(&pool.spec.node);
             let held = pinned.contains(name.as_str())
                 || snapshot_held.contains(&(pool.spec.node.as_str(), name.as_str()))
-                || owes(&pool.spec.node);
+                || !waits.is_empty();
+            report_discovery_wait(ctx, memory, &pool, waits).await;
             if wanted.is_empty() && current.is_empty() && !held && released(&pool) {
                 set_finalizer(&api, pool.as_ref(), FINALIZER_POOL, false).await;
                 continue;
@@ -183,6 +193,38 @@ pub(crate) async fn reconcile_all(ctx: &Ctx<'_>, memory: &Memory) {
             apply_status(&api, &name, status).await;
         }
     }
+}
+
+/// Warning Event: a Pool's deletion waits for its node's discovery answers.
+pub const DELETION_WAITS_FOR_DISCOVERY: &str = "DeletionWaitsForDiscovery";
+
+/// One Event per change of the Snapshots a deleting Pool waits for: the
+/// wait shows, without an Event per pass.
+async fn report_discovery_wait(
+    ctx: &Ctx<'_>,
+    memory: &mut Memory,
+    pool: &Pool,
+    waits: Vec<String>,
+) {
+    let uid = pool.uid().unwrap_or_default();
+    if waits.is_empty() {
+        memory.pool_waits.remove(&uid);
+        return;
+    }
+    if memory.pool_waits.get(&uid) == Some(&waits) {
+        return;
+    }
+    let message = format!(
+        "deletion waits until node {} answered the discovery of {}",
+        pool.spec.node,
+        waits.join(", ")
+    );
+    info!(
+        pool = pool.name_any(),
+        message, "pool deletion waits for a discovery"
+    );
+    crate::warning_event(ctx.client, pool, DELETION_WAITS_FOR_DISCOVERY, &message).await;
+    memory.pool_waits.insert(uid, waits);
 }
 
 #[cfg(test)]

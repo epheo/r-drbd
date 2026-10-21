@@ -301,6 +301,27 @@ async fn a_pool_goes_once_its_node_answered() {
         .unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(support::get_pool(&client, "p-n3").await.is_some(), "held");
+    // The wait shows on the Pool, once.
+    let waits = || async {
+        Api::<Event>::namespaced(client.clone(), "default")
+            .list(&ListParams::default())
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .filter(|e| {
+                e.reason.as_deref() == Some("DeletionWaitsForDiscovery")
+                    && e.involved_object.name.as_deref() == Some("p-n3")
+            })
+            .filter_map(|e| e.message)
+            .collect::<Vec<_>>()
+    };
+    let shown = waits().await;
+    assert_eq!(shown.len(), 1, "{shown:?}");
+    assert!(
+        shown[0].contains("n3") && shown[0].contains("snap"),
+        "{shown:?}"
+    );
     let s = get_snapshot(&client, "snap").await.unwrap();
     agents[2].answer(&s).await.unwrap();
     support::eventually(Duration::from_secs(20), || async {

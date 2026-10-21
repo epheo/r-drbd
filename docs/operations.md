@@ -234,7 +234,7 @@ While it waits:
 - A node whose agent is down holds the decision: it could hold a copy.
   After 10 minutes `Ready` reads `DiscoveryIncomplete`, and one `ImageDiscoveryIncomplete` Warning Event names the silent nodes.
 - Deleting that node's Node object changes nothing.
-  Deleting its Pool gives up on its copies; a Pool's deletion waits until its node answered, unless its agent is stale or its search fails.
+  Deleting its Pool gives up on its copies; a Pool's deletion waits until its node answered, unless its agent is stale or its search fails, and a `DeletionWaitsForDiscovery` Warning Event on the Pool names the Snapshots it waits for.
 - CreateSnapshot answers not ready, and a restore waits.
 - A deleted Snapshot finishes its discovery first, then removes the copies found.
 

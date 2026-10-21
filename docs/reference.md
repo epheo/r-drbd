@@ -186,7 +186,7 @@ Pool `Available`: `ThinPoolReady`, `ThinPoolUnavailable`, `ZeroingDisabled`, `In
 
 Pool `Released`: `Removed` (True: thin pool, VG and PV labels removed), `RemoveBlocked` (False: something else is in the VG, the VG is not the Pool's, or it misses a PV; nothing removed), `RemoveFailed` (False: an LVM command failed, retried on the next pass).
 
-Pool Events: `DeviceNotUsable` (Warning: an appended path is not blank and stays out of the pool), `PoolNotGrown` (Warning: a growth step failed, or the metadata maximum leaves VG space out of the pool), `ImageOrphanLv` (Warning, once per LV: a snapshot LV whose tag names a uid no Snapshot has or does not parse, or with no tag and named by no ack; left alone).
+Pool Events: `DeviceNotUsable` (Warning: an appended path is not blank and stays out of the pool), `PoolNotGrown` (Warning: a growth step failed, or the metadata maximum leaves VG space out of the pool), `ImageOrphanLv` (Warning, once per LV: a snapshot LV whose tag names a uid no Snapshot has or does not parse, or with no tag and named by no ack; left alone), `DeletionWaitsForDiscovery` (Warning, once per change: a deleting Pool waits for its node's answer to the discovery of the Snapshots named).
 
 Volume Events: `Evicted`, `EvictionBlocked`, `SplitBrainResolved`, `PeerUnreachable` (Warning), `PeersReachable`, `AttachmentFailed` (Warning, once per distinct message), `StatusApplyFailed` (Warning, once per error kind until an apply succeeds), `DuplicateAssignment` (Warning on each holder of a minor or port held twice; never rewritten).
 

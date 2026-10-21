@@ -270,6 +270,9 @@ pub(crate) struct Memory {
     pub(crate) probe_wait: HashSet<String>,
     /// Per Volume uid: what PeerUnreachable last announced as an Event.
     pub(crate) peer_unreachable: HashMap<String, volume::Announced>,
+    /// Per Pool uid: the Snapshots its deletion last said, in an Event, it
+    /// waits for.
+    pub(crate) pool_waits: HashMap<String, Vec<String>>,
 }
 
 impl Memory {
