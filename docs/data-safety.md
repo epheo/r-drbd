@@ -30,7 +30,7 @@ These are the guarantees.
 - A volume or snapshot LV is removed only when its Volume or Snapshot is deleted, or when the agent created it in the same pass and it never held data.
   A snapshot LV also goes when its Snapshot Failed: a partial copy is never an image.
 - Every snapshot LV carries its Snapshot's uid in a tag from the lvcreate that made it.
-  Only an LV with that tag is adopted, restored from or searched for; one tagged with another uid is never adopted or removed.
+  Only an LV with that tag is adopted, restored from or searched for; one with a snap tag of another uid, or one that does not parse, is never adopted or removed.
 - Before removal the agent reads the LV report and waits while the LV is open; lvremove itself refuses an LV in use.
 - That lvremove passes `--yes`: it answers LVM's prompt for an active LV, not the in-use refusal.
 - The DRBD metadata on an LV belongs to the Volume and node named in an LVM tag on that LV.

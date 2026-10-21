@@ -1060,8 +1060,9 @@ impl Reconciler {
         }
         let vg = place.vg.as_str();
         let tagged = self.lvm.tags(vg).await.map_err(|e| e.to_string())?;
-        let uid = snap_tag_in(tagged.get(&source).map_or(&[], Vec::as_slice)).map(|t| t.uid);
-        if uid.is_none() || uid.as_deref() != snap.metadata.uid.as_deref() {
+        let source_tags = tagged.get(&source).map_or(&[][..], Vec::as_slice);
+        let uid = snap.metadata.uid.as_deref().unwrap_or_default();
+        if !matches!(snap_tags(source_tags, uid), SnapTags::Own(_)) {
             return Err(format!(
                 "snapshot LV {vg}/{source} has no tag of this snapshot: not its copy"
             ));
@@ -1449,7 +1450,7 @@ impl Reconciler {
                 continue;
             };
             let tagged = reads.tagged(&self.lvm, vg, lv).await?;
-            let Some(tag) = snap_tag_in(&tagged.tags).filter(|t| t.uid == uid) else {
+            let SnapTags::Own(tag) = snap_tags(&tagged.tags, uid) else {
                 continue;
             };
             let Some(pool) = pools.iter().find(|q| {
@@ -1559,7 +1560,7 @@ impl Reconciler {
     }
 
     /// Why an LV of the snapshot LV's name is not this Snapshot's copy:
-    /// it has no snap tag, or another uid's. Such an LV is never adopted.
+    /// it has no snap tag, or a foreign one. Such an LV is never adopted.
     async fn foreign_lv(
         &self,
         reads: &mut Reads,
@@ -1573,13 +1574,12 @@ impl Reconciler {
         }
         let tags = reads.tags(&self.lvm, &place.vg, lv).await?;
         let at = format!("LV {}/{lv}", place.vg);
-        Ok(match snap_tag_in(&tags) {
-            Some(t) if t.uid == uid => None,
-            Some(t) => Some(format!(
-                "{at} belongs to snapshot uid {}; left untouched",
-                t.uid
+        Ok(match snap_tags(&tags, uid) {
+            SnapTags::Own(_) => None,
+            SnapTags::Foreign(t) => Some(format!(
+                "{at} carries tag {t}, not this snapshot's; left untouched"
             )),
-            None => Some(format!("{at} has no snapshot tag; left untouched")),
+            SnapTags::None => Some(format!("{at} has no snapshot tag; left untouched")),
         })
     }
 
@@ -1744,9 +1744,9 @@ impl Reconciler {
         })
     }
 
-    /// Removes the snapshot LV in `place` unless another Snapshot's uid
-    /// tags it: then it is not this one's, and none was found. One with no
-    /// snap tag was taken before tags existed.
+    /// Removes the snapshot LV in `place` unless a foreign snap tag marks
+    /// it: then it is not this one's, and none was found. One with no snap
+    /// tag was taken before tags existed.
     async fn remove_snapshot(
         &self,
         reads: &mut Reads,
@@ -1759,12 +1759,12 @@ impl Reconciler {
             return Ok(());
         }
         let tags = reads.tags(&self.lvm, &place.vg, lv).await?;
-        if let Some(t) = snap_tag_in(&tags).filter(|t| t.uid != uid) {
+        if let SnapTags::Foreign(tag) = snap_tags(&tags, uid) {
             tracing::info!(
                 lv,
                 vg = place.vg,
-                uid = t.uid,
-                "snapshot LV of another snapshot: left"
+                tag,
+                "snapshot LV not this snapshot's: left"
             );
             return Ok(());
         }
@@ -1849,18 +1849,21 @@ impl Reconciler {
     }
 }
 
-/// Why a snapshot LV no holder ack names belongs to no Snapshot: its snap
+/// Why a snapshot LV no holder ack names belongs to no Snapshot: a snap
 /// tag names a uid no Snapshot has (objects restored from a backup get new
-/// uids), or it has no snap tag.
+/// uids) or does not parse, or it has no snap tag.
 fn orphan_snapshot_lv(snaps: &[&Snapshot], tags: &[String]) -> Option<String> {
-    let Some(tag) = tags.iter().find(|t| storage::parse_snap_tag(t).is_some()) else {
+    let mut snap_tags = tags.iter().filter(|t| storage::is_snap_tag(t)).peekable();
+    if snap_tags.peek().is_none() {
         return Some("no snapshot tag, and no Snapshot's ack names it".to_owned());
-    };
-    let uid = storage::parse_snap_tag(tag)?.uid;
-    let owned = snaps
-        .iter()
-        .any(|s| s.metadata.uid.as_deref() == Some(uid.as_str()));
-    (!owned).then(|| format!("tag {tag} names a Snapshot uid no Snapshot has"))
+    }
+    snap_tags.find_map(|tag| match storage::parse_snap_tag(tag) {
+        None => Some(format!("tag {tag} does not parse")),
+        Some(t) => (!snaps
+            .iter()
+            .any(|s| s.metadata.uid.as_deref() == Some(t.uid.as_str())))
+        .then(|| format!("tag {tag} names a Snapshot uid no Snapshot has")),
+    })
 }
 
 /// Warning Event on a Pool: a snapshot LV in it belongs to no Snapshot.
@@ -2012,9 +2015,27 @@ fn snap_tag_of(snap: &Snapshot) -> Result<storage::SnapTag, String> {
     }
 }
 
-/// The first snap tag among an LV's tags.
-fn snap_tag_in(tags: &[String]) -> Option<storage::SnapTag> {
-    tags.iter().find_map(|t| storage::parse_snap_tag(t))
+/// What an LV's snap tags say about Snapshot `uid`.
+enum SnapTags {
+    /// Taken before tags existed.
+    None,
+    Own(storage::SnapTag),
+    /// A snap tag that names another uid or does not parse: the LV is
+    /// never this Snapshot's, never adopted or removed by it.
+    Foreign(String),
+}
+
+fn snap_tags(tags: &[String], uid: &str) -> SnapTags {
+    let mut own = None;
+    for t in tags.iter().filter(|t| storage::is_snap_tag(t)) {
+        match storage::parse_snap_tag(t) {
+            Some(p) if p.uid == uid => {
+                own.get_or_insert(p);
+            }
+            _ => return SnapTags::Foreign(t.clone()),
+        }
+    }
+    own.map_or(SnapTags::None, SnapTags::Own)
 }
 
 fn unix_time(secs: i64) -> Option<Time> {

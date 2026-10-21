@@ -128,7 +128,7 @@ Snapshot it, then restore the snapshot.
 ## Deleting
 
 Deleting the VolumeSnapshot (deletion policy Delete) deletes the Snapshot, and each node removes its snapshot LV.
-Each node removes it from the Pool it was taken in (`takenPool`), even after its replica moved to another Pool: the LV of that name with this Snapshot's uid tag, or with no snap tag (taken before tags existed), never one tagged with another uid.
+Each node removes it from the Pool it was taken in (`takenPool`), even after its replica moved to another Pool: the LV of that name with this Snapshot's uid tag, or with no snap tag (taken before tags existed), never one with a snap tag of another uid or one that does not parse.
 A node without that record searches the thin pools of its Pools for the LV with this Snapshot's uid tag; such an LV outside them is an error, never removed.
 A Snapshot rebuilding a lost status finishes that first; then, Ready or Lost, it removes the copies its discovery found.
 A Snapshot waits for the restores from it that are not yet initialized: it stays until each restored volume is first Ready, and a node holding a copy for such a restore keeps it until then.

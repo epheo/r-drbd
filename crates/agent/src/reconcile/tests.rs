@@ -102,6 +102,9 @@ fn snap_tag(name: &str) -> String {
     storage::snap_tag(&format!("uid-{name}"), GIB, 1)
 }
 
+/// A snap tag that does not parse: no Snapshot's.
+const GARBLED: &str = "r-drbd.snap.garbled";
+
 /// The tags report of VG: each LV with its tags.
 fn expect_tags(x: &ScriptedExec, lvs: &[(&str, &[&str])]) {
     x.expect(lvm::cmd::lv_tags(VG), ok(&tags_out(lvs)));
@@ -540,7 +543,7 @@ async fn restore_then_grow() {
 async fn a_restore_reads_only_a_copy_with_its_snapshots_tag() {
     // Taken before tags existed, or another uid's: not this Snapshot's copy.
     let other = storage::snap_tag("uid-other", GIB, 1);
-    for tags in [vec![], vec![other.as_str()]] {
+    for tags in [vec![], vec![other.as_str()], vec![GARBLED]] {
         let x = Arc::new(ScriptedExec::new());
         let snap_lv = lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive);
         reads(&x, std::slice::from_ref(&snap_lv));
@@ -821,9 +824,13 @@ async fn snapshot_taking_existing_lv_is_adopted() {
 #[tokio::test]
 async fn snapshot_taking_never_adopts_another_snapshots_lv() {
     let other = storage::snap_tag("uid-other", GIB, 1);
+    let own = snap_tag("snap-1");
+    let foreign = |t: &str| format!("carries tag {t}, not this snapshot's");
     for (tags, why) in [
-        (vec![], "has no snapshot tag"),
-        (vec![other.as_str()], "belongs to snapshot uid uid-other"),
+        (vec![], "has no snapshot tag".to_owned()),
+        (vec![other.as_str()], foreign(&other)),
+        (vec![GARBLED], foreign(GARBLED)),
+        (vec![own.as_str(), other.as_str()], foreign(&other)),
     ] {
         let x = Arc::new(ScriptedExec::new());
         reads(
@@ -1421,12 +1428,14 @@ async fn snapshot_lvs_of_no_snapshot_are_reported_once() {
     let own = snap_tag("snap-1");
     let rows = [
         lv_row("pvc-1+old", GIB_KIB, St::Inactive),
+        lv_row("pvc-1+garbled", GIB_KIB, St::Inactive),
         lv_row("pvc-1+legacy", GIB_KIB, St::Inactive),
         lv_row("pvc-1+acked", GIB_KIB, St::Inactive),
         lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive),
     ];
     let tags = [
         ("pvc-1+old", &[other.as_str()][..]),
+        ("pvc-1+garbled", &[GARBLED][..]),
         ("pvc-1+legacy", &[][..]),
         ("pvc-1+acked", &[][..]),
         ("pvc-1+snap-1", &[own.as_str()][..]),
@@ -1454,6 +1463,10 @@ async fn snapshot_lvs_of_no_snapshot_are_reported_once() {
         [
             (
                 POOL.to_owned(),
+                format!("LV vg1/pvc-1+garbled: tag {GARBLED} does not parse; left alone")
+            ),
+            (
+                POOL.to_owned(),
                 "LV vg1/pvc-1+legacy: no snapshot tag, and no Snapshot's ack names it; left alone"
                     .to_owned()
             ),
@@ -1475,7 +1488,7 @@ async fn snapshot_lvs_of_no_snapshot_are_reported_once() {
         message: String::new(),
     };
     r.events_unsent(vec![unsent]);
-    assert_eq!(pass(&mut r).await.len(), 2);
+    assert_eq!(pass(&mut r).await.len(), 3);
     let seen = x.seen.lock().unwrap();
     assert!(
         seen.iter()
@@ -1501,7 +1514,13 @@ async fn a_failed_snapshots_copy_is_removed_everywhere() {
     assert_eq!(snapshot_acks(&w), vec![]);
 
     let other = storage::snap_tag("uid-other", GIB, 1);
-    for tags in [vec![], vec![other.as_str()]] {
+    let own = snap_tag("snap-1");
+    for tags in [
+        vec![],
+        vec![other.as_str()],
+        vec![GARBLED],
+        vec![own.as_str(), GARBLED],
+    ] {
         let x = Arc::new(ScriptedExec::new());
         reads(&x, std::slice::from_ref(&snap_lv));
         expect_tags(&x, &[("pvc-1+snap-1", &tags)]);
@@ -1511,22 +1530,27 @@ async fn a_failed_snapshots_copy_is_removed_everywhere() {
     }
 }
 
-/// Through takenPool the delete never removes another uid's LV: none of
-/// this Snapshot's was found.
+/// Through takenPool the delete never removes an LV with a snap tag that
+/// is not its own: none of this Snapshot's was found.
 #[tokio::test]
 async fn a_delete_leaves_another_snapshots_lv() {
-    let x = Arc::new(ScriptedExec::new());
-    reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
-    expect_tags(
-        &x,
-        &[("pvc-1+snap-1", &[&storage::snap_tag("uid-new", GIB, 1)])],
-    );
-    let mut snap = deleting(snapshot("snap-1", "pvc-1", SnapshotPhase::Ready));
-    snap.status.as_mut().unwrap().acks = vec![taken_ack(SnapshotPhase::Taking, POOL)];
-    let w = run(&x, vec![], vec![snap]).await;
-    let (_, a) = &snapshot_acks(&w)[0];
-    assert!(a.ok && a.phase == SnapshotPhase::Deleting, "{a:?}");
-    assert!(!x.seen.lock().unwrap().iter().any(|a| a[0] == "lvremove"));
+    let other = storage::snap_tag("uid-new", GIB, 1);
+    let own = snap_tag("snap-1");
+    for tags in [
+        vec![other.as_str()],
+        vec![GARBLED],
+        vec![own.as_str(), other.as_str()],
+    ] {
+        let x = Arc::new(ScriptedExec::new());
+        reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
+        expect_tags(&x, &[("pvc-1+snap-1", &tags)]);
+        let mut snap = deleting(snapshot("snap-1", "pvc-1", SnapshotPhase::Ready));
+        snap.status.as_mut().unwrap().acks = vec![taken_ack(SnapshotPhase::Taking, POOL)];
+        let w = run(&x, vec![], vec![snap]).await;
+        let (_, a) = &snapshot_acks(&w)[0];
+        assert!(a.ok && a.phase == SnapshotPhase::Deleting, "{a:?}");
+        assert!(!x.seen.lock().unwrap().iter().any(|a| a[0] == "lvremove"));
+    }
 }
 
 /// Every holder the source had acked: an LV of that name here is no copy

@@ -613,7 +613,7 @@ async fn reconcile_decision_table() {
             .error
             .as_deref()
             .unwrap()
-            .contains("belongs to snapshot uid uid-snapshot-test-host"),
+            .contains("carries tag r-drbd.snap.uid-snapshot-test-host."),
         "{refused:?}"
     );
     let tagged = lvm().tagged(VG).await.unwrap();

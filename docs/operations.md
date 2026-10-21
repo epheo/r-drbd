@@ -249,7 +249,7 @@ A restored Snapshot object gets a new uid, so no tag matches it: restored with i
 A VolumeSnapshot backed up by a tool that copies the data is the supported path.
 To bind a restored Snapshot to its old copies by hand, retag each snapshot LV with the new uid (`lvchange --deltag` the old `r-drbd.snap.<uid>.<size>.<replicas>`, `--addtag` it with the new uid), then remove `status.phase`.
 
-Each agent reports, once, a snapshot LV in its Pools that belongs to no Snapshot (its tag names a uid no Snapshot has, or it has no tag and no ack names it), as an `ImageOrphanLv` Warning Event on the Pool naming the LV and the tag.
+Each agent reports, once, a snapshot LV in its Pools that belongs to no Snapshot (its tag names a uid no Snapshot has or does not parse, or it has no tag and no ack names it), as an `ImageOrphanLv` Warning Event on the Pool naming the LV and the tag.
 Nothing is removed or retagged; remove such an LV by hand once you no longer need it.
 
 ## Upgrading r-drbd
