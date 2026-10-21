@@ -679,17 +679,19 @@ pub async fn start_discovery(api: &Api<Snapshot>, s: &Snapshot) {
     }
 }
 
-/// Every node with a Pool object, with its Pool names sorted: the nodes a
-/// discovery asks, since the source's nodes are often unknown by then.
+/// Every node with a Pool object, with its Pool uids sorted: the nodes a
+/// discovery asks, since the source's nodes are often unknown by then. A
+/// Pool recreated under its name may point elsewhere: an answer for the
+/// old one says nothing of it.
 pub fn pools_by_node(pools: &[std::sync::Arc<model::Pool>]) -> BTreeMap<String, Vec<String>> {
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for p in pools {
         out.entry(p.spec.node.clone())
             .or_default()
-            .push(p.name_any());
+            .extend(p.metadata.uid.clone());
     }
-    for names in out.values_mut() {
-        names.sort();
+    for uids in out.values_mut() {
+        uids.sort();
     }
     out
 }

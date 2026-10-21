@@ -193,8 +193,9 @@ pub struct SnapshotAck {
     /// A found ack is a holder ack from then on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub found: Option<bool>,
-    /// Discovering: every Pool of the node, searched. The answer counts
-    /// only while these are the node's Pools.
+    /// Discovering: the uid of every Pool of the node, searched. The
+    /// answer counts only while these are the node's Pools; one recreated
+    /// under its name is another.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub searched_pools: Vec<String>,
     /// Discovering: the phaseSince of the discovery answered. An answer

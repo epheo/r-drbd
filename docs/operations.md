@@ -220,7 +220,7 @@ The controller sees the loss as the finalizer without a phase (it writes the fir
 
 1. It sets phase `Discovering` and drops every ack, in one write.
 2. Every node with a Pool object searches the thin pools of all its Pools for the snapshot LV by the Snapshot's uid tag, and answers with the Pools it searched.
-   An answer counts only while those are still the node's Pools; a node whose Pools change answers again.
+   An answer counts only while those are still the node's Pools; a node whose Pools change answers again, and a Pool recreated under its name counts as a change.
    A search that fails is no answer.
 3. Once every such node answered:
    - copies whose tags agree: phase Ready, with `sizeBytes`, `sourceReplicas` and `createdAt` from the tags and the LVs' creation times; the nodes that found a copy are its holders, and their digests write `copiesIdentical` again;

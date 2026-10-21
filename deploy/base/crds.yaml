@@ -1157,7 +1157,7 @@
                               "type": "string"
                             },
                             "searchedPools": {
-                              "description": "Discovering: every Pool of the node, searched. The answer counts\nonly while these are the node's Pools.",
+                              "description": "Discovering: the uid of every Pool of the node, searched. The\nanswer counts only while these are the node's Pools; one recreated\nunder its name is another.",
                               "items": {
                                 "type": "string"
                               },

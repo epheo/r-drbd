@@ -776,7 +776,7 @@ impl FakeAgent {
             .items
             .iter()
             .filter(|p| p.spec.node == self.node)
-            .map(ResourceExt::name_any)
+            .filter_map(ResourceExt::uid)
             .collect();
         searched.sort();
         let status = snap.status.clone().unwrap_or_default();

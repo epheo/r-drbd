@@ -14,6 +14,7 @@ use crate::storage::fixtures::*;
 
 const NODE: &str = "n1";
 const POOL: &str = "pool-n1";
+const POOL_UID: &str = "uid-pool-n1";
 const GIB: u64 = 1 << 30;
 const GIB_KIB: u64 = 1 << 20;
 
@@ -37,6 +38,7 @@ fn pool_in(name: &str, vg: &str, thin: &str) -> Arc<Pool> {
         },
     );
     p.metadata.generation = Some(1);
+    p.metadata.uid = Some(format!("uid-{name}"));
     Arc::new(p)
 }
 
@@ -1246,7 +1248,7 @@ async fn a_discovery_is_answered_by_the_uid_tag() {
     let w = run(&x, vec![], vec![discovering("snap-1")]).await;
     let found = SnapshotAck {
         found: Some(true),
-        searched_pools: vec![POOL.into()],
+        searched_pools: vec![POOL_UID.into()],
         phase_since: Some(discovery_since(1)),
         taken_pool: Some(POOL.into()),
         lv_bytes: Some(GIB),
@@ -1262,7 +1264,7 @@ async fn a_discovery_is_answered_by_the_uid_tag() {
     let other = storage::snap_tag("uid-other", GIB, 1);
     let not_found = SnapshotAck {
         found: Some(false),
-        searched_pools: vec![POOL.into()],
+        searched_pools: vec![POOL_UID.into()],
         phase_since: Some(discovery_since(1)),
         ok: true,
         ..SnapshotAck::new(NODE, SnapshotPhase::Discovering)
@@ -1293,6 +1295,14 @@ async fn a_discovery_is_answered_by_the_uid_tag() {
     let w = run(&x, vec![], vec![s.clone()]).await;
     assert_eq!(answers(&w), []);
 
+    // Its Pool recreated under its name, maybe on another VG: searched again.
+    let x = Arc::new(ScriptedExec::new());
+    reads(&x, &[]);
+    let mut recreated = (*pool()).clone();
+    recreated.metadata.uid = Some("uid-pool-n1-new".into());
+    let w = run_in(&x, &[Arc::new(recreated)], vec![], vec![s.clone()]).await;
+    assert_eq!(answers(&w)[0].searched_pools, ["uid-pool-n1-new"]);
+
     // A new discovery: the old answer stands for nothing, searched again.
     let x = Arc::new(ScriptedExec::new());
     reads(&x, &[]);
@@ -1309,7 +1319,7 @@ async fn a_discovery_is_answered_by_the_uid_tag() {
     let pools = [pool(), pool_in("pool-n1b", "vg2", THIN)];
     let w = run_in(&x, &pools, vec![], vec![s]).await;
     let a = &answers(&w)[0];
-    assert_eq!(a.searched_pools, [POOL, "pool-n1b"]);
+    assert_eq!(a.searched_pools, [POOL_UID, "uid-pool-n1b"]);
     assert_eq!((a.found, a.ok), (Some(false), true));
 }
 
@@ -1323,7 +1333,7 @@ async fn a_failed_discovery_search_is_no_answer() {
     let w = run(&x, vec![], vec![discovering("snap-1")]).await;
     let a = &answers(&w)[0];
     assert!(!a.ok && a.found.is_none(), "{a:?}");
-    assert_eq!(a.searched_pools, [POOL]);
+    assert_eq!(a.searched_pools, [POOL_UID]);
     assert!(
         a.error
             .as_deref()
@@ -1361,7 +1371,7 @@ async fn a_failing_search_warns_once_per_error() {
 async fn not_found_answers_go_after_the_discovery() {
     let not_found = SnapshotAck {
         found: Some(false),
-        searched_pools: vec![POOL.into()],
+        searched_pools: vec![POOL_UID.into()],
         ok: true,
         ..SnapshotAck::new(NODE, SnapshotPhase::Discovering)
     };

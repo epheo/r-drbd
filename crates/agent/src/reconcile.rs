@@ -430,9 +430,9 @@ pub struct Reconciler {
     orphan_suspects: HashSet<String>,
     /// `pool/lv` of those reported, once each.
     orphans_reported: HashSet<String>,
-    /// Every Pool of this node by name, usable or not: what a discovery
-    /// answer names as searched.
-    pool_names: Vec<String>,
+    /// The uid of every Pool of this node, usable or not, sorted: what a
+    /// discovery answer names as searched.
+    pool_uids: Vec<String>,
     /// Per Snapshot uid, the step and error last logged at warn.
     snapshot_warnings: HashMap<String, (&'static str, String)>,
 }
@@ -486,7 +486,7 @@ impl Reconciler {
             events: Vec::new(),
             orphan_suspects: HashSet::new(),
             orphans_reported: HashSet::new(),
-            pool_names: Vec::new(),
+            pool_uids: Vec::new(),
             snapshot_warnings: HashMap::new(),
         }
     }
@@ -601,7 +601,8 @@ impl Reconciler {
             .filter(|p| p.spec.node == self.node)
             .collect();
         pools.sort_by_key(|p| p.name_any());
-        self.pool_names = pools.iter().map(|p| p.name_any()).collect();
+        self.pool_uids = pools.iter().filter_map(|p| p.uid()).collect();
+        self.pool_uids.sort();
         self.unready_pools.clear();
         for pool in &pools {
             writes.extend(self.pool(&mut reads, pool).await);
@@ -1377,7 +1378,7 @@ impl Reconciler {
         lv: &str,
         prev: Option<&SnapshotAck>,
     ) -> Option<SnapshotAck> {
-        let searched = &self.pool_names;
+        let searched = &self.pool_uids;
         let since = snap.status.as_ref().and_then(|st| st.phase_since.clone());
         let stands = |a: &SnapshotAck| {
             a.phase == SnapshotPhase::Discovering

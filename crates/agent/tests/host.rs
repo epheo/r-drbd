@@ -443,6 +443,7 @@ fn pool() -> Arc<Pool> {
         },
     );
     p.metadata.generation = Some(1);
+    p.metadata.uid = Some("uid-test-host-pool".into());
     Arc::new(p)
 }
 
@@ -592,7 +593,7 @@ async fn reconcile_decision_table() {
     println!("discovery: {found:?}");
     assert_eq!((found.found, found.ok), (Some(true), true));
     assert_eq!(found.taken_pool.as_deref(), Some("test-host-pool"));
-    assert_eq!(found.searched_pools, ["test-host-pool"]);
+    assert_eq!(found.searched_pools, ["uid-test-host-pool"]);
     assert_eq!(
         (found.tag_size_bytes, found.tag_source_replicas),
         (Some(2 * GIB), Some(1))
