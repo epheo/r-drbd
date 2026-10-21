@@ -1415,6 +1415,36 @@ async fn not_found_answers_go_after_the_discovery() {
     );
 }
 
+/// A Lost Snapshot is never restored, but its copies stay until it is
+/// deleted: a found answer and its LV are left as they are.
+#[tokio::test]
+async fn a_lost_snapshot_keeps_its_found_copy() {
+    let x = Arc::new(ScriptedExec::new());
+    reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
+    let mut lost = snapshot("snap-1", "pvc-1", SnapshotPhase::Lost);
+    lost.status.as_mut().unwrap().acks = vec![SnapshotAck {
+        found: Some(true),
+        searched_pools: vec![POOL_UID.into()],
+        taken_pool: Some(POOL.into()),
+        lv_bytes: Some(GIB),
+        tag_size_bytes: Some(2 * GIB),
+        tag_source_replicas: Some(1),
+        ok: true,
+        ..SnapshotAck::new(NODE, SnapshotPhase::Discovering)
+    }];
+    let w = run(&x, vec![], vec![lost]).await;
+    assert!(
+        w.iter().all(|w| matches!(w, StatusWrite::Pool { .. })),
+        "{w:?}"
+    );
+    let seen = x.seen.lock().unwrap();
+    assert!(
+        seen.iter()
+            .all(|a| !matches!(a[0].as_str(), "lvremove" | "lvchange")),
+        "{seen:?}"
+    );
+}
+
 /// A deleting Snapshot without a phase lost its status: nothing goes
 /// before its discovery found the copies.
 #[tokio::test]

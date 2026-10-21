@@ -1303,13 +1303,19 @@ async fn lost_live(ctx: &Ctx<'_>, v: &Volume) -> bool {
     };
     let api: Api<Snapshot> = Api::all(ctx.client.clone());
     match api.get_opt(&src.snapshot).await {
-        Ok(Some(s)) => src.is(&s) && s.status.and_then(|st| st.phase) == Some(SnapshotPhase::Lost),
-        Ok(None) => false,
+        Ok(s) => lost_source(src, s.as_ref()),
         Err(e) => {
             warn!(volume = v.name_any(), error = %e, "reading the restore's snapshot failed");
             false
         }
     }
+}
+
+/// `snap` is the Snapshot the source names by uid, and Lost.
+fn lost_source(src: &model::VolumeSource, snap: Option<&Snapshot>) -> bool {
+    snap.is_some_and(|s| {
+        src.is(s) && s.status.as_ref().and_then(|st| st.phase) == Some(SnapshotPhase::Lost)
+    })
 }
 
 /// Converges the diskless entries of a DRBD volume to spec.attachments;
@@ -3384,6 +3390,32 @@ mod tests {
         assert_eq!(c.reason, reason::SNAPSHOT_NOT_READY);
         snap.status.as_mut().unwrap().size_bytes = Some(G);
         assert!(ready_snapshot(Some(&snap), "s").is_ok());
+    }
+
+    /// The live read decides a Lost restore: only the Snapshot of the
+    /// source's uid, still Lost.
+    #[test]
+    fn a_restore_fails_on_a_live_read_of_its_snapshot_still_lost() {
+        let mut snap = Snapshot::new("s", spec_of("v"));
+        snap.metadata.uid = Some("uid-s".into());
+        snap.status = Some(model::SnapshotStatus {
+            phase: Some(SnapshotPhase::Lost),
+            ..model::SnapshotStatus::default()
+        });
+        let src = model::VolumeSource {
+            snapshot: "s".into(),
+            snapshot_uid: Some("uid-s".into()),
+        };
+        assert!(lost_source(&src, Some(&snap)));
+        assert!(!lost_source(&src, None), "gone");
+        let other = model::VolumeSource {
+            snapshot_uid: Some("uid-other".into()),
+            ..src.clone()
+        };
+        assert!(!lost_source(&other, Some(&snap)), "another uid");
+        // The phase cleared by hand: a new discovery, no failure.
+        snap.status.as_mut().unwrap().phase = None;
+        assert!(!lost_source(&src, Some(&snap)));
     }
 
     /// The ack of a holder copy in `pool`, with the tag values of its take.
