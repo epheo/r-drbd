@@ -86,14 +86,14 @@ A snapshot over the limit ends Failed before any IO is suspended.
 |---|---|
 | `spec.volume` | Source Volume; immutable |
 | `spec.volumeUid` | That Volume's uid, written by the CSI driver; immutable. A Volume of the name with another uid counts as absent; a Snapshot without a uid takes no round |
-| `status.phase` | Pending, Suspending, Taking, Ready, Failed, Deleting |
+| `status.phase` | Pending, Suspending, Taking, Ready, Failed, Deleting. No default: absent until the controller's first status, which it writes before its finalizer |
 | `status.sizeBytes` | Volume size at snapshot time |
 | `status.fileSystem` | Inherited by restores |
-| `status.createdAt` | When the snapshot was taken |
+| `status.createdAt` | When the earliest holder's snapshot LV was created |
 | `status.phaseSince` | When the current phase began |
 | `status.sourceReplicas` | The source Volume's replicas, written on the way into Taking |
 | `status.copiesIdentical` | Written once every holder acked a digest: true when all match. Absent while pending |
-| `status.acks[]` | Per node: `node`, `phase`, `ok`, `error`, and from its successful take `takenPool`, `lvBytes`, `allocatedBytes`; after Ready, `digest` (hex sha256 over the sha256 of each 4 MiB chunk) and `digestBytes` (the range, the DRBD device size from the copy's metadata). Every later ack copies them |
+| `status.acks[]` | Per node: `node`, `phase`, `ok`, `error`, and from its successful take `takenPool`, `lvBytes`, `allocatedBytes`, `lvCreatedAt` (when LVM created the snapshot LV); after Ready, `digest` (hex sha256 over the sha256 of each 4 MiB chunk) and `digestBytes` (the range, the DRBD device size from the copy's metadata). Every later ack copies them |
 | `status.lastError` | Why it waits in Pending, or why it failed |
 | `status.conditions` | `Ready` |
 | `status.observedGeneration` | Spec generation the controller last wrote status for |
@@ -189,7 +189,7 @@ Pool Events: `DeviceNotUsable` (Warning: an appended path is not blank and stays
 
 Volume Events: `Evicted`, `EvictionBlocked`, `SplitBrainResolved`, `PeerUnreachable` (Warning), `PeersReachable`, `AttachmentFailed` (Warning, once per distinct message), `StatusApplyFailed` (Warning, once per error kind until an apply succeeds), `DuplicateAssignment` (Warning on each holder of a minor or port held twice; never rewritten).
 
-Snapshot Events: `ImageCopiesDiffer` (Warning, once when `copiesIdentical` is written false; names each holder's digest).
+Snapshot Events: `ImageCopiesDiffer` (Warning, once when `copiesIdentical` is written false; names each holder's digest), `SnapshotLvConflict` (Warning, from a node's agent: an LV of the snapshot LV's name without this Snapshot's uid tag; the round fails and the LV stays).
 
 ## CSI driver
 
@@ -246,6 +246,7 @@ Other environment:
 | DRBD minors | 50000 to 99999 |
 | DRBD resource name, LV name | Volume name |
 | Snapshot LV name | `<volume>+<snapshot>` |
+| Snapshot LV tag | `r-drbd.snap.<snapshot uid>.<size bytes>.<source replicas>`, set by the lvcreate |
 | Resource files | `/var/lib/r-drbd/<volume>.res` |
 | Include file | `/etc/drbd.d/r-drbd.res` |
 | CSI socket | `/var/lib/kubelet/plugins/r-drbd.io/csi.sock` |
