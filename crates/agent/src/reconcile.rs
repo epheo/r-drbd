@@ -84,6 +84,10 @@ pub enum StatusWrite {
         name: String,
         ack: SnapshotAck,
     },
+    /// An empty list drops the ack this node owns.
+    SnapshotGone {
+        name: String,
+    },
     /// A Warning Event on a Pool or a Snapshot.
     Event {
         kind: &'static str,
@@ -101,6 +105,7 @@ impl StatusWrite {
             | Self::Volume { name, .. }
             | Self::VolumeGone { name }
             | Self::Snapshot { name, .. }
+            | Self::SnapshotGone { name }
             | Self::Event { name, .. } => name,
         }
     }
@@ -159,6 +164,12 @@ impl StatusWrite {
                 "kind": "Snapshot",
                 "metadata": { "name": name },
                 "status": { "acks": [ack] },
+            }),
+            Self::SnapshotGone { name } => json!({
+                "apiVersion": api_version,
+                "kind": "Snapshot",
+                "metadata": { "name": name },
+                "status": { "acks": [] },
             }),
             Self::Event { .. } => json!(self.event()),
         }
@@ -222,7 +233,7 @@ impl StatusWrite {
                     .patch_status(name, &params, &patch)
                     .await?;
             }
-            Self::Snapshot { name, .. } => {
+            Self::Snapshot { name, .. } | Self::SnapshotGone { name } => {
                 Api::<Snapshot>::all(client.clone())
                     .patch_status(name, &params, &patch)
                     .await?;
@@ -413,6 +424,9 @@ pub struct Reconciler {
     digest_jobs: Vec<digest::Job>,
     /// Snapshot Events of this pass, returned with its writes.
     events: Vec<StatusWrite>,
+    /// Every Pool of this node by name, usable or not: what a discovery
+    /// answer names as searched.
+    pool_names: Vec<String>,
 }
 
 /// Where a pass sends its writes as each step ends, so statuses trail the
@@ -462,6 +476,7 @@ impl Reconciler {
             digests: Digests::default(),
             digest_jobs: Vec::new(),
             events: Vec::new(),
+            pool_names: Vec::new(),
         }
     }
 
@@ -567,6 +582,7 @@ impl Reconciler {
             .filter(|p| p.spec.node == self.node)
             .collect();
         pools.sort_by_key(|p| p.name_any());
+        self.pool_names = pools.iter().map(|p| p.name_any()).collect();
         self.unready_pools.clear();
         for pool in &pools {
             writes.extend(self.pool(&mut reads, pool).await);
@@ -1068,6 +1084,20 @@ impl Reconciler {
         let name = snap.name_any();
         let status = snap.status.clone().unwrap_or_default();
         let prev = status.acks.iter().find(|a| a.node == self.node).cloned();
+        let lv = lvm::names::snapshot_lv(&snap.spec.volume, &name);
+        if status.phase == Some(SnapshotPhase::Discovering) {
+            let ack = self
+                .discovery_answer(reads, pools, snap, &lv, prev.as_ref())
+                .await?;
+            return Some(StatusWrite::Snapshot { name, ack });
+        }
+        // Found answers are holder acks from then on; the others go.
+        if prev
+            .as_ref()
+            .is_some_and(|a| a.phase == SnapshotPhase::Discovering && a.taken_pool.is_none())
+        {
+            return Some(StatusWrite::SnapshotGone { name });
+        }
         let taken = Taken::of(prev.as_ref());
         let vol = vols.iter().find(|v| snap.is_of(v));
         let replica = vol.and_then(|v| self.local_replica(v));
@@ -1075,11 +1105,12 @@ impl Reconciler {
         if replicated.is_some() && !self.drbd_available() {
             return None;
         }
-        let deleting = snap.metadata.deletion_timestamp.is_some()
-            || status.phase == Some(SnapshotPhase::Deleting);
+        // Without a phase the status was lost: its copies are found before
+        // any is removed.
+        let deleting = status.phase == Some(SnapshotPhase::Deleting)
+            || (snap.metadata.deletion_timestamp.is_some() && status.phase.is_some());
         // Before its take the round works in the replica's Pool.
         let replica_pool = replica.and_then(|r| r.pool.clone());
-        let lv = lvm::names::snapshot_lv(&snap.spec.volume, &name);
 
         let ack = if deleting {
             let related = prev.is_some() || replica.is_some();
@@ -1285,6 +1316,68 @@ impl Reconciler {
         }
     }
 
+    /// This node's answer to a discovery, None when the one it gave
+    /// stands: it searched the thin pools of all its Pools for the
+    /// Snapshot's LV by its uid tag. An answer holds only for the Pools it
+    /// names, so a changed Pool set searches again. A failed search is no
+    /// answer: its ack says why and is not ok. A node without a Pool is not
+    /// asked.
+    async fn discovery_answer(
+        &self,
+        reads: &mut Reads,
+        pools: &[&Pool],
+        snap: &Snapshot,
+        lv: &str,
+        prev: Option<&SnapshotAck>,
+    ) -> Option<SnapshotAck> {
+        let searched = &self.pool_names;
+        let stands = |a: &SnapshotAck| {
+            a.phase == SnapshotPhase::Discovering && a.ok && a.searched_pools == *searched
+        };
+        if searched.is_empty() || prev.is_some_and(stands) {
+            return None;
+        }
+        let uid = snap.metadata.uid.as_deref()?;
+        let asked = SnapshotAck {
+            searched_pools: searched.clone(),
+            ..SnapshotAck::new(&self.node, SnapshotPhase::Discovering)
+        };
+        let ack = match self.find_own_lv(reads, pools, lv, uid).await {
+            Ok(Some(own)) => {
+                tracing::info!(
+                    snapshot = snap.name_any(),
+                    lv,
+                    pool = own.place.pool,
+                    "copy found by its tag"
+                );
+                let t = own.taken();
+                SnapshotAck {
+                    found: Some(true),
+                    taken_pool: t.pool,
+                    lv_bytes: t.lv_bytes,
+                    lv_created_at: t.lv_created_at,
+                    tag_size_bytes: Some(own.tag.size_bytes),
+                    tag_source_replicas: Some(own.tag.source_replicas),
+                    ok: true,
+                    ..asked
+                }
+            }
+            Ok(None) => SnapshotAck {
+                found: Some(false),
+                ok: true,
+                ..asked
+            },
+            Err(e) => {
+                tracing::warn!(snapshot = snap.name_any(), error = %e, "discovery search failed");
+                SnapshotAck {
+                    error: Some(e),
+                    ..asked
+                }
+            }
+        };
+        (prev != Some(&ack)).then_some(ack)
+    }
+
     /// A Failed Snapshot is never restored, and a partial copy left behind
     /// would pass for an image after a status loss: each node removes an
     /// LV with its uid tag, on every pass, whether or not it took part.
@@ -1340,9 +1433,9 @@ impl Reconciler {
                 continue;
             };
             let tagged = reads.tagged(&self.lvm, vg, lv).await?;
-            if snap_tag_in(&tagged.tags).is_none_or(|t| t.uid != uid) {
+            let Some(tag) = snap_tag_in(&tagged.tags).filter(|t| t.uid == uid) else {
                 continue;
-            }
+            };
             let Some(pool) = pools.iter().find(|q| {
                 q.spec.vg == vg && row.pool.as_deref() == Some(q.spec.thin_pool.as_str())
             }) else {
@@ -1353,6 +1446,7 @@ impl Reconciler {
             hits.push(OwnLv {
                 place: self.place(pools, Some(&pool.name_any()))?,
                 row,
+                tag,
                 created: tagged.created,
             });
         }
@@ -1748,6 +1842,7 @@ fn find_in_pool<'a>(rows: &'a [Lv], name: &str, thin: &str) -> Result<Option<&'a
 struct OwnLv {
     place: Place,
     row: Lv,
+    tag: storage::SnapTag,
     /// lv_time, unix seconds.
     created: Option<i64>,
 }
@@ -1793,8 +1888,6 @@ impl Taken {
 
 fn ack(node: &str, phase: SnapshotPhase, taken: Taken, res: Result<(), String>) -> SnapshotAck {
     SnapshotAck {
-        node: node.to_owned(),
-        phase,
         taken_pool: taken.pool,
         lv_bytes: taken.lv_bytes,
         allocated_bytes: taken.allocated_bytes,
@@ -1803,6 +1896,7 @@ fn ack(node: &str, phase: SnapshotPhase, taken: Taken, res: Result<(), String>) 
         digest_bytes: taken.digest_bytes,
         ok: res.is_ok(),
         error: res.err(),
+        ..SnapshotAck::new(node, phase)
     }
 }
 

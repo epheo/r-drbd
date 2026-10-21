@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use k8s_openapi::jiff::Timestamp;
-use kube::api::ListParams;
+use kube::api::{ListParams, Patch, PatchParams};
 use kube::{Api, ResourceExt};
 use model::condition::{self, Condition, FALSE, TRUE, types};
 use model::keys::FINALIZER_SNAPSHOT;
@@ -315,17 +315,23 @@ struct Owned {
     copies_identical: Option<bool>,
     last_error: Option<String>,
     observed_generation: Option<i64>,
+    /// The Ready reason of a discovery's outcome or delay; the phase alone
+    /// names the others.
+    reason: Option<&'static str>,
 }
 
 impl Owned {
     fn current(s: &Snapshot) -> Self {
         let st = s.status.clone().unwrap_or_default();
+        let ready = condition::get(&st.conditions, types::READY);
         Self {
             phase: st.phase,
-            conditions: condition::get(&st.conditions, types::READY)
-                .cloned()
-                .into_iter()
-                .collect(),
+            reason: ready.and_then(|c| {
+                [DISCOVERY_INCOMPLETE, SNAPSHOT_LOST, TAGS_DISAGREE]
+                    .into_iter()
+                    .find(|r| *r == c.reason)
+            }),
+            conditions: ready.cloned().into_iter().collect(),
             size_bytes: st.size_bytes,
             created_at: st.created_at,
             phase_since: st.phase_since,
@@ -372,22 +378,32 @@ impl Owned {
     }
 }
 
-fn ready_cond(phase: SnapshotPhase, error: Option<&str>) -> Cond {
+fn ready_cond(phase: SnapshotPhase, error: Option<&str>, reason: Option<&'static str>) -> Cond {
+    let message = error.unwrap_or_default().to_owned();
     match phase {
+        SnapshotPhase::Discovering => Cond {
+            status: FALSE,
+            reason: reason
+                .filter(|r| *r == DISCOVERY_INCOMPLETE)
+                .unwrap_or("Discovering"),
+            message,
+        },
+        SnapshotPhase::Lost => Cond {
+            status: FALSE,
+            reason: reason
+                .filter(|r| *r == TAGS_DISAGREE)
+                .unwrap_or(SNAPSHOT_LOST),
+            message,
+        },
         SnapshotPhase::Ready => Cond {
             status: TRUE,
             reason: "Ready",
             message: String::new(),
         },
-        SnapshotPhase::Failed => Cond {
-            status: FALSE,
-            reason: "Failed",
-            message: error.unwrap_or_default().to_owned(),
-        },
         p => Cond {
             status: FALSE,
             reason: phase_reason(p),
-            message: error.unwrap_or_default().to_owned(),
+            message,
         },
     }
 }
@@ -416,7 +432,7 @@ async fn write(api: &Api<Snapshot>, s: &Snapshot, mut wanted: Owned) -> bool {
         .as_ref()
         .map(|st| st.conditions.as_slice())
         .unwrap_or_default();
-    let cond = ready_cond(phase, wanted.last_error.as_deref());
+    let cond = ready_cond(phase, wanted.last_error.as_deref(), wanted.reason);
     wanted.conditions = build_conditions(existing, &[(types::READY, &cond)], s.metadata.generation);
     wanted.observed_generation = s.metadata.generation;
     if Owned::current(s) == wanted {
@@ -433,9 +449,10 @@ pub(crate) async fn reconcile_all(ctx: &Ctx<'_>, memory: &mut Memory) -> Option<
     let api: Api<Snapshot> = Api::all(ctx.client.clone());
     let snapshots = Stores::sorted(&ctx.stores.snapshots);
     let restores = restoring_from(&Stores::sorted(&ctx.stores.volumes));
+    let pools = pools_by_node(&Stores::sorted(&ctx.stores.pools));
     let mut wake: Option<Duration> = None;
     for s in snapshots {
-        if let Some(d) = reconcile(ctx, memory, &api, &s, &restores).await {
+        if let Some(d) = reconcile(ctx, memory, &api, &s, &restores, &pools).await {
             wake = Some(wake.map_or(d, |w| w.min(d)));
         }
     }
@@ -483,6 +500,7 @@ async fn reconcile(
     api: &Api<Snapshot>,
     s: &Snapshot,
     restores: &BTreeMap<String, String>,
+    pools: &BTreeMap<String, Vec<String>>,
 ) -> Option<Duration> {
     let name = s.name_any();
     let current = Owned::current(s);
@@ -496,24 +514,25 @@ async fn reconcile(
         .filter(|r| r.role == Role::Diskful)
         .map(|r| r.node.clone())
         .collect();
+    if !has_finalizer(s, FINALIZER_SNAPSHOT) {
+        if s.metadata.deletion_timestamp.is_none() {
+            first_status(api, s, current).await;
+        }
+        return None;
+    }
+    if status_lost(s) {
+        start_discovery(api, s).await;
+        return None;
+    }
+    // A deleting Snapshot finishes its discovery first: the copies found
+    // are the ones its delete removes.
+    if current.phase == Some(SnapshotPhase::Discovering) {
+        return discover(ctx, api, s, current, pools).await;
+    }
     if s.metadata.deletion_timestamp.is_some() {
         let restoring = s.uid().and_then(|u| restores.get(&u)).map(String::as_str);
         let exists = |n: &str| ctx.stores.node(n).is_some();
         delete(api, s, current, &diskful, restoring, &exists).await;
-        return None;
-    }
-    if !has_finalizer(s, FINALIZER_SNAPSHOT) {
-        // The first status comes before the finalizer, so no version of
-        // the object has the finalizer without a phase.
-        if current.phase.is_none() {
-            let wanted = Owned {
-                phase: Some(SnapshotPhase::Pending),
-                ..current
-            };
-            write(api, s, wanted).await;
-        } else {
-            set_finalizer(api, s, FINALIZER_SNAPSHOT, true).await;
-        }
         return None;
     }
     let phase = current.phase?;
@@ -525,13 +544,11 @@ async fn reconcile(
     // and Lost: rewriting it could fail a newer version's good snapshot.
     if matches!(
         phase,
-        SnapshotPhase::Failed
-            | SnapshotPhase::Lost
-            | SnapshotPhase::Discovering
-            | SnapshotPhase::Unknown
+        SnapshotPhase::Failed | SnapshotPhase::Lost | SnapshotPhase::Unknown
     ) {
         return None;
     }
+
     if !valid_name(&name) {
         let error = format!("name must match {}", model::keys::NAME_PATTERN);
         fail(api, s, current, error).await;
@@ -587,6 +604,20 @@ async fn reconcile(
     step(ctx, api, s, v, &a, phase, current).await
 }
 
+/// The first status comes before the finalizer, so no version of the
+/// object has the finalizer without a phase.
+async fn first_status(api: &Api<Snapshot>, s: &Snapshot, current: Owned) {
+    if current.phase.is_none() {
+        let wanted = Owned {
+            phase: Some(SnapshotPhase::Pending),
+            ..current
+        };
+        write(api, s, wanted).await;
+    } else {
+        set_finalizer(api, s, FINALIZER_SNAPSHOT, true).await;
+    }
+}
+
 async fn fail(api: &Api<Snapshot>, s: &Snapshot, current: Owned, error: String) {
     let wanted = Owned {
         phase: Some(SnapshotPhase::Failed),
@@ -594,6 +625,241 @@ async fn fail(api: &Api<Snapshot>, s: &Snapshot, current: Owned, error: String) 
         ..current
     };
     write(api, s, wanted).await;
+}
+
+/// Ready reason: a discovery still waits for some node past its bound.
+pub const DISCOVERY_INCOMPLETE: &str = "DiscoveryIncomplete";
+/// Ready reason of Lost: no node with a Pool holds a copy.
+pub const SNAPSHOT_LOST: &str = "SnapshotLost";
+/// Ready reason of Lost: the copies' tags record different values.
+pub const TAGS_DISAGREE: &str = "TagsDisagree";
+/// Warning Event: a discovery waits for silent nodes past its bound.
+pub const IMAGE_DISCOVERY_INCOMPLETE: &str = "ImageDiscoveryIncomplete";
+/// Warning Event: a discovery ended Lost.
+pub const IMAGE_LOST: &str = "ImageLost";
+
+/// The status was lost, whole or in part: the finalizer without a phase
+/// (the first status comes before the finalizer), or Ready without the
+/// size every Ready has.
+pub fn status_lost(s: &Snapshot) -> bool {
+    let st = s.status.as_ref();
+    match st.and_then(|st| st.phase) {
+        None => true,
+        Some(SnapshotPhase::Ready) => st.is_some_and(|st| st.size_bytes.is_none()),
+        Some(_) => false,
+    }
+}
+
+/// Starts a discovery: phase Discovering and no ack, in one merge patch
+/// on the version read, so no old ack acts as a holder or holds a Pool. An
+/// apply could not remove the agents' entries. Every field a discovery
+/// rebuilds goes too, so the outcome holds only what the disks say.
+pub async fn start_discovery(api: &Api<Snapshot>, s: &Snapshot) {
+    let name = s.name_any();
+    let existing = s
+        .status
+        .as_ref()
+        .map(|st| st.conditions.as_slice())
+        .unwrap_or_default();
+    let cond = ready_cond(SnapshotPhase::Discovering, None, None);
+    let conditions = build_conditions(existing, &[(types::READY, &cond)], s.metadata.generation);
+    let patch = json!({
+        "metadata": { "resourceVersion": s.metadata.resource_version },
+        "status": {
+            "phase": SnapshotPhase::Discovering,
+            "acks": [],
+            "phaseSince": crate::now(),
+            "conditions": conditions,
+            "observedGeneration": s.metadata.generation,
+            "sizeBytes": null,
+            "createdAt": null,
+            "sourceReplicas": null,
+            "copiesIdentical": null,
+            "fileSystem": null,
+            "lastError": null,
+        },
+    });
+    let pp = PatchParams {
+        field_manager: Some(model::keys::CONTROLLER_FIELD_MANAGER.to_owned()),
+        ..PatchParams::default()
+    };
+    match api.patch_status(&name, &pp, &Patch::Merge(&patch)).await {
+        Ok(_) => warn!(snapshot = name, "status lost: discovering its copies"),
+        Err(kube::Error::Api(e)) if e.is_conflict() || e.is_not_found() => {
+            debug!(snapshot = name, "discovery start raced; retrying next pass");
+        }
+        Err(e) => warn!(snapshot = name, error = %e, "discovery start failed"),
+    }
+}
+
+/// Every node with a Pool object, with its Pool names sorted: the nodes a
+/// discovery asks, since the source's nodes are often unknown by then.
+pub fn pools_by_node(pools: &[std::sync::Arc<model::Pool>]) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for p in pools {
+        out.entry(p.spec.node.clone())
+            .or_default()
+            .push(p.name_any());
+    }
+    for names in out.values_mut() {
+        names.sort();
+    }
+    out
+}
+
+/// What the answers of a discovery decide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Discovery {
+    /// Nodes asked that have not answered for their current Pools: an
+    /// agent that is down could hold a copy.
+    Waiting(Vec<String>),
+    Ready {
+        size_bytes: u64,
+        source_replicas: u32,
+        created_at: Option<Time>,
+    },
+    Lost {
+        reason: &'static str,
+        message: String,
+    },
+}
+
+/// The decision, pure: only once every node with a Pool answered for its
+/// current Pools; a failed search is no answer.
+pub fn discovery(acks: &[SnapshotAck], pools: &BTreeMap<String, Vec<String>>) -> Discovery {
+    let mut silent = Vec::new();
+    let mut found = Vec::new();
+    for (node, names) in pools {
+        let answer = acks.iter().find(|a| {
+            a.node == *node
+                && a.phase == SnapshotPhase::Discovering
+                && a.ok
+                && a.searched_pools == *names
+        });
+        match answer {
+            None => silent.push(node.clone()),
+            Some(a) if a.found == Some(true) => found.push(a),
+            Some(_) => {}
+        }
+    }
+    if !silent.is_empty() {
+        return Discovery::Waiting(silent);
+    }
+    if found.is_empty() {
+        return Discovery::Lost {
+            reason: SNAPSHOT_LOST,
+            message: "no copy on any node with a Pool".to_owned(),
+        };
+    }
+    let tags: BTreeSet<(Option<u64>, Option<u32>)> = found
+        .iter()
+        .map(|a| (a.tag_size_bytes, a.tag_source_replicas))
+        .collect();
+    match tags.into_iter().collect::<Vec<_>>()[..] {
+        [(Some(size_bytes), Some(source_replicas))] => Discovery::Ready {
+            size_bytes,
+            source_replicas,
+            created_at: found
+                .iter()
+                .filter_map(|a| a.lv_created_at.clone())
+                .min_by_key(|t| t.0),
+        },
+        _ => Discovery::Lost {
+            reason: TAGS_DISAGREE,
+            message: format!(
+                "the copies' tags disagree: {}",
+                found
+                    .iter()
+                    .map(|a| format!(
+                        "{} size {:?} replicas {:?}",
+                        a.node, a.tag_size_bytes, a.tag_source_replicas
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        },
+    }
+}
+
+/// One step of a discovery; returns when to look again.
+async fn discover(
+    ctx: &Ctx<'_>,
+    api: &Api<Snapshot>,
+    s: &Snapshot,
+    current: Owned,
+    pools: &BTreeMap<String, Vec<String>>,
+) -> Option<Duration> {
+    let name = s.name_any();
+    let Some(since) = &current.phase_since else {
+        let wanted = Owned {
+            phase_since: Some(crate::now()),
+            ..current
+        };
+        write(api, s, wanted).await;
+        return Some(model::snapshot::DISCOVERY_SILENT);
+    };
+    let elapsed = Duration::try_from(Timestamp::now().duration_since(since.0)).unwrap_or_default();
+    let acks = s
+        .status
+        .as_ref()
+        .map(|st| st.acks.as_slice())
+        .unwrap_or_default();
+    match discovery(acks, pools) {
+        Discovery::Waiting(silent) => {
+            let message = format!("waiting for the answer of {}", silent.join(", "));
+            let bound = model::snapshot::DISCOVERY_SILENT;
+            let late = elapsed >= bound;
+            let reason = late.then_some(DISCOVERY_INCOMPLETE);
+            let first = late && current.reason != reason;
+            let wanted = Owned {
+                last_error: Some(message.clone()),
+                reason,
+                ..current
+            };
+            if write(api, s, wanted).await && first {
+                warn!(snapshot = name, message, "discovery incomplete");
+                crate::warning_event(ctx.client, s, IMAGE_DISCOVERY_INCOMPLETE, &message).await;
+            }
+            (!late).then(|| bound.saturating_sub(elapsed))
+        }
+        Discovery::Ready {
+            size_bytes,
+            source_replicas,
+            created_at,
+        } => {
+            info!(
+                snapshot = name,
+                size_bytes, source_replicas, "status rebuilt from the copies"
+            );
+            let wanted = Owned {
+                phase: Some(SnapshotPhase::Ready),
+                size_bytes: Some(size_bytes),
+                source_replicas: Some(source_replicas),
+                created_at,
+                phase_since: Some(crate::now()),
+                last_error: None,
+                reason: None,
+                ..current
+            };
+            write(api, s, wanted).await;
+            None
+        }
+        Discovery::Lost { reason, message } => {
+            let wanted = Owned {
+                phase: Some(SnapshotPhase::Lost),
+                phase_since: Some(crate::now()),
+                last_error: Some(message.clone()),
+                reason: Some(reason),
+                ..current
+            };
+            if write(api, s, wanted).await {
+                warn!(snapshot = name, reason, message, "snapshot lost");
+                let message = format!("{reason}: {message}; restores refused, copies kept");
+                crate::warning_event(ctx.client, s, IMAGE_LOST, &message).await;
+            }
+            None
+        }
+    }
 }
 
 /// What the holders' digests prove, once every holder acked one.
@@ -907,6 +1173,10 @@ mod tests {
             lv_bytes: None,
             allocated_bytes: None,
             lv_created_at: None,
+            found: None,
+            searched_pools: Vec::new(),
+            tag_size_bytes: None,
+            tag_source_replicas: None,
             digest: None,
             digest_bytes: None,
             ok,
@@ -1504,5 +1774,144 @@ mod tests {
             None,
         );
         assert_eq!(copies_proof(&two), None);
+    }
+
+    #[test]
+    fn a_lost_status_is_the_finalizer_without_a_phase_or_ready_without_its_size() {
+        let mut s = Snapshot::new(
+            "s",
+            model::SnapshotSpec {
+                volume: "v".into(),
+                volume_uid: Some("u".into()),
+            },
+        );
+        assert!(status_lost(&s), "no status at all");
+        s.status = Some(model::SnapshotStatus::default());
+        assert!(status_lost(&s), "no phase");
+        s.status = Some(status(vec![], Some(2)));
+        assert!(status_lost(&s), "Ready without sizeBytes");
+        s.status.as_mut().unwrap().size_bytes = Some(GI);
+        assert!(!status_lost(&s));
+        for phase in [P::Pending, P::Taking, P::Lost, P::Discovering, P::Failed] {
+            s.status.as_mut().unwrap().phase = Some(phase);
+            s.status.as_mut().unwrap().size_bytes = None;
+            assert!(!status_lost(&s), "{phase:?}");
+        }
+    }
+
+    /// A Discovering answer of `node` for `pools`, found when `tag` is
+    /// (size, replicas, LV time).
+    fn answer(node: &str, pools: &[&str], tag: Option<(u64, u32, i64)>) -> SnapshotAck {
+        let pool = pools.first().map(|p| (*p).to_owned());
+        SnapshotAck {
+            found: Some(tag.is_some()),
+            searched_pools: pools.iter().map(|p| (*p).to_owned()).collect(),
+            taken_pool: tag.and(pool),
+            tag_size_bytes: tag.map(|t| t.0),
+            tag_source_replicas: tag.map(|t| t.1),
+            lv_created_at: tag.map(|t| Time(Timestamp::from_second(t.2).unwrap())),
+            ok: true,
+            ..SnapshotAck::new(node, P::Discovering)
+        }
+    }
+
+    fn asked(nodes: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
+        nodes
+            .iter()
+            .map(|(n, p)| ((*n).to_owned(), p.iter().map(|x| (*x).to_owned()).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn a_discovery_decides_only_once_every_node_with_a_pool_answered() {
+        let pools = asked(&[("n1", &["p1"]), ("n2", &["p2", "p3"]), ("n3", &["p4"])]);
+        let a1 = answer("n1", &["p1"], Some((GI, 2, 20)));
+        let a2 = answer("n2", &["p2", "p3"], Some((GI, 2, 10)));
+        let a3 = answer("n3", &["p4"], None);
+        assert_eq!(
+            discovery(&[a1.clone(), a2.clone()], &pools),
+            Discovery::Waiting(vec!["n3".into()])
+        );
+        // An answer for an older Pool set is no answer.
+        let stale = answer("n2", &["p2"], Some((GI, 2, 10)));
+        assert_eq!(
+            discovery(&[a1.clone(), stale, a3.clone()], &pools),
+            Discovery::Waiting(vec!["n2".into()])
+        );
+        // A failed search is no answer either.
+        let mut failed = a3.clone();
+        failed.ok = false;
+        failed.error = Some("vg unreadable".into());
+        assert_eq!(
+            discovery(&[a1.clone(), a2.clone(), failed], &pools),
+            Discovery::Waiting(vec!["n3".into()])
+        );
+        // Ready from the tags, created at the earliest copy.
+        assert_eq!(
+            discovery(&[a1.clone(), a2.clone(), a3.clone()], &pools),
+            Discovery::Ready {
+                size_bytes: GI,
+                source_replicas: 2,
+                created_at: Some(Time(Timestamp::from_second(10).unwrap())),
+            }
+        );
+        // A node without a Pool is not asked; its ack counts for nothing.
+        let gone = answer("n9", &["p9"], Some((2 * GI, 3, 1)));
+        assert!(matches!(
+            discovery(&[a1.clone(), a2.clone(), a3.clone(), gone], &pools),
+            Discovery::Ready { size_bytes: GI, .. }
+        ));
+    }
+
+    #[test]
+    fn a_discovery_without_agreeing_copies_is_lost() {
+        let pools = asked(&[("n1", &["p1"]), ("n2", &["p2"])]);
+        let none = [answer("n1", &["p1"], None), answer("n2", &["p2"], None)];
+        let Discovery::Lost { reason, .. } = discovery(&none, &pools) else {
+            panic!("no copy");
+        };
+        assert_eq!(reason, SNAPSHOT_LOST);
+        let differ = [
+            answer("n1", &["p1"], Some((GI, 2, 1))),
+            answer("n2", &["p2"], Some((2 * GI, 2, 1))),
+        ];
+        let Discovery::Lost { reason, message } = discovery(&differ, &pools) else {
+            panic!("tags disagree");
+        };
+        assert_eq!(reason, TAGS_DISAGREE);
+        assert!(
+            message.contains("n1") && message.contains("n2"),
+            "{message}"
+        );
+        // No node with a Pool at all: nothing can hold a copy.
+        assert!(matches!(
+            discovery(&[], &BTreeMap::new()),
+            Discovery::Lost {
+                reason: SNAPSHOT_LOST,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn discovery_reasons_follow_their_phase() {
+        let c = ready_cond(P::Discovering, None, None);
+        assert_eq!((c.status, c.reason), (FALSE, "Discovering"));
+        let c = ready_cond(P::Discovering, Some("n2"), Some(DISCOVERY_INCOMPLETE));
+        assert_eq!((c.reason, c.message.as_str()), (DISCOVERY_INCOMPLETE, "n2"));
+        assert_eq!(ready_cond(P::Lost, None, None).reason, SNAPSHOT_LOST);
+        assert_eq!(
+            ready_cond(P::Lost, None, Some(TAGS_DISAGREE)).reason,
+            TAGS_DISAGREE
+        );
+        // A reason never outlives its phase.
+        assert_eq!(
+            ready_cond(P::Deleting, None, Some(SNAPSHOT_LOST)).reason,
+            "Deleting"
+        );
+        assert_eq!(
+            ready_cond(P::Lost, None, Some(DISCOVERY_INCOMPLETE)).reason,
+            SNAPSHOT_LOST
+        );
     }
 }

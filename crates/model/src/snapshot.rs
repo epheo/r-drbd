@@ -146,6 +146,9 @@ pub const DIGEST_CHUNK: usize = 4 << 20;
 /// Agent: how long a restore's first data waits for pending digests
 /// before it starts as the sync source.
 pub const DIGEST_WAIT: Duration = Duration::from_secs(120);
+/// Controller: a discovery still waiting for some node after this long
+/// says so in its Ready condition, and keeps waiting.
+pub const DISCOVERY_SILENT: Duration = Duration::from_secs(600);
 
 /// The last phase a node completed, and whether it succeeded.
 /// `takenPool`, `lvBytes` and `allocatedBytes` come from the successful
@@ -172,6 +175,20 @@ pub struct SnapshotAck {
     /// When LVM created the snapshot LV; createdAt is the earliest holder's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lv_created_at: Option<Time>,
+    /// Discovering: whether the node found the snapshot LV by its uid tag.
+    /// A found ack is a holder ack from then on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub found: Option<bool>,
+    /// Discovering: every Pool of the node, searched. The answer counts
+    /// only while these are the node's Pools.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub searched_pools: Vec<String>,
+    /// Discovering: the size the found LV's tag records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_size_bytes: Option<u64>,
+    /// Discovering: the source replicas the found LV's tag records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_source_replicas: Option<u32>,
     /// Hex sha256 over the sha256 of each 4 MiB chunk of the snapshot LV
     /// over [0, digestBytes), written once after Ready.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -185,4 +202,26 @@ pub struct SnapshotAck {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+impl SnapshotAck {
+    /// A failed ack of `phase` that records nothing else yet.
+    pub fn new(node: impl Into<String>, phase: SnapshotPhase) -> Self {
+        Self {
+            node: node.into(),
+            phase,
+            taken_pool: None,
+            lv_bytes: None,
+            allocated_bytes: None,
+            lv_created_at: None,
+            found: None,
+            searched_pools: Vec::new(),
+            tag_size_bytes: None,
+            tag_source_replicas: None,
+            digest: None,
+            digest_bytes: None,
+            ok: false,
+            error: None,
+        }
+    }
 }

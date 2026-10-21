@@ -1110,6 +1110,11 @@
                               "nullable": true,
                               "type": "string"
                             },
+                            "found": {
+                              "description": "Discovering: whether the node found the snapshot LV by its uid tag.\nA found ack is a holder ack from then on.",
+                              "nullable": true,
+                              "type": "boolean"
+                            },
                             "lvBytes": {
                               "description": "Size of the snapshot LV.",
                               "format": "uint64",
@@ -1144,6 +1149,27 @@
                                 "Lost"
                               ],
                               "type": "string"
+                            },
+                            "searchedPools": {
+                              "description": "Discovering: every Pool of the node, searched. The answer counts\nonly while these are the node's Pools.",
+                              "items": {
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "tagSizeBytes": {
+                              "description": "Discovering: the size the found LV's tag records.",
+                              "format": "uint64",
+                              "minimum": 0.0,
+                              "nullable": true,
+                              "type": "integer"
+                            },
+                            "tagSourceReplicas": {
+                              "description": "Discovering: the source replicas the found LV's tag records.",
+                              "format": "uint32",
+                              "minimum": 0.0,
+                              "nullable": true,
+                              "type": "integer"
                             },
                             "takenPool": {
                               "description": "The Pool holding this node's snapshot LV; restores, holder lookups\nand deletes read it, never the replica's current Pool.",

@@ -134,6 +134,10 @@ fn taken_ack(phase: SnapshotPhase, pool: &str) -> SnapshotAck {
         lv_bytes: Some(GIB),
         allocated_bytes: Some(GIB / 4),
         lv_created_at: None,
+        found: None,
+        searched_pools: Vec::new(),
+        tag_size_bytes: None,
+        tag_source_replicas: None,
         digest: None,
         digest_bytes: None,
         ok: true,
@@ -931,6 +935,10 @@ async fn snapshot_deleting_after_volume_is_gone() {
             lv_bytes: None,
             allocated_bytes: None,
             lv_created_at: None,
+            found: None,
+            searched_pools: Vec::new(),
+            tag_size_bytes: None,
+            tag_source_replicas: None,
             digest: None,
             digest_bytes: None,
             ok: true,
@@ -1192,6 +1200,178 @@ async fn ready_snapshot_lv_is_rediscovered() {
     }
 }
 
+fn discovering(name: &str) -> Snapshot {
+    let mut s = snapshot(name, "pvc-1", SnapshotPhase::Discovering);
+    let st = s.status.as_mut().unwrap();
+    (st.size_bytes, st.source_replicas) = (None, None);
+    s
+}
+
+fn answers(writes: &[StatusWrite]) -> Vec<SnapshotAck> {
+    snapshot_acks(writes).into_iter().map(|(_, a)| a).collect()
+}
+
+/// A discovery: this node's answer names its Pools and, for a copy found
+/// by its uid tag, what an ack and the tag record.
+#[tokio::test]
+async fn a_discovery_is_answered_by_the_uid_tag() {
+    let x = Arc::new(ScriptedExec::new());
+    reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
+    let tag = storage::snap_tag("uid-snap-1", 3 * GIB, 2);
+    x.expect(
+        lvm::cmd::lv_tags(VG),
+        ok(&tagged_out(&[("pvc-1+snap-1", &[&tag], LV_TIME)])),
+    );
+    let w = run(&x, vec![], vec![discovering("snap-1")]).await;
+    let found = SnapshotAck {
+        found: Some(true),
+        searched_pools: vec![POOL.into()],
+        taken_pool: Some(POOL.into()),
+        lv_bytes: Some(GIB),
+        lv_created_at: Some(lv_time()),
+        tag_size_bytes: Some(3 * GIB),
+        tag_source_replicas: Some(2),
+        ok: true,
+        ..SnapshotAck::new(NODE, SnapshotPhase::Discovering)
+    };
+    assert_eq!(answers(&w), std::slice::from_ref(&found));
+
+    // Untagged or another uid's, or no LV at all: not found.
+    let other = storage::snap_tag("uid-other", GIB, 1);
+    let not_found = SnapshotAck {
+        found: Some(false),
+        searched_pools: vec![POOL.into()],
+        ok: true,
+        ..SnapshotAck::new(NODE, SnapshotPhase::Discovering)
+    };
+    for tags in [vec![], vec![other.as_str()]] {
+        let x = Arc::new(ScriptedExec::new());
+        reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
+        expect_tags(&x, &[("pvc-1+snap-1", &tags)]);
+        let w = run(&x, vec![], vec![discovering("snap-1")]).await;
+        assert_eq!(answers(&w), std::slice::from_ref(&not_found));
+    }
+    let x = Arc::new(ScriptedExec::new());
+    reads(&x, &[]);
+    let w = run(&x, vec![], vec![discovering("snap-1")]).await;
+    assert_eq!(answers(&w), std::slice::from_ref(&not_found));
+
+    // Deleting too: the discovery ends before any copy goes.
+    let x = Arc::new(ScriptedExec::new());
+    reads(&x, &[]);
+    let w = run(&x, vec![], vec![deleting(discovering("snap-1"))]).await;
+    assert_eq!(answers(&w), std::slice::from_ref(&not_found));
+
+    // An answer stands while the node's Pools stay the same: no search.
+    let x = Arc::new(ScriptedExec::new());
+    reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
+    let mut s = discovering("snap-1");
+    s.status.as_mut().unwrap().acks = vec![found];
+    let w = run(&x, vec![], vec![s.clone()]).await;
+    assert_eq!(answers(&w), []);
+
+    // Another Pool on the node: searched again, both named.
+    let x = Arc::new(ScriptedExec::new());
+    reads(&x, &[]);
+    x.expect(lvm::cmd::lvs("vg2"), ok(&lvs_out(&[])));
+    expect_vgs_of(&x, "vg2");
+    let pools = [pool(), pool_in("pool-n1b", "vg2", THIN)];
+    let w = run_in(&x, &pools, vec![], vec![s]).await;
+    let a = &answers(&w)[0];
+    assert_eq!(a.searched_pools, [POOL, "pool-n1b"]);
+    assert_eq!((a.found, a.ok), (Some(false), true));
+}
+
+/// A search that cannot see every Pool is no answer: the copy may be in
+/// the Pool it could not read.
+#[tokio::test]
+async fn a_failed_discovery_search_is_no_answer() {
+    let x = Arc::new(ScriptedExec::new());
+    reads(&x, &[foreign_row("pvc-1+snap-1", "")]);
+    expect_tags(&x, &[("pvc-1+snap-1", &[&snap_tag("snap-1")])]);
+    let w = run(&x, vec![], vec![discovering("snap-1")]).await;
+    let a = &answers(&w)[0];
+    assert!(!a.ok && a.found.is_none(), "{a:?}");
+    assert_eq!(a.searched_pools, [POOL]);
+    assert!(
+        a.error
+            .as_deref()
+            .unwrap()
+            .contains("outside the thin pools")
+    );
+}
+
+/// Once the phase leaves Discovering a not-found answer goes; a found
+/// one is a holder ack and stays.
+#[tokio::test]
+async fn not_found_answers_go_after_the_discovery() {
+    let not_found = SnapshotAck {
+        found: Some(false),
+        searched_pools: vec![POOL.into()],
+        ok: true,
+        ..SnapshotAck::new(NODE, SnapshotPhase::Discovering)
+    };
+    for phase in [SnapshotPhase::Ready, SnapshotPhase::Lost] {
+        let x = Arc::new(ScriptedExec::new());
+        reads(&x, &[]);
+        let mut s = snapshot("snap-1", "pvc-1", phase);
+        s.status.as_mut().unwrap().acks = vec![not_found.clone()];
+        let w = run(&x, vec![], vec![s]).await;
+        let gone: Vec<&str> = w
+            .iter()
+            .filter_map(|w| match w {
+                StatusWrite::SnapshotGone { name } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gone, ["snap-1"], "{phase:?}");
+        let body = w
+            .iter()
+            .find(|w| matches!(w, StatusWrite::SnapshotGone { .. }))
+            .unwrap()
+            .body();
+        assert_eq!(body["status"]["acks"], serde_json::json!([]));
+    }
+    // Found: a single-replica holder with nothing to hash, so nothing to say.
+    let x = Arc::new(ScriptedExec::new());
+    reads(&x, &[]);
+    let mut s = snapshot("snap-1", "pvc-1", SnapshotPhase::Ready);
+    s.status.as_mut().unwrap().acks = vec![SnapshotAck {
+        found: Some(true),
+        taken_pool: Some(POOL.into()),
+        ..not_found
+    }];
+    let w = run(&x, vec![], vec![s]).await;
+    assert!(
+        w.iter().all(|w| !matches!(
+            w,
+            StatusWrite::SnapshotGone { .. } | StatusWrite::Snapshot { .. }
+        )),
+        "{w:?}"
+    );
+}
+
+/// A deleting Snapshot without a phase lost its status: nothing goes
+/// before its discovery found the copies.
+#[tokio::test]
+async fn a_deleting_snapshot_without_a_phase_removes_nothing() {
+    let x = Arc::new(ScriptedExec::new());
+    reads(
+        &x,
+        &[
+            lv_row("pvc-1", GIB_KIB, St::Active),
+            lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive),
+        ],
+    );
+    let mut s = deleting(snapshot("snap-1", "pvc-1", SnapshotPhase::Ready));
+    let st = s.status.as_mut().unwrap();
+    st.phase = None;
+    st.acks.clear();
+    let w = run(&x, vec![volume("pvc-1", GIB, 1)], vec![s]).await;
+    assert_eq!(snapshot_acks(&w), vec![]);
+    assert!(!x.seen.lock().unwrap().iter().any(|a| a[0] == "lvremove"));
+}
+
 /// A Failed Snapshot's copy goes on every node with a Pool, whether or
 /// not it took part, and no ack says so. Another uid's LV, or one
 /// without a tag, stays.
@@ -1324,6 +1504,10 @@ async fn snapshot_deleting_is_kept_only_for_its_own_uid() {
             lv_bytes: None,
             allocated_bytes: None,
             lv_created_at: None,
+            found: None,
+            searched_pools: Vec::new(),
+            tag_size_bytes: None,
+            tag_source_replicas: None,
             digest: None,
             digest_bytes: None,
             ok: true,

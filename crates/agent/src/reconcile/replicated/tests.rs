@@ -393,6 +393,10 @@ fn source_snapshot() -> Snapshot {
             lv_bytes: None,
             allocated_bytes: None,
             lv_created_at: None,
+            found: None,
+            searched_pools: Vec::new(),
+            tag_size_bytes: None,
+            tag_source_replicas: None,
             digest: None,
             digest_bytes: None,
             ok: true,
@@ -1243,6 +1247,10 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
         lv_bytes: None,
         allocated_bytes: None,
         lv_created_at: None,
+        found: None,
+        searched_pools: Vec::new(),
+        tag_size_bytes: None,
+        tag_source_replicas: None,
         digest: None,
         digest_bytes: None,
         ok: true,
@@ -1711,6 +1719,10 @@ async fn snapshot_lv_is_kept_while_a_restore_here_is_not_initialized() {
         lv_bytes: None,
         allocated_bytes: None,
         lv_created_at: None,
+        found: None,
+        searched_pools: Vec::new(),
+        tag_size_bytes: None,
+        tag_source_replicas: None,
         digest: None,
         digest_bytes: None,
         ok: true,
@@ -2313,6 +2325,10 @@ fn round_ack(phase: SnapshotPhase, ok: bool) -> SnapshotAck {
         lv_bytes: taken.then_some(LV_KIB * 1024),
         allocated_bytes: taken.then_some(0),
         lv_created_at: None,
+        found: None,
+        searched_pools: Vec::new(),
+        tag_size_bytes: None,
+        tag_source_replicas: None,
         digest: None,
         digest_bytes: None,
         ok,
@@ -2473,17 +2489,24 @@ async fn a_lost_status_keeps_the_freeze_to_the_deadline() {
         let lost = [s];
         tokio::time::advance(model::snapshot::RESUME_AFTER.saturating_sub(Duration::from_secs(1)))
             .await;
+        // Only a discovery answer, never a failed round ack.
+        let outside = |w: &[StatusWrite]| {
+            acks(w)
+                .iter()
+                .all(|a| a.phase == SnapshotPhase::Discovering && a.ok)
+        };
         reads_again(&r.x, &[lv(LV_KIB)]);
         dry(&r.x, "");
-        assert_eq!(acks(&r.pass(&[volume(GIB)], &lost).await), vec![]);
+        assert!(outside(&r.pass(&[volume(GIB)], &lost).await));
         assert!(!seen(&r.x, "resume-io"), "{phase:?}");
         tokio::time::advance(Duration::from_secs(1)).await;
         reads_again(&r.x, &[lv(LV_KIB)]);
         r.x.expect(argv::resume_io("pvc-1"), ok(""));
         dry(&r.x, "");
         let w = r.pass(&[volume(GIB)], &lost).await;
-        assert_eq!(acks(&w), vec![], "no failed ack outside a round");
+        assert!(outside(&w), "no failed ack outside a round");
     }
+
     for phase in [
         SnapshotPhase::Ready,
         SnapshotPhase::Failed,
@@ -2592,6 +2615,10 @@ async fn diskless_replica_keeps_its_freeze_through_taking() {
         lv_bytes: None,
         allocated_bytes: None,
         lv_created_at: None,
+        found: None,
+        searched_pools: Vec::new(),
+        tag_size_bytes: None,
+        tag_source_replicas: None,
         digest: None,
         digest_bytes: None,
         ok: true,
@@ -2608,6 +2635,10 @@ async fn diskless_replica_keeps_its_freeze_through_taking() {
         lv_bytes: None,
         allocated_bytes: None,
         lv_created_at: None,
+        found: None,
+        searched_pools: Vec::new(),
+        tag_size_bytes: None,
+        tag_source_replicas: None,
         digest: None,
         digest_bytes: None,
         ok: true,

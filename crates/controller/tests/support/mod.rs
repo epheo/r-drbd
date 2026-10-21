@@ -729,6 +729,11 @@ pub fn ready_reason(v: &Volume) -> Option<String> {
     model::condition::get(&s.conditions, "Ready").map(|c| c.reason.clone())
 }
 
+pub fn ready_reason_of_snapshot(s: &Snapshot) -> Option<String> {
+    let st = s.status.as_ref()?;
+    model::condition::get(&st.conditions, "Ready").map(|c| c.reason.clone())
+}
+
 /// One node's agent, reduced to its status writes. It reports replicas >= 2
 /// volumes too (UpToDate, peers Connected, quorum), diskless and tiebreaker
 /// replicas as Diskless, and drops its entry once its node leaves the
@@ -740,6 +745,17 @@ pub fn ready_reason(v: &Volume) -> Option<String> {
 pub struct FakeAgent {
     pub client: Client,
     pub node: String,
+    /// The snapshot LVs on this node, as LVM would keep them: by Snapshot
+    /// uid, the Pool and what the tag records. A status loss leaves them.
+    pub copies: std::sync::Arc<Mutex<std::collections::HashMap<String, FakeCopy>>>,
+}
+
+/// A snapshot LV of a [`FakeAgent`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakeCopy {
+    pub pool: String,
+    pub size_bytes: Option<u64>,
+    pub source_replicas: Option<u32>,
 }
 
 impl FakeAgent {
@@ -747,7 +763,65 @@ impl FakeAgent {
         Self {
             client: client.clone(),
             node: node.into(),
+            copies: std::sync::Arc::default(),
         }
+    }
+
+    /// Answers a discovery from its copies, for the node's current Pools.
+    pub async fn answer(&self, snap: &Snapshot) -> Result<(), kube::Error> {
+        let mut searched: Vec<String> = Api::<Pool>::all(self.client.clone())
+            .list(&ListParams::default())
+            .await?
+            .items
+            .iter()
+            .filter(|p| p.spec.node == self.node)
+            .map(ResourceExt::name_any)
+            .collect();
+        searched.sort();
+        let status = snap.status.clone().unwrap_or_default();
+        let mine = status.acks.iter().find(|a| a.node == self.node);
+        if searched.is_empty()
+            || mine.is_some_and(|a| {
+                a.phase == SnapshotPhase::Discovering && a.searched_pools == searched
+            })
+        {
+            return Ok(());
+        }
+        let copy = snap
+            .metadata
+            .uid
+            .as_ref()
+            .and_then(|u| self.copies.lock().unwrap().get(u).cloned());
+        let ack = SnapshotAck {
+            found: Some(copy.is_some()),
+            searched_pools: searched,
+            taken_pool: copy.as_ref().map(|c| c.pool.clone()),
+            tag_size_bytes: copy.as_ref().and_then(|c| c.size_bytes),
+            tag_source_replicas: copy.as_ref().and_then(|c| c.source_replicas),
+            lv_created_at: copy.as_ref().map(|_| self.lv_time()),
+            ok: true,
+            ..SnapshotAck::new(&self.node, SnapshotPhase::Discovering)
+        };
+        self.apply_ack(&snap.name_any(), &ack).await;
+        Ok(())
+    }
+
+    /// Drops this node's ack: everything applied under its manager.
+    pub async fn forget_ack(&self, snapshot: &str) {
+        let status = json!({
+            "apiVersion": "r-drbd.io/v1alpha1",
+            "kind": "Snapshot",
+            "metadata": { "name": snapshot },
+            "status": { "acks": [] },
+        });
+        Api::<Snapshot>::all(self.client.clone())
+            .patch_status(
+                snapshot,
+                &PatchParams::apply(&agent_field_manager(&self.node)).force(),
+                &Patch::Apply(&status),
+            )
+            .await
+            .expect("agent ack");
     }
 
     /// When this node's snapshot LVs were made: distinct per node, so a
@@ -894,6 +968,10 @@ impl FakeAgent {
             lv_bytes: None,
             allocated_bytes: None,
             lv_created_at: pool.map(|_| self.lv_time()),
+            found: None,
+            searched_pools: Vec::new(),
+            tag_size_bytes: None,
+            tag_source_replicas: None,
             digest: None,
             digest_bytes: None,
             ok,
@@ -911,6 +989,10 @@ impl FakeAgent {
             lv_bytes: None,
             allocated_bytes: None,
             lv_created_at: None,
+            found: None,
+            searched_pools: Vec::new(),
+            tag_size_bytes: None,
+            tag_source_replicas: None,
             digest: Some(digest.to_owned()),
             digest_bytes: Some(GIB),
             ok: true,
@@ -989,6 +1071,16 @@ impl FakeAgent {
                 continue;
             };
             let mine = status.acks.iter().find(|a| a.node == self.node);
+            if phase == SnapshotPhase::Discovering {
+                self.answer(s).await?;
+                continue;
+            }
+            // As the agent: not-found answers go once the discovery ended.
+            if mine.is_some_and(|a| a.phase == SnapshotPhase::Discovering && a.taken_pool.is_none())
+            {
+                self.forget_ack(&s.name_any()).await;
+                continue;
+            }
             if mine.is_some_and(|a| a.phase == phase) {
                 continue;
             }
@@ -1010,13 +1102,25 @@ impl FakeAgent {
                 }
                 // Diskless and tiebreaker ack with IO still suspended.
                 SnapshotPhase::Taking if member => {
+                    if let (Some(pool), Some(uid)) = (&my_pool, &s.metadata.uid) {
+                        let copy = FakeCopy {
+                            pool: pool.clone(),
+                            size_bytes: status.size_bytes,
+                            source_replicas: status.source_replicas,
+                        };
+                        self.copies.lock().unwrap().insert(uid.clone(), copy);
+                    }
                     self.ack(&name, phase, true, my_pool.as_deref()).await;
                 }
                 // Like the agent: any node of the round answers the delete.
                 SnapshotPhase::Deleting if mine.is_some() => {
+                    if let Some(uid) = &s.metadata.uid {
+                        self.copies.lock().unwrap().remove(uid);
+                    }
                     let pool = mine.and_then(|a| a.taken_pool.clone());
                     self.ack(&name, phase, true, pool.as_deref()).await;
                 }
+
                 _ => {}
             }
         }
