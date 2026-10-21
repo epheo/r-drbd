@@ -226,7 +226,7 @@ Backups:
 ### 6.8 Proving holder copies identical
 
 - Why: a page rewritten while it is being written out reaches the local disk and the peer in two versions; the writer's next writeback heals it. A writer that dies first (a killed VM, an O_DIRECT buffer changed in flight) leaves the split for good, and no property of the writer or of the round rules it out. Only content does.
-- After the round ends Ready, each holder reads its snapshot LV over [0, la_size), la_size from that LV's own superblock, and acks `digest` (a sha256 root over 4 MiB chunks) and `digestBytes`. Background, idle IO priority, one snapshot at a time per node; unmapped thin ranges read as zeros without disk IO, and a chunk that reads all zeros counts as the known hash of a zero chunk, so the cost follows the allocated bytes, not the virtual size.
+- After the round ends Ready, each holder reads its snapshot LV over [0, la_size), la_size from that LV's own superblock read as in 7.2 step 2, and acks `digest` (a sha256 root over 4 MiB chunks) and `digestBytes`. Background, idle IO priority, one snapshot at a time per node; unmapped thin ranges read as zeros without disk IO, and a chunk that reads all zeros counts as the known hash of a zero chunk, so the cost follows the allocated bytes, not the virtual size.
 - Once every holder acked, the controller writes `status.copiesIdentical` once: true when all pairs match; false otherwise, with `ImageCopiesDiffer` naming the holders. Absent while pending.
 - While the digests are pending, a restore waits for them up to 2 minutes, and the holders hash that snapshot first. False, or still pending after the bound: the restore takes the sync-source path with checksums (7.5), correct and thin, not instant. Golden images, imported and detached before their snapshot, are expected to match and become instant once the digests are in.
 - Warm copies need no digest: a completed DRBD full sync from the preferred holder makes the copy identical to it.
@@ -240,21 +240,29 @@ Governs every replicated restore: plain restores, VM disks and the warm Volume's
 - CreateVolume sizes the Volume at the request, at least S. Every replica starts at that size: a restore never resizes its DRBD device before its first data.
 - A replica's LV is G: never below L_img. Why: a replica whose usable size falls below la_size cuts the image's tail, where the file system end and a GPT backup header live. The source's la_size is at most the usable size of its smallest LV, so an LV never smaller than L_img holds it.
 - A warm Volume's two LVs are exactly the holder's `lvBytes`.
+- Measured by hand, with no Volume object: a 2 GiB image into a 40 GiB disk on two replicas has both replicas UpToDate 2 s after the first lvcreate.
+- No resync, verify clean, both replicas equal to the image below la_size and zero past it; 16 MiB allocated for both, mostly new metadata.
 
 ### 7.2 Preparing a copy replica (agent)
 
 Runs when the Volume is restoring and the replica's LV is missing in its Pool; it resumes on later passes from the LV's tags and size alone.
 
 1. lvcreate a thin snapshot of the local image copy, with `r-drbd.new`, `r-drbd.from.<volume uid>.<snapshot uid>` and `r-drbd.seed.<volume uid>.<snapshot uid>` in the same command. Its size is L0.
-2. Unless a zeroing or zeroed tag exists: read the superblock at L0 with `drbdmeta --force <unused minor> v09 <lv> internal dump-md`, read-only. `--force` because a snapshot of a live device carries an unclean activity log; never apply-al, never create-md here. Parse la_size and the metadata size. Checks, the first that fails makes the replica a fallback with `ProofFailed`, or stops the restore on the initial node:
-   - C1 dump-md succeeded and the LV is still L0;
-   - C2 S is at most la_size;
-   - C3 la_size plus the metadata size is at most L0;
-   - C4 L0 is at most G (true by construction; kept as an assertion).
-   A la_size that differs from the size formula of drbd-config emits `MetadataSizeDiffers` once; it gates nothing, since that formula is a bound, not DRBD's value.
+2. Unless a zeroing or zeroed tag exists: read the superblock at L0 with `drbdmeta --force <minor> v09 <lv> internal dump-md`, read-only; parse la_size and the metadata size.
+   - `--force` on every dump: drbdmeta calls even a cleanly downed device unclean, and a snapshot of a live device carries an unclean activity log; never apply-al, never create-md here.
+   - Measured: it writes nothing (LV checksum, thin mappings and pool chunks unchanged).
+   - The minor is a fixed one outside the range the controller assigns; for this read it need not be free.
+   - One drbdmeta at a time on that minor, shared by this read and the digest (6.8); a retry on its lock-held exit (20), bounded by the pass or by the digest's next attempt: a TiB bitmap holds the lock for seconds.
+   - The size formula of drbd-config gives DRBD's la_size exactly for holders of one LV size (61 of 61 image and extent sizes measured, 6 peer slots).
+   - Holders one extent apart share the smaller size, so a comparison tells nothing and no Event is emitted.
+   - Checks, the first that fails makes the replica a fallback with `ProofFailed`, or stops the restore on the initial node:
+     - C1 dump-md succeeded and the LV is still L0;
+     - C2 S is at most la_size;
+     - C3 la_size plus the metadata size is at most L0;
+     - C4 L0 is at most G (true by construction; kept as an assertion).
 3. Tag `r-drbd.zeroing.<volume uid>.<la_size>`: la_size is pinned before anything changes and never re-read, because the lvextend moves the device end and the zeroing destroys the superblock.
 4. lvextend to G when the LV is smaller.
-5. Write zeroes over [la_size, L0) of the LV device with BLKZEROOUT. Never below la_size; never at or past L0; [L0, G) has no thin mappings and reads zero unwritten. Never a discard: on dm-thin a discard of part of a chunk keeps the old bytes.
+5. Write zeroes over [la_size, L0) of the LV device with a zero-range fallocate (keep size), which behaves as BLKZEROOUT without unsafe code. Never below la_size; never at or past L0; [L0, G) has no thin mappings and reads zero unwritten. Never a discard: on dm-thin a discard of part of a chunk keeps the old bytes (measured: 40960 old bytes left). Measured: the pool grows only by the chunks that meet the tail; the image copy and its origin stay unchanged.
 6. fdatasync the LV device: dm-thin commits new mappings only on a flush, and an LVM tag commit does not flush the pool.
 7. One lvchange: add `r-drbd.zeroed.<volume uid>.<la_size>`, drop the zeroing tag.
 8. create-md at G and the metadata tag, after the resource file is written.
@@ -293,6 +301,7 @@ A parser test on captured real dump-md output pins the fields: a value parsed wr
 - Once its own proof holds, the initial node's bounds all start at that pass and run side by side: 60 s for each assigned peer to connect and prove, the warm Volume's bound for a warming peer, 2 minutes for pending digests. It decides at once, as the sync source, on `copiesIdentical` false or a connected fallback. Otherwise it decides when every assigned peer is connected and proven or past its bound, and `copiesIdentical` is true or past its bound: the wait is the longest bound still open, never their sum. An unmarked connected peer not yet proven is waited for within its bound, since a status entry can lag the connect.
 - Then it reads the Volume live; a failed live read waits. If `copiesIdentical` is true and every assigned diskful peer is connected and proven with its `zeroedFrom`, it runs `new-current-uuid --clear-bitmap`: no sync. Otherwise it runs `new-current-uuid --force-resync`: every connected peer syncs; copy replicas carry the seed tag, so their connections run with checksums and only differing blocks move, keeping the thin share; a peer that connects later joins the same way. `RestoreFullSync` names the peers and the cause.
 - Because the no-sync start needs every assigned diskful peer connected and proven, no replica can connect after the decision and be declared in sync.
+- DRBD gates neither start on quorum (measured): these checks and the live read are the only guard.
 - Proven peers lose nothing to a forced start but a checksum read pass, run alongside any other sync; the claim waits for the slowest (decision 12).
 - The first Ready needs every diskful replica UpToDate at full size, so a fallback delays the claim by its sync (decision 12).
 
@@ -308,7 +317,12 @@ A parser test on captured real dump-md output pins the fields: a value parsed wr
 - Once the zeroed tag exists no zero write ever repeats: a crash after create-md and before the metadata tag reruns create-md only. When G equals L0 the new metadata sits inside [la_size, L0), and a repeated zero write would destroy it.
 - Status lost: `copyOf`, `zeroedFrom`, `fallback` come back from the tags; preparation never touches an LV with a metadata tag; first data still refuses while any replica holds data.
 - Image copy lost after the lvcreate: the replica keeps its blocks (dm-thin refcounts); before: `NoLocalCopy`, or a new warm copy.
-- A peer down before the first data: the initial node waits 60 s, then starts as the sync source with the connected peers; the peer joins later, with checksums when it is a copy.
+- A peer down before the first data, seen Inconsistent first: the initial node waits 60 s, then starts as the sync source with the connected peers; the peer joins later with a full sync, with checksums when it is a copy.
+- A diskful peer never up, measured with two diskful replicas and a tiebreaker:
+  - after 60 s the initial node starts as the sync source (7.5), but DRBD gives no replica quorum while that peer was never seen, so IO stays suspended;
+  - once the initial node is UpToDate with quorum false and a diskful peer not connected, the controller writes Ready False with reason `WaitingForPeer` and emits one `RestorePeerMissing` Event naming the peer; it differs from `ReplicaMissing` in that the peer never joined;
+  - a node down for good: delete its Node object, then evict (9.5 waives the quorum for a deleted Node); a live node whose replica never comes up: repair it;
+  - the new replica is a copy replica when its Pool holds a copy, else a fallback; the initial node started with a forced resync, so the new replica always syncs.
 - Snapshot status lost: restores wait while the Snapshot is `Discovering` (6.7); the found acks bring `lvBytes` back.
 - The initial node down before the first data: nothing starts until it returns; moving the initial node is a later liveness item.
 
@@ -394,7 +408,7 @@ With checksums, both ends read each block and only differing blocks cross the ne
 
 ### 9.5 Where an eviction joins, and quorum
 
-The eviction's placement ranks Pools with a copy first, then by room; a Pool without a copy gives an empty join. Quorum rules: one move per Volume and pass, refused while no other diskful replica is UpToDate with quorum, or a previous rebuild still runs. After every seeded join in the tests, `drbdadm verify` on the joining connection must end with zero out-of-sync blocks; a difference fails the test and is never resynced silently.
+The eviction's placement ranks Pools with a copy first, then by room; a Pool without a copy gives an empty join. Quorum rules: one move per Volume and pass, refused while no other diskful replica is UpToDate with quorum, or a previous rebuild still runs. A deleted Node object of the evicted node waives the quorum, never the UpToDate. After every seeded join in the tests, `drbdadm verify` on the joining connection must end with zero out-of-sync blocks; a difference fails the test and is never resynced silently.
 
 ## 10. Placement and scheduling
 
@@ -444,7 +458,7 @@ Volume:
 - `spec.purpose`: `Disk` (default) or `WarmCopy` (controller, immutable; WarmCopy needs a source, replicas 2 and ReadWriteOnce). Why not `role`: it already names replica roles.
 - `spec.assignment` of a WarmCopy Volume is written by the controller at creation.
 - `status.replicas[].copyOf`, `zeroedFrom`, `fallback` (values `NoLocalCopy`, `CopyNotUsable`, `RestoreFailed`, `ProofFailed`, `SnapshotNotFound`, `Unknown`), `seededFrom`; all agent-written from tags. A replica entry names its restore source only by `copyOf`, the Snapshot uid; there is no name-based source field.
-- Ready reasons `WaitingForImageCopy`, `SnapshotRetired`, `SnapshotUidMismatch`, `SnapshotLost`; `UnsupportedRestore` also covers a single-replica source.
+- Ready reasons `WaitingForImageCopy`, `WaitingForPeer`, `SnapshotRetired`, `SnapshotUidMismatch`, `SnapshotLost`; `UnsupportedRestore` also covers a single-replica source.
 
 Snapshot:
 - `spec.volumeUid` (controller, immutable); phase `Retired` with Ready reason `Retired`; `phase` without a default; phase `Discovering` with Ready reason `DiscoveryIncomplete`; phase `Lost` with Ready reasons `SnapshotLost` and `TagsDisagree`; the first status written before the finalizer; ack phase `Discovering` with `found`, `searchedPools`, `phaseSince` (the discovery's, echoed), `takenPool`, `lvBytes`, `tagSizeBytes`, `tagSourceReplicas`, `lvCreatedAt`; `lvCreatedAt` on every Taking ack; `status.referencingDisks`; `status.sourceReplicas`; `status.acks[].takenPool`, `lvBytes`, `allocatedBytes` (agent, written once, copied forward); `status.acks[].digest` and `digestBytes` (holders, written once after Ready); `status.copiesIdentical` (controller, written once).
@@ -457,7 +471,7 @@ StorageClass parameters: `capacity` (`cluster`, `node`). Agent settings: `R_DRBD
 
 LV tags (next to the existing `r-drbd.new`, `r-drbd.md.<volume uid>.<node id>`, `r-drbd.from.<volume uid>.<snapshot uid>`): `r-drbd.snap.<snapshot uid>.<size bytes>.<source replicas>` on every snapshot LV, `r-drbd.zeroing.<volume uid>.<la bytes>`, `r-drbd.zeroed.<volume uid>.<la bytes>`, `r-drbd.seed.<volume uid>.<snapshot uid>`, `r-drbd.warm.<snapshot uid>`, `r-drbd.idle.<unix seconds>`. Any path that makes an LV new again, or leaves it behind, drops every tag of this design except the warm tag. Uids are 36-character UUIDs.
 
-Events: `RestoreFullSync`, `MetadataSizeDiffers`, `ReplicaSeeded`, `ReplicaFullSync`, `PlacedOffSchedulerNode` (Volume); `ImageRetired`, `ImageCopiesDiffer`, `ImageDiscoveryIncomplete`, `ImageLost`, `SnapshotLvConflict`, `ImageWarming`, `ImageWarmed`, `ImageWarmFailed`, `ImageWarmRefused` (Snapshot); `ImageOrphanLv`, `ImageEvicted`, `DeletionWaitsForDiscovery` (Pool); `ImageLabelsCapped` (Node). One per transition; the per-replica ones once per replica at its check.
+Events: `RestoreFullSync`, `RestorePeerMissing`, `ReplicaSeeded`, `ReplicaFullSync`, `PlacedOffSchedulerNode` (Volume); `ImageRetired`, `ImageCopiesDiffer`, `ImageDiscoveryIncomplete`, `ImageLost`, `SnapshotLvConflict`, `ImageWarming`, `ImageWarmed`, `ImageWarmFailed`, `ImageWarmRefused` (Snapshot); `ImageOrphanLv`, `ImageEvicted`, `DeletionWaitsForDiscovery` (Pool); `ImageLabelsCapped` (Node). One per transition; the per-replica ones once per replica at its check.
 
 Constants: copy digest chunk 4 MiB; digest wait bound 2 min; warm eviction grace 24 h; minimum idle before an over-budget eviction 10 min; warm Volume progress bound 10 min; seed connect bound 10 min; `csums-alg` sha256 on joining connections; `verify-alg` sha256 everywhere; image label cap 32 per node.
 
@@ -487,7 +501,7 @@ RBAC: the agent patches Nodes and creates Events; the controller creates, patche
 - Storage following a migrated VM (decision 7). If it ever comes: a class parameter, add a seeded replica on the VM's node on publish, trim one unattached replica after a dwell, never below the replica count, never during a migration, one move per node at a time, best effort; it would be the one exception to the rule that r-drbd never moves replicas on its own.
 - A node health label required by replicated volumes (decision 6). If it comes: never from NodeGetInfo, removed only on a positive failure, with hysteresis; no taint, since a taint repels every pod.
 - A scheduler extender, a second scheduler, a pod-mutating webhook (it rewrites specs owned by the VM manager or by GitOps), node-name affinity on replicated volumes (hard and immutable, stale after any move, and it stalls a drain when both replica nodes are unavailable), a PV annotation mirroring the replica nodes (PVs belong to the external provisioner; a manager needs one read rule instead).
-- A per-volume node label (one label per disk on every node), a list of copies on the Snapshot (warm copies are Pool contents), a retained flag (the Retired phase says it), a DRBD device size in the acks (a later relaxation that would let holders with mixed extent sizes take the no-sync path).
+- A per-volume node label (one label per disk on every node), a list of copies on the Snapshot (warm copies are Pool contents), a retained flag (the Retired phase says it), a DRBD device size in the acks (holders one extent apart already record the same la_size; only a warm copy cut from the larger holder differs, 8.3).
 - Limiting a join's resync to the disk's changed ranges by crafting DRBD metadata; rejected. Using thin_delta to drive a range-limited resync is a study item with the default answer no.
 - Moving the initial node of a restore to another copy replica while it is down: a later liveness item.
 - Fallback isolation: keeping a replica without a copy disconnected until the proven replicas have started, which allowed a start rule that ignores unconnected peers. Dropped together with that rule for the strict rule of 7.5, which is race-free without a gate; it can return as an optimization if the checksum pass proves costly on large disks.
@@ -498,12 +512,12 @@ Each result goes into this document before the step it gates; the list shrinks a
 
 - Read latency inside a VM, local replica against a network attachment: random 4k and sequential 1 MiB reads at p50 and p99, a boot and a package install, fixed guest memory, cold and warm. KubeVirt runs QEMU with cache none on block, so the guest page cache is the only cache and a re-read crosses the network only on a guest miss. Decides the value of locality, the copy rank at birth, the `capacity` default and whether follow is ever revisited. The bar: p50 read latency at least twice lower, or a VM-like load at least 20 percent shorter, cold.
 - The checksum resync: a 10 GiB image plus a 500 MiB delta, a seed cut from a copy, bytes on the wire, time, allocation on the target, verify clean, at DRBD's default and a raised rate limit, VM latency during it, sha256 against crc32c; whether DRBD refuses a connect whose ends disagree on `csums-alg` or `verify-alg`, and whether a live change needs a reconnect; which configuration section carries the per-peer-device rate options and which end's values the resync uses.
-- The no-grow restore: a sweep of image sizes and extent sizes comparing the formula's usable size with DRBD's la_size (how often the diagnostic Event fires); dump-md with `--force` on a snapshot of a live device writes nothing (LV checksum before and after); whether `new-current-uuid` is accepted without quorum; how drbdmeta takes a minor with no resource configured, else the agent reserves one; what quorum a replica entry reports before the first data with every disk Inconsistent; BLKZEROOUT then fdatasync then a hard reset reads zero; a 2 GiB image into a 40 GiB disk on two replicas is Ready with no resync bytes and verify clean.
+- The no-grow restore: a zero-range write then fdatasync then a hard reset reads zero (needs a host whose hard reset is allowed); three diskful replicas with one never up: the quorum each reports before and after the start.
 - The checksum pass of a forced start: its rate at DRBD's default and raised controller settings; whether unmapped zero ranges count against the rate limit; the source's CPU and read amplification with two checksum targets; digest bytes on the wire per GiB. From the measured 8 GiB zero sync at about 170 MiB/s: minutes per 40 GiB at the default pace, tens of seconds at a raised pace bound by hashing.
 - The holder digest: time for a 10 GiB image with 3 GiB allocated and for 100 GiB with 30 GiB; the 2-minute wait bound against it.
 - Divergence under live writes: compare holder copies only with IO suspended on every node or through verify, never by reading the two nodes at different moments; the same round under a buffered writer inside a VM; whether any difference outlives one minute without a writer.
 - Live migration onto a replica mid checksum resync: the VM keeps running, a writer inside loses nothing, verify clean.
-- The warm copy path: a 10 GiB image with 3 GiB allocated copied through a two-replica restore by hand; time and bytes (within 10 percent of the allocated size), data areas equal, the holder's snapshot LV untouched, the sync completing without a tiebreaker.
+- The warm copy path: a 10 GiB image with 3 GiB allocated copied through a two-replica restore by hand; time and bytes (within 10 percent of the allocated size), data areas equal, the holder's snapshot LV untouched, the sync completing without a tiebreaker; the warm LV's la-size-sect after down, since metadata that never had first data records 0.
 - Quorum with three diskful replicas, one Inconsistent, plus a tiebreaker: who keeps quorum under each partition. Only needed if follow is ever revisited.
 - KubeVirt affinity updates: a running VM accepts a changed preferred affinity and the next migration uses it; which rollout strategy propagates it; a drain of one replica node with N VMs, counting how many land on the other replica node, and a second drain showing the fallen-through VMs healing. Needs a multi-node KubeVirt cluster.
 - CDI on the version in use: the import PVC is deleted with the snapshot source format; a snapshot clone under WaitForFirstConsumer binds only when the VM's pod is scheduled; a larger clone gets its size from CDI without an expand step on block; a source PVC name is never reused for the same digest.
@@ -542,6 +556,7 @@ No-grow restore:
 - Every peer proven with digests pending: the start waits up to 2 minutes, the clear-bitmap on true, else the sync source; false gives the sync source at once.
 - A holder copy altered by hand: its restore moves only the altered chunk.
 - A single-replica snapshot refused as an image.
+- A diskful peer on a node down for good: `WaitingForPeer` after the start and one `RestorePeerMissing`; after its Node object is deleted and the evict runs, the restore completes and verify is clean.
 
 Capacity: a restore whose full size exceeds a holder Pool's room is refused with ResourceExhausted; an accepted one counts at full size.
 
