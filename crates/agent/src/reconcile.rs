@@ -1357,16 +1357,10 @@ impl Reconciler {
                     pool = own.place.pool,
                     "copy found by its tag"
                 );
-                let t = own.taken();
                 SnapshotAck {
                     found: Some(true),
-                    taken_pool: t.pool,
-                    lv_bytes: t.lv_bytes,
-                    lv_created_at: t.lv_created_at,
-                    tag_size_bytes: Some(own.tag.size_bytes),
-                    tag_source_replicas: Some(own.tag.source_replicas),
-                    ok: true,
-                    ..asked
+                    searched_pools: asked.searched_pools,
+                    ..ack(&self.node, SnapshotPhase::Discovering, own.taken(), Ok(()))
                 }
             }
             Ok(None) => SnapshotAck {
@@ -1515,7 +1509,7 @@ impl Reconciler {
         let origin = lvm::names::volume_lv(&snap.spec.volume);
         let mut conflict = false;
         let res = match (self.place(pools, pool), snap_tag_of(snap)) {
-            (Ok(place), Ok((uid, tag))) => match self.foreign_lv(reads, &place, lv, uid).await {
+            (Ok(place), Ok(tag)) => match self.foreign_lv(reads, &place, lv, &tag.uid).await {
                 Ok(Some(why)) => {
                     conflict = true;
                     Err(why)
@@ -1583,9 +1577,11 @@ impl Reconciler {
         origin: &str,
         lv: &str,
         kind: Origin,
-        tag: &str,
+        tag: &storage::SnapTag,
     ) -> Result<Taken, String> {
-        self.take_lv(reads, place, origin, lv, kind, tag).await?;
+        let tagged = storage::snap_tag(&tag.uid, tag.size_bytes, tag.source_replicas);
+        self.take_lv(reads, place, origin, lv, kind, &tagged)
+            .await?;
         let rows = reads.lvs(&self.lvm, &place.vg).await?;
         let row = find_in_pool(&rows, lv, &place.thin)?
             .ok_or_else(|| format!("snapshot LV {}/{lv} missing after its take", place.vg))?;
@@ -1598,6 +1594,8 @@ impl Reconciler {
             allocated_bytes: find_in_pool(&rows, origin, &place.thin)?
                 .and_then(lvm::report::thin_used_bytes),
             lv_created_at: created.and_then(unix_time),
+            tag_size_bytes: Some(tag.size_bytes),
+            tag_source_replicas: Some(tag.source_replicas),
             ..Taken::default()
         })
     }
@@ -1925,20 +1923,24 @@ impl OwnLv {
             pool: Some(self.place.pool.clone()),
             lv_bytes: Some(self.row.size_bytes),
             lv_created_at: self.created.and_then(unix_time),
+            tag_size_bytes: Some(self.tag.size_bytes),
+            tag_source_replicas: Some(self.tag.source_replicas),
             ..Taken::default()
         }
     }
 }
 
-/// Where this node's snapshot LV lives, as its successful Taking ack
-/// recorded it, and its digest once hashed; every later ack carries them
-/// unchanged.
+/// Where this node's snapshot LV lives and what its tag records, as its
+/// successful Taking ack recorded them, and its digest once hashed; every
+/// later ack carries them unchanged.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Taken {
     pool: Option<String>,
     lv_bytes: Option<u64>,
     allocated_bytes: Option<u64>,
     lv_created_at: Option<Time>,
+    tag_size_bytes: Option<u64>,
+    tag_source_replicas: Option<u32>,
     digest: Option<String>,
     digest_bytes: Option<u64>,
 }
@@ -1950,6 +1952,8 @@ impl Taken {
             lv_bytes: a.lv_bytes,
             allocated_bytes: a.allocated_bytes,
             lv_created_at: a.lv_created_at.clone(),
+            tag_size_bytes: a.tag_size_bytes,
+            tag_source_replicas: a.tag_source_replicas,
             digest: a.digest.clone(),
             digest_bytes: a.digest_bytes,
         })
@@ -1962,6 +1966,8 @@ fn ack(node: &str, phase: SnapshotPhase, taken: Taken, res: Result<(), String>) 
         lv_bytes: taken.lv_bytes,
         allocated_bytes: taken.allocated_bytes,
         lv_created_at: taken.lv_created_at,
+        tag_size_bytes: taken.tag_size_bytes,
+        tag_source_replicas: taken.tag_source_replicas,
         digest: taken.digest,
         digest_bytes: taken.digest_bytes,
         ok: res.is_ok(),
@@ -1973,16 +1979,20 @@ fn ack(node: &str, phase: SnapshotPhase, taken: Taken, res: Result<(), String>) 
 /// Warning Event: an LV of a Snapshot's LV name that is not its copy.
 pub const SNAPSHOT_LV_CONFLICT: &str = "SnapshotLvConflict";
 
-/// The uid and the snap tag of this Snapshot's LV: the controller writes
-/// sizeBytes and sourceReplicas on the way into Taking.
-fn snap_tag_of(snap: &Snapshot) -> Result<(&str, String), String> {
+/// What this Snapshot's LV tag records: the controller writes sizeBytes
+/// and sourceReplicas on the way into Taking.
+fn snap_tag_of(snap: &Snapshot) -> Result<storage::SnapTag, String> {
     let st = snap.status.as_ref();
     match (
         snap.metadata.uid.as_deref(),
         st.and_then(|s| s.size_bytes),
         st.and_then(|s| s.source_replicas),
     ) {
-        (Some(uid), Some(size), Some(n)) => Ok((uid, storage::snap_tag(uid, size, n))),
+        (Some(uid), Some(size_bytes), Some(source_replicas)) => Ok(storage::SnapTag {
+            uid: uid.to_owned(),
+            size_bytes,
+            source_replicas,
+        }),
         _ => Err("no uid, sizeBytes or sourceReplicas to tag the snapshot LV with".to_owned()),
     }
 }

@@ -197,10 +197,11 @@ pub struct SnapshotAck {
     /// only while these are the node's Pools.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub searched_pools: Vec<String>,
-    /// Discovering: the size the found LV's tag records.
+    /// The size the snapshot LV's tag records, as the take wrote it or a
+    /// discovery found it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag_size_bytes: Option<u64>,
-    /// Discovering: the source replicas the found LV's tag records.
+    /// The source replicas the snapshot LV's tag records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag_source_replicas: Option<u32>,
     /// Hex sha256 over the sha256 of each 4 MiB chunk of the snapshot LV
@@ -237,5 +238,14 @@ impl SnapshotAck {
             ok: false,
             error: None,
         }
+    }
+
+    /// Names a holder copy: takenPool and the tag values. A holder ack
+    /// without them was written before snapshot LV tags, and nothing
+    /// proves its LV is this Snapshot's copy.
+    pub fn holder_copy(&self) -> bool {
+        self.taken_pool.is_some()
+            && self.tag_size_bytes.is_some()
+            && self.tag_source_replicas.is_some()
     }
 }

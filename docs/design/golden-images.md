@@ -154,6 +154,7 @@ Snapshot LV tags:
 - A CSI retry under the same name fails the same way; the orphan report names the LV.
 - A restore or warm copy cut from a snapshot LV drops the snap tag.
 - Every Taking ack carries the LV's creation time; `createdAt` is the earliest holder's, so a rebuilt status equals the lost one.
+- Every holder ack carries the tag values; one without them is not a holder copy.
 - Snapshot LVs from before tags existed are not holder copies: such snapshots are no longer restorable.
 
 Freeze and failure:

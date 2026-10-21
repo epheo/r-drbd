@@ -97,9 +97,8 @@ It always lands in the Pools that hold the snapshot.
 
 Rules:
 
-- A copy is restored only when its LV carries the Snapshot's uid tag: a snapshot taken before these tags existed is no longer restorable, and its restore fails saying so.
+- A copy is restored only when its LV carries the Snapshot's uid tag: a snapshot taken before these tags existed is no longer restorable, and its restore fails saying so (CreateVolume answers FailedPrecondition; a restore already placed fails with reason `UnsupportedRestore`).
   A restored LV never keeps the snapshot's tag.
-
 - A local restore (`replicas: 1`) uses one of the nodes holding the snapshot, preferring one whose agent is alive; the new volume is a writable thin snapshot of the snapshot LV, so it is instant and shares blocks.
 - A replicated restore needs `replicas` equal to the number of nodes holding the snapshot.
   With `copiesIdentical` true every replica restores its own copy, a thin snapshot, and nothing syncs.
@@ -107,7 +106,7 @@ Rules:
   While the digests are pending each replica restores its copy and the first node waits for them up to 2 minutes; past that it is the sync source and the others are copied in full.
   The volume is Ready, and its claim usable, once any sync ends.
 - A holder whose node is down, whose agent is stale or whose Pool is not Available keeps the restore Pending, reason `Insufficient`, naming it.
-- A Ready snapshot without a holder ack keeps the restore Pending, reason `SnapshotNotReady`: while it has fewer holders than its source had replicas, every node without an ack searches for its LV by the uid tag and acks a copy it finds.
+- A Ready snapshot with fewer holders than its source had replicas (an ack lost) has every node without an ack search for its LV by the uid tag and ack a copy it finds.
 - A snapshot rebuilding a lost status (phase `Discovering`) is waited for: CreateVolume writes nothing until its size is known again.
   A Lost one is refused: CreateVolume answers FailedPrecondition, and a restore already placed fails with reason `SnapshotLost`.
 - A replicated restore larger than its snapshot starts at the snapshot's size, then grows online; the new area syncs, zero blocks as discards.

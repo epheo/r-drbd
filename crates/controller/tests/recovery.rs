@@ -659,3 +659,53 @@ async fn csi_and_placement_wait_on_a_discovery_and_refuse_a_lost_image() {
     let v = volume_where(&client, "placed", |v| phase_of(v) == VolumePhase::Failed).await;
     assert_eq!(support::ready_reason(&v).as_deref(), Some("SnapshotLost"));
 }
+
+/// Holder acks without the tag values were written before snapshot LV
+/// tags: nothing proves those LVs are the snapshot's copies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_taken_before_tags_is_refused_as_an_image() {
+    use csi::tonic::{Code, Request};
+    use csi::v1::controller_server::Controller;
+    let assets = require_envtest!();
+    let (env, client, _ctl) = setup(&assets).await;
+    let agents = cluster(&client).await;
+    let auto: Vec<_> = agents.iter().cloned().map(FakeAgent::spawn_auto).collect();
+    let snap = ready_snapshot(&client).await;
+    for h in auto {
+        h.abort();
+    }
+    for a in &snap.status.unwrap().acks {
+        let untagged = model::SnapshotAck {
+            tag_size_bytes: None,
+            tag_source_replicas: None,
+            ..a.clone()
+        };
+        let agent = agents.iter().find(|x| x.node == a.node).unwrap();
+        agent.apply_ack("snap", &untagged).await;
+    }
+    snapshot_where(&client, "snap", |s| holders(s).is_empty()).await;
+    let (stores, watchers) = controller::store::start(
+        client.clone(),
+        support::NAMESPACE,
+        controller::store::LEASE_STALE,
+    );
+    let _watchers = tokio::spawn(watchers);
+    stores.wait_ready().await.unwrap();
+    let svc = controller::csi::Csi::new(client.clone(), stores, support::config(&env, "ctl"));
+    let e = svc
+        .create_volume(Request::new(restore_request("refused")))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), Code::FailedPrecondition, "{e}");
+    assert!(e.message().contains("before snapshot LV tags"), "{e}");
+    assert!(support::get_volume(&client, "refused").await.is_none());
+
+    let mut spec = volume_spec(GIB, 2, "fast");
+    spec.source = Some(support::snapshot_source(&client, "snap").await);
+    create_volume(&client, "placed", spec).await;
+    let v = volume_where(&client, "placed", |v| phase_of(v) == VolumePhase::Failed).await;
+    assert_eq!(
+        support::ready_reason(&v).as_deref(),
+        Some("UnsupportedRestore")
+    );
+}

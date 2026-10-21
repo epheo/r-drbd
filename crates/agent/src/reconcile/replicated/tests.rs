@@ -2325,20 +2325,13 @@ async fn only_the_lowest_node_id_resizes() {
 fn round_ack(phase: SnapshotPhase, ok: bool) -> SnapshotAck {
     let taken = phase == SnapshotPhase::Taking && ok;
     SnapshotAck {
-        node: NODE.into(),
-        phase,
         taken_pool: taken.then(|| POOL.into()),
         lv_bytes: taken.then_some(LV_KIB * 1024),
         allocated_bytes: taken.then_some(0),
-        lv_created_at: None,
-        found: None,
-        searched_pools: Vec::new(),
-        tag_size_bytes: None,
-        tag_source_replicas: None,
-        digest: None,
-        digest_bytes: None,
+        tag_size_bytes: taken.then_some(GIB),
+        tag_source_replicas: taken.then_some(2),
         ok,
-        error: None,
+        ..SnapshotAck::new(NODE, phase)
     }
 }
 

@@ -1158,14 +1158,14 @@
                               "type": "array"
                             },
                             "tagSizeBytes": {
-                              "description": "Discovering: the size the found LV's tag records.",
+                              "description": "The size the snapshot LV's tag records, as the take wrote it or a\ndiscovery found it.",
                               "format": "uint64",
                               "minimum": 0.0,
                               "nullable": true,
                               "type": "integer"
                             },
                             "tagSourceReplicas": {
-                              "description": "Discovering: the source replicas the found LV's tag records.",
+                              "description": "The source replicas the snapshot LV's tag records.",
                               "format": "uint32",
                               "minimum": 0.0,
                               "nullable": true,

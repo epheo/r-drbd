@@ -128,20 +128,13 @@ fn expect_restore(x: &ScriptedExec, source: &str, snapshot: &str, lv: &str) {
 
 fn taken_ack(phase: SnapshotPhase, pool: &str) -> SnapshotAck {
     SnapshotAck {
-        node: NODE.into(),
-        phase,
         taken_pool: Some(pool.into()),
         lv_bytes: Some(GIB),
         allocated_bytes: Some(GIB / 4),
-        lv_created_at: None,
-        found: None,
-        searched_pools: Vec::new(),
-        tag_size_bytes: None,
-        tag_source_replicas: None,
-        digest: None,
-        digest_bytes: None,
+        tag_size_bytes: Some(GIB),
+        tag_source_replicas: Some(1),
         ok: true,
-        error: None,
+        ..SnapshotAck::new(NODE, phase)
     }
 }
 

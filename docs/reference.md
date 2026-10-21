@@ -93,7 +93,7 @@ A snapshot over the limit ends Failed before any IO is suspended.
 | `status.phaseSince` | When the current phase began |
 | `status.sourceReplicas` | The source Volume's replicas, written on the way into Taking |
 | `status.copiesIdentical` | Written once every holder acked a digest: true when all match. Absent while pending |
-| `status.acks[]` | Per node: `node`, `phase`, `ok`, `error`, and from its successful take `takenPool`, `lvBytes`, `allocatedBytes`, `lvCreatedAt` (when LVM created the snapshot LV); after Ready, `digest` (hex sha256 over the sha256 of each 4 MiB chunk) and `digestBytes` (the range, the DRBD device size from the copy's metadata). Every later ack copies them. A `Discovering` answer: `searchedPools` (every Pool of the node), `found`, and for a copy found `takenPool`, `lvBytes`, `lvCreatedAt`, `tagSizeBytes` and `tagSourceReplicas` (what its tag records); a found answer is a holder ack from then on, the others go once the phase moves on |
+| `status.acks[]` | Per node: `node`, `phase`, `ok`, `error`, and from its successful take `takenPool`, `lvBytes`, `allocatedBytes`, `lvCreatedAt` (when LVM created the snapshot LV), `tagSizeBytes` and `tagSourceReplicas` (what the take wrote in the LV's tag; a holder ack without them is no holder copy); after Ready, `digest` (hex sha256 over the sha256 of each 4 MiB chunk) and `digestBytes` (the range, the DRBD device size from the copy's metadata). Every later ack copies them. A `Discovering` answer: `searchedPools` (every Pool of the node), `found`, and for a copy found `takenPool`, `lvBytes`, `lvCreatedAt`, `tagSizeBytes` and `tagSourceReplicas` (what its tag records); a found answer is a holder ack from then on, the others go once the phase moves on |
 | `status.lastError` | Why it waits in Pending, or why it failed |
 | `status.conditions` | `Ready` |
 | `status.observedGeneration` | Spec generation the controller last wrote status for |
@@ -156,7 +156,7 @@ Volume `Ready`:
 | `SnapshotFailed` | Restore source has no node holding it |
 | `SnapshotUidMismatch` | The Snapshot of that name has another uid (waits), or the source has no uid (fails) |
 | `SnapshotLost` | The Snapshot is Lost, confirmed on a live read (fails) |
-| `UnsupportedRestore` | Replica count differs from the snapshot's node count |
+| `UnsupportedRestore` | Replica count differs from the snapshot's node count, or the snapshot was taken before snapshot LV tags |
 | `RestoreNodeConflict` | Pins point away from the snapshot |
 | `InvalidSurvivor` | `spec.resolve.survivor` holds no diskful replica |
 | `ResolveWithoutSplitBrain` | `spec.resolve` is set but there is no split brain; the status of `Ready` is kept; remove `spec.resolve` |

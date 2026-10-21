@@ -18,7 +18,8 @@ use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Api, Client, ResourceExt};
 use model::keys::{agent_field_manager, agent_lease_name};
 use model::{
-    Pool, PoolSpec, ReplicaStatus, Role, Snapshot, SnapshotAck, SnapshotPhase, Volume, VolumeSpec,
+    Pool, PoolSpec, ReplicaStatus, Role, Snapshot, SnapshotAck, SnapshotPhase, SnapshotStatus,
+    Volume, VolumeSpec,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -960,22 +961,23 @@ impl FakeAgent {
         .await;
     }
 
+    /// With `pool`, a holder ack carrying what the take wrote in its tag.
     pub async fn ack(&self, snapshot: &str, phase: SnapshotPhase, ok: bool, pool: Option<&str>) {
+        let st = match pool {
+            Some(_) => get_snapshot(&self.client, snapshot)
+                .await
+                .and_then(|s| s.status)
+                .unwrap_or_default(),
+            None => SnapshotStatus::default(),
+        };
         let ack = SnapshotAck {
-            node: self.node.clone(),
-            phase,
             taken_pool: pool.map(str::to_owned),
-            lv_bytes: None,
-            allocated_bytes: None,
             lv_created_at: pool.map(|_| self.lv_time()),
-            found: None,
-            searched_pools: Vec::new(),
-            tag_size_bytes: None,
-            tag_source_replicas: None,
-            digest: None,
-            digest_bytes: None,
+            tag_size_bytes: st.size_bytes,
+            tag_source_replicas: st.source_replicas,
             ok,
             error: (!ok).then(|| format!("fake failure on {}", self.node)),
+            ..SnapshotAck::new(&self.node, phase)
         };
         self.apply_ack(snapshot, &ack).await;
     }
@@ -983,25 +985,18 @@ impl FakeAgent {
     /// The successful Taking ack in `pool`, with this node's digest.
     pub async fn ack_digest(&self, snapshot: &str, pool: &str, digest: &str) {
         let ack = SnapshotAck {
-            node: self.node.clone(),
-            phase: SnapshotPhase::Taking,
             taken_pool: Some(pool.to_owned()),
-            lv_bytes: None,
-            allocated_bytes: None,
-            lv_created_at: None,
-            found: None,
-            searched_pools: Vec::new(),
-            tag_size_bytes: None,
-            tag_source_replicas: None,
+            tag_size_bytes: Some(GIB),
+            tag_source_replicas: Some(2),
             digest: Some(digest.to_owned()),
             digest_bytes: Some(GIB),
             ok: true,
-            error: None,
+            ..SnapshotAck::new(&self.node, SnapshotPhase::Taking)
         };
         self.apply_ack(snapshot, &ack).await;
     }
 
-    async fn apply_ack(&self, snapshot: &str, ack: &SnapshotAck) {
+    pub async fn apply_ack(&self, snapshot: &str, ack: &SnapshotAck) {
         let status = json!({
             "apiVersion": "r-drbd.io/v1alpha1",
             "kind": "Snapshot",

@@ -570,9 +570,10 @@ impl Csi {
         Ok((source, size, holder_node))
     }
 
-    /// The live Snapshot a restore reads: never a Lost one, and never one
-    /// still rebuilding its status, whose size is unknown until its copies
-    /// answered; that one is waited for like a Volume not Ready yet.
+    /// The live Snapshot a restore reads: never a Lost one or one taken
+    /// before snapshot LV tags, and never one still rebuilding its status,
+    /// whose size is unknown until its copies answered; that one is waited
+    /// for like a Volume not Ready yet.
     async fn resolve_snapshot(&self, id: &str) -> Result<Snapshot, Status> {
         let read = || async {
             let snap = self
@@ -581,8 +582,11 @@ impl Csi {
                 .await
                 .map_err(|e| kube_status("reading snapshot", &e))?
                 .ok_or_else(|| Status::not_found(format!("snapshot {id} not found")))?;
-            match lost(id, &snap) {
-                Some(e) => Err(e),
+            if let Some(e) = lost(id, &snap) {
+                return Err(e);
+            }
+            match crate::volume::taken_before_tags(&snap) {
+                Some(why) => Err(Status::failed_precondition(why)),
                 None => Ok(snap),
             }
         };
