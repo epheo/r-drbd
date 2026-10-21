@@ -107,7 +107,7 @@ Rules:
   The volume is Ready, and its claim usable, once any sync ends.
 - A holder whose node is down, whose agent is stale or whose Pool is not Available keeps the restore Pending, reason `Insufficient`, naming it.
 - A Ready snapshot with fewer holders than its source had replicas (an ack lost) has every node without an ack search for its LV by the uid tag and ack a copy it finds.
-- A snapshot rebuilding a lost status (phase `Discovering`) is waited for: CreateVolume writes nothing until its size is known again.
+- A snapshot rebuilding a lost status (phase `Discovering`) is waited for: CreateVolume writes nothing until its size is known again, and the replicas of a restore already placed wait for their copies rather than start empty.
   A Lost one is refused: CreateVolume answers FailedPrecondition, and a restore already placed fails with reason `SnapshotLost`.
 - A replicated restore larger than its snapshot starts at the snapshot's size, then grows online; the new area syncs, zero blocks as discards.
   The claim is usable once the volume is Ready at the requested size.

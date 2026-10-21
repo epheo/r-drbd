@@ -124,6 +124,11 @@ fn holds_freeze(s: &Snapshot) -> bool {
         }
 }
 
+/// A Snapshot that lost its status or is finding its copies again.
+fn rebuilding(s: &Snapshot) -> bool {
+    s.status_lost() || s.status.as_ref().and_then(|st| st.phase) == Some(SnapshotPhase::Discovering)
+}
+
 pub(super) fn snapshot_round_active(snapshots: &[Arc<Snapshot>], volume: &str) -> bool {
     snapshots
         .iter()
@@ -1058,6 +1063,15 @@ impl Reconciler {
         desired: u64,
     ) -> (Result<(), String>, bool) {
         let vg = place.vg.as_str();
+        // A discovery cleared the acks; this node's copy is still there and
+        // acked again once found.
+        if let Some(snap) = source.filter(|s| rebuilding(s)) {
+            let e = format!(
+                "source snapshot {} is rebuilding its status: waiting for its copies",
+                snap.name_any()
+            );
+            return (Err(e), false);
+        }
         let identical = source.and_then(self.drbd.copies_identical);
         // Pending digests may still prove the copies: a peer restores its
         // own, and a full sync overwrites it if the start is not clean.

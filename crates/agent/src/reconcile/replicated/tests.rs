@@ -1277,6 +1277,27 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
     assert!(!seen(&x, "drbdadm"));
 }
 
+/// A source rebuilding its status has no acks yet: the peer waits for it,
+/// never an empty LV in place of its copy.
+#[tokio::test]
+async fn restore_peer_waits_while_its_source_is_discovering() {
+    let mut snap = source_snapshot();
+    let st = snap.status.as_mut().unwrap();
+    st.phase = Some(SnapshotPhase::Discovering);
+    st.acks.clear();
+    let mut r = Rig::on("n2", &[], FakeHost::default());
+    r.rec.drbd.copies_identical = proven;
+    let x = r.x.clone();
+    reads(&x, &[source_lv()]);
+    // Then the discovery finds this node's copy by its tag.
+    expect_lvs(&x, &[source_lv()]);
+    expect_source_tags(&x);
+    let e = n2_restore_pass(&mut r, &[snap]).await;
+    let err = e.last_error.unwrap();
+    assert!(err.contains("rebuilding its status"), "{err}");
+    assert!(!seen(&x, "lvcreate"));
+}
+
 /// Holder copies that differ, whichever version took them: one copy, the
 /// initial node's, and the other replicas sync in full from it, even when
 /// they claim a copy. Never a start without a sync.
