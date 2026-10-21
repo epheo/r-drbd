@@ -374,6 +374,8 @@ fn source_snapshot() -> Snapshot {
             taken_pool: Some(format!("pool-{n}")),
             lv_bytes: None,
             allocated_bytes: None,
+            digest: None,
+            digest_bytes: None,
             ok: true,
             error: None,
         })
@@ -1097,6 +1099,8 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
         taken_pool: Some("pool-elsewhere".into()),
         lv_bytes: None,
         allocated_bytes: None,
+        digest: None,
+        digest_bytes: None,
         ok: true,
         error: None,
     }];
@@ -1560,6 +1564,8 @@ async fn snapshot_lv_is_kept_while_a_restore_here_is_not_initialized() {
         taken_pool: Some(POOL.into()),
         lv_bytes: None,
         allocated_bytes: None,
+        digest: None,
+        digest_bytes: None,
         ok: true,
         error: None,
     }];
@@ -2158,6 +2164,8 @@ fn round_ack(phase: SnapshotPhase, ok: bool) -> SnapshotAck {
         taken_pool: taken.then(|| POOL.into()),
         lv_bytes: taken.then_some(LV_KIB * 1024),
         allocated_bytes: taken.then_some(0),
+        digest: None,
+        digest_bytes: None,
         ok,
         error: None,
     }
@@ -2392,6 +2400,8 @@ async fn diskless_replica_keeps_its_freeze_through_taking() {
         taken_pool: None,
         lv_bytes: None,
         allocated_bytes: None,
+        digest: None,
+        digest_bytes: None,
         ok: true,
         error: None,
     };
@@ -2405,6 +2415,8 @@ async fn diskless_replica_keeps_its_freeze_through_taking() {
         taken_pool: None,
         lv_bytes: None,
         allocated_bytes: None,
+        digest: None,
+        digest_bytes: None,
         ok: true,
         error: None,
     };

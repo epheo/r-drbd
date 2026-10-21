@@ -92,7 +92,8 @@ A snapshot over the limit ends Failed before any IO is suspended.
 | `status.createdAt` | When the snapshot was taken |
 | `status.phaseSince` | When the current phase began |
 | `status.sourceReplicas` | The source Volume's replicas, written on the way into Taking |
-| `status.acks[]` | Per node: `node`, `phase`, `ok`, `error`, and from its successful take `takenPool`, `lvBytes`, `allocatedBytes`, copied by every later ack |
+| `status.copiesIdentical` | Written once every holder acked a digest: true when all match. Absent while pending |
+| `status.acks[]` | Per node: `node`, `phase`, `ok`, `error`, and from its successful take `takenPool`, `lvBytes`, `allocatedBytes`; after Ready, `digest` (hex sha256 over the sha256 of each 4 MiB chunk) and `digestBytes` (the range, the DRBD device size from the copy's metadata). Every later ack copies them |
 | `status.lastError` | Why it waits in Pending, or why it failed |
 | `status.conditions` | `Ready` |
 | `status.observedGeneration` | Spec generation the controller last wrote status for |
@@ -187,6 +188,8 @@ Pool `Released`: `Removed` (True: thin pool, VG and PV labels removed), `RemoveB
 Pool Events: `DeviceNotUsable` (Warning: an appended path is not blank and stays out of the pool), `PoolNotGrown` (Warning: a growth step failed, or the metadata maximum leaves VG space out of the pool).
 
 Volume Events: `Evicted`, `EvictionBlocked`, `SplitBrainResolved`, `PeerUnreachable` (Warning), `PeersReachable`, `AttachmentFailed` (Warning, once per distinct message), `StatusApplyFailed` (Warning, once per error kind until an apply succeeds), `DuplicateAssignment` (Warning on each holder of a minor or port held twice; never rewritten).
+
+Snapshot Events: `ImageCopiesDiffer` (Warning, once when `copiesIdentical` is written false; names each holder's digest).
 
 ## CSI driver
 

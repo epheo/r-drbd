@@ -14,6 +14,8 @@ k8s-openapi.workspace = true
 kube = { workspace = true, features = ["client", "runtime", "rustls-tls", "ring"] }
 lvm.workspace = true
 model.workspace = true
+# Already in the tree through rustls: the holder digests use its sha256.
+ring = "0.17.14"
 rustix = { workspace = true, features = ["fs", "process", "net", "event"] }
 serde.workspace = true
 serde_json.workspace = true

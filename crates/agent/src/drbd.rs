@@ -210,6 +210,21 @@ pub mod argv {
         ])
     }
 
+    /// The superblock of an LV no resource uses, a snapshot LV. --force: a
+    /// snapshot of a live device carries an unclean activity log. Never
+    /// apply-al or create-md on such an LV: the read writes nothing.
+    pub fn dump_md(dev: &str) -> Vec<String> {
+        a(&[
+            "drbdmeta",
+            "--force",
+            &super::UNUSED_MINOR.to_string(),
+            "v09",
+            dev,
+            "internal",
+            "dump-md",
+        ])
+    }
+
     /// No block device freeze: it flushes the Primary's page cache into
     /// its own backing device after IO is suspended, never to the peers,
     /// so the copies of one snapshot round would differ. drbdadm has no
@@ -287,6 +302,28 @@ pub fn slot_holders(stdout: &str) -> Result<Vec<u8>, String> {
         .filter(|(_, p)| p["bitmap_index"].as_i64().is_some_and(|i| i >= 0))
         .filter_map(|(id, _)| u8::try_from(id).ok())
         .collect())
+}
+
+/// drbdmeta needs a minor even for an LV no resource uses: one outside
+/// the range the controller assigns.
+pub const UNUSED_MINOR: u32 = *model::keys::MINOR_RANGE.end() + 1;
+
+/// The DRBD device size in bytes from dump-md output: the size the
+/// device had when this metadata was last written.
+pub fn la_size(dump_md: &str) -> Result<u64, String> {
+    let sectors = dump_md
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("la-size-sect "))
+        .and_then(|v| v.trim().strip_suffix(';'))
+        .ok_or("no la-size-sect in the superblock dump")?
+        .trim()
+        .parse::<u64>()
+        .map_err(|e| format!("la-size-sect: {e}"))?;
+    match sectors.checked_mul(512) {
+        Some(0) => Err("la-size-sect is 0: the metadata was never attached".to_owned()),
+        Some(b) => Ok(b),
+        None => Err(format!("la-size-sect {sectors} out of range")),
+    }
 }
 
 /// (drbdsetup command, option) for each optional setting.

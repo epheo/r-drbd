@@ -48,6 +48,58 @@ fn command_lines() {
     );
 }
 
+/// The head of a real dump-md of a snapshot LV of a 256 MiB volume, from
+/// drbd-utils 9.35; the peer and bitmap blocks are cut.
+const DUMP_MD: &str = r#"# DRBD meta data dump
+# 2026-10-21 08:12:31 +0000 [1792570351]
+# host> drbdmeta --force 100000 v09 /dev/vg/pvc-1+snap-1 internal dump-md
+#
+
+version "v09";
+
+This_is_an_unclean_meta_data_dump._Don't_trust_the_bitmap.
+# You should "apply-al" first, if you plan to restore this.
+
+max-peers 6;
+# md_size_sect 176
+# md_offset 272625664
+# al_offset 272592896
+# bm_offset 272539648
+
+node-id 1;
+current-uuid 0x13AD6FB30D74E086;
+flags 0x00000411;
+members 0x0000000000000003;
+features 0x0000000000000003;
+history-uuids {
+        0x0000000000000000; 0x0000000000000000; 0x0000000000000000; 0x0000000000000000;
+}
+# al-extents 1237;
+la-size-sect 532304;
+bm-byte-per-bit 4096;
+device-uuid 0xD6D6E49783DE0F5C;
+la-peer-max-bio-size 1048576;
+al-stripes 1;
+al-stripe-size-4k 8;
+# bm-bytes 53248;
+"#;
+
+#[test]
+fn la_size_from_dump_md() {
+    // The data area ends where the bitmap starts.
+    assert_eq!(la_size(DUMP_MD), Ok(272_539_648));
+    let never = DUMP_MD.replace("la-size-sect 532304;", "la-size-sect 0;");
+    assert!(la_size(&never).unwrap_err().contains("never attached"));
+    let cut = DUMP_MD.replace("la-size-sect 532304;\n", "");
+    assert!(la_size(&cut).is_err());
+    assert!(la_size("la-size-sect x;").is_err());
+    assert!(la_size("la-size-sect 36028797018963968;").is_err());
+    assert_eq!(
+        argv::dump_md("/dev/vg/pvc-1+snap-1").join(" "),
+        "drbdmeta --force 100000 v09 /dev/vg/pvc-1+snap-1 internal dump-md"
+    );
+}
+
 #[test]
 fn features_from_help_texts() {
     let f = features([

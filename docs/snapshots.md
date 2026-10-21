@@ -46,6 +46,9 @@ Then:
 
 Each node's copy is crash-consistent.
 The copies of one snapshot can still differ: a page rewritten while it is written out can reach each node's disk in another version.
+So once Ready, each node holding a copy of a replicated snapshot hashes it in the background, one snapshot at a time per node, at idle IO priority, and acks the digest:
+a sha256 over 4 MiB chunks, up to the DRBD device size the copy's own metadata records.
+Once every holder acked, the controller writes `status.copiesIdentical`: true when all digests match; false otherwise, with a Warning Event `ImageCopiesDiffer` naming each holder's digest.
 Snapshots are crash-consistent: no file system is frozen or flushed first, so data still in a page cache is not in the snapshot, as after a power loss.
 For application consistency, quiesce the application (for example with a pre-snapshot hook) before taking the VolumeSnapshot.
 A local volume skips the suspend: it waits only for the volume to be Ready and for no other snapshot of it to run.

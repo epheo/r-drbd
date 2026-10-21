@@ -137,6 +137,18 @@ fn changes_put_options_before_names() {
         v(&["lvchange", "--config", C, "--activate", "y", "vg1/pvc-1"])
     );
     assert_eq!(
+        cmd::activate_snapshot("vg1", "snap-1"),
+        v(&[
+            "lvchange",
+            "--config",
+            C,
+            "--activate",
+            "y",
+            "--ignoreactivationskip",
+            "vg1/snap-1"
+        ])
+    );
+    assert_eq!(
         cmd::deactivate("vg1", "pvc-1"),
         v(&["lvchange", "--config", C, "--activate", "n", "vg1/pvc-1"])
     );

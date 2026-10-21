@@ -18,6 +18,7 @@ On every node that stores data, also:
   Make it with `vgimportdevices <vg>` for each VG of the host, not `--all`: without the file, LVM also sees PVs inside volumes attached through DRBD.
   Older LVM does not know `scan_lvs`; the agent then marks its Pools Available False, reason `LvmUnsupported`.
 - xfsprogs.
+- ionice (util-linux): snapshot digests read at idle IO priority; without it they run at the default priority.
 - The host's own LVM must not scan DRBD devices or LVs. Either:
   - a devices file (`use_devicesfile = 1`, the default on recent distributions) that lists only the host's real PVs; an empty file is enough, LVM adds what it creates; or
   - in lvm.conf, `global_filter` rejecting `/dev/drbd` and `scan_lvs = 0`.

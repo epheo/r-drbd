@@ -1084,10 +1084,23 @@
                         "default": [],
                         "description": "One entry per replica of the assignment, diskless ones included,\nwritten by that node's agent.",
                         "items": {
-                          "description": "The last phase a node completed, and whether it succeeded.\n`takenPool`, `lvBytes` and `allocatedBytes` come from the successful\nTaking ack and every later ack copies them unchanged: the replica may\nmove to another Pool, the snapshot LV never does.",
+                          "description": "The last phase a node completed, and whether it succeeded.\n`takenPool`, `lvBytes` and `allocatedBytes` come from the successful\nTaking ack and every later ack copies them unchanged, as it does\n`digest` and `digestBytes` once they exist: the replica may move to\nanother Pool, the snapshot LV never does.",
                           "properties": {
                             "allocatedBytes": {
                               "description": "Thin data mapped by the snapshot LV at the take.",
+                              "format": "uint64",
+                              "minimum": 0.0,
+                              "nullable": true,
+                              "type": "integer"
+                            },
+                            "digest": {
+                              "description": "Hex sha256 over the sha256 of each 4 MiB chunk of the snapshot LV\nover [0, digestBytes), written once after Ready.",
+                              "maxLength": 64,
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "digestBytes": {
+                              "description": "The source's DRBD device size, read from the snapshot LV's own\nsuperblock: the range the digest covers.",
                               "format": "uint64",
                               "minimum": 0.0,
                               "nullable": true,
@@ -1189,6 +1202,11 @@
                           "type"
                         ],
                         "x-kubernetes-list-type": "map"
+                      },
+                      "copiesIdentical": {
+                        "description": "Every holder's digest matches, written once all holders acked one;\nabsent while pending. Only true lets a restore start without a sync.",
+                        "nullable": true,
+                        "type": "boolean"
                       },
                       "createdAt": {
                         "description": "Time is a wrapper around time.Time which supports correct marshaling to YAML and JSON.  Wrappers are provided for many of the factory methods that the time package offers.",

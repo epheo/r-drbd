@@ -1468,3 +1468,125 @@ async fn drbd_blocked_port_is_reported() {
     }
     assert!(!lv_names(&lvm()).await.iter().any(|n| n.starts_with("rw-")));
 }
+
+/// Holder digests of real snapshot LVs of an idle two-replica volume:
+/// equal on both copies and on a second read, over the DRBD device size
+/// their superblock recorded, and different once one byte of one copy
+/// changed. Each read leaves the snapshot LV inactive.
+#[tokio::test]
+#[ignore = "needs root, DRBD 9 and the test VG"]
+async fn drbd_snapshot_digests() {
+    use agent::digest::{Hasher, LvHasher};
+    if !enabled() {
+        return;
+    }
+    drbd_clean(EVERY).await;
+    let h = start().await;
+    let mut g = group(&h, 256 * MIB, &[A, B], &[], None);
+    let [a, b] = &mut g[..] else { unreachable!() };
+    settle(&h, &mut [&mut *a, &mut *b], "both UpToDate", |t| {
+        disk(t, "rw-a").as_deref() == Some("UpToDate")
+            && disk(t, "rw-b").as_deref() == Some("UpToDate")
+            && connected(t, "rw-a")
+            && connected(t, "rw-b")
+    })
+    .await;
+    write_payload("rw-a", A.minor).await;
+    let l = lvm();
+    for r in ["rw-a", "rw-b"] {
+        l.snapshot(VG, r, &format!("{r}+dg")).await.unwrap();
+    }
+    let hasher = LvHasher::new(h.exec.clone());
+    let first = hasher.digest(VG, "rw-a+dg").await.unwrap();
+    let again = hasher.digest(VG, "rw-a+dg").await.unwrap();
+    let peer = hasher.digest(VG, "rw-b+dg").await.unwrap();
+    println!("digests: {first:?} {again:?} {peer:?}");
+    assert_eq!(first, again, "a second read");
+    assert_eq!(first, peer, "the other copy");
+    assert_eq!(first.bytes, sectors(A.minor) * 512, "the DRBD device size");
+    assert!(!lv_active("rw-a+dg").await && !lv_active("rw-b+dg").await);
+
+    // A hash thread gets the idle IO class.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (exec, handle) = (h.exec.clone(), tokio::runtime::Handle::current());
+    std::thread::spawn(move || {
+        let set = handle.block_on(agent::digest::idle_io(exec.as_ref()));
+        let link = std::fs::read_link("/proc/thread-self").unwrap();
+        let tid = link.file_name().unwrap().to_string_lossy().into_owned();
+        let shown = handle.block_on(sh(&["ionice", "-p", &tid])).stdout;
+        let _ = tx.send((set, shown));
+    });
+    let (set, shown) = rx.await.unwrap();
+    assert_eq!((set, shown.trim()), (Ok(()), "idle"));
+
+    // The dump the la-size parser reads, for its fixture.
+    let dev = format!("/dev/{VG}/rw-b+dg");
+    let lv = format!("{VG}/rw-b+dg");
+    assert_eq!(sh(&["lvchange", "-ay", "-K", &lv]).await.exit_code, Some(0));
+    let argv = drbd::argv::dump_md(&dev);
+    let dump = sh(&argv.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    let head: Vec<&str> = dump
+        .stdout
+        .lines()
+        .filter(|l| !l.starts_with(' ') && !l.starts_with("peer[") && !l.starts_with('}'))
+        .take(40)
+        .collect();
+    println!(
+        "dump-md ({:?}):\n{}\nstderr: {}",
+        dump.exit_code,
+        head.join("\n"),
+        dump.stderr
+    );
+    assert_eq!(drbd::la_size(&dump.stdout), Ok(first.bytes));
+
+    // One byte of b's copy, inside the payload, made different; the
+    // snapshot LV is read-only, so writable for the edit only.
+    let at = PAYLOAD / 2;
+    for args in [&["-an"][..], &["-prw"], &["-ay", "-K"]] {
+        let argv: Vec<&str> = ["lvchange"]
+            .into_iter()
+            .chain(args.iter().copied())
+            .chain([lv.as_str()])
+            .collect();
+        assert_eq!(sh(&argv).await.exit_code, Some(0), "{argv:?}");
+    }
+    let flip = format!(
+        "b=$(dd if={dev} bs=1 skip={at} count=1 status=none | od -An -tu1 | tr -d ' '); printf \"$(printf '\\\\%03o' $(( (b + 1) % 256 )))\" | dd of={dev} bs=1 seek={at} count=1 conv=notrunc,fsync status=none"
+    );
+    let out = sh(&["sh", "-c", &flip]).await;
+    assert_eq!(out.exit_code, Some(0), "{out:?}");
+    for arg in ["-an", "-pr"] {
+        assert_eq!(sh(&["lvchange", arg, &lv]).await.exit_code, Some(0));
+    }
+    let altered = hasher.digest(VG, "rw-b+dg").await.unwrap();
+    println!("altered: {altered:?}");
+    assert_ne!(altered.hex, first.hex);
+    assert_eq!(altered.bytes, first.bytes);
+    assert!(!lv_active("rw-b+dg").await);
+    assert_eq!(hasher.digest(VG, "rw-a+dg").await.unwrap(), first);
+
+    // No superblock, no digest; the LV still ends inactive.
+    l.create(VG, super::THIN, "rw-e", 8 * MIB, &[])
+        .await
+        .unwrap();
+    l.snapshot(VG, "rw-e", "rw-e+dg").await.unwrap();
+    let e = hasher.digest(VG, "rw-e+dg").await.unwrap_err();
+    println!("without metadata: {e}");
+    assert!(!lv_active("rw-e+dg").await);
+
+    for m in [&mut *a, &mut *b] {
+        delete(&h, m).await;
+    }
+    drbd_clean(&["rw-e"]).await;
+}
+
+async fn lv_active(lv: &str) -> bool {
+    lvm()
+        .lvs(VG)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == lv)
+        .unwrap()
+        .active
+}

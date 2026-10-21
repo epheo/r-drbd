@@ -677,6 +677,86 @@ async fn snapshot_replicated_rounds() {
     );
 }
 
+/// copiesIdentical is written once every holder acked a digest: true when
+/// they match; false, with one ImageCopiesDiffer Event, when not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn holder_digests_write_copies_identical() {
+    let assets = require_envtest!();
+    let (_env, client, _ctl) = setup(&assets, |_| {}).await;
+    for n in ["n1", "n2", "n3"] {
+        node(&client, n, true).await;
+    }
+    pool(&client, "p1", "n1", "fast", 100 * GIB).await;
+    pool(&client, "p2", "n2", "fast", 100 * GIB).await;
+    let auto = ["n1", "n2", "n3"].map(|n| FakeAgent::new(&client, n).spawn_auto());
+    create_volume(&client, "rep", volume_spec(GIB, 2, "fast")).await;
+    volume_where(&client, "rep", |v| phase_of(v) == VolumePhase::Ready).await;
+    for s in ["same", "differ"] {
+        create_snapshot(&client, s, "rep").await;
+        snapshot_where(&client, s, |x| snap_phase(x) == SnapshotPhase::Ready).await;
+    }
+    for a in auto {
+        a.abort();
+    }
+    let (n1, n2) = (FakeAgent::new(&client, "n1"), FakeAgent::new(&client, "n2"));
+
+    n1.ack_digest("same", "p1", "d").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let st = get_snapshot(&client, "same").await.unwrap().status.unwrap();
+    assert_eq!(
+        st.copies_identical, None,
+        "pending until every holder acked"
+    );
+    n2.ack_digest("same", "p2", "d").await;
+    let s = snapshot_where(&client, "same", |x| {
+        x.status
+            .as_ref()
+            .is_some_and(|st| st.copies_identical.is_some())
+    })
+    .await;
+    assert_eq!(s.status.unwrap().copies_identical, Some(true));
+
+    n1.ack_digest("differ", "p1", "d").await;
+    n2.ack_digest("differ", "p2", "e").await;
+    let s = snapshot_where(&client, "differ", |x| {
+        x.status
+            .as_ref()
+            .is_some_and(|st| st.copies_identical.is_some())
+    })
+    .await;
+    let st = s.status.unwrap();
+    assert_eq!(st.copies_identical, Some(false));
+    assert_eq!(st.phase, SnapshotPhase::Ready);
+    let differ_events = || async {
+        Api::<k8s_openapi::api::core::v1::Event>::namespaced(client.clone(), "default")
+            .list(&kube::api::ListParams::default())
+            .await
+            .expect("list events")
+            .items
+            .into_iter()
+            .filter(|e| {
+                e.reason.as_deref() == Some("ImageCopiesDiffer")
+                    && e.involved_object.kind.as_deref() == Some("Snapshot")
+            })
+            .collect::<Vec<_>>()
+    };
+    support::eventually(Duration::from_secs(10), || async {
+        (!differ_events().await.is_empty()).then_some(())
+    })
+    .await;
+    // Later passes add none.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let events = differ_events().await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    let e = &events[0];
+    assert_eq!(e.involved_object.name.as_deref(), Some("differ"));
+    let message = e.message.as_deref().unwrap_or_default();
+    assert!(
+        message.contains("n1 d") && message.contains("n2 e"),
+        "{message}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_snapshots_of_one_volume_never_overlap() {
     let assets = require_envtest!();

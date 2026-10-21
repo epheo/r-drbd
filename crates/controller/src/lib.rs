@@ -497,7 +497,7 @@ async fn report_duplicates(ctx: &Ctx<'_>, memory: &mut Memory) {
         }
         error!(message, "duplicate DRBD assignment; not rewritten");
         for v in held {
-            warning_event(ctx.client, v, DUPLICATE_ASSIGNMENT, message).await;
+            warning_event(ctx.client, v.as_ref(), DUPLICATE_ASSIGNMENT, message).await;
         }
     }
     memory.duplicates = found.into_iter().map(|(m, _)| m).collect();
@@ -509,19 +509,36 @@ pub(crate) const DUPLICATE_ASSIGNMENT: &str = "DuplicateAssignment";
 /// Warning Event: the controller's own status apply failed.
 pub(crate) const STATUS_APPLY_FAILED: &str = "StatusApplyFailed";
 
-/// A Normal core/v1 Event on a Volume; cluster-scoped objects get theirs
-/// in "default", as kubectl describe looks there. Failure only logs: the
-/// RBAC grants core events, not events.k8s.io, hence no kube Recorder.
-pub(crate) async fn event(client: &Client, v: &model::Volume, reason: &str, message: &str) {
+/// A Normal core/v1 Event on one of our objects; cluster-scoped objects
+/// get theirs in "default", as kubectl describe looks there. Failure only
+/// logs: the RBAC grants core events, not events.k8s.io, hence no kube
+/// Recorder.
+pub(crate) async fn event<K: Resource<DynamicType = ()>>(
+    client: &Client,
+    v: &K,
+    reason: &str,
+    message: &str,
+) {
     emit(client, v, "Normal", reason, message).await;
 }
 
 /// `event` of type Warning.
-pub(crate) async fn warning_event(client: &Client, v: &model::Volume, reason: &str, message: &str) {
+pub(crate) async fn warning_event<K: Resource<DynamicType = ()>>(
+    client: &Client,
+    v: &K,
+    reason: &str,
+    message: &str,
+) {
     emit(client, v, "Warning", reason, message).await;
 }
 
-async fn emit(client: &Client, v: &model::Volume, type_: &str, reason: &str, message: &str) {
+async fn emit<K: Resource<DynamicType = ()>>(
+    client: &Client,
+    v: &K,
+    type_: &str,
+    reason: &str,
+    message: &str,
+) {
     use k8s_openapi::api::core::v1::{Event, EventSource, ObjectReference};
     let name = v.name_any();
     let now = model::time::now();
@@ -532,11 +549,11 @@ async fn emit(client: &Client, v: &model::Volume, type_: &str, reason: &str, mes
             ..kube::api::ObjectMeta::default()
         },
         involved_object: ObjectReference {
-            api_version: Some(format!("{}/{}", model::GROUP, model::VERSION)),
-            kind: Some("Volume".into()),
+            api_version: Some(K::api_version(&()).into_owned()),
+            kind: Some(K::kind(&()).into_owned()),
             name: Some(name.clone()),
-            uid: v.metadata.uid.clone(),
-            resource_version: v.metadata.resource_version.clone(),
+            uid: v.meta().uid.clone(),
+            resource_version: v.meta().resource_version.clone(),
             ..ObjectReference::default()
         },
         reason: Some(reason.into()),
