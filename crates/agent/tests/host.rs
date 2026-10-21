@@ -557,11 +557,67 @@ async fn reconcile_decision_table() {
     let tag = agent::storage::snap_tag("uid-snapshot-test-host", 2 * GIB, 1);
     let tagged = lvm().tagged(VG).await.unwrap();
     let lv = &tagged["rw-l-r1+snapshot-test-host"];
-    assert_eq!(lv.tags, [tag], "tagged by its lvcreate");
+    assert_eq!(
+        lv.tags,
+        std::slice::from_ref(&tag),
+        "tagged by its lvcreate"
+    );
     let created = lv
         .created
         .map(|s| k8s_openapi::jiff::Timestamp::from_second(s).unwrap());
     assert_eq!(ack.lv_created_at.as_ref().map(|t| t.0), created);
+
+    // Status lost: the copy is found again by its uid tag alone.
+    let snap_ack = |w: &[StatusWrite]| {
+        w.iter().find_map(|w| match w {
+            StatusWrite::Snapshot { ack, .. } => Some(ack.clone()),
+            _ => None,
+        })
+    };
+    let lost = |uid: &str, phase: SnapshotPhase| {
+        let mut s = snap.clone();
+        s.metadata.uid = Some(uid.into());
+        s.status = Some(SnapshotStatus {
+            phase: Some(phase),
+            size_bytes: Some(2 * GIB),
+            source_replicas: Some(1),
+            ..SnapshotStatus::default()
+        });
+        Arc::new(s)
+    };
+    let vols = [Arc::new(grown.clone())];
+    let found = lost("uid-snapshot-test-host", SnapshotPhase::Discovering);
+    let w = rec.pass(&pools, &vols, &[found]).await;
+    let found = snap_ack(&w).unwrap();
+    println!("discovery: {found:?}");
+    assert_eq!((found.found, found.ok), (Some(true), true));
+    assert_eq!(found.taken_pool.as_deref(), Some("test-host-pool"));
+    assert_eq!(found.searched_pools, ["test-host-pool"]);
+    assert_eq!(
+        (found.tag_size_bytes, found.tag_source_replicas),
+        (Some(2 * GIB), Some(1))
+    );
+    assert_eq!(found.lv_created_at, ack.lv_created_at);
+    // A Snapshot of the same name with another uid finds nothing, and its
+    // take fails with the LV untouched.
+    let other = lost("uid-other-test-host", SnapshotPhase::Discovering);
+    let w = rec.pass(&pools, &vols, &[other]).await;
+    assert_eq!(snap_ack(&w).unwrap().found, Some(false));
+    let other = lost("uid-other-test-host", SnapshotPhase::Taking);
+    let w = rec.pass(&pools, &vols, &[other]).await;
+    let refused = snap_ack(&w).unwrap();
+    println!("conflict: {refused:?}");
+    assert!(!refused.ok && refused.taken_pool.is_none());
+    assert!(
+        refused
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("belongs to snapshot uid uid-snapshot-test-host"),
+        "{refused:?}"
+    );
+    let tagged = lvm().tagged(VG).await.unwrap();
+    assert_eq!(tagged["rw-l-r1+snapshot-test-host"].tags, [tag]);
     // The restore finds the copy through the ack's takenPool.
     snap.status.as_mut().unwrap().acks = vec![ack];
 
