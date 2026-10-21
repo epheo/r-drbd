@@ -154,12 +154,7 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
     let listener = ::csi::bind_unix(&cfg.csi_endpoint)
         .and_then(tokio::net::UnixListener::from_std)
         .map_err(|e| Error::io("CSI socket", e))?;
-    let node_service = csi::NodeService::new(
-        cfg.node.clone(),
-        exec.clone(),
-        Arc::new(stores.volumes.clone()),
-        Arc::new(csi::KubeFsMarker::new(client.clone())),
-    );
+    let node_service = node_service(&cfg, &exec, &stores, &client, &tracker);
     let inflight = node_service.inflight();
     let guard = shutdown::Guard::new(&exec, tracker, &cfg, &tools, &client, &node_service);
     let mut csi_stop = stop_rx.clone();
@@ -234,6 +229,22 @@ fn host_name() -> Option<String> {
         .inspect_err(|e| tracing::warn!(error = %e, "host name unreadable; using the node name"))
         .ok()?;
     Some(name.trim().to_owned()).filter(|n| !n.is_empty())
+}
+
+fn node_service(
+    cfg: &Config,
+    exec: &Arc<dyn Exec>,
+    stores: &watch::Stores,
+    client: &Client,
+    tracker: &Arc<Mutex<Tracker>>,
+) -> csi::NodeService {
+    csi::NodeService::new(
+        cfg.node.clone(),
+        exec.clone(),
+        Arc::new(stores.volumes.clone()),
+        Arc::new(csi::KubeFsMarker::new(client.clone())),
+    )
+    .with_resync(tracker.clone())
 }
 
 /// The reconciler, on the runner that keeps the loop's deadlines.

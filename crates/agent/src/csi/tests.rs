@@ -710,6 +710,51 @@ async fn expand_waits_for_lv() {
     env.x.assert_done();
 }
 
+struct Syncing(Arc<std::sync::atomic::AtomicBool>);
+
+impl ResyncLookup for Syncing {
+    fn resyncing(&self, volume: &str) -> bool {
+        volume == "pvc-1" && self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[tokio::test]
+async fn expand_waits_for_the_resync() {
+    let env = Env::new("expand-resync");
+    let target = env.path("mnt");
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let svc = env
+        .svc(Lookup::default())
+        .with_resync(Arc::new(Syncing(flag.clone())));
+    let grown = |x: &ScriptedExec| {
+        x.expect_s(
+            &["findmnt", "-n", "-o", "SOURCE", "--mountpoint", &target],
+            ok("/dev/drbd1000\n"),
+        )
+        .expect_s(
+            &["blockdev", "--getsize64", "/dev/drbd1000"],
+            ok("2147483648\n"),
+        );
+    };
+    grown(&env.x);
+    let e = svc
+        .expand(expand_req(&target, 2 << 30, mount_cap("", &[])))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), tonic::Code::Unavailable);
+    env.x.assert_done();
+
+    flag.store(false, std::sync::atomic::Ordering::SeqCst);
+    grown(&env.x);
+    env.x.expect_s(&["xfs_growfs", &target], ok(""));
+    let got = svc
+        .expand(expand_req(&target, 2 << 30, mount_cap("", &[])))
+        .await
+        .unwrap();
+    assert_eq!(got, 2 << 30);
+    env.x.assert_done();
+}
+
 #[tokio::test]
 async fn expand_block_only_checks_size() {
     let env = Env::new("expand-block");

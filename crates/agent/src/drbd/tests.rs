@@ -216,6 +216,52 @@ fn sync_target_without_done_uses_the_fallback() {
     assert_eq!(json_sync_percent("not json"), None);
 }
 
+#[test]
+fn resync_seen_from_every_end() {
+    let res = |dev: &str, pd: &[&str]| {
+        let mut lines = vec![
+            "exists resource name:r role:Primary".to_owned(),
+            "exists connection name:r peer-node-id:1 conn-name:b connection:Connected".to_owned(),
+            format!("exists device name:r volume:0 minor:1 {dev}"),
+        ];
+        lines.extend(
+            pd.iter().map(|p| {
+                format!("exists peer-device name:r peer-node-id:1 conn-name:b volume:0 {p}")
+            }),
+        );
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        resyncing(tracked(&refs).resource("r").unwrap())
+    };
+    let est = "replication:Established peer-disk:UpToDate";
+    assert!(!res("disk:UpToDate client:no", &[est]));
+    assert!(res(
+        "disk:UpToDate client:no",
+        &["replication:SyncSource peer-disk:Inconsistent"]
+    ));
+    assert!(res(
+        "disk:UpToDate client:no",
+        &["replication:PausedSyncS peer-disk:Inconsistent"]
+    ));
+    assert!(res(
+        "disk:Inconsistent client:no",
+        &["replication:SyncTarget peer-disk:UpToDate"]
+    ));
+    // A diskless primary: its peers resync between themselves.
+    assert!(res(
+        "disk:Diskless client:yes",
+        &["replication:Established peer-disk:Inconsistent"]
+    ));
+    // A peer gone is no resync: the grow must not wait for its return.
+    assert!(!res(
+        "disk:UpToDate client:no",
+        &["replication:Off peer-disk:DUnknown"]
+    ));
+    assert!(!res(
+        "disk:UpToDate client:no",
+        &["replication:Ahead peer-disk:Outdated"]
+    ));
+}
+
 fn replica(node: &str, id: u8, role: Role) -> AssignedReplica {
     AssignedReplica {
         node: node.into(),

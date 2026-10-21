@@ -62,6 +62,20 @@ pub trait VolumeLookup: Send + Sync + 'static {
     fn facts(&self, volume: &str) -> Option<VolumeFacts>;
 }
 
+/// Live DRBD state on this node.
+pub trait ResyncLookup: Send + Sync + 'static {
+    fn resyncing(&self, volume: &str) -> bool;
+}
+
+impl ResyncLookup for Mutex<crate::events2::Tracker> {
+    fn resyncing(&self, volume: &str) -> bool {
+        self.lock()
+            .ok()
+            .and_then(|t| t.resource(volume).map(crate::drbd::resyncing))
+            .unwrap_or(false)
+    }
+}
+
 /// Durable record that a volume's file system is complete.
 #[async_trait::async_trait]
 pub trait FsMarker: Send + Sync + 'static {
@@ -303,11 +317,13 @@ impl Inflight {
     }
 }
 
+#[derive(Clone)]
 struct Inner {
     node: String,
     exec: Arc<dyn Exec>,
     volumes: Arc<dyn VolumeLookup>,
     marker: Arc<dyn FsMarker>,
+    resync: Option<Arc<dyn ResyncLookup>>,
     /// Volumes this process marked: a second guard next to the live read.
     marked: Arc<Mutex<HashSet<String>>>,
     device_wait: Duration,
@@ -404,6 +420,7 @@ impl NodeService {
                 exec,
                 volumes,
                 marker,
+                resync: None,
                 marked: Arc::default(),
                 device_wait: DEVICE_WAIT,
             }),
@@ -415,18 +432,22 @@ impl NodeService {
     /// Only before the service is shared.
     #[must_use]
     pub fn with_device_wait(self, wait: Duration) -> Self {
-        let i = &self.inner;
+        let mut i = (*self.inner).clone();
+        i.device_wait = wait;
         Self {
-            inner: Arc::new(Inner {
-                node: i.node.clone(),
-                exec: i.exec.clone(),
-                volumes: i.volumes.clone(),
-                marker: i.marker.clone(),
-                marked: i.marked.clone(),
-                device_wait: wait,
-            }),
-            inflight: self.inflight,
-            opens: self.opens,
+            inner: Arc::new(i),
+            ..self
+        }
+    }
+
+    /// Only before the service is shared.
+    #[must_use]
+    pub fn with_resync(self, resync: Arc<dyn ResyncLookup>) -> Self {
+        let mut i = (*self.inner).clone();
+        i.resync = Some(resync);
+        Self {
+            inner: Arc::new(i),
+            ..self
         }
     }
 
@@ -996,9 +1017,10 @@ impl Inner {
     }
 
     /// The LV grows first (the agent follows Volume.spec.sizeBytes); until it
-    /// did, return Unavailable so the kubelet retries.
+    /// did, or while the grown area resyncs, return Unavailable so the
+    /// kubelet retries.
     async fn expand(&self, req: NodeExpandVolumeRequest) -> Result<i64, Status> {
-        required(&req.volume_id, "volume_id")?;
+        let volume = required(&req.volume_id, "volume_id")?;
         let path = if req.volume_path.is_empty() {
             required(&req.staging_target_path, "volume_path")?
         } else {
@@ -1023,6 +1045,15 @@ impl Inner {
             )));
         }
         if !block {
+            // xfs_growfs writes into the grown area, and those writes stall
+            // until its resync ends: it would hit the command timeout and
+            // hold the grow lock, failing every retry until then.
+            if self.resync.as_ref().is_some_and(|r| r.resyncing(volume)) {
+                tracing::info!(volume, "file system grow waits for the resync");
+                return Err(Status::unavailable(format!(
+                    "volume {volume} is resyncing: file system grow waits"
+                )));
+            }
             self.run(&argv(&["xfs_growfs", path])).await?;
         }
         Ok(have)
