@@ -1064,6 +1064,84 @@ async fn snapshot_suspend_bound_and_mid_round_attach() {
     assert!(e.contains("n3") && !e.contains("n1"), "{e}");
 }
 
+async fn held_with(client: &Client, name: &str, needle: &str) -> model::Snapshot {
+    let s = snapshot_where(client, name, |s| {
+        s.status
+            .as_ref()
+            .and_then(|st| st.last_error.as_deref())
+            .is_some_and(|e| e.contains(needle))
+    })
+    .await;
+    assert_eq!(support::snap_phase(&s), Some(SnapshotPhase::Pending));
+    s
+}
+
+/// A failed round holds the volume's next one: longer after each failure
+/// in a row, until a Ready round; and while a node that never acked has
+/// not renewed its agent Lease since, though that Lease is still fresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_round_holds_the_next_one() {
+    let assets = require_envtest!();
+    let (_env, client, _cfg, _ctl) = setup_with(&assets, |c| {
+        c.suspend_timeout = Duration::from_secs(3);
+        c.round_backoff = Duration::from_secs(3);
+    })
+    .await;
+    cluster(&client).await;
+    let agents = ["n1", "n2", "n3"].map(|n| FakeAgent::new(&client, n));
+    ready_rep(&client, &agents).await;
+    let [a1, a2, a3] = &agents;
+    let suspend = async |s: &str, n2_ok: bool| {
+        snap_in(&client, s, SnapshotPhase::Suspending).await;
+        a1.ack(s, SnapshotPhase::Suspending, true, None).await;
+        a2.ack(s, SnapshotPhase::Suspending, n2_ok, None).await;
+    };
+
+    // n3's agent stops renewing; its Lease stays fresh for 40 s.
+    support::agent_lease(&client, "n3", Duration::ZERO, true).await;
+    create_snapshot(&client, "s1", "rep").await;
+    suspend("s1", true).await;
+    snap_in(&client, "s1", SnapshotPhase::Failed).await;
+    create_snapshot(&client, "s2", "rep").await;
+    held_with(
+        &client,
+        "s2",
+        "1 failed round(s) in a row: the next waits 3 s",
+    )
+    .await;
+    held_with(&client, "s2", "agent not reachable on n3").await;
+    support::agent_lease(&client, "n3", Duration::ZERO, false).await;
+    suspend("s2", false).await;
+    snap_in(&client, "s2", SnapshotPhase::Failed).await;
+
+    create_snapshot(&client, "s3", "rep").await;
+    held_with(
+        &client,
+        "s3",
+        "2 failed round(s) in a row: the next waits 6 s",
+    )
+    .await;
+    suspend("s3", true).await;
+    a3.ack("s3", SnapshotPhase::Suspending, true, None).await;
+    snap_in(&client, "s3", SnapshotPhase::Taking).await;
+    a1.ack("s3", SnapshotPhase::Taking, true, Some("p1")).await;
+    a2.ack("s3", SnapshotPhase::Taking, true, Some("p2")).await;
+    a3.ack("s3", SnapshotPhase::Taking, true, None).await;
+    snap_in(&client, "s3", SnapshotPhase::Ready).await;
+
+    // A Ready round starts the count again.
+    create_snapshot(&client, "s4", "rep").await;
+    suspend("s4", false).await;
+    snap_in(&client, "s4", SnapshotPhase::Failed).await;
+    create_snapshot(&client, "s5", "rep").await;
+    held_with(
+        &client,
+        "s5",
+        "1 failed round(s) in a row: the next waits 3 s",
+    )
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_round_waits_for_every_agent() {
     let assets = require_envtest!();
