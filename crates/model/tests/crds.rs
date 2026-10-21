@@ -101,6 +101,27 @@ fn cel_rules_present() {
 }
 
 #[test]
+fn uid_bindings_are_optional_and_the_evict_list_bounded() {
+    let crd = to_json(&Volume::crd());
+    let spec = &schema(&crd)["properties"]["spec"];
+    // The assignment rule walks evict; the CRD cost budget holds only with these.
+    let evict = &spec["properties"]["evict"];
+    assert_eq!(evict["maxItems"], 32);
+    assert_eq!(evict["items"]["maxLength"], 253);
+    let source = &spec["properties"]["source"];
+    assert_eq!(source["properties"]["snapshotUid"]["maxLength"], 36);
+    assert_eq!(source["required"], json!(["snapshot"]));
+    let crd = to_json(&Snapshot::crd());
+    let spec = &schema(&crd)["properties"]["spec"];
+    assert_eq!(spec["properties"]["volumeUid"]["maxLength"], 36);
+    assert_eq!(spec["required"], json!(["volume"]));
+    // Objects written before the uids still decode.
+    let old: model::SnapshotSpec = serde_json::from_value(json!({"volume": "v"})).unwrap();
+    assert_eq!(old.volume_uid, None);
+    assert_eq!(to_json(&old), json!({"volume": "v"}));
+}
+
+#[test]
 fn volume_defaults_and_camel_case() {
     let spec: VolumeSpec =
         serde_json::from_value(json!({"sizeBytes": 1_073_741_824, "tier": "nvme"})).unwrap();

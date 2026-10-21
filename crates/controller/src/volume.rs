@@ -28,6 +28,7 @@ pub mod reason {
     pub const RESTORE_NODE_CONFLICT: &str = "RestoreNodeConflict";
     pub const SNAPSHOT_NOT_READY: &str = "SnapshotNotReady";
     pub const SNAPSHOT_FAILED: &str = "SnapshotFailed";
+    pub const SNAPSHOT_UID_MISMATCH: &str = "SnapshotUidMismatch";
     pub const ALLOCATION_FAILED: &str = "AllocationFailed";
     /// AttachmentFailed True, and its Warning Event.
     pub const ATTACHMENT_FAILED: &str = "AttachmentFailed";
@@ -1845,6 +1846,35 @@ pub fn snapshot_holders(snap: &Snapshot) -> Vec<(String, String)> {
 }
 
 /// The Snapshot a restore reads, once Ready.
+/// The store's Snapshot of the source's name, if it is the one the source
+/// names by uid. A source without a uid was written before uids were
+/// recorded and never binds. Another uid waits: the store may lag behind
+/// the Snapshot CreateVolume read.
+fn bound_snapshot<'a>(
+    src: &model::VolumeSource,
+    snap: Option<&'a Snapshot>,
+) -> Result<Option<&'a Snapshot>, Placement> {
+    let Some(want) = src.snapshot_uid.as_deref() else {
+        return Err(Placement::Fail(Cond::new(
+            FALSE,
+            reason::SNAPSHOT_UID_MISMATCH,
+            format!("source snapshot {} names no uid", src.snapshot),
+        )));
+    };
+    match snap {
+        Some(s) if !src.is(s) => Err(Placement::Wait(Cond::new(
+            FALSE,
+            reason::SNAPSHOT_UID_MISMATCH,
+            format!(
+                "snapshot {} has uid {}, the source names {want}",
+                src.snapshot,
+                s.metadata.uid.as_deref().unwrap_or("none")
+            ),
+        ))),
+        s => Ok(s),
+    }
+}
+
 fn ready_snapshot<'a>(snap: Option<&'a Snapshot>, wanted: &str) -> Result<&'a Snapshot, Placement> {
     let Some(snap) = snap else {
         return Err(Placement::Wait(Cond::new(
@@ -2023,8 +2053,12 @@ fn lv_name_fits(ctx: &Ctx<'_>, v: &Volume, diskful: &[placer::Chosen]) -> Option
 fn place(ctx: &Ctx<'_>, placing: &Placing, v: &Volume) -> Placement {
     if let Some(src) = &v.spec.source {
         let snap = ctx.stores.snapshot(&src.snapshot);
+        let snap = match bound_snapshot(src, snap.as_deref()) {
+            Ok(s) => s,
+            Err(p) => return p,
+        };
         let exists = |n: &str| ctx.stores.node(n).is_some();
-        return match restore_holders(v, snap.as_deref(), &src.snapshot, &placing.views, &exists) {
+        return match restore_holders(v, snap, &src.snapshot, &placing.views, &exists) {
             Ok(diskful) => {
                 lv_name_fits(ctx, v, &diskful).unwrap_or_else(|| assign(placing, v, &diskful))
             }
@@ -3112,9 +3146,42 @@ mod tests {
         assert!(next.unwrap().replicas.iter().all(|r| r.node != "m8"));
     }
 
+    fn spec_of(volume: &str) -> model::SnapshotSpec {
+        model::SnapshotSpec {
+            volume: volume.into(),
+            volume_uid: Some(format!("uid-{volume}")),
+        }
+    }
+
+    #[test]
+    fn a_source_binds_only_the_snapshot_of_its_uid() {
+        let (v, snap, _) = restore_case(1, 10 * G);
+        let src = v.spec.source.clone().unwrap();
+        assert!(matches!(bound_snapshot(&src, Some(&snap)), Ok(Some(_))));
+        assert!(matches!(bound_snapshot(&src, None), Ok(None)));
+        let mut other = snap.clone();
+        other.metadata.uid = Some("uid-t".into());
+        let Err(Placement::Wait(c)) = bound_snapshot(&src, Some(&other)) else {
+            panic!("another uid must wait");
+        };
+        assert_eq!(c.reason, reason::SNAPSHOT_UID_MISMATCH);
+        assert_eq!(
+            c.message,
+            "snapshot s has uid uid-t, the source names uid-s"
+        );
+        let legacy = model::VolumeSource {
+            snapshot_uid: None,
+            ..src
+        };
+        let Err(Placement::Fail(c)) = bound_snapshot(&legacy, Some(&snap)) else {
+            panic!("a source without a uid must fail");
+        };
+        assert_eq!(c.reason, reason::SNAPSHOT_UID_MISMATCH);
+    }
+
     #[test]
     fn snapshot_rounds_that_block_eviction() {
-        let mut snap = Snapshot::new("s", model::SnapshotSpec { volume: "v".into() });
+        let mut snap = Snapshot::new("s", spec_of("v"));
         assert!(!round_running(&snap), "no status yet");
         for (phase, running) in [
             (SnapshotPhase::Pending, false),
@@ -3197,7 +3264,7 @@ mod tests {
             ok,
             error: None,
         };
-        let mut snap = Snapshot::new("s", model::SnapshotSpec { volume: "v".into() });
+        let mut snap = Snapshot::new("s", spec_of("v"));
         snap.status = Some(model::SnapshotStatus {
             acks: vec![
                 ack("n2", true, Some("p2")),
@@ -3219,7 +3286,7 @@ mod tests {
     #[test]
     fn holders_of_a_snapshot_an_older_version_made_ready() {
         // Its acks carry a phase this version removed; the copies are there.
-        let mut snap = Snapshot::new("s", model::SnapshotSpec { volume: "v".into() });
+        let mut snap = Snapshot::new("s", spec_of("v"));
         snap.status = Some(model::SnapshotStatus {
             phase: SnapshotPhase::Ready,
             acks: vec![model::SnapshotAck {
@@ -3245,7 +3312,8 @@ mod tests {
             ok: true,
             error: None,
         };
-        let mut snap = Snapshot::new("s", model::SnapshotSpec { volume: "v".into() });
+        let mut snap = Snapshot::new("s", spec_of("v"));
+        snap.metadata.uid = Some("uid-s".into());
         snap.status = Some(model::SnapshotStatus {
             phase: SnapshotPhase::Ready,
             size_bytes: Some(10 * G),
@@ -3265,6 +3333,7 @@ mod tests {
                 evict: Vec::new(),
                 source: Some(model::VolumeSource {
                     snapshot: "s".into(),
+                    snapshot_uid: Some("uid-s".into()),
                 }),
                 resolve: None,
                 assignment: None,

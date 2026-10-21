@@ -453,29 +453,18 @@
                             "description": "The node that makes the first data current: it starts the volume\nwithout a sync, or, for a restore, is the sync source.",
                             "maxLength": 253,
                             "nullable": true,
-                            "type": "string",
-                            "x-kubernetes-validations": [
-                              {
-                                "message": "initialUpToDateNode is immutable",
-                                "rule": "self == oldSelf"
-                              }
-                            ]
+                            "type": "string"
                           },
                           "minor": {
                             "description": "DRBD minor, cluster wide unique, same on every node; absent for replicas 1.",
                             "format": "uint32",
                             "minimum": 0.0,
                             "nullable": true,
-                            "type": "integer",
-                            "x-kubernetes-validations": [
-                              {
-                                "message": "minor is immutable",
-                                "rule": "self == oldSelf"
-                              }
-                            ]
+                            "type": "integer"
                           },
                           "replicas": {
                             "items": {
+                              "description": "Old and new entries correlate by node through the list map. A\ntiebreaker or diskless entry may become diskful (an evict move); a\ndiskful one never changes.",
                               "properties": {
                                 "node": {
                                   "maxLength": 253,
@@ -517,32 +506,60 @@
                                 "nodeId",
                                 "role"
                               ],
-                              "type": "object"
+                              "type": "object",
+                              "x-kubernetes-validations": [
+                                {
+                                  "message": "nodeId is immutable",
+                                  "rule": "self.nodeId == oldSelf.nodeId"
+                                },
+                                {
+                                  "message": "port is immutable",
+                                  "rule": "has(self.port) == has(oldSelf.port) && (!has(self.port) || self.port == oldSelf.port)"
+                                },
+                                {
+                                  "message": "a diskful replica keeps its role and pool",
+                                  "rule": "oldSelf.role != 'diskful' || (self.role == 'diskful' && has(self.pool) == has(oldSelf.pool) && (!has(self.pool) || self.pool == oldSelf.pool))"
+                                }
+                              ]
                             },
                             "maxItems": 32,
                             "type": "array",
                             "x-kubernetes-list-map-keys": [
                               "node"
                             ],
-                            "x-kubernetes-list-type": "map"
+                            "x-kubernetes-list-type": "map",
+                            "x-kubernetes-validations": [
+                              {
+                                "message": "nodeId must be unique",
+                                "rule": "self.all(x, self.exists_one(y, y.nodeId == x.nodeId))"
+                              }
+                            ]
                           },
                           "secret": {
                             "description": "Shared secret, 32 random bytes in Base64; absent for replicas 1.",
                             "maxLength": 64,
                             "nullable": true,
-                            "type": "string",
-                            "x-kubernetes-validations": [
-                              {
-                                "message": "secret is immutable",
-                                "rule": "self == oldSelf"
-                              }
-                            ]
+                            "type": "string"
                           }
                         },
                         "required": [
                           "replicas"
                         ],
-                        "type": "object"
+                        "type": "object",
+                        "x-kubernetes-validations": [
+                          {
+                            "message": "minor is immutable",
+                            "rule": "has(self.minor) == has(oldSelf.minor) && (!has(self.minor) || self.minor == oldSelf.minor)"
+                          },
+                          {
+                            "message": "secret is immutable",
+                            "rule": "has(self.secret) == has(oldSelf.secret) && (!has(self.secret) || self.secret == oldSelf.secret)"
+                          },
+                          {
+                            "message": "initialUpToDateNode is immutable",
+                            "rule": "has(self.initialUpToDateNode) == has(oldSelf.initialUpToDateNode) && (!has(self.initialUpToDateNode) || self.initialUpToDateNode == oldSelf.initialUpToDateNode)"
+                          }
+                        ]
                       },
                       "attachments": {
                         "default": [],
@@ -557,8 +574,10 @@
                         "default": [],
                         "description": "Nodes whose replica must be placed elsewhere (a dead or retired\nnode). The controller makes one move per pass, for the first node\nby name that can act. Every move needs no resolve pending, no split\nbrain, no Snapshot in Suspending or Taking, and the\nreplica neither attached nor in use, unless the node's Node object is\ngone. A diskful move also needs replicas above 1, status.initializedAt\nset unless the node is not the initial one, another UpToDate replica\nwith quorum from a fresh agent, every other reachable diskful replica\nUpToDate, and no pin to the evicted node. A node listed here never receives a\ndiskless entry either. A node leaves the list once it holds no entry\nand no attachment. The replaced node keeps its LV as an orphan.",
                         "items": {
+                          "maxLength": 253,
                           "type": "string"
                         },
+                        "maxItems": 32,
                         "type": "array",
                         "x-kubernetes-list-type": "set"
                       },
@@ -623,18 +642,18 @@
                             "maxLength": 253,
                             "minLength": 1,
                             "type": "string"
+                          },
+                          "snapshotUid": {
+                            "description": "The Snapshot's uid, read live at CreateVolume. A Snapshot of that\nname with another uid, or a source without one, restores nothing.",
+                            "maxLength": 36,
+                            "nullable": true,
+                            "type": "string"
                           }
                         },
                         "required": [
                           "snapshot"
                         ],
-                        "type": "object",
-                        "x-kubernetes-validations": [
-                          {
-                            "message": "source is immutable",
-                            "rule": "self == oldSelf"
-                          }
-                        ]
+                        "type": "object"
                       },
                       "tier": {
                         "maxLength": 63,
@@ -661,6 +680,14 @@
                       {
                         "message": "ReadWriteMany needs replicas >= 2",
                         "rule": "self.accessMode != 'ReadWriteMany' || self.replicas >= 2"
+                      },
+                      {
+                        "message": "source is immutable",
+                        "rule": "has(self.source) == has(oldSelf.source) && (!has(self.source) || self.source == oldSelf.source)"
+                      },
+                      {
+                        "message": "a diskful replica leaves the assignment only through evict",
+                        "rule": "!has(oldSelf.assignment) || oldSelf.assignment.replicas.all(o, o.role != 'diskful' || self.assignment.replicas.exists(n, n.node == o.node) || o.node in self.evict)"
                       }
                     ]
                   },
@@ -1031,12 +1058,24 @@
                             "rule": "self == oldSelf"
                           }
                         ]
+                      },
+                      "volumeUid": {
+                        "description": "The source Volume's uid, read live at CreateSnapshot. A Volume of\nthat name with another uid, or a Snapshot without one, binds nothing.",
+                        "maxLength": 36,
+                        "nullable": true,
+                        "type": "string"
                       }
                     },
                     "required": [
                       "volume"
                     ],
-                    "type": "object"
+                    "type": "object",
+                    "x-kubernetes-validations": [
+                      {
+                        "message": "volumeUid is immutable",
+                        "rule": "has(self.volumeUid) == has(oldSelf.volumeUid) && (!has(self.volumeUid) || self.volumeUid == oldSelf.volumeUid)"
+                      }
+                    ]
                   },
                   "status": {
                     "nullable": true,

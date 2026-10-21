@@ -28,10 +28,27 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
+// has() on both sides: a field-level `self == oldSelf` never runs on an
+// add or a removal.
+#[x_kube(validation = Rule::new("has(self.volumeUid) == has(oldSelf.volumeUid) && (!has(self.volumeUid) || self.volumeUid == oldSelf.volumeUid)").message("volumeUid is immutable"))]
 pub struct SnapshotSpec {
     #[schemars(length(min = 1, max = 253))]
     #[x_kube(validation = Rule::new("self == oldSelf").message("volume is immutable"))]
     pub volume: String,
+    /// The source Volume's uid, read live at CreateSnapshot. A Volume of
+    /// that name with another uid, or a Snapshot without one, binds nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 36))]
+    pub volume_uid: Option<String>,
+}
+
+impl Snapshot {
+    /// This Snapshot is of `vol`: same name and the recorded uid.
+    pub fn is_of(&self, vol: &crate::Volume) -> bool {
+        self.spec.volume == kube::ResourceExt::name_any(vol)
+            && self.spec.volume_uid.is_some()
+            && self.spec.volume_uid == vol.metadata.uid
+    }
 }
 
 #[derive(JsonSchema, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]

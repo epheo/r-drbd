@@ -30,6 +30,10 @@ use crate::condition::Condition;
 #[serde(rename_all = "camelCase")]
 #[x_kube(validation = Rule::new("!has(oldSelf.assignment) || has(self.assignment)").message("assignment cannot be removed"))]
 #[x_kube(validation = Rule::new("self.accessMode != 'ReadWriteMany' || self.replicas >= 2").message("ReadWriteMany needs replicas >= 2"))]
+// has() on both sides: a field-level `self == oldSelf` never runs on an
+// add or a removal.
+#[x_kube(validation = Rule::new("has(self.source) == has(oldSelf.source) && (!has(self.source) || self.source == oldSelf.source)").message("source is immutable"))]
+#[x_kube(validation = Rule::new("!has(oldSelf.assignment) || oldSelf.assignment.replicas.all(o, o.role != 'diskful' || self.assignment.replicas.exists(n, n.node == o.node) || o.node in self.evict)").message("a diskful replica leaves the assignment only through evict"))]
 pub struct VolumeSpec {
     /// Usable size as the CSI caller sees it; the LV is larger by the DRBD metadata.
     #[schemars(range(min = 1))]
@@ -75,9 +79,11 @@ pub struct VolumeSpec {
     /// and no attachment. The replaced node keeps its LV as an orphan.
     #[serde(default)]
     #[x_kube(merge_strategy = ListMerge::Set)]
+    // Bounded: the assignment rule above walks it and fits the CRD cost
+    // budget only with these bounds.
+    #[schemars(length(max = 32), inner(length(max = 253)))]
     pub evict: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[x_kube(validation = Rule::new("self == oldSelf").message("source is immutable"))]
     pub source: Option<VolumeSource>,
     /// Split-brain resolution: every diskful replica except the
     /// survivor is discarded and resynced from it.
@@ -108,6 +114,20 @@ pub struct VolumeSource {
     /// Name of a Ready Snapshot; the new volume is a writable thin snapshot of it.
     #[schemars(length(min = 1, max = 253))]
     pub snapshot: String,
+    /// The Snapshot's uid, read live at CreateVolume. A Snapshot of that
+    /// name with another uid, or a source without one, restores nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 36))]
+    pub snapshot_uid: Option<String>,
+}
+
+impl VolumeSource {
+    /// `snap` is this source: same name and the recorded uid.
+    pub fn is(&self, snap: &crate::Snapshot) -> bool {
+        self.snapshot == kube::ResourceExt::name_any(snap)
+            && self.snapshot_uid.is_some()
+            && self.snapshot_uid == snap.metadata.uid
+    }
 }
 
 #[derive(KubeSchema, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -120,29 +140,36 @@ pub struct Resolve {
 
 #[derive(KubeSchema, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[x_kube(validation = Rule::new("has(self.minor) == has(oldSelf.minor) && (!has(self.minor) || self.minor == oldSelf.minor)").message("minor is immutable"))]
+#[x_kube(validation = Rule::new("has(self.secret) == has(oldSelf.secret) && (!has(self.secret) || self.secret == oldSelf.secret)").message("secret is immutable"))]
+#[x_kube(validation = Rule::new("has(self.initialUpToDateNode) == has(oldSelf.initialUpToDateNode) && (!has(self.initialUpToDateNode) || self.initialUpToDateNode == oldSelf.initialUpToDateNode)").message("initialUpToDateNode is immutable"))]
 pub struct Assignment {
     #[schemars(length(max = 32))]
     #[x_kube(merge_strategy = ListMerge::Map(vec!["node".into()]))]
+    #[x_kube(validation = Rule::new("self.all(x, self.exists_one(y, y.nodeId == x.nodeId))").message("nodeId must be unique"))]
     pub replicas: Vec<AssignedReplica>,
     /// DRBD minor, cluster wide unique, same on every node; absent for replicas 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[x_kube(validation = Rule::new("self == oldSelf").message("minor is immutable"))]
     pub minor: Option<u32>,
     /// Shared secret, 32 random bytes in Base64; absent for replicas 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 64))]
-    #[x_kube(validation = Rule::new("self == oldSelf").message("secret is immutable"))]
     pub secret: Option<String>,
     /// The node that makes the first data current: it starts the volume
     /// without a sync, or, for a restore, is the sync source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 253))]
-    #[x_kube(validation = Rule::new("self == oldSelf").message("initialUpToDateNode is immutable"))]
     pub initial_up_to_date_node: Option<String>,
 }
 
+/// Old and new entries correlate by node through the list map. A
+/// tiebreaker or diskless entry may become diskful (an evict move); a
+/// diskful one never changes.
 #[derive(KubeSchema, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[x_kube(validation = Rule::new("self.nodeId == oldSelf.nodeId").message("nodeId is immutable"))]
+#[x_kube(validation = Rule::new("has(self.port) == has(oldSelf.port) && (!has(self.port) || self.port == oldSelf.port)").message("port is immutable"))]
+#[x_kube(validation = Rule::new("oldSelf.role != 'diskful' || (self.role == 'diskful' && has(self.pool) == has(oldSelf.pool) && (!has(self.pool) || self.pool == oldSelf.pool))").message("a diskful replica keeps its role and pool"))]
 pub struct AssignedReplica {
     #[schemars(length(min = 1, max = 253))]
     pub node: String,
@@ -188,13 +215,13 @@ impl Volume {
     /// The snapshot this volume restores from while it has not made its
     /// first data (no initializedAt). Until then every diskful replica
     /// restores from its own copy, and the Snapshot must stay.
-    pub fn restoring(&self) -> Option<&str> {
+    pub fn restoring(&self) -> Option<&VolumeSource> {
         let src = self.spec.source.as_ref()?;
         let initialized = self
             .status
             .as_ref()
             .is_some_and(|st| st.initialized_at.is_some());
-        (!initialized).then_some(src.snapshot.as_str())
+        (!initialized).then_some(src)
     }
 }
 

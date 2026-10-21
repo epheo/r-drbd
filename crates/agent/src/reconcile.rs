@@ -564,8 +564,7 @@ impl Reconciler {
         vols.sort_by_key(|v| v.name_any());
         let mut snaps: Vec<&Snapshot> = snapshots.iter().map(AsRef::as_ref).collect();
         snaps.sort_by_key(|s| s.name_any());
-        let round_of =
-            |vol: &Volume, s: &Snapshot| s.spec.volume == vol.name_any() && replicated::in_round(s);
+        let round_of = |vol: &Volume, s: &Snapshot| s.is_of(vol) && replicated::in_round(s);
         for vol in &vols {
             writes.extend(self.freeze(vol, &snaps).await);
             if let Some(w) = self.volume(&mut reads, &pools, snapshots, vol).await {
@@ -743,8 +742,8 @@ impl Reconciler {
 
     /// `vol` restores from `snapshot` on this node and has not made its first
     /// data yet: until then a lost LV is restored again from this copy.
-    fn restores_here_from(&self, vol: &Volume, snapshot: &str) -> bool {
-        vol.restoring() == Some(snapshot)
+    fn restores_here_from(&self, vol: &Volume, snapshot: &Snapshot) -> bool {
+        vol.restoring().is_some_and(|src| src.is(snapshot))
             && vol.metadata.deletion_timestamp.is_none()
             && self.local_replica(vol).is_some()
     }
@@ -1009,7 +1008,7 @@ impl Reconciler {
         let name = snap.name_any();
         let status = snap.status.clone().unwrap_or_default();
         let prev = status.acks.iter().find(|a| a.node == self.node).cloned();
-        let vol = vols.iter().find(|v| v.name_any() == snap.spec.volume);
+        let vol = vols.iter().find(|v| snap.is_of(v));
         let replica = vol.and_then(|v| self.local_replica(v));
         let replicated = vol.filter(|v| v.spec.replicas >= 2);
         if replicated.is_some() && !self.drbd_available() {
@@ -1026,7 +1025,7 @@ impl Reconciler {
             pool_name.as_ref()?;
             let restoring = vols
                 .iter()
-                .find(|v| self.restores_here_from(v, &name))
+                .find(|v| self.restores_here_from(v, snap))
                 .map(|v| v.name_any());
             let res = match (restoring, self.place(pools, pool_name.as_deref())) {
                 (Some(v), _) => Err(format!(
@@ -1378,13 +1377,10 @@ fn ack(
     }
 }
 
-/// The Snapshot a volume restores from, when it exists.
+/// The Snapshot a volume restores from, when it exists with the uid the source names.
 fn source_snapshot<'a>(vol: &Volume, snapshots: &'a [Arc<Snapshot>]) -> Option<&'a Snapshot> {
     let src = vol.spec.source.as_ref()?;
-    snapshots
-        .iter()
-        .find(|x| x.name_any() == src.snapshot)
-        .map(AsRef::as_ref)
+    snapshots.iter().find(|x| src.is(x)).map(AsRef::as_ref)
 }
 
 /// This node's Volume status entry from the LV row after the pass.

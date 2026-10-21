@@ -355,6 +355,7 @@ fn initialized(mut v: Volume) -> Volume {
 fn restored(mut v: Volume) -> Volume {
     v.spec.source = Some(VolumeSource {
         snapshot: "snap-1".into(),
+        snapshot_uid: Some(SNAP_UID.into()),
     });
     v
 }
@@ -362,6 +363,7 @@ fn restored(mut v: Volume) -> Volume {
 fn source_snapshot() -> Snapshot {
     let mut s = snapshot(SnapshotPhase::Ready);
     s.spec.volume = "pvc-0".into();
+    s.spec.volume_uid = Some("uid-0".into());
     s.metadata.uid = Some(SNAP_UID.into());
     let st = s.status.as_mut().unwrap();
     st.size_bytes = Some(GIB);
@@ -432,6 +434,7 @@ fn snapshot(phase: SnapshotPhase) -> Snapshot {
         "snap-1",
         SnapshotSpec {
             volume: "pvc-1".into(),
+            volume_uid: Some(UID.into()),
         },
     );
     s.status = Some(SnapshotStatus {
@@ -962,10 +965,15 @@ async fn restored_from_is_reported_from_the_tag_only_while_the_snapshot_exists()
     // No tag: an LV made empty.
     let e = restored_from_on_n2(vol(), &[source_snapshot()], Some(&[N2])).await;
     assert_eq!(e.restored_from, None);
-    // The Snapshot is a new object of the same name.
+    // The Snapshot is a new object of the same name: absent, LVM is not read.
     let mut other = source_snapshot();
     other.metadata.uid = Some("snap-uid-2".into());
-    let e = restored_from_on_n2(vol(), &[other], Some(&[N2, FROM])).await;
+    let e = restored_from_on_n2(vol(), &[other], None).await;
+    assert_eq!(e.restored_from, None);
+    // A source without a uid binds no Snapshot.
+    let mut legacy = vol();
+    legacy.spec.source.as_mut().unwrap().snapshot_uid = None;
+    let e = restored_from_on_n2(legacy, &[source_snapshot()], None).await;
     assert_eq!(e.restored_from, None);
     // The Snapshot is gone, or the volume initialized: LVM is not read.
     let e = restored_from_on_n2(vol(), &[], None).await;

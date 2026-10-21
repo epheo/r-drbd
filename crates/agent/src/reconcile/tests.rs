@@ -65,6 +65,7 @@ fn volume(name: &str, size: u64, replicas: u32) -> Volume {
         },
     );
     v.metadata.generation = Some(3);
+    v.metadata.uid = Some(format!("uid-{name}"));
     v
 }
 
@@ -73,13 +74,22 @@ fn snapshot(name: &str, volume: &str, phase: SnapshotPhase) -> Snapshot {
         name,
         SnapshotSpec {
             volume: volume.into(),
+            volume_uid: Some(format!("uid-{volume}")),
         },
     );
+    s.metadata.uid = Some(format!("uid-{name}"));
     s.status = Some(SnapshotStatus {
         phase,
         ..SnapshotStatus::default()
     });
     s
+}
+
+fn source(snapshot: &str) -> VolumeSource {
+    VolumeSource {
+        snapshot: snapshot.into(),
+        snapshot_uid: Some(format!("uid-{snapshot}")),
+    }
 }
 
 fn deleting<T: kube::Resource>(mut o: T) -> T {
@@ -451,9 +461,7 @@ async fn restore_then_grow() {
     x.expect(lvm::cmd::extend(VG, "pvc-2", 2 * GIB), ok(""));
     expect_lvs(&x, &[snap_lv, lv_row("pvc-2", 2 * GIB_KIB, St::Active)]);
     let mut v = volume("pvc-2", 2 * GIB, 1);
-    v.spec.source = Some(VolumeSource {
-        snapshot: "snap-1".into(),
-    });
+    v.spec.source = Some(source("snap-1"));
     let w = run(
         &x,
         vec![v],
@@ -472,9 +480,7 @@ async fn restore_without_snapshot_lv_is_an_error_not_an_empty_lv() {
     reads(&x, &[]);
     expect_lvs(&x, &[]);
     let mut v = volume("pvc-2", GIB, 1);
-    v.spec.source = Some(VolumeSource {
-        snapshot: "snap-1".into(),
-    });
+    v.spec.source = Some(source("snap-1"));
     let w = run(
         &x,
         vec![v],
@@ -711,6 +717,85 @@ async fn snapshot_deleting_not_ours_is_ignored() {
 }
 
 #[tokio::test]
+async fn snapshot_of_another_volume_uid_takes_nothing() {
+    for uid in [Some("uid-old".to_owned()), None] {
+        let x = Arc::new(ScriptedExec::new());
+        reads(&x, &[lv_row("pvc-1", GIB_KIB, St::Active)]);
+        let mut s = snapshot("snap-1", "pvc-1", SnapshotPhase::Taking);
+        s.spec.volume_uid = uid;
+        let w = run(&x, vec![volume("pvc-1", GIB, 1)], vec![s]).await;
+        assert_eq!(snapshot_acks(&w), vec![]);
+    }
+}
+
+#[tokio::test]
+async fn restore_from_a_snapshot_of_another_uid_is_an_error() {
+    for uid in [Some("uid-old".to_owned()), None] {
+        let x = Arc::new(ScriptedExec::new());
+        let snap_lv = lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive);
+        reads(&x, std::slice::from_ref(&snap_lv));
+        expect_lvs(&x, &[snap_lv]);
+        let mut v = volume("pvc-2", GIB, 1);
+        v.spec.source = Some(VolumeSource {
+            snapshot_uid: uid,
+            ..source("snap-1")
+        });
+        let w = run(
+            &x,
+            vec![v],
+            vec![snapshot("snap-1", "pvc-1", SnapshotPhase::Ready)],
+        )
+        .await;
+        let (_, e) = &volume_writes(&w)[0];
+        assert!(!e.present);
+        assert_eq!(
+            e.last_error.as_deref(),
+            Some("source snapshot snap-1 not found")
+        );
+    }
+}
+
+#[tokio::test]
+async fn snapshot_deleting_is_kept_only_for_its_own_uid() {
+    let rows = [
+        lv_row("pvc-2", GIB_KIB, St::Active),
+        lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive),
+    ];
+    let mut s = deleting(snapshot("snap-1", "pvc-1", SnapshotPhase::Ready));
+    if let Some(st) = s.status.as_mut() {
+        st.acks.push(SnapshotAck {
+            node: NODE.into(),
+            phase: SnapshotPhase::Taking,
+            pool: Some(POOL.into()),
+            ok: true,
+            error: None,
+        });
+    }
+    let restore = |uid: &str| {
+        let mut v = volume("pvc-2", GIB, 1);
+        v.spec.source = Some(VolumeSource {
+            snapshot_uid: Some(uid.into()),
+            ..source("snap-1")
+        });
+        v
+    };
+    let x = Arc::new(ScriptedExec::new());
+    reads(&x, &rows);
+    let w = run(&x, vec![restore("uid-snap-1")], vec![s.clone()]).await;
+    let acks = snapshot_acks(&w);
+    assert!(!acks[0].1.ok);
+    assert!(acks[0].1.error.as_deref().unwrap().starts_with("kept"));
+    // A restore naming another uid holds nothing.
+    let x = Arc::new(ScriptedExec::new());
+    reads(&x, &rows);
+    expect_lvs(&x, &rows);
+    x.expect(lvm::cmd::remove(VG, "pvc-1+snap-1"), ok(""));
+    expect_lvs(&x, &rows[..1]);
+    let w = run(&x, vec![restore("uid-old")], vec![s]).await;
+    assert!(snapshot_acks(&w)[0].1.ok);
+}
+
+#[tokio::test]
 async fn snapshot_suspend_of_local_volume_is_an_error() {
     let x = Arc::new(ScriptedExec::new());
     reads(&x, &[lv_row("pvc-1", GIB_KIB, St::Active)]);
@@ -833,9 +918,7 @@ async fn foreign_restore_source_is_an_error() {
     reads(&x, &[foreign_row("pvc-1+snap-1", "")]);
     expect_lvs(&x, &[foreign_row("pvc-1+snap-1", "")]);
     let mut v = volume("pvc-2", GIB, 1);
-    v.spec.source = Some(VolumeSource {
-        snapshot: "snap-1".into(),
-    });
+    v.spec.source = Some(source("snap-1"));
     let w = run(
         &x,
         vec![v],
@@ -856,9 +939,7 @@ async fn restore_across_pools_is_an_error() {
     reads(&x, std::slice::from_ref(&snap_lv));
     expect_lvs(&x, &[snap_lv]);
     let mut v = volume("pvc-2", GIB, 1);
-    v.spec.source = Some(VolumeSource {
-        snapshot: "snap-1".into(),
-    });
+    v.spec.source = Some(source("snap-1"));
     let mut snap = snapshot("snap-1", "pvc-1", SnapshotPhase::Ready);
     if let Some(st) = snap.status.as_mut() {
         st.acks.push(SnapshotAck {
@@ -959,9 +1040,7 @@ async fn missing_lv_of_restored_volume_is_not_recreated() {
     reads(&x, &[]);
     expect_lvs(&x, &[]);
     let mut v = volume("pvc-1", GIB, 1);
-    v.spec.source = Some(VolumeSource {
-        snapshot: "snap-1".into(),
-    });
+    v.spec.source = Some(source("snap-1"));
     v.status = Some(VolumeStatus {
         replicas: vec![entry("pvc-1", GIB_KIB, Some(3))],
         ..VolumeStatus::default()
@@ -1006,9 +1085,7 @@ async fn failed_restore_stays_retryable() {
     x.expect(lvm::cmd::restore(VG, "pvc-0+snap-1", "pvc-1", &[]), ok(""));
     expect_lvs(&x, &[snap_lv.clone(), lv_row("pvc-1", GIB_KIB, St::Active)]);
     let mut v = volume("pvc-1", GIB, 1);
-    v.spec.source = Some(VolumeSource {
-        snapshot: "snap-1".into(),
-    });
+    v.spec.source = Some(source("snap-1"));
     v.status = Some(VolumeStatus {
         file_system: Some("xfs".into()),
         replicas: vec![ReplicaStatus {
@@ -1035,9 +1112,7 @@ async fn seeded_marker_does_not_block_restore() {
     x.expect(lvm::cmd::restore(VG, "pvc-1+snap-1", "pvc-2", &[]), ok(""));
     expect_lvs(&x, &[snap_lv, lv_row("pvc-2", GIB_KIB, St::Active)]);
     let mut v = volume("pvc-2", GIB, 1);
-    v.spec.source = Some(VolumeSource {
-        snapshot: "snap-1".into(),
-    });
+    v.spec.source = Some(source("snap-1"));
     v.status = Some(VolumeStatus {
         file_system: Some("xfs".into()),
         ..VolumeStatus::default()

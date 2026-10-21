@@ -441,7 +441,10 @@ fn volume(name: &str, size: u64, source: Option<&str>) -> Volume {
             attachments: vec![],
             access_mode: model::AccessMode::default(),
             evict: vec![],
-            source: source.map(|s| VolumeSource { snapshot: s.into() }),
+            source: source.map(|s| VolumeSource {
+                snapshot: s.into(),
+                snapshot_uid: Some(format!("uid-{s}")),
+            }),
             resolve: None,
             assignment: Some(Assignment {
                 replicas: vec![AssignedReplica {
@@ -458,6 +461,7 @@ fn volume(name: &str, size: u64, source: Option<&str>) -> Volume {
         },
     );
     v.metadata.generation = Some(1);
+    v.metadata.uid = Some(format!("uid-{name}"));
     v
 }
 
@@ -507,6 +511,7 @@ async fn reconcile_decision_table() {
         "snapshot-test-host",
         SnapshotSpec {
             volume: "rw-l-r1".into(),
+            volume_uid: Some("uid-rw-l-r1".into()),
         },
     );
     snap.status = Some(SnapshotStatus {

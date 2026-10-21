@@ -646,7 +646,11 @@ pub async fn create_volume(client: &Client, name: &str, spec: VolumeSpec) {
         .expect("create volume");
 }
 
+/// Bound to the Volume's uid, as CreateSnapshot does, when it exists.
 pub async fn create_snapshot(client: &Client, name: &str, volume: &str) {
+    let volume_uid = get_volume(client, volume)
+        .await
+        .and_then(|v| v.metadata.uid);
     let api: Api<Snapshot> = Api::all(client.clone());
     api.create(
         &PostParams::default(),
@@ -654,11 +658,22 @@ pub async fn create_snapshot(client: &Client, name: &str, volume: &str) {
             name,
             model::SnapshotSpec {
                 volume: volume.into(),
+                volume_uid,
             },
         ),
     )
     .await
     .expect("create snapshot");
+}
+
+/// A restore source bound to the Snapshot's uid, as CreateVolume does.
+pub async fn snapshot_source(client: &Client, name: &str) -> model::VolumeSource {
+    model::VolumeSource {
+        snapshot: name.into(),
+        snapshot_uid: get_snapshot(client, name)
+            .await
+            .and_then(|s| s.metadata.uid),
+    }
 }
 
 pub async fn get_volume(client: &Client, name: &str) -> Option<Volume> {
