@@ -110,10 +110,11 @@ Not in this design (section 13): backing chains or qcow2, asynchronous replicati
 
 - DeleteSnapshot deletes the Snapshot object and returns success once it carries a deletion timestamp. It never waits for LV removal: with retention that wait could last months and the snapshot controller would retry forever.
 - On each pass for a Snapshot with a deletion timestamp:
-  1. Phase `Discovering`: wait for its outcome (6.7). Phase not yet Retired or Deleting: write phase `Retired`, Ready False with reason `Retired`, one `ImageRetired` Event.
-  2. List Volumes live (a linearizable read); count references: any Volume object, whatever its phase or deletion timestamp, with `purpose: Disk` and this uid in `spec.source.snapshotUid`; write `status.referencingDisks`. On every other pass the controller keeps `status.referencingDisks` current from its cache, for visibility; only the release decision recounts from a live list.
-  3. Above zero: stay Retired; the next pass comes from Volume events.
-  4. Zero: phase `Deleting`; the holders remove their snapshot LVs; the finalizer goes when every holder acked.
+  1. Phase `Discovering`: wait for its outcome (6.7).
+  2. Phase not yet Retired or Deleting: write phase `Retired`, Ready False with reason `Retired`, one `ImageRetired` Event.
+  3. List Volumes live (a linearizable read); count references: any Volume object, whatever its phase or deletion timestamp, with `purpose: Disk` and this uid in `spec.source.snapshotUid`; write `status.referencingDisks`. On every other pass the controller keeps `status.referencingDisks` current from its cache, for visibility; only the release decision recounts from a live list.
+  4. Above zero: stay Retired; the next pass comes from Volume events.
+  5. Zero: phase `Deleting`; the holders remove their snapshot LVs; the finalizer goes when every holder acked.
 - A Retired Snapshot never returns to Ready, never starts a new disk and never gets a new warm copy. Repairs still use its copies.
 - Warm Volumes are never references. An uninitialized restore is a reference.
 - The creation race is closed by order. CreateVolume writes the Volume, then re-reads the Snapshot live; if it is gone, deleting, Retired or of another uid, it deletes the Volume and answers NotFound. The controller writes Retired, then lists live, then releases. Either the list sees the Volume or the re-read sees Retired: a Volume can never reference a released image. An idempotent retry that finds its Volume runs the re-read first; it may delete a Volume the list had already counted, which is harmless: an unpublished Volume holds no data and the claim is provisioned again.
@@ -156,7 +157,7 @@ Snapshot LV tags:
 - Snapshot LVs from before tags existed are not holder copies: such snapshots are no longer restorable.
 
 Freeze and failure:
-- An agent that suspended IO for a round resumes on Ready, Failed or its own clock bound, never because the round's status vanished or turned `Discovering`.
+- An agent that suspended IO for a round resumes on its own clock bound, or on any phase other than Suspending, Taking or Discovering; never because the phase vanished.
 - So every copy of a round is taken inside one freeze.
 - The cost: a status lost mid-round keeps IO frozen up to the clock bound.
 - On a Failed Snapshot, every node with a Pool removes an LV with this uid tag, on any pass, whether or not it took part.
@@ -168,8 +169,8 @@ Detecting a lost status:
 - `phase` has no default: absent reads as absent, never as Pending.
 - The controller writes the first status (phase Pending) before it adds its finalizer, so no version of the object has the finalizer without a phase.
 - A Snapshot with the finalizer and no phase has lost its status, whole or in part.
-- So has one in Ready, Retired or Deleting without `sizeBytes`, which is written on the way into Taking.
-- The controller then writes phase `Discovering` with an empty ack list, so no old ack acts as a holder or holds a Pool.
+- So has a Ready one without `sizeBytes`: Ready always has it, from Taking or from discovery.
+- The controller then writes phase `Discovering` and an empty ack list in one merge patch with the resource version precondition, so no old ack acts as a holder or holds a Pool; an apply could not remove the agents' entries.
 - A new Snapshot never looks like one, so it pays nothing.
 - A Snapshot created with the finalizer already set looks like one and ends Lost.
 
@@ -438,7 +439,7 @@ Volume:
 - `spec.purpose`: `Disk` (default) or `WarmCopy` (controller, immutable; WarmCopy needs a source, replicas 2 and ReadWriteOnce). Why not `role`: it already names replica roles.
 - `spec.assignment` of a WarmCopy Volume is written by the controller at creation.
 - `status.replicas[].copyOf`, `zeroedFrom`, `fallback` (values `NoLocalCopy`, `CopyNotUsable`, `RestoreFailed`, `ProofFailed`, `SnapshotNotFound`, `Unknown`), `seededFrom`; all agent-written from tags. A replica entry names its restore source only by `copyOf`, the Snapshot uid; there is no name-based source field.
-- Ready reasons `WaitingForImageCopy`, `SnapshotRetired`, `SnapshotUidMismatch`; `UnsupportedRestore` also covers a single-replica source.
+- Ready reasons `WaitingForImageCopy`, `SnapshotRetired`, `SnapshotUidMismatch`, `SnapshotLost`; `UnsupportedRestore` also covers a single-replica source.
 
 Snapshot:
 - `spec.volumeUid` (controller, immutable); phase `Retired` with Ready reason `Retired`; `phase` without a default; phase `Discovering` with Ready reason `DiscoveryIncomplete`; phase `Lost` with Ready reasons `SnapshotLost` and `TagsDisagree`; the first status written before the finalizer; ack phase `Discovering` with `found`, `searchedPools`, `takenPool`, `lvBytes`, `tagSizeBytes`, `tagSourceReplicas`, `lvCreatedAt`; `lvCreatedAt` on every Taking ack; `status.referencingDisks`; `status.sourceReplicas`; `status.acks[].takenPool`, `lvBytes`, `allocatedBytes` (agent, written once, copied forward); `status.acks[].digest` and `digestBytes` (holders, written once after Ready); `status.copiesIdentical` (controller, written once).
