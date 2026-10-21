@@ -17,7 +17,7 @@ use super::{DrbdEnv, NOT_OURS};
 use crate::drbd::{Host, argv};
 use crate::events2::Tracker;
 use crate::exec::scripted::{ScriptedExec, code, ok};
-use crate::reconcile::{LV_LOST, Reconciler, StatusWrite};
+use crate::reconcile::{LV_LOST, Reconciler, SNAPSHOT_LV_CONFLICT, StatusWrite};
 use crate::storage;
 use crate::storage::fixtures::*;
 
@@ -3057,6 +3057,59 @@ async fn snapshot_lv_name_lvm_refuses_never_suspends() {
         "{a:?}"
     );
     assert!(!seen(&r.x, "suspend-io"), "no suspend");
+}
+
+/// An LV of the snapshot LV's name that is not this Snapshot's copy would
+/// fail the take: the round fails before this node suspends, with one Event.
+#[tokio::test]
+async fn a_foreign_snapshot_lv_refuses_the_suspend() {
+    let other = storage::snap_tag("uid-other", GIB, 2);
+    for tags in [vec![], vec![other.as_str()]] {
+        let mut r = Rig::new(&healthy(), up_host());
+        let rows = [lv(LV_KIB), lv_row("pvc-1+snap-1", LV_KIB, St::Inactive)];
+        reads(&r.x, &rows);
+        r.expect_check();
+        r.expect_sweep();
+        dry(&r.x, "");
+        expect_lv_tags(&r.x, &[("pvc-1", &[OWN]), ("pvc-1+snap-1", &tags)]);
+        let w = r
+            .pass(&[volume(GIB)], &[snapshot(SnapshotPhase::Suspending)])
+            .await;
+        let a = acks(&w).remove(0);
+        assert_eq!((a.phase, a.ok), (SnapshotPhase::Suspending, false));
+        let e = a.error.clone().unwrap();
+        assert!(e.starts_with("LV vg1/pvc-1+snap-1 ") && e.ends_with("; left untouched"));
+        let events: Vec<&str> = w
+            .iter()
+            .filter_map(|w| match w {
+                StatusWrite::Event {
+                    reason, message, ..
+                } if reason == SNAPSHOT_LV_CONFLICT => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events, [e.as_str()]);
+        assert!(!seen(&r.x, "suspend-io"), "no suspend");
+
+        // The refusal stands: no suspend and no second Event.
+        reads_again(&r.x, &rows);
+        dry(&r.x, "");
+        // The orphan report's read.
+        expect_lv_tags(&r.x, &[("pvc-1", &[OWN]), ("pvc-1+snap-1", &tags)]);
+        let w = r
+            .pass(&[volume(GIB)], &[acked(SnapshotPhase::Suspending, a)])
+            .await;
+        assert!(
+            !w.iter().any(|w| match w {
+                StatusWrite::Snapshot { .. } => true,
+                StatusWrite::Event { reason, .. } => reason == SNAPSHOT_LV_CONFLICT,
+                _ => false,
+            }),
+            "{w:?}"
+        );
+        assert!(!seen(&r.x, "suspend-io"), "no suspend");
+        r.x.assert_done();
+    }
 }
 
 #[tokio::test]
