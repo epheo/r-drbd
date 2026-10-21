@@ -1452,11 +1452,21 @@ async fn evict_keeps_running_workloads() {
         ctx.get("devicePath")
             .is_some_and(|p| p.starts_with("/dev/drbd"))
     );
-    patch_spec(&client, "rep", json!({ "evict": ["n4", "n5"] })).await;
-    let err = svc
-        .controller_publish_volume(Request::new(publish("n5")))
-        .await
-        .unwrap_err();
+    // The controller drops n5 from evict as soon as it sees it, since n5
+    // holds nothing: the publish may read the list after that.
+    let mut err = None;
+    for _ in 0..10 {
+        patch_spec(&client, "rep", json!({ "evict": ["n4", "n5"] })).await;
+        let e = svc
+            .controller_publish_volume(Request::new(publish("n5")))
+            .await
+            .unwrap_err();
+        if e.code() != Code::NotFound {
+            err = Some(e);
+            break;
+        }
+    }
+    let err = err.expect("evict of n5 never seen by the publish");
     assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
     assert_eq!(err.message(), "node n5 is being evicted from volume rep");
     assert_eq!(
