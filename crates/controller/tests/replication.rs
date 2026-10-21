@@ -708,7 +708,7 @@ async fn replicated_restore_from_acks() {
     support::set_file_system(&client, "src", "xfs").await;
     create_snapshot(&client, "snap", "src").await;
     snapshot_where(&client, "snap", |s| {
-        support::snap_phase(s) == SnapshotPhase::Ready
+        support::snap_phase(s) == Some(SnapshotPhase::Ready)
     })
     .await;
 
@@ -786,7 +786,7 @@ async fn snapshot_outlives_an_uninitialized_restore() {
     volume_where(&client, "src", |v| phase_of(v) == VolumePhase::Ready).await;
     create_snapshot(&client, "snap", "src").await;
     snapshot_where(&client, "snap", |s| {
-        support::snap_phase(s) == SnapshotPhase::Ready
+        support::snap_phase(s) == Some(SnapshotPhase::Ready)
     })
     .await;
     for a in auto {
@@ -802,7 +802,7 @@ async fn snapshot_outlives_an_uninitialized_restore() {
         .await
         .expect("delete snapshot");
     snapshot_where(&client, "snap", |s| {
-        support::snap_phase(s) == SnapshotPhase::Deleting
+        support::snap_phase(s) == Some(SnapshotPhase::Deleting)
     })
     .await;
     let agents = ["n1", "n2", "n3"].map(|n| FakeAgent::new(&client, n));
@@ -849,7 +849,7 @@ async fn larger_restore_is_ready_only_at_the_full_size() {
     volume_where(&client, "src", |v| phase_of(v) == VolumePhase::Ready).await;
     create_snapshot(&client, "snap", "src").await;
     snapshot_where(&client, "snap", |s| {
-        support::snap_phase(s) == SnapshotPhase::Ready
+        support::snap_phase(s) == Some(SnapshotPhase::Ready)
     })
     .await;
     for a in auto {
@@ -882,7 +882,7 @@ async fn larger_restore_is_ready_only_at_the_full_size() {
         .await
         .expect("delete snapshot");
     snapshot_where(&client, "snap", |s| {
-        support::snap_phase(s) == SnapshotPhase::Deleting
+        support::snap_phase(s) == Some(SnapshotPhase::Deleting)
     })
     .await;
     // Each holder copies its takenPool forward, like the agent.
@@ -1004,7 +1004,7 @@ async fn ready_rep(client: &Client, agents: &[FakeAgent]) {
 }
 
 async fn snap_in(client: &Client, name: &str, phase: SnapshotPhase) -> model::Snapshot {
-    snapshot_where(client, name, |s| support::snap_phase(s) == phase).await
+    snapshot_where(client, name, |s| support::snap_phase(s) == Some(phase)).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1037,7 +1037,7 @@ async fn snapshot_suspend_bound_and_mid_round_attach() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
         support::snap_phase(&support::get_snapshot(&client, "s-attach").await.unwrap()),
-        SnapshotPhase::Taking,
+        Some(SnapshotPhase::Taking),
         "waits for n4"
     );
     a4.ack("s-attach", SnapshotPhase::Taking, false, None).await;
@@ -1088,11 +1088,11 @@ async fn snapshot_round_waits_for_every_agent() {
             .is_some_and(|e| e.contains("agent not reachable on n4"))
     })
     .await;
-    assert_eq!(support::snap_phase(&s), SnapshotPhase::Pending);
+    assert_eq!(support::snap_phase(&s), Some(SnapshotPhase::Pending));
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(
         support::snap_phase(&support::get_snapshot(&client, "s1").await.unwrap()),
-        SnapshotPhase::Pending
+        Some(SnapshotPhase::Pending)
     );
 
     // n4 no longer listed: the round starts and every listed replica acks.
@@ -1170,7 +1170,7 @@ async fn evict_stale_diskful_to_a_fourth_node() {
     create_snapshot(&client, "s0", "rep").await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let s0 = support::get_snapshot(&client, "s0").await.unwrap();
-    assert_eq!(support::snap_phase(&s0), SnapshotPhase::Pending);
+    assert_eq!(support::snap_phase(&s0), Some(SnapshotPhase::Pending));
     patch_spec(&client, "rep", json!({ "evict": ["n1"] })).await;
 
     let v = volume_where(&client, "rep", |v| role_of(v, "n1").is_none()).await;

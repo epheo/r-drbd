@@ -720,8 +720,8 @@ pub fn phase_of(v: &Volume) -> model::VolumePhase {
     v.status.as_ref().map(|s| s.phase).unwrap_or_default()
 }
 
-pub fn snap_phase(s: &Snapshot) -> SnapshotPhase {
-    s.status.as_ref().map(|s| s.phase).unwrap_or_default()
+pub fn snap_phase(s: &Snapshot) -> Option<SnapshotPhase> {
+    s.status.as_ref().and_then(|s| s.phase)
 }
 
 pub fn ready_reason(v: &Volume) -> Option<String> {
@@ -974,8 +974,11 @@ impl FakeAgent {
             .await?;
         for s in &snapshots.items {
             let status = s.status.clone().unwrap_or_default();
+            let Some(phase) = status.phase else {
+                continue;
+            };
             let mine = status.acks.iter().find(|a| a.node == self.node);
-            if mine.is_some_and(|a| a.phase == status.phase) {
+            if mine.is_some_and(|a| a.phase == phase) {
                 continue;
             }
             let volume = volumes.items.iter().find(|v| v.name_any() == s.spec.volume);
@@ -989,20 +992,19 @@ impl FakeAgent {
                 })
                 .and_then(|r| r.pool.clone());
             let name = s.name_any();
-            match status.phase {
+            match phase {
                 SnapshotPhase::Suspending if member => {
                     let pool = mine.and_then(|a| a.taken_pool.clone());
-                    self.ack(&name, status.phase, true, pool.as_deref()).await;
+                    self.ack(&name, phase, true, pool.as_deref()).await;
                 }
                 // Diskless and tiebreaker ack with IO still suspended.
                 SnapshotPhase::Taking if member => {
-                    self.ack(&name, status.phase, true, my_pool.as_deref())
-                        .await;
+                    self.ack(&name, phase, true, my_pool.as_deref()).await;
                 }
                 // Like the agent: any node of the round answers the delete.
                 SnapshotPhase::Deleting if mine.is_some() => {
                     let pool = mine.and_then(|a| a.taken_pool.clone());
-                    self.ack(&name, status.phase, true, pool.as_deref()).await;
+                    self.ack(&name, phase, true, pool.as_deref()).await;
                 }
                 _ => {}
             }

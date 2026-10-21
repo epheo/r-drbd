@@ -296,7 +296,7 @@ pub fn deleted_everywhere(acks: &[SnapshotAck], holders: &BTreeSet<String>) -> b
 
 #[derive(Debug, Clone, PartialEq)]
 struct Owned {
-    phase: SnapshotPhase,
+    phase: Option<SnapshotPhase>,
     conditions: Vec<Condition>,
     size_bytes: Option<u64>,
     created_at: Option<Time>,
@@ -329,8 +329,11 @@ impl Owned {
     }
 
     fn json(&self) -> serde_json::Value {
-        let mut s = json!({ "phase": self.phase, "conditions": self.conditions });
+        let mut s = json!({ "conditions": self.conditions });
         if let Some(m) = s.as_object_mut() {
+            if let Some(v) = self.phase {
+                m.insert("phase".into(), json!(v));
+            }
             if let Some(v) = self.size_bytes {
                 m.insert("sizeBytes".into(), json!(v));
             }
@@ -394,12 +397,15 @@ fn phase_reason(p: SnapshotPhase) -> &'static str {
 
 /// Returns whether a patch went through.
 async fn write(api: &Api<Snapshot>, s: &Snapshot, mut wanted: Owned) -> bool {
+    let Some(phase) = wanted.phase else {
+        return false;
+    };
     let existing = s
         .status
         .as_ref()
         .map(|st| st.conditions.as_slice())
         .unwrap_or_default();
-    let cond = ready_cond(wanted.phase, wanted.last_error.as_deref());
+    let cond = ready_cond(phase, wanted.last_error.as_deref());
     wanted.conditions = build_conditions(existing, &[(types::READY, &cond)], s.metadata.generation);
     wanted.observed_generation = s.metadata.generation;
     if Owned::current(s) == wanted {
@@ -486,19 +492,27 @@ async fn reconcile(
         return None;
     }
     if !has_finalizer(s, FINALIZER_SNAPSHOT) {
-        set_finalizer(api, s, FINALIZER_SNAPSHOT, true).await;
+        // The first status comes before the finalizer, so no version of
+        // the object has the finalizer without a phase.
+        if current.phase.is_none() {
+            let wanted = Owned {
+                phase: Some(SnapshotPhase::Pending),
+                ..current
+            };
+            write(api, s, wanted).await;
+        } else {
+            set_finalizer(api, s, FINALIZER_SNAPSHOT, true).await;
+        }
         return None;
     }
-    if current.phase == SnapshotPhase::Ready {
+    let phase = current.phase?;
+    if phase == SnapshotPhase::Ready {
         record_proof(ctx, api, s, current).await;
         return None;
     }
     // Unknown: a phase another version wrote. Left as it is, like Failed:
     // rewriting it could fail a newer version's good snapshot.
-    if matches!(
-        current.phase,
-        SnapshotPhase::Failed | SnapshotPhase::Unknown
-    ) {
+    if matches!(phase, SnapshotPhase::Failed | SnapshotPhase::Unknown) {
         return None;
     }
     if !valid_name(&name) {
@@ -506,9 +520,9 @@ async fn reconcile(
         fail(api, s, current, error).await;
         return None;
     }
-    let usable = volume.as_deref().filter(|v| {
-        v.metadata.deletion_timestamp.is_none() || current.phase != SnapshotPhase::Pending
-    });
+    let usable = volume
+        .as_deref()
+        .filter(|v| v.metadata.deletion_timestamp.is_none() || phase != SnapshotPhase::Pending);
     let (Some(v), Some(a)) = (usable, assignment) else {
         let age = s
             .metadata
@@ -517,13 +531,12 @@ async fn reconcile(
             .map_or(Duration::ZERO, |t| {
                 Duration::try_from(Timestamp::now().duration_since(t.0)).unwrap_or(Duration::ZERO)
             });
-        let (phase, error, wake) =
-            without_volume(current.phase, &s.spec.volume, volume.as_deref(), age);
+        let (phase, error, wake) = without_volume(phase, &s.spec.volume, volume.as_deref(), age);
         write(
             api,
             s,
             Owned {
-                phase,
+                phase: Some(phase),
                 last_error: Some(error),
                 ..current
             },
@@ -533,7 +546,7 @@ async fn reconcile(
     };
     // Before any suspend: a snapshot LV name LVM would refuse in some
     // replica's VG fails the snapshot here, not in Taking with IO suspended.
-    if current.phase == SnapshotPhase::Pending
+    if phase == SnapshotPhase::Pending
         && let Some(error) = lv_name_problem(ctx, &a, &s.spec.volume, &name)
     {
         fail(api, s, current, error).await;
@@ -541,10 +554,10 @@ async fn reconcile(
     }
     // A bounded phase without a start (written by hand or by an older
     // controller): the bound starts now, persisted so it does not slide.
-    if bound(ctx, current.phase).is_some() && current.phase_since.is_none() {
+    if bound(ctx, phase).is_some() && current.phase_since.is_none() {
         info!(
             snapshot = name,
-            phase = ?current.phase,
+            ?phase,
             "phase without phaseSince; starting the bound now"
         );
         let wanted = Owned {
@@ -552,14 +565,14 @@ async fn reconcile(
             ..current
         };
         write(api, s, wanted).await;
-        return bound(ctx, current.phase);
+        return bound(ctx, phase);
     }
-    step(ctx, api, s, v, &a, current).await
+    step(ctx, api, s, v, &a, phase, current).await
 }
 
 async fn fail(api: &Api<Snapshot>, s: &Snapshot, current: Owned, error: String) {
     let wanted = Owned {
-        phase: SnapshotPhase::Failed,
+        phase: Some(SnapshotPhase::Failed),
         last_error: Some(error),
         ..current
     };
@@ -668,6 +681,7 @@ async fn step(
     s: &Snapshot,
     v: &Volume,
     a: &Assignment,
+    phase: SnapshotPhase,
     current: Owned,
 ) -> Option<Duration> {
     // Measured from the persisted start, so a controller restart keeps the bound.
@@ -687,7 +701,7 @@ async fn step(
         .collect();
     let other = crate::volume::snapshot_in_progress(ctx.stores, &s.spec.volume);
     let round = Round {
-        phase: current.phase,
+        phase,
         replicated: v.spec.replicas >= 2,
         volume: v,
         assignment: a,
@@ -699,7 +713,7 @@ async fn step(
         suspend_timeout: ctx.cfg.suspend_timeout,
     };
     let mut step = next(&round);
-    if current.phase == SnapshotPhase::Pending && matches!(step, Step::Go { .. }) {
+    if phase == SnapshotPhase::Pending && matches!(step, Step::Go { .. }) {
         match live_round(api, s).await {
             Ok(None) => {}
             Ok(Some(other)) => {
@@ -710,7 +724,7 @@ async fn step(
             Err(e) => step = Step::Hold(format!("reading snapshots: {e}")),
         }
     }
-    apply_step(ctx, api, s, v, current, phase_for, step).await
+    apply_step(ctx, api, s, v, phase, current, phase_for, step).await
 }
 
 /// Another Snapshot of the volume in its round, as the API server has it.
@@ -744,11 +758,13 @@ pub fn restore_size(v: &Volume) -> u64 {
 }
 
 /// Writes the outcome of one step; returns when to look again.
+#[allow(clippy::too_many_arguments)]
 async fn apply_step(
     ctx: &Ctx<'_>,
     api: &Api<Snapshot>,
     s: &Snapshot,
     v: &Volume,
+    from: SnapshotPhase,
     current: Owned,
     phase_for: Option<Duration>,
     step: Step,
@@ -756,7 +772,7 @@ async fn apply_step(
     let name = s.name_any();
     match step {
         Step::Stay => {
-            let left = bound(ctx, current.phase)
+            let left = bound(ctx, from)
                 .zip(phase_for)
                 .map(|(b, t)| b.saturating_sub(t));
             write(api, s, current).await;
@@ -774,7 +790,6 @@ async fn apply_step(
             None
         }
         Step::Go { phase, error } => {
-            let from = current.phase;
             let mut wanted = current;
             wanted.phase_since = Some(crate::now());
             if from == SnapshotPhase::Pending {
@@ -793,7 +808,7 @@ async fn apply_step(
                 wanted.last_error = error;
             }
             info!(snapshot = name, ?from, to = ?phase, error = ?wanted.last_error, "snapshot round");
-            wanted.phase = phase;
+            wanted.phase = Some(phase);
             write(api, s, wanted).await;
             bound(ctx, phase)
         }
@@ -838,7 +853,10 @@ async fn delete(
         .unwrap_or_default();
     // sizeBytes is written on the way into Taking.
     let reached_taking = current.size_bytes.is_some()
-        || matches!(current.phase, SnapshotPhase::Taking | SnapshotPhase::Ready);
+        || matches!(
+            current.phase,
+            Some(SnapshotPhase::Taking | SnapshotPhase::Ready)
+        );
     let mut held = holders(acks, reached_taking, diskful);
     held.retain(|n| exists(n));
     if let Some(v) = restoring {
@@ -856,7 +874,7 @@ async fn delete(
         set_finalizer(api, s, FINALIZER_SNAPSHOT, false).await;
     } else {
         let wanted = Owned {
-            phase: SnapshotPhase::Deleting,
+            phase: Some(SnapshotPhase::Deleting),
             ..current
         };
         write(api, s, wanted).await;
@@ -1397,7 +1415,7 @@ mod tests {
 
     fn status(acks: Vec<SnapshotAck>, source_replicas: Option<u32>) -> model::SnapshotStatus {
         model::SnapshotStatus {
-            phase: P::Ready,
+            phase: Some(P::Ready),
             acks,
             source_replicas,
             ..model::SnapshotStatus::default()

@@ -27,7 +27,7 @@ fn a_removed_phase_decodes_as_unknown() {
     use model::{Snapshot, SnapshotPhase};
     let s: Snapshot = serde_json::from_str(OLD).expect("decodes");
     let st = s.status.unwrap();
-    assert_eq!(st.phase, SnapshotPhase::Unknown);
+    assert_eq!(st.phase, Some(SnapshotPhase::Unknown));
     assert!(st.acks.iter().all(|a| a.phase == SnapshotPhase::Unknown));
     // Never written back.
     assert!(serde_json::to_string(&SnapshotPhase::Unknown).is_err());

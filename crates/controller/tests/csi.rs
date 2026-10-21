@@ -898,7 +898,7 @@ async fn expand_refused_mid_round() {
 
     support::create_snapshot(&client, "s1", "pvc-x").await;
     support::snapshot_where(&client, "s1", |s| {
-        support::snap_phase(s) == SnapshotPhase::Taking
+        support::snap_phase(s) == Some(SnapshotPhase::Taking)
     })
     .await;
     support::eventually(Duration::from_secs(10), || async {
@@ -920,7 +920,7 @@ async fn expand_refused_mid_round() {
 
     a1.ack("s1", SnapshotPhase::Taking, true, Some("p1")).await;
     support::snapshot_where(&client, "s1", |s| {
-        support::snap_phase(s) == SnapshotPhase::Ready
+        support::snap_phase(s) == Some(SnapshotPhase::Ready)
     })
     .await;
     let _auto = a1.spawn_auto();

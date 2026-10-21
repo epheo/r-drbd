@@ -1230,7 +1230,7 @@
                         "type": "integer"
                       },
                       "phase": {
-                        "default": "Pending",
+                        "description": "No default: absent reads as absent, never as Pending. The controller\nwrites the first status before its finalizer, so the finalizer\nwithout a phase means a lost status.",
                         "enum": [
                           "Ready",
                           "Failed",
@@ -1239,6 +1239,7 @@
                           "Taking",
                           "Deleting"
                         ],
+                        "nullable": true,
                         "type": "string"
                       },
                       "phaseSince": {

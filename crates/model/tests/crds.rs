@@ -83,6 +83,11 @@ fn per_node_lists_are_maps_keyed_by_node() {
     let snap = to_json(&Snapshot::crd());
     let acks = &schema(&snap)["properties"]["status"]["properties"]["acks"];
     assert_eq!(acks["x-kubernetes-list-map-keys"], json!(["node"]));
+    // A phase lost from the status reads as absent, never as Pending.
+    let phase = &schema(&snap)["properties"]["status"]["properties"]["phase"];
+    assert_eq!(phase.get("default"), None, "{phase}");
+    let st: model::SnapshotStatus = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(st.phase, None);
 }
 
 #[test]

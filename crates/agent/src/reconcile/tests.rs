@@ -88,7 +88,7 @@ fn snapshot(name: &str, volume: &str, phase: SnapshotPhase) -> Snapshot {
         .into_iter()
         .collect();
     s.status = Some(SnapshotStatus {
-        phase,
+        phase: Some(phase),
         acks,
         ..SnapshotStatus::default()
     });

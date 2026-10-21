@@ -51,11 +51,10 @@ impl Snapshot {
     }
 }
 
-#[derive(JsonSchema, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(JsonSchema, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotPhase {
     /// Waiting for the volume to be Ready, in sync and connected everywhere,
     /// every agent reachable, and no other round on the volume.
-    #[default]
     Pending,
     /// Every replica suspends DRBD IO; SUSPEND_BOUND.
     Suspending,
@@ -76,8 +75,11 @@ pub enum SnapshotPhase {
 #[derive(KubeSchema, Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotStatus {
-    #[serde(default)]
-    pub phase: SnapshotPhase,
+    /// No default: absent reads as absent, never as Pending. The controller
+    /// writes the first status before its finalizer, so the finalizer
+    /// without a phase means a lost status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<SnapshotPhase>,
     #[serde(default)]
     #[x_kube(merge_strategy = ListMerge::Map(vec!["type".into()]))]
     pub conditions: Vec<Condition>,

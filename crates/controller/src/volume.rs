@@ -1379,7 +1379,7 @@ async fn attach_report(
 /// it waits for a Ready volume, which may need the very move it would block.
 pub fn round_running(s: &Snapshot) -> bool {
     matches!(
-        s.status.as_ref().map(|st| st.phase),
+        s.status.as_ref().and_then(|st| st.phase),
         Some(SnapshotPhase::Suspending | SnapshotPhase::Taking)
     )
 }
@@ -1883,9 +1883,9 @@ fn ready_snapshot<'a>(snap: Option<&'a Snapshot>, wanted: &str) -> Result<&'a Sn
     };
     let status = snap.status.clone().unwrap_or_default();
     match status.phase {
-        SnapshotPhase::Ready => Ok(snap),
+        Some(SnapshotPhase::Ready) => Ok(snap),
         // Unknown: written by another version; no round ever ends it.
-        SnapshotPhase::Failed | SnapshotPhase::Unknown => Err(Placement::Fail(Cond::new(
+        Some(SnapshotPhase::Failed | SnapshotPhase::Unknown) => Err(Placement::Fail(Cond::new(
             FALSE,
             reason::SNAPSHOT_FAILED,
             format!(
@@ -1896,7 +1896,10 @@ fn ready_snapshot<'a>(snap: Option<&'a Snapshot>, wanted: &str) -> Result<&'a Sn
         p => Err(Placement::Wait(Cond::new(
             FALSE,
             reason::SNAPSHOT_NOT_READY,
-            format!("snapshot {wanted} is {p:?}"),
+            match p {
+                Some(p) => format!("snapshot {wanted} is {p:?}"),
+                None => format!("snapshot {wanted} has no phase yet"),
+            },
         ))),
     }
 }
@@ -3199,7 +3202,7 @@ mod tests {
             (SnapshotPhase::Deleting, false),
         ] {
             snap.status = Some(model::SnapshotStatus {
-                phase,
+                phase: Some(phase),
                 ..model::SnapshotStatus::default()
             });
             assert_eq!(round_running(&snap), running, "{phase:?}");
@@ -3301,7 +3304,7 @@ mod tests {
         // Its acks carry a phase this version removed; the copies are there.
         let mut snap = Snapshot::new("s", spec_of("v"));
         snap.status = Some(model::SnapshotStatus {
-            phase: SnapshotPhase::Ready,
+            phase: Some(SnapshotPhase::Ready),
             acks: vec![model::SnapshotAck {
                 node: "n1".into(),
                 phase: SnapshotPhase::Unknown,
@@ -3336,7 +3339,7 @@ mod tests {
         let mut snap = Snapshot::new("s", spec_of("v"));
         snap.metadata.uid = Some("uid-s".into());
         snap.status = Some(model::SnapshotStatus {
-            phase: SnapshotPhase::Ready,
+            phase: Some(SnapshotPhase::Ready),
             size_bytes: Some(10 * G),
             acks: vec![ack("n1", "p1"), ack("n2", "p2")],
             ..model::SnapshotStatus::default()

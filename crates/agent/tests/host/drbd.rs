@@ -672,7 +672,7 @@ async fn restore_case(h: &Host, factor: u64, max_received: Option<u64>) {
     snap.metadata.uid = Some("uid-rw-snap".into());
     // Every member is this host: one ack stands for each holder.
     snap.status = Some(SnapshotStatus {
-        phase: SnapshotPhase::Ready,
+        phase: Some(SnapshotPhase::Ready),
         size_bytes: Some(source_size),
         source_replicas: Some(2),
         copies_identical: Some(max_received.is_some()),
@@ -867,7 +867,7 @@ async fn drbd_snapshot_rounds_under_a_writer() {
             );
             s.metadata.uid = Some(format!("uid-{}-s{i}", m.res));
             s.status = Some(SnapshotStatus {
-                phase,
+                phase: Some(phase),
                 ..SnapshotStatus::default()
             });
             Arc::new(s)
@@ -1027,7 +1027,7 @@ async fn drbd_replicated_lifecycle() {
             },
         );
         s.status = Some(SnapshotStatus {
-            phase,
+            phase: Some(phase),
             acks,
             ..SnapshotStatus::default()
         });

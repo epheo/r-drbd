@@ -440,7 +440,10 @@ async fn snapshot_lv_name_too_long_fails_before_any_round() {
     create_volume(&client, &vol, spec).await;
     volume_where(&client, &vol, |v| v.spec.assignment.is_some()).await;
     create_snapshot(&client, &snap, &vol).await;
-    let s = snapshot_where(&client, &snap, |s| snap_phase(s) == SnapshotPhase::Failed).await;
+    let s = snapshot_where(&client, &snap, |s| {
+        snap_phase(s) == Some(SnapshotPhase::Failed)
+    })
+    .await;
     let e = s.status.unwrap().last_error.unwrap();
     assert!(e.starts_with("pool p1: LV name vg/"), "{e}");
     assert!(e.contains("device-mapper"), "{e}");
@@ -466,19 +469,25 @@ async fn snapshot_local_and_restore() {
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(
         snap_phase(&get_snapshot(&client, "snap1").await.unwrap()),
-        SnapshotPhase::Pending
+        Some(SnapshotPhase::Pending)
     );
     // The node plugin's marker after mkfs, under the shared fs manager.
     support::set_file_system(&client, "src", "xfs").await;
     a1.ready("src").await;
-    let s = snapshot_where(&client, "snap1", |s| snap_phase(s) == SnapshotPhase::Taking).await;
+    let s = snapshot_where(&client, "snap1", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Taking)
+    })
+    .await;
     let st = s.status.unwrap();
     assert_eq!(st.size_bytes, Some(GIB));
     assert_eq!(st.file_system.as_deref(), Some("xfs"));
     assert_eq!(st.source_replicas, Some(1));
     a1.ack("snap1", SnapshotPhase::Taking, true, Some("p1"))
         .await;
-    let s = snapshot_where(&client, "snap1", |s| snap_phase(s) == SnapshotPhase::Ready).await;
+    let s = snapshot_where(&client, "snap1", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Ready)
+    })
+    .await;
     assert!(s.status.unwrap().created_at.is_some());
 
     // A restore is charged at full size: p1 too full for a new volume
@@ -572,7 +581,7 @@ async fn snapshot_local_and_restore() {
         .await
         .expect("delete snapshot");
     snapshot_where(&client, "snap1", |s| {
-        snap_phase(s) == SnapshotPhase::Deleting
+        snap_phase(s) == Some(SnapshotPhase::Deleting)
     })
     .await;
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -607,7 +616,7 @@ async fn snapshot_replicated_rounds() {
 
     create_snapshot(&client, "rs", "rep").await;
     snapshot_where(&client, "rs", |s| {
-        snap_phase(s) == SnapshotPhase::Suspending
+        snap_phase(s) == Some(SnapshotPhase::Suspending)
     })
     .await;
     agents[0]
@@ -616,7 +625,7 @@ async fn snapshot_replicated_rounds() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
         snap_phase(&get_snapshot(&client, "rs").await.unwrap()),
-        SnapshotPhase::Suspending
+        Some(SnapshotPhase::Suspending)
     );
     agents[1]
         .ack("rs", SnapshotPhase::Suspending, true, None)
@@ -625,12 +634,15 @@ async fn snapshot_replicated_rounds() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
         snap_phase(&get_snapshot(&client, "rs").await.unwrap()),
-        SnapshotPhase::Suspending
+        Some(SnapshotPhase::Suspending)
     );
     agents[2]
         .ack("rs", SnapshotPhase::Suspending, true, None)
         .await;
-    let s = snapshot_where(&client, "rs", |s| snap_phase(s) == SnapshotPhase::Taking).await;
+    let s = snapshot_where(&client, "rs", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Taking)
+    })
+    .await;
     assert_eq!(s.status.unwrap().source_replicas, Some(2));
     agents[0]
         .ack("rs", SnapshotPhase::Taking, true, Some("p1"))
@@ -642,11 +654,14 @@ async fn snapshot_replicated_rounds() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
         snap_phase(&get_snapshot(&client, "rs").await.unwrap()),
-        SnapshotPhase::Taking
+        Some(SnapshotPhase::Taking)
     );
     agents[2].ack("rs", SnapshotPhase::Taking, true, None).await;
     // Ready at once: every agent resumes on its own when the round ends.
-    let s = snapshot_where(&client, "rs", |s| snap_phase(s) == SnapshotPhase::Ready).await;
+    let s = snapshot_where(&client, "rs", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Ready)
+    })
+    .await;
     let st = s.status.unwrap();
     assert!(st.created_at.is_some());
     assert_eq!(st.size_bytes, Some(GIB));
@@ -655,7 +670,7 @@ async fn snapshot_replicated_rounds() {
     // A failed suspend fails the round.
     create_snapshot(&client, "rs-bad", "rep").await;
     snapshot_where(&client, "rs-bad", |s| {
-        snap_phase(s) == SnapshotPhase::Suspending
+        snap_phase(s) == Some(SnapshotPhase::Suspending)
     })
     .await;
     agents[0]
@@ -665,7 +680,7 @@ async fn snapshot_replicated_rounds() {
         .ack("rs-bad", SnapshotPhase::Suspending, false, None)
         .await;
     let s = snapshot_where(&client, "rs-bad", |s| {
-        snap_phase(s) == SnapshotPhase::Failed
+        snap_phase(s) == Some(SnapshotPhase::Failed)
     })
     .await;
     assert!(
@@ -693,7 +708,7 @@ async fn holder_digests_write_copies_identical() {
     volume_where(&client, "rep", |v| phase_of(v) == VolumePhase::Ready).await;
     for s in ["same", "differ"] {
         create_snapshot(&client, s, "rep").await;
-        snapshot_where(&client, s, |x| snap_phase(x) == SnapshotPhase::Ready).await;
+        snapshot_where(&client, s, |x| snap_phase(x) == Some(SnapshotPhase::Ready)).await;
     }
     for a in auto {
         a.abort();
@@ -726,7 +741,7 @@ async fn holder_digests_write_copies_identical() {
     .await;
     let st = s.status.unwrap();
     assert_eq!(st.copies_identical, Some(false));
-    assert_eq!(st.phase, SnapshotPhase::Ready);
+    assert_eq!(st.phase, Some(SnapshotPhase::Ready));
     let differ_events = || async {
         Api::<k8s_openapi::api::core::v1::Event>::namespaced(client.clone(), "default")
             .list(&kube::api::ListParams::default())
@@ -798,7 +813,7 @@ async fn two_snapshots_of_one_volume_never_overlap() {
             && all
                 .items
                 .iter()
-                .all(|s| snap_phase(s) == SnapshotPhase::Ready)
+                .all(|s| snap_phase(s) == Some(SnapshotPhase::Ready))
         {
             break;
         }
@@ -817,9 +832,15 @@ async fn snapshot_ack_failure() {
     let agent = FakeAgent::new(&client, "n1");
     ready_local(&client, &agent, "vol", GIB).await;
     create_snapshot(&client, "snap", "vol").await;
-    snapshot_where(&client, "snap", |s| snap_phase(s) == SnapshotPhase::Taking).await;
+    snapshot_where(&client, "snap", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Taking)
+    })
+    .await;
     agent.ack("snap", SnapshotPhase::Taking, false, None).await;
-    let s = snapshot_where(&client, "snap", |s| snap_phase(s) == SnapshotPhase::Failed).await;
+    let s = snapshot_where(&client, "snap", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Failed)
+    })
+    .await;
     assert!(
         s.status
             .unwrap()
@@ -833,7 +854,7 @@ async fn snapshot_ack_failure() {
         .await
         .expect("delete snapshot");
     snapshot_where(&client, "snap", |s| {
-        snap_phase(s) == SnapshotPhase::Deleting
+        snap_phase(s) == Some(SnapshotPhase::Deleting)
     })
     .await;
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -854,9 +875,15 @@ async fn snapshot_take_timeout() {
     let agent = FakeAgent::new(&client, "n1");
     ready_local(&client, &agent, "vol", GIB).await;
     create_snapshot(&client, "slow", "vol").await;
-    snapshot_where(&client, "slow", |s| snap_phase(s) == SnapshotPhase::Taking).await;
+    snapshot_where(&client, "slow", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Taking)
+    })
+    .await;
     let started = std::time::Instant::now();
-    let s = snapshot_where(&client, "slow", |s| snap_phase(s) == SnapshotPhase::Failed).await;
+    let s = snapshot_where(&client, "slow", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Failed)
+    })
+    .await;
     assert!(
         started.elapsed() < Duration::from_secs(10),
         "timeout took {:?}",
@@ -867,14 +894,44 @@ async fn snapshot_take_timeout() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_waits_for_volume() {
+    use futures::{StreamExt, TryStreamExt};
+    use kube::api::{ListParams, WatchEvent, WatchParams};
     let assets = require_envtest!();
     let (_env, client, _ctl) = setup(&assets, |_| {}).await;
+    let api: Api<Snapshot> = Api::all(client.clone());
+    let from = api.list(&ListParams::default()).await.unwrap().metadata;
+    let mut versions = api
+        .watch(&WatchParams::default(), &from.resource_version.unwrap())
+        .await
+        .unwrap()
+        .boxed();
     create_snapshot(&client, "orphan", "nope").await;
+    // Every stored version: none has the finalizer without a phase.
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(30), versions.try_next())
+            .await
+            .expect("a version with the finalizer")
+            .unwrap()
+            .expect("watch open");
+        let (WatchEvent::Added(s) | WatchEvent::Modified(s)) = event else {
+            continue;
+        };
+        let finalized = s
+            .metadata
+            .finalizers
+            .iter()
+            .flatten()
+            .any(|f| f == model::keys::FINALIZER_SNAPSHOT);
+        if finalized {
+            assert_eq!(snap_phase(&s), Some(SnapshotPhase::Pending));
+            break;
+        }
+    }
     let s = snapshot_where(&client, "orphan", |s| {
         s.status.as_ref().is_some_and(|st| st.last_error.is_some())
     })
     .await;
-    assert_eq!(snap_phase(&s), SnapshotPhase::Pending);
+    assert_eq!(snap_phase(&s), Some(SnapshotPhase::Pending));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -898,7 +955,7 @@ async fn snapshot_of_another_volume_uid_never_starts() {
             s.status.as_ref().is_some_and(|st| st.last_error.is_some())
         })
         .await;
-        assert_eq!(snap_phase(&s), SnapshotPhase::Pending, "{name}");
+        assert_eq!(snap_phase(&s), Some(SnapshotPhase::Pending), "{name}");
         let error = s.status.unwrap().last_error.unwrap();
         assert_eq!(error, "volume vol not found", "{name}");
     }
@@ -972,19 +1029,25 @@ async fn take_bound_survives_restart() {
     let agent = FakeAgent::new(&client, "n1");
     ready_local(&client, &agent, "vol", GIB).await;
     create_snapshot(&client, "snap", "vol").await;
-    let s = snapshot_where(&client, "snap", |s| snap_phase(s) == SnapshotPhase::Taking).await;
+    let s = snapshot_where(&client, "snap", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Taking)
+    })
+    .await;
     assert!(s.status.unwrap().phase_since.is_some());
     drop(first);
     tokio::time::sleep(Duration::from_secs(7)).await;
     assert_eq!(
         snap_phase(&get_snapshot(&client, "snap").await.unwrap()),
-        SnapshotPhase::Taking
+        Some(SnapshotPhase::Taking)
     );
     // Same identity: the lease is ours at once. The bound already passed,
     // so the new process fails the round without waiting another 6 s.
     let started = std::time::Instant::now();
     let _second = support::spawn(env.clients().await, cfg);
-    snapshot_where(&client, "snap", |s| snap_phase(s) == SnapshotPhase::Failed).await;
+    snapshot_where(&client, "snap", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Failed)
+    })
+    .await;
     assert!(
         started.elapsed() < Duration::from_secs(4),
         "took {:?}",
@@ -1001,13 +1064,16 @@ async fn snapshot_deleted_mid_taking() {
     let agent = FakeAgent::new(&client, "n1");
     ready_local(&client, &agent, "vol", GIB).await;
     create_snapshot(&client, "snap", "vol").await;
-    snapshot_where(&client, "snap", |s| snap_phase(s) == SnapshotPhase::Taking).await;
+    snapshot_where(&client, "snap", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Taking)
+    })
+    .await;
     Api::<Snapshot>::all(client.clone())
         .delete("snap", &DeleteParams::default())
         .await
         .expect("delete snapshot");
     snapshot_where(&client, "snap", |s| {
-        snap_phase(s) == SnapshotPhase::Deleting
+        snap_phase(s) == Some(SnapshotPhase::Deleting)
     })
     .await;
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1031,11 +1097,17 @@ async fn pool_held_by_snapshot() {
     let agent = FakeAgent::new(&client, "n1");
     ready_local(&client, &agent, "vol", GIB).await;
     create_snapshot(&client, "snap", "vol").await;
-    snapshot_where(&client, "snap", |s| snap_phase(s) == SnapshotPhase::Taking).await;
+    snapshot_where(&client, "snap", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Taking)
+    })
+    .await;
     agent
         .ack("snap", SnapshotPhase::Taking, true, Some("p1"))
         .await;
-    snapshot_where(&client, "snap", |s| snap_phase(s) == SnapshotPhase::Ready).await;
+    snapshot_where(&client, "snap", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Ready)
+    })
+    .await;
     delete_volume(&client, "vol").await;
     volume_where(&client, "vol", |v| phase_of(v) == VolumePhase::Deleting).await;
     agent.gone("vol").await;
@@ -1059,7 +1131,7 @@ async fn pool_held_by_snapshot() {
         .await
         .expect("delete snapshot");
     snapshot_where(&client, "snap", |s| {
-        snap_phase(s) == SnapshotPhase::Deleting
+        snap_phase(s) == Some(SnapshotPhase::Deleting)
     })
     .await;
     agent
@@ -1114,18 +1186,24 @@ async fn controller_owns_no_agent_fields() {
     volume_where(&client, "rep", |v| phase_of(v) == VolumePhase::Ready).await;
     create_snapshot(&client, "snap", "rep").await;
     snapshot_where(&client, "snap", |s| {
-        snap_phase(s) == SnapshotPhase::Suspending
+        snap_phase(s) == Some(SnapshotPhase::Suspending)
     })
     .await;
     // The tiebreaker suspends too.
     for a in &agents {
         a.ack("snap", SnapshotPhase::Suspending, true, None).await;
     }
-    snapshot_where(&client, "snap", |s| snap_phase(s) == SnapshotPhase::Taking).await;
+    snapshot_where(&client, "snap", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Taking)
+    })
+    .await;
     for (a, p) in agents.iter().zip([Some("p1"), Some("p2"), None]) {
         a.ack("snap", SnapshotPhase::Taking, true, p).await;
     }
-    snapshot_where(&client, "snap", |s| snap_phase(s) == SnapshotPhase::Ready).await;
+    snapshot_where(&client, "snap", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Ready)
+    })
+    .await;
     support::eventually(Duration::from_secs(20), || async {
         get_pool(&client, "p1")
             .await
@@ -1193,9 +1271,12 @@ async fn taking_without_start_gets_one() {
     .await;
     assert_eq!(
         snap_phase(&get_snapshot(&client, "snap").await.unwrap()),
-        SnapshotPhase::Taking
+        Some(SnapshotPhase::Taking)
     );
-    let s = snapshot_where(&client, "snap", |s| snap_phase(s) == SnapshotPhase::Failed).await;
+    let s = snapshot_where(&client, "snap", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Failed)
+    })
+    .await;
     // Bounded from when the controller started the clock, not instantly.
     assert!(
         started.elapsed() >= Duration::from_secs(2),
@@ -1327,13 +1408,13 @@ async fn a_transition_from_a_stale_copy_is_rejected() {
     let rv = stale.metadata.resource_version.as_deref();
     assert!(!controller::apply_status_at(&api, "s", rv, phase(SnapshotPhase::Taking)).await);
     let now = get_snapshot(&client, "s").await.unwrap();
-    assert_eq!(snap_phase(&now), SnapshotPhase::Pending);
+    assert_eq!(snap_phase(&now), None, "never defaulted");
     assert_eq!(now.status.unwrap().acks.len(), 1, "the ack stays");
     let rv = now.metadata.resource_version.as_deref();
     assert!(controller::apply_status_at(&api, "s", rv, phase(SnapshotPhase::Taking)).await);
     assert_eq!(
         snap_phase(&get_snapshot(&client, "s").await.unwrap()),
-        SnapshotPhase::Taking
+        Some(SnapshotPhase::Taking)
     );
 }
 
@@ -1411,12 +1492,19 @@ async fn a_snapshot_in_a_removed_phase_never_stops_the_controller() {
     volume_where(&client, "vol", |v| phase_of(v) == VolumePhase::Ready).await;
 
     let s = get_snapshot(&client, "old").await.unwrap();
-    assert_eq!(snap_phase(&s), SnapshotPhase::Unknown, "left as it is");
+    assert_eq!(
+        snap_phase(&s),
+        Some(SnapshotPhase::Unknown),
+        "left as it is"
+    );
     Api::<Snapshot>::all(client.clone())
         .delete("old", &DeleteParams::default())
         .await
         .expect("delete snapshot");
-    snapshot_where(&client, "old", |s| snap_phase(s) == SnapshotPhase::Deleting).await;
+    snapshot_where(&client, "old", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Deleting)
+    })
+    .await;
     agent
         .ack("old", SnapshotPhase::Deleting, true, Some("p1"))
         .await;

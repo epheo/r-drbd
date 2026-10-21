@@ -1043,8 +1043,8 @@ impl Reconciler {
         if replicated.is_some() && !self.drbd_available() {
             return None;
         }
-        let deleting =
-            snap.metadata.deletion_timestamp.is_some() || status.phase == SnapshotPhase::Deleting;
+        let deleting = snap.metadata.deletion_timestamp.is_some()
+            || status.phase == Some(SnapshotPhase::Deleting);
         // Before its take the round works in the replica's Pool.
         let replica_pool = replica.and_then(|r| r.pool.clone());
         let lv = lvm::names::snapshot_lv(&snap.spec.volume, &name);
@@ -1055,7 +1055,7 @@ impl Reconciler {
                 .await?
         } else {
             match status.phase {
-                SnapshotPhase::Taking => match (replica, replicated) {
+                Some(SnapshotPhase::Taking) => match (replica, replicated) {
                     // Taken: the LV and its ack stay as they are.
                     (Some(_), _) if taken.pool.is_some() => return None,
                     (Some(_), _) => {
@@ -1093,7 +1093,7 @@ impl Reconciler {
                     }
                     (None, None) => return None,
                 },
-                SnapshotPhase::Suspending => {
+                Some(SnapshotPhase::Suspending) => {
                     if let Some(v) = replicated {
                         self.my_replica(v)?;
                         // Backstop to the controller's admission check: an
@@ -1118,10 +1118,10 @@ impl Reconciler {
                         )
                     }
                 }
-                SnapshotPhase::Ready if taken.pool.is_none() && holder_missing(&status) => {
+                Some(SnapshotPhase::Ready) if taken.pool.is_none() && holder_missing(&status) => {
                     self.rediscover(reads, pools, &name, &lv).await?
                 }
-                SnapshotPhase::Ready
+                Some(SnapshotPhase::Ready)
                     if taken.pool.is_some() && taken.digest.is_none() && wants_digest(&status) =>
                 {
                     let prev = prev.clone()?;

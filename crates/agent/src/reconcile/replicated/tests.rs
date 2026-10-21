@@ -455,7 +455,7 @@ fn snapshot(phase: SnapshotPhase) -> Snapshot {
         },
     );
     s.status = Some(SnapshotStatus {
-        phase,
+        phase: Some(phase),
         ..SnapshotStatus::default()
     });
     s
@@ -3134,7 +3134,10 @@ async fn a_snapshot_in_an_unknown_phase_is_no_round() {
         }
     }))
     .unwrap();
-    assert_eq!(old.status.as_ref().unwrap().phase, SnapshotPhase::Unknown);
+    assert_eq!(
+        old.status.as_ref().unwrap().phase,
+        Some(SnapshotPhase::Unknown)
+    );
     let mut sus = healthy();
     sus[0] = "exists resource name:pvc-1 role:Secondary suspended:user".into();
     let mut r = Rig::new(&sus, up_host());

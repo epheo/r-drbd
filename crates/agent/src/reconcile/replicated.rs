@@ -101,9 +101,12 @@ fn gross_bytes(vol: &Volume) -> u64 {
 /// A Snapshot whose round may hold IO of its volume suspended.
 pub(super) fn in_round(s: &Snapshot) -> bool {
     s.metadata.deletion_timestamp.is_none()
-        && s.status
-            .as_ref()
-            .is_some_and(|st| matches!(st.phase, SnapshotPhase::Suspending | SnapshotPhase::Taking))
+        && s.status.as_ref().is_some_and(|st| {
+            matches!(
+                st.phase,
+                Some(SnapshotPhase::Suspending | SnapshotPhase::Taking)
+            )
+        })
 }
 
 pub(super) fn snapshot_round_active(snapshots: &[Arc<Snapshot>], volume: &str) -> bool {
@@ -1820,7 +1823,7 @@ impl Reconciler {
                 }
                 let ack = super::ack(
                     &self.node,
-                    status.phase,
+                    status.phase?,
                     super::Taken::of(prev),
                     Err(error.clone()),
                 );

@@ -516,7 +516,7 @@ async fn reconcile_decision_table() {
     );
     snap.metadata.uid = Some("uid-snapshot-test-host".into());
     snap.status = Some(SnapshotStatus {
-        phase: SnapshotPhase::Taking,
+        phase: Some(SnapshotPhase::Taking),
         ..SnapshotStatus::default()
     });
     let w = rec
