@@ -252,13 +252,14 @@ Runs when the Volume is restoring and the replica's LV is missing in its Pool; i
    - `--force` on every dump: drbdmeta calls even a cleanly downed device unclean, and a snapshot of a live device carries an unclean activity log; never apply-al, never create-md here.
    - Measured: it writes nothing (LV checksum, thin mappings and pool chunks unchanged).
    - The minor is a fixed one outside the range the controller assigns; for this read it need not be free.
-   - One drbdmeta at a time on that minor, shared by this read and the digest (6.8); a retry on its lock-held exit (20), bounded by the pass: a TiB bitmap holds the lock for seconds. Checks, the first that fails makes the replica a fallback with `ProofFailed`, or stops the restore on the initial node:
-   - C1 dump-md succeeded and the LV is still L0;
-   - C2 S is at most la_size;
-   - C3 la_size plus the metadata size is at most L0;
-   - C4 L0 is at most G (true by construction; kept as an assertion).
+   - One drbdmeta at a time on that minor, shared by this read and the digest (6.8); a retry on its lock-held exit (20), bounded by the pass or by the digest's next attempt: a TiB bitmap holds the lock for seconds.
    - The size formula of drbd-config gives DRBD's la_size exactly for holders of one LV size (61 of 61 image and extent sizes measured, 6 peer slots).
    - Holders one extent apart share the smaller size, so a comparison tells nothing and no Event is emitted.
+   - Checks, the first that fails makes the replica a fallback with `ProofFailed`, or stops the restore on the initial node:
+     - C1 dump-md succeeded and the LV is still L0;
+     - C2 S is at most la_size;
+     - C3 la_size plus the metadata size is at most L0;
+     - C4 L0 is at most G (true by construction; kept as an assertion).
 3. Tag `r-drbd.zeroing.<volume uid>.<la_size>`: la_size is pinned before anything changes and never re-read, because the lvextend moves the device end and the zeroing destroys the superblock.
 4. lvextend to G when the LV is smaller.
 5. Write zeroes over [la_size, L0) of the LV device with a zero-range fallocate (keep size), which behaves as BLKZEROOUT without unsafe code. Never below la_size; never at or past L0; [L0, G) has no thin mappings and reads zero unwritten. Never a discard: on dm-thin a discard of part of a chunk keeps the old bytes (measured: 40960 old bytes left). Measured: the pool grows only by the chunks that meet the tail; the image copy and its origin stay unchanged.
@@ -319,9 +320,9 @@ A parser test on captured real dump-md output pins the fields: a value parsed wr
 - A peer down before the first data, seen Inconsistent first: the initial node waits 60 s, then starts as the sync source with the connected peers; the peer joins later with a full sync, with checksums when it is a copy.
 - A diskful peer never up, measured with two diskful replicas and a tiebreaker:
   - after 60 s the initial node starts as the sync source (7.5), but DRBD gives no replica quorum while that peer was never seen, so IO stays suspended;
-  - the controller writes Ready False with reason `WaitingForPeer` and emits one `RestorePeerMissing` Event naming the peer; it differs from `ReplicaMissing` in that the peer never joined;
-  - the way out is the evict of 9.5: with no survivor that has quorum, it needs the missing node's Node object deleted;
-  - the new replica is a copy replica when its Pool holds a copy, else a fallback; the initial node started with a forced resync, so it always syncs.
+  - once the initial node is UpToDate with quorum false and a diskful peer not connected, the controller writes Ready False with reason `WaitingForPeer` and emits one `RestorePeerMissing` Event naming the peer; it differs from `ReplicaMissing` in that the peer never joined;
+  - a node down for good: delete its Node object, then evict (9.5 waives the quorum for a deleted Node); a live node whose replica never comes up: repair it;
+  - the new replica is a copy replica when its Pool holds a copy, else a fallback; the initial node started with a forced resync, so the new replica always syncs.
 - Snapshot status lost: restores wait while the Snapshot is `Discovering` (6.7); the found acks bring `lvBytes` back.
 - The initial node down before the first data: nothing starts until it returns; moving the initial node is a later liveness item.
 
@@ -555,7 +556,7 @@ No-grow restore:
 - Every peer proven with digests pending: the start waits up to 2 minutes, the clear-bitmap on true, else the sync source; false gives the sync source at once.
 - A holder copy altered by hand: its restore moves only the altered chunk.
 - A single-replica snapshot refused as an image.
-- A diskful peer never up: `WaitingForPeer` after 60 s and one `RestorePeerMissing`; after its Node object is deleted and the evict runs, the restore completes and verify is clean.
+- A diskful peer on a node down for good: `WaitingForPeer` after the start and one `RestorePeerMissing`; after its Node object is deleted and the evict runs, the restore completes and verify is clean.
 
 Capacity: a restore whose full size exceeds a holder Pool's room is refused with ResourceExhausted; an accepted one counts at full size.
 
