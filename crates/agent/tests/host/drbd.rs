@@ -284,19 +284,6 @@ fn group(
     hidden: &[(usize, usize)],
     source: Option<&str>,
 ) -> Vec<Member> {
-    group_with(h, size, specs, hidden, source, None)
-}
-
-/// `group`, with `identical` deciding whether a snapshot's copies are
-/// proven identical, in place of the agent's own rule.
-fn group_with(
-    h: &Host,
-    size: u64,
-    specs: &[Spec],
-    hidden: &[(usize, usize)],
-    source: Option<&str>,
-    identical: Option<fn(&Snapshot) -> bool>,
-) -> Vec<Member> {
     let addr = |me: usize, j: usize| -> std::net::IpAddr {
         if hidden.contains(&(me, j)) {
             format!("127.0.0.{}", 10 + me).parse().unwrap()
@@ -353,9 +340,6 @@ fn group_with(
             vol.metadata.uid = Some(format!("uid-{}", s.res));
             let mut env = DrbdEnv::new(Some(h.features), RES_DIR, h.tracker.clone());
             env.init_wait = Duration::from_secs(3);
-            if let Some(f) = identical {
-                env.copies_identical = f;
-            }
             let live = Arc::new(MemberLive::default());
             let mut rec = Reconciler::new(h.node.clone(), h.exec.clone())
                 .with_drbd(env)
@@ -629,9 +613,9 @@ async fn drbd_no_start_without_quorum() {
     delete(&h, a).await;
 }
 
-/// A replicated restore as it runs today: no holder copies are proven
-/// identical, so the initial node restores its copy and the peer syncs in
-/// full from it; the copies verify equal.
+/// A replicated restore of holder copies that differ: the initial node
+/// restores its copy and the peer syncs in full from it; the copies
+/// verify equal.
 #[tokio::test]
 #[ignore = "needs root, DRBD 9 and the test VG"]
 async fn drbd_restore_syncs_from_one_copy() {
@@ -686,22 +670,28 @@ async fn restore_case(h: &Host, factor: u64, max_received: Option<u64>) {
         },
     );
     snap.metadata.uid = Some("uid-rw-snap".into());
+    // Every member is this host: one ack stands for each holder.
     snap.status = Some(SnapshotStatus {
         phase: SnapshotPhase::Ready,
         size_bytes: Some(source_size),
+        source_replicas: Some(2),
+        copies_identical: Some(max_received.is_some()),
+        acks: vec![model::SnapshotAck {
+            node: h.node.clone(),
+            phase: SnapshotPhase::Taking,
+            taken_pool: Some("test-host-pool".into()),
+            lv_bytes: None,
+            allocated_bytes: None,
+            digest: None,
+            digest_bytes: None,
+            ok: true,
+            error: None,
+        }],
         ..SnapshotStatus::default()
     });
     let snaps = [Arc::new(snap)];
     let pools = [pool(&h.node).await];
-    let identical: fn(&Snapshot) -> bool = |_| true;
-    let mut g = group_with(
-        h,
-        size,
-        &[A, B],
-        &[],
-        Some("rw-snap"),
-        max_received.map(|_| identical),
-    );
+    let mut g = group(h, size, &[A, B], &[], Some("rw-snap"));
     let mut proven = [false, false];
     let mut done = false;
     for _ in 0..120 {
@@ -1027,7 +1017,8 @@ async fn drbd_replicated_lifecycle() {
         file
     );
 
-    let snap = |phase| {
+    // Each phase sees this node's last ack, as the Snapshot status keeps it.
+    let snap = |phase, acks: Vec<model::SnapshotAck>| {
         let mut s = Snapshot::new(
             "rw-s",
             SnapshotSpec {
@@ -1037,21 +1028,26 @@ async fn drbd_replicated_lifecycle() {
         );
         s.status = Some(SnapshotStatus {
             phase,
+            acks,
             ..SnapshotStatus::default()
         });
         Arc::new(s)
     };
+    let mut acks = Vec::new();
     for phase in [
         SnapshotPhase::Suspending,
         SnapshotPhase::Taking,
         SnapshotPhase::Ready,
         SnapshotPhase::Deleting,
     ] {
-        let w = a.pass(&pools, &[snap(phase)]).await;
+        let w = a.pass(&pools, &[snap(phase, acks.clone())]).await;
         let ack = w.iter().find_map(|w| match w {
             StatusWrite::Snapshot { ack, .. } => Some(ack.clone()),
             _ => None,
         });
+        if let Some(x) = &ack {
+            acks = vec![x.clone()];
+        }
         println!("{phase:?}: {ack:?}");
         // Ready: the agent resumes on its own and has nothing to report.
         assert_eq!(ack.is_none(), phase == SnapshotPhase::Ready, "{ack:?}");
@@ -1467,4 +1463,126 @@ async fn drbd_blocked_port_is_reported() {
         delete(&h, m).await;
     }
     assert!(!lv_names(&lvm()).await.iter().any(|n| n.starts_with("rw-")));
+}
+
+/// Holder digests of real snapshot LVs of an idle two-replica volume:
+/// equal on both copies and on a second read, over the DRBD device size
+/// their superblock recorded, and different once one byte of one copy
+/// changed. Each read leaves the snapshot LV inactive.
+#[tokio::test]
+#[ignore = "needs root, DRBD 9 and the test VG"]
+async fn drbd_snapshot_digests() {
+    use agent::digest::{Hasher, LvHasher};
+    if !enabled() {
+        return;
+    }
+    drbd_clean(EVERY).await;
+    let h = start().await;
+    let mut g = group(&h, 256 * MIB, &[A, B], &[], None);
+    let [a, b] = &mut g[..] else { unreachable!() };
+    settle(&h, &mut [&mut *a, &mut *b], "both UpToDate", |t| {
+        disk(t, "rw-a").as_deref() == Some("UpToDate")
+            && disk(t, "rw-b").as_deref() == Some("UpToDate")
+            && connected(t, "rw-a")
+            && connected(t, "rw-b")
+    })
+    .await;
+    write_payload("rw-a", A.minor).await;
+    let l = lvm();
+    for r in ["rw-a", "rw-b"] {
+        l.snapshot(VG, r, &format!("{r}+dg")).await.unwrap();
+    }
+    let hasher = LvHasher::new(h.exec.clone());
+    let first = hasher.digest(VG, "rw-a+dg").await.unwrap();
+    let again = hasher.digest(VG, "rw-a+dg").await.unwrap();
+    let peer = hasher.digest(VG, "rw-b+dg").await.unwrap();
+    println!("digests: {first:?} {again:?} {peer:?}");
+    assert_eq!(first, again, "a second read");
+    assert_eq!(first, peer, "the other copy");
+    assert_eq!(first.bytes, sectors(A.minor) * 512, "the DRBD device size");
+    assert!(!lv_active("rw-a+dg").await && !lv_active("rw-b+dg").await);
+
+    // A hash thread gets the idle IO class.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (exec, handle) = (h.exec.clone(), tokio::runtime::Handle::current());
+    std::thread::spawn(move || {
+        let set = handle.block_on(agent::digest::idle_io(exec.as_ref()));
+        let link = std::fs::read_link("/proc/thread-self").unwrap();
+        let tid = link.file_name().unwrap().to_string_lossy().into_owned();
+        let shown = handle.block_on(sh(&["ionice", "-p", &tid])).stdout;
+        let _ = tx.send((set, shown));
+    });
+    let (set, shown) = rx.await.unwrap();
+    assert_eq!((set, shown.trim()), (Ok(()), "idle"));
+
+    // The dump the la-size parser reads, for its fixture.
+    let dev = format!("/dev/{VG}/rw-b+dg");
+    let lv = format!("{VG}/rw-b+dg");
+    assert_eq!(sh(&["lvchange", "-ay", "-K", &lv]).await.exit_code, Some(0));
+    let argv = drbd::argv::dump_md(&dev);
+    let dump = sh(&argv.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    let head: Vec<&str> = dump
+        .stdout
+        .lines()
+        .filter(|l| !l.starts_with(' ') && !l.starts_with("peer[") && !l.starts_with('}'))
+        .take(40)
+        .collect();
+    println!(
+        "dump-md ({:?}):\n{}\nstderr: {}",
+        dump.exit_code,
+        head.join("\n"),
+        dump.stderr
+    );
+    assert_eq!(drbd::la_size(&dump.stdout), Ok(first.bytes));
+
+    // One byte of b's copy, inside the payload, made different; the
+    // snapshot LV is read-only, so writable for the edit only.
+    let at = PAYLOAD / 2;
+    for args in [&["-an"][..], &["-prw"], &["-ay", "-K"]] {
+        let argv: Vec<&str> = ["lvchange"]
+            .into_iter()
+            .chain(args.iter().copied())
+            .chain([lv.as_str()])
+            .collect();
+        assert_eq!(sh(&argv).await.exit_code, Some(0), "{argv:?}");
+    }
+    let flip = format!(
+        "b=$(dd if={dev} bs=1 skip={at} count=1 status=none | od -An -tu1 | tr -d ' '); printf \"$(printf '\\\\%03o' $(( (b + 1) % 256 )))\" | dd of={dev} bs=1 seek={at} count=1 conv=notrunc,fsync status=none"
+    );
+    let out = sh(&["sh", "-c", &flip]).await;
+    assert_eq!(out.exit_code, Some(0), "{out:?}");
+    for arg in ["-an", "-pr"] {
+        assert_eq!(sh(&["lvchange", arg, &lv]).await.exit_code, Some(0));
+    }
+    let altered = hasher.digest(VG, "rw-b+dg").await.unwrap();
+    println!("altered: {altered:?}");
+    assert_ne!(altered.hex, first.hex);
+    assert_eq!(altered.bytes, first.bytes);
+    assert!(!lv_active("rw-b+dg").await);
+    assert_eq!(hasher.digest(VG, "rw-a+dg").await.unwrap(), first);
+
+    // No superblock, no digest; the LV still ends inactive.
+    l.create(VG, super::THIN, "rw-e", 8 * MIB, &[])
+        .await
+        .unwrap();
+    l.snapshot(VG, "rw-e", "rw-e+dg").await.unwrap();
+    let e = hasher.digest(VG, "rw-e+dg").await.unwrap_err();
+    println!("without metadata: {e}");
+    assert!(!lv_active("rw-e+dg").await);
+
+    for m in [&mut *a, &mut *b] {
+        delete(&h, m).await;
+    }
+    drbd_clean(&["rw-e"]).await;
+}
+
+async fn lv_active(lv: &str) -> bool {
+    lvm()
+        .lvs(VG)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == lv)
+        .unwrap()
+        .active
 }

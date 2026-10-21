@@ -11,6 +11,7 @@
 
 pub mod csi;
 pub mod devices;
+pub mod digest;
 pub mod drbd;
 pub mod events2;
 pub mod exec;

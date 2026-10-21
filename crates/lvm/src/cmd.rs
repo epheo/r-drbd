@@ -220,6 +220,16 @@ pub fn activate(vg: &str, lv: &str) -> Vec<String> {
     lvm("lvchange", &["--activate", "y"], format!("{vg}/{lv}"))
 }
 
+/// A snapshot LV for a read: it carries activation skip, and its
+/// read-only permission makes the device read-only.
+pub fn activate_snapshot(vg: &str, lv: &str) -> Vec<String> {
+    lvm(
+        "lvchange",
+        &["--activate", "y", "--ignoreactivationskip"],
+        format!("{vg}/{lv}"),
+    )
+}
+
 pub fn deactivate(vg: &str, lv: &str) -> Vec<String> {
     lvm("lvchange", &["--activate", "n"], format!("{vg}/{lv}"))
 }

@@ -17,7 +17,7 @@ use model::condition::{self, Condition, FALSE, TRUE, types};
 use model::keys::FINALIZER_SNAPSHOT;
 use model::{Assignment, Role, Snapshot, SnapshotAck, SnapshotPhase, Volume, VolumePhase};
 use serde_json::json;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::store::Stores;
 use crate::volume::{Cond, build_conditions};
@@ -303,6 +303,7 @@ struct Owned {
     phase_since: Option<Time>,
     file_system: Option<String>,
     source_replicas: Option<u32>,
+    copies_identical: Option<bool>,
     last_error: Option<String>,
     observed_generation: Option<i64>,
 }
@@ -321,6 +322,7 @@ impl Owned {
             phase_since: st.phase_since,
             file_system: st.file_system,
             source_replicas: st.source_replicas,
+            copies_identical: st.copies_identical,
             last_error: st.last_error,
             observed_generation: st.observed_generation,
         }
@@ -340,6 +342,9 @@ impl Owned {
             }
             if let Some(v) = self.source_replicas {
                 m.insert("sourceReplicas".into(), json!(v));
+            }
+            if let Some(v) = self.copies_identical {
+                m.insert("copiesIdentical".into(), json!(v));
             }
             if let Some(v) = &self.phase_since {
                 m.insert("phaseSince".into(), json!(v));
@@ -387,7 +392,8 @@ fn phase_reason(p: SnapshotPhase) -> &'static str {
     }
 }
 
-async fn write(api: &Api<Snapshot>, s: &Snapshot, mut wanted: Owned) {
+/// Returns whether a patch went through.
+async fn write(api: &Api<Snapshot>, s: &Snapshot, mut wanted: Owned) -> bool {
     let existing = s
         .status
         .as_ref()
@@ -397,12 +403,12 @@ async fn write(api: &Api<Snapshot>, s: &Snapshot, mut wanted: Owned) {
     wanted.conditions = build_conditions(existing, &[(types::READY, &cond)], s.metadata.generation);
     wanted.observed_generation = s.metadata.generation;
     if Owned::current(s) == wanted {
-        return;
+        return false;
     }
     // Computed from `s`: a store copy that lags must never move the phase
     // backwards, e.g. a started round back to Pending.
     let rv = s.metadata.resource_version.as_deref();
-    apply_status_at(api, &s.name_any(), rv, wanted.json()).await;
+    apply_status_at(api, &s.name_any(), rv, wanted.json()).await
 }
 
 /// Returns the time left until the earliest bound, if any.
@@ -483,26 +489,21 @@ async fn reconcile(
         set_finalizer(api, s, FINALIZER_SNAPSHOT, true).await;
         return None;
     }
+    if current.phase == SnapshotPhase::Ready {
+        record_proof(ctx, api, s, current).await;
+        return None;
+    }
     // Unknown: a phase another version wrote. Left as it is, like Failed:
     // rewriting it could fail a newer version's good snapshot.
     if matches!(
         current.phase,
-        SnapshotPhase::Ready | SnapshotPhase::Failed | SnapshotPhase::Unknown
+        SnapshotPhase::Failed | SnapshotPhase::Unknown
     ) {
         return None;
     }
     if !valid_name(&name) {
         let error = format!("name must match {}", model::keys::NAME_PATTERN);
-        write(
-            api,
-            s,
-            Owned {
-                phase: SnapshotPhase::Failed,
-                last_error: Some(error),
-                ..current
-            },
-        )
-        .await;
+        fail(api, s, current, error).await;
         return None;
     }
     let usable = volume.as_deref().filter(|v| {
@@ -535,16 +536,7 @@ async fn reconcile(
     if current.phase == SnapshotPhase::Pending
         && let Some(error) = lv_name_problem(ctx, &a, &s.spec.volume, &name)
     {
-        write(
-            api,
-            s,
-            Owned {
-                phase: SnapshotPhase::Failed,
-                last_error: Some(error),
-                ..current
-            },
-        )
-        .await;
+        fail(api, s, current, error).await;
         return None;
     }
     // A bounded phase without a start (written by hand or by an older
@@ -564,6 +556,89 @@ async fn reconcile(
     }
     step(ctx, api, s, v, &a, current).await
 }
+
+async fn fail(api: &Api<Snapshot>, s: &Snapshot, current: Owned, error: String) {
+    let wanted = Owned {
+        phase: SnapshotPhase::Failed,
+        last_error: Some(error),
+        ..current
+    };
+    write(api, s, wanted).await;
+}
+
+/// What the holders' digests prove, once every holder acked one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Proof {
+    pub identical: bool,
+    pub source_replicas: u32,
+    /// Each holder with its digest, for the Event.
+    pub digests: String,
+}
+
+/// The proof to write, None while a digest is pending or once written.
+/// A holder is a node whose ack names takenPool. With fewer holders than
+/// the source had replicas, a lost ack may still come back with another
+/// digest, so nothing is written. Without sourceReplicas (a status loss)
+/// it comes back from two or more holders: a digest exists only for an
+/// LV whose DRBD superblock gave its range.
+pub fn copies_proof(st: &model::SnapshotStatus) -> Option<Proof> {
+    if st.copies_identical.is_some() {
+        return None;
+    }
+    let digests = st
+        .acks
+        .iter()
+        .filter(|a| a.taken_pool.is_some())
+        .map(|a| Some((a.node.as_str(), a.digest.as_deref()?, a.digest_bytes?)))
+        .collect::<Option<Vec<_>>>()?;
+    let n = u32::try_from(digests.len()).ok()?;
+    if n < st.source_replicas.unwrap_or(2).max(1) {
+        return None;
+    }
+    let identical = digests
+        .windows(2)
+        .all(|w| (w[0].1, w[0].2) == (w[1].1, w[1].2));
+    let digests = digests
+        .iter()
+        .map(|(n, d, b)| format!("{n} {d} over {b} bytes"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(Proof {
+        identical,
+        source_replicas: st.source_replicas.unwrap_or(n),
+        digests,
+    })
+}
+
+/// Writes copiesIdentical once, with sourceReplicas when it was lost;
+/// copies that differ get one Warning Event.
+async fn record_proof(ctx: &Ctx<'_>, api: &Api<Snapshot>, s: &Snapshot, current: Owned) {
+    let Some(p) = s.status.as_ref().and_then(copies_proof) else {
+        return;
+    };
+    let name = s.name_any();
+    let wanted = Owned {
+        copies_identical: Some(p.identical),
+        source_replicas: Some(p.source_replicas),
+        ..current
+    };
+    if !write(api, s, wanted).await {
+        return;
+    }
+    if p.identical {
+        info!(snapshot = name, "holder copies identical");
+    } else {
+        warn!(snapshot = name, digests = p.digests, "holder copies differ");
+        let message = format!(
+            "holder copies differ, restores sync from one copy: {}",
+            p.digests
+        );
+        crate::warning_event(ctx.client, s, IMAGE_COPIES_DIFFER, &message).await;
+    }
+}
+
+/// Warning Event: the holders' digests of a Snapshot differ.
+pub const IMAGE_COPIES_DIFFER: &str = "ImageCopiesDiffer";
 
 /// Why the snapshot LV cannot be made in the VG of some diskful replica.
 /// A Pool not in the store yet is skipped; the agents check again before
@@ -803,6 +878,8 @@ mod tests {
             taken_pool: (phase == P::Taking).then(|| format!("p-{node}")),
             lv_bytes: None,
             allocated_bytes: None,
+            digest: None,
+            digest_bytes: None,
             ok,
             error: (!ok).then(|| "boom".into()),
         }
@@ -1308,5 +1385,85 @@ mod tests {
         for x in [legacy, init, unplaced, deleting] {
             assert!(restoring_from(&[Arc::new(x)]).is_empty());
         }
+    }
+
+    fn holder(node: &str, digest: Option<&str>, bytes: u64) -> SnapshotAck {
+        SnapshotAck {
+            digest: digest.map(str::to_owned),
+            digest_bytes: digest.map(|_| bytes),
+            ..ack(node, P::Taking, true)
+        }
+    }
+
+    fn status(acks: Vec<SnapshotAck>, source_replicas: Option<u32>) -> model::SnapshotStatus {
+        model::SnapshotStatus {
+            phase: P::Ready,
+            acks,
+            source_replicas,
+            ..model::SnapshotStatus::default()
+        }
+    }
+
+    #[test]
+    fn copies_proof_once_every_holder_digested() {
+        let same = status(
+            vec![holder("n1", Some("d"), 9), holder("n2", Some("d"), 9)],
+            Some(2),
+        );
+        let p = copies_proof(&same).unwrap();
+        assert!(p.identical);
+        assert_eq!(p.source_replicas, 2);
+        assert_eq!(p.digests, "n1 d over 9 bytes, n2 d over 9 bytes");
+
+        let differ = status(
+            vec![holder("n1", Some("d"), 9), holder("n2", Some("e"), 9)],
+            Some(2),
+        );
+        assert!(!copies_proof(&differ).unwrap().identical);
+        // Another range is another content.
+        let range = status(
+            vec![holder("n1", Some("d"), 9), holder("n2", Some("d"), 8)],
+            Some(2),
+        );
+        assert!(!copies_proof(&range).unwrap().identical);
+        // A diskless ack is no holder.
+        let mut tiebreaker = same.clone();
+        tiebreaker.acks.push(ack("n3", P::Suspending, true));
+        assert!(copies_proof(&tiebreaker).unwrap().identical);
+    }
+
+    #[test]
+    fn copies_proof_pending() {
+        let one_missing = status(
+            vec![holder("n1", Some("d"), 9), holder("n2", None, 9)],
+            Some(2),
+        );
+        assert_eq!(copies_proof(&one_missing), None);
+        // A lost ack may come back with another digest.
+        let short = status(
+            vec![holder("n1", Some("d"), 9), holder("n2", Some("d"), 9)],
+            Some(3),
+        );
+        assert_eq!(copies_proof(&short), None);
+        assert_eq!(copies_proof(&status(vec![], Some(2))), None);
+        let mut written = status(
+            vec![holder("n1", Some("d"), 9), holder("n2", Some("e"), 9)],
+            Some(2),
+        );
+        written.copies_identical = Some(true);
+        assert_eq!(copies_proof(&written), None, "written once");
+    }
+
+    /// Status lost: sourceReplicas comes back from two digested holders.
+    #[test]
+    fn copies_proof_restores_source_replicas_from_two_holders() {
+        let one = status(vec![holder("n1", Some("d"), 9)], None);
+        assert_eq!(copies_proof(&one), None);
+        let two = status(
+            vec![holder("n1", Some("d"), 9), holder("n2", Some("d"), 9)],
+            None,
+        );
+        let p = copies_proof(&two).unwrap();
+        assert_eq!((p.identical, p.source_replicas), (true, 2));
     }
 }

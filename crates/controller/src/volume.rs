@@ -3270,6 +3270,8 @@ mod tests {
             taken_pool: pool.map(str::to_owned),
             lv_bytes: None,
             allocated_bytes: None,
+            digest: None,
+            digest_bytes: None,
             ok,
             error: None,
         };
@@ -3306,6 +3308,8 @@ mod tests {
                 taken_pool: Some("p1".into()),
                 lv_bytes: None,
                 allocated_bytes: None,
+                digest: None,
+                digest_bytes: None,
                 ok: true,
                 error: None,
             }],
@@ -3324,6 +3328,8 @@ mod tests {
             taken_pool: Some(pool.into()),
             lv_bytes: None,
             allocated_bytes: None,
+            digest: None,
+            digest_bytes: None,
             ok: true,
             error: None,
         };

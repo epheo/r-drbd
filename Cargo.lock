@@ -14,6 +14,7 @@ dependencies = [
  "kube",
  "lvm",
  "model",
+ "ring",
  "rustix",
  "serde",
  "serde_json",

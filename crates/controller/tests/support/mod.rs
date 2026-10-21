@@ -884,9 +884,31 @@ impl FakeAgent {
             taken_pool: pool.map(str::to_owned),
             lv_bytes: None,
             allocated_bytes: None,
+            digest: None,
+            digest_bytes: None,
             ok,
             error: (!ok).then(|| format!("fake failure on {}", self.node)),
         };
+        self.apply_ack(snapshot, &ack).await;
+    }
+
+    /// The successful Taking ack in `pool`, with this node's digest.
+    pub async fn ack_digest(&self, snapshot: &str, pool: &str, digest: &str) {
+        let ack = SnapshotAck {
+            node: self.node.clone(),
+            phase: SnapshotPhase::Taking,
+            taken_pool: Some(pool.to_owned()),
+            lv_bytes: None,
+            allocated_bytes: None,
+            digest: Some(digest.to_owned()),
+            digest_bytes: Some(GIB),
+            ok: true,
+            error: None,
+        };
+        self.apply_ack(snapshot, &ack).await;
+    }
+
+    async fn apply_ack(&self, snapshot: &str, ack: &SnapshotAck) {
         let status = json!({
             "apiVersion": "r-drbd.io/v1alpha1",
             "kind": "Snapshot",

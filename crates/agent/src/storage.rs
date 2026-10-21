@@ -235,6 +235,10 @@ impl Lvm {
         self.change(&cmd::activate(vg, lv)).await
     }
 
+    pub async fn activate_snapshot(&self, vg: &str, lv: &str) -> Result<(), CmdError> {
+        self.change(&cmd::activate_snapshot(vg, lv)).await
+    }
+
     pub async fn deactivate(&self, vg: &str, lv: &str) -> Result<(), CmdError> {
         self.change(&cmd::deactivate(vg, lv)).await
     }

@@ -102,6 +102,8 @@ fn taken_ack(phase: SnapshotPhase, pool: &str) -> SnapshotAck {
         taken_pool: Some(pool.into()),
         lv_bytes: Some(GIB),
         allocated_bytes: Some(GIB / 4),
+        digest: None,
+        digest_bytes: None,
         ok: true,
         error: None,
     }
@@ -719,6 +721,8 @@ async fn snapshot_deleting_after_volume_is_gone() {
             taken_pool: Some(POOL.into()),
             lv_bytes: None,
             allocated_bytes: None,
+            digest: None,
+            digest_bytes: None,
             ok: true,
             error: None,
         });
@@ -748,13 +752,93 @@ async fn snapshot_delete_follows_taken_pool_after_a_pool_move() {
     if let Some(a) = v.spec.assignment.as_mut() {
         a.replicas[0].pool = Some("pool-n1b".into());
     }
-    let snap = deleting(snapshot("snap-1", "pvc-1", SnapshotPhase::Ready));
+    let mut snap = deleting(snapshot("snap-1", "pvc-1", SnapshotPhase::Ready));
+    snap.status.as_mut().unwrap().acks = vec![digested(taken_ack(SnapshotPhase::Taking, POOL))];
     let pools = [pool(), pool_in("pool-n1b", VG, "thin2")];
     let w = run_in(&x, &pools, vec![v], vec![snap]).await;
     assert_eq!(
         snapshot_acks(&w),
-        vec![("snap-1".into(), taken_ack(SnapshotPhase::Deleting, POOL))]
+        vec![(
+            "snap-1".into(),
+            digested(taken_ack(SnapshotPhase::Deleting, POOL))
+        )]
     );
+}
+
+fn digested(a: SnapshotAck) -> SnapshotAck {
+    SnapshotAck {
+        digest: Some("ab".repeat(32)),
+        digest_bytes: Some(GIB),
+        ..a
+    }
+}
+
+#[derive(Debug, Default)]
+struct FakeHasher(std::sync::Mutex<Vec<(String, String)>>);
+
+#[async_trait::async_trait]
+impl digest::Hasher for FakeHasher {
+    async fn digest(&self, vg: &str, lv: &str) -> Result<digest::Digest, String> {
+        self.0.lock().unwrap().push((vg.into(), lv.into()));
+        Ok(digest::Digest {
+            hex: "ab".repeat(32),
+            bytes: GIB,
+        })
+    }
+}
+
+/// A Ready holder hashes its snapshot LV off the pass, then acks the
+/// digest beside what its Taking ack recorded; once acked, never again.
+#[tokio::test]
+async fn a_ready_holder_acks_its_digest_once_hashed() {
+    let x = Arc::new(ScriptedExec::new());
+    let hasher = Arc::new(FakeHasher::default());
+    let digests = Digests::new(hasher.clone(), None);
+    let mut r = Reconciler::new(NODE, x.clone()).with_digests(digests.clone());
+    let snap = Arc::new(snapshot("snap-1", "pvc-1", SnapshotPhase::Ready));
+    reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
+    let w = r.pass(&[pool()], &[], std::slice::from_ref(&snap)).await;
+    assert_eq!(snapshot_acks(&w), vec![]);
+    for _ in 0..100 {
+        if digests.result("uid-snap-1").is_some() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        *hasher.0.lock().unwrap(),
+        [(VG.to_owned(), "pvc-1+snap-1".to_owned())]
+    );
+
+    reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
+    let w = r.pass(&[pool()], &[], &[snap]).await;
+    let want = digested(taken_ack(SnapshotPhase::Taking, POOL));
+    assert_eq!(snapshot_acks(&w), vec![("snap-1".into(), want.clone())]);
+
+    let mut acked = snapshot("snap-1", "pvc-1", SnapshotPhase::Ready);
+    acked.status.as_mut().unwrap().acks = vec![want];
+    reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
+    let w = r.pass(&[pool()], &[], &[Arc::new(acked)]).await;
+    assert_eq!(snapshot_acks(&w), vec![]);
+    x.assert_done();
+    assert_eq!(hasher.0.lock().unwrap().len(), 1);
+}
+
+/// A single-replica source has no superblock and one copy: no digest.
+#[tokio::test]
+async fn a_single_replica_snapshot_is_never_hashed() {
+    let x = Arc::new(ScriptedExec::new());
+    let hasher = Arc::new(FakeHasher::default());
+    let mut r = Reconciler::new(NODE, x.clone()).with_digests(Digests::new(hasher.clone(), None));
+    let mut snap = snapshot("snap-1", "pvc-1", SnapshotPhase::Ready);
+    snap.status.as_mut().unwrap().source_replicas = Some(1);
+    reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
+    let w = r.pass(&[pool()], &[], &[Arc::new(snap)]).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(snapshot_acks(&w), vec![]);
+    assert!(hasher.0.lock().unwrap().is_empty());
 }
 
 /// The vgs report of another VG.
@@ -796,6 +880,8 @@ async fn snapshot_delete_on_a_node_without_pools_is_ok() {
         taken_pool: None,
         lv_bytes: None,
         allocated_bytes: None,
+        digest: None,
+        digest_bytes: None,
         ..taken_ack(SnapshotPhase::Taking, POOL)
     }];
     let w = run_in(&x, &[], vec![], vec![snap]).await;
@@ -814,6 +900,8 @@ async fn ready_snapshot_lv_is_rediscovered() {
         taken_pool: None,
         lv_bytes: None,
         allocated_bytes: None,
+        digest: None,
+        digest_bytes: None,
         ..taken_ack(SnapshotPhase::Taking, POOL)
     };
     for acks in [vec![], vec![legacy]] {
@@ -824,6 +912,8 @@ async fn ready_snapshot_lv_is_rediscovered() {
         let w = run(&x, vec![], vec![snap]).await;
         let want = SnapshotAck {
             allocated_bytes: None,
+            digest: None,
+            digest_bytes: None,
             ..taken_ack(SnapshotPhase::Taking, POOL)
         };
         assert_eq!(snapshot_acks(&w), vec![("snap-1".into(), want)]);
@@ -915,6 +1005,8 @@ async fn snapshot_deleting_is_kept_only_for_its_own_uid() {
             taken_pool: Some(POOL.into()),
             lv_bytes: None,
             allocated_bytes: None,
+            digest: None,
+            digest_bytes: None,
             ok: true,
             error: None,
         });

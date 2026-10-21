@@ -514,6 +514,7 @@ async fn reconcile_decision_table() {
             volume_uid: Some("uid-rw-l-r1".into()),
         },
     );
+    snap.metadata.uid = Some("uid-snapshot-test-host".into());
     snap.status = Some(SnapshotStatus {
         phase: SnapshotPhase::Taking,
         ..SnapshotStatus::default()
@@ -534,6 +535,8 @@ async fn reconcile_decision_table() {
         .unwrap();
     println!("take: {ack:?}");
     assert!(ack.ok);
+    // The restore finds the copy through the ack's takenPool.
+    snap.status.as_mut().unwrap().acks = vec![ack];
 
     let v2 = volume("rw-l-r2", 3 * GIB, Some("snapshot-test-host"));
     let w = rec

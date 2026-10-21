@@ -24,6 +24,7 @@ use serde_json::json;
 
 use crate::Exec;
 use crate::devices::{HostDisks, SysDisks};
+use crate::digest::{self, Digests};
 use crate::drbd::Facts;
 use crate::events2::Tracker;
 use crate::storage::{self, Lvm, PoolCapacity};
@@ -399,6 +400,9 @@ pub struct Reconciler {
     /// Per volume, the IO suspend this agent keeps. Memory only: a restart
     /// forgets it, which only forbids takes until the next round.
     freezes: HashMap<String, Freeze>,
+    digests: Digests,
+    /// The snapshot LVs this pass found still to hash.
+    digest_jobs: Vec<digest::Job>,
 }
 
 /// Where a pass sends its writes as each step ends, so statuses trail the
@@ -445,7 +449,16 @@ impl Reconciler {
             live: Arc::new(NoLiveVolumes),
             publish: None,
             freezes: HashMap::new(),
+            digests: Digests::default(),
+            digest_jobs: Vec::new(),
         }
+    }
+
+    /// Without it this node hashes no snapshot LV.
+    #[must_use]
+    pub fn with_digests(mut self, digests: Digests) -> Self {
+        self.digests = digests;
+        self
     }
 
     #[must_use]
@@ -600,6 +613,7 @@ impl Reconciler {
             }
         }
 
+        self.digests.schedule(std::mem::take(&mut self.digest_jobs));
         self.log_orphans(&mut reads, &pools, &vols, &snaps).await;
         writes
     }
@@ -1107,6 +1121,17 @@ impl Reconciler {
                 SnapshotPhase::Ready if taken.pool.is_none() && holder_missing(&status) => {
                     self.rediscover(reads, pools, &name, &lv).await?
                 }
+                // A single-replica source has no DRBD superblock to bound
+                // the digest, and a single copy nothing to match.
+                SnapshotPhase::Ready
+                    if taken.pool.is_some()
+                        && taken.digest.is_none()
+                        && status.source_replicas != Some(1) =>
+                {
+                    let prev = prev.clone()?;
+                    self.digest_step(reads, pools, vols, snap, &lv, prev)
+                        .await?
+                }
                 _ => return None,
             }
         };
@@ -1158,6 +1183,57 @@ impl Reconciler {
                 None
             }
         }
+    }
+
+    /// The ack with this node's digest once its job finished; until then
+    /// the job goes to this pass's schedule.
+    async fn digest_step(
+        &mut self,
+        reads: &mut Reads,
+        pools: &[&Pool],
+        vols: &[&Volume],
+        snap: &Snapshot,
+        lv: &str,
+        prev: SnapshotAck,
+    ) -> Option<SnapshotAck> {
+        let uid = snap.metadata.uid.clone()?;
+        if let Some(d) = self.digests.result(&uid) {
+            return Some(SnapshotAck {
+                digest: Some(d.hex),
+                digest_bytes: Some(d.bytes),
+                ..prev
+            });
+        }
+        let name = snap.name_any();
+        let place = match self.place(pools, prev.taken_pool.as_deref()) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(snapshot = name, error = %e, "no digest: pool not usable");
+                return None;
+            }
+        };
+        match reads.find(&self.lvm, &place.vg, lv, &place.thin).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tracing::debug!(snapshot = name, lv, "no digest: snapshot LV not found");
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(snapshot = name, error = %e, "no digest: LV read failed");
+                return None;
+            }
+        }
+        let first = vols.iter().any(|v| {
+            v.metadata.deletion_timestamp.is_none() && v.restoring().is_some_and(|s| s.is(snap))
+        });
+        self.digest_jobs.push(digest::Job {
+            uid,
+            snapshot: name,
+            vg: place.vg,
+            lv: lv.to_owned(),
+            first,
+        });
+        None
     }
 
     /// A Ready Snapshot's LV found here without an ack that says where:
@@ -1239,6 +1315,8 @@ impl Reconciler {
                 // An inactive snapshot reports no allocation, and its origin
                 // has moved on since the take.
                 allocated_bytes: None,
+                digest: None,
+                digest_bytes: None,
             };
             (place, found)
         }))
@@ -1294,6 +1372,7 @@ impl Reconciler {
             // at the take it maps exactly what its origin maps.
             allocated_bytes: find_in_pool(&rows, origin, &place.thin)?
                 .and_then(lvm::report::thin_used_bytes),
+            ..Taken::default()
         })
     }
 
@@ -1527,12 +1606,15 @@ fn find_in_pool<'a>(rows: &'a [Lv], name: &str, thin: &str) -> Result<Option<&'a
 }
 
 /// Where this node's snapshot LV lives, as its successful Taking ack
-/// recorded it; every later ack carries it unchanged.
+/// recorded it, and its digest once hashed; every later ack carries them
+/// unchanged.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Taken {
     pool: Option<String>,
     lv_bytes: Option<u64>,
     allocated_bytes: Option<u64>,
+    digest: Option<String>,
+    digest_bytes: Option<u64>,
 }
 
 impl Taken {
@@ -1541,6 +1623,8 @@ impl Taken {
             pool: a.taken_pool.clone(),
             lv_bytes: a.lv_bytes,
             allocated_bytes: a.allocated_bytes,
+            digest: a.digest.clone(),
+            digest_bytes: a.digest_bytes,
         })
     }
 }
@@ -1552,6 +1636,8 @@ fn ack(node: &str, phase: SnapshotPhase, taken: Taken, res: Result<(), String>) 
         taken_pool: taken.pool,
         lv_bytes: taken.lv_bytes,
         allocated_bytes: taken.allocated_bytes,
+        digest: taken.digest,
+        digest_bytes: taken.digest_bytes,
         ok: res.is_ok(),
         error: res.err(),
     }

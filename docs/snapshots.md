@@ -46,6 +46,9 @@ Then:
 
 Each node's copy is crash-consistent.
 The copies of one snapshot can still differ: a page rewritten while it is written out can reach each node's disk in another version.
+So once Ready, each node holding a copy of a replicated snapshot hashes it in the background, one snapshot at a time per node, at idle IO priority, and acks the digest:
+a sha256 over 4 MiB chunks, up to the DRBD device size the copy's own metadata records.
+Once every holder acked, the controller writes `status.copiesIdentical`: true when all digests match; false otherwise, with a Warning Event `ImageCopiesDiffer` naming each holder's digest.
 Snapshots are crash-consistent: no file system is frozen or flushed first, so data still in a page cache is not in the snapshot, as after a power loss.
 For application consistency, quiesce the application (for example with a pre-snapshot hook) before taking the VolumeSnapshot.
 A local volume skips the suspend: it waits only for the volume to be Ready and for no other snapshot of it to run.
@@ -88,8 +91,10 @@ Rules:
 
 - A local restore (`replicas: 1`) uses one of the nodes holding the snapshot, preferring one whose agent is alive; the new volume is a writable thin snapshot of the snapshot LV, so it is instant and shares blocks.
 - A replicated restore needs `replicas` equal to the number of nodes holding the snapshot.
-  The first node restores its copy, a thin snapshot; every other replica starts empty and is copied in full from it.
-  The volume is Ready, and its claim usable, once that sync ends.
+  With `copiesIdentical` true every replica restores its own copy, a thin snapshot, and nothing syncs.
+  With it false, the first node restores its copy and every other replica starts empty and is copied in full from it.
+  While the digests are pending each replica restores its copy and the first node waits for them up to 2 minutes; past that it is the sync source and the others are copied in full.
+  The volume is Ready, and its claim usable, once any sync ends.
 - A holder whose node is down, whose agent is stale or whose Pool is not Available keeps the restore Pending, reason `Insufficient`, naming it.
 - A Ready snapshot whose acks lost their `takenPool` keeps the restore Pending, reason `SnapshotNotReady`, until each holder finds its LV again and acks it.
 - A replicated restore larger than its snapshot starts at the snapshot's size, then grows online; the new area syncs, zero blocks as discards.

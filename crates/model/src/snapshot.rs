@@ -94,6 +94,10 @@ pub struct SnapshotStatus {
     /// source is often gone by the time a restore asks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_replicas: Option<u32>,
+    /// Every holder's digest matches, written once all holders acked one;
+    /// absent while pending. Only true lets a restore start without a sync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copies_identical: Option<bool>,
     /// When the current phase began; the round bounds (Suspending, Taking)
     /// count from it and survive a controller restart. Agents never read
     /// it: a wall clock of another node is no input to their deadlines.
@@ -128,11 +132,17 @@ pub const TAKE_WINDOW: Duration = Duration::from_secs(120);
 pub const RESUME_AFTER: Duration = Duration::from_secs(240);
 /// Clock skew between controller runs that read one phaseSince.
 pub const CLOCK_MARGIN: Duration = Duration::from_secs(30);
+/// Holder digests: the unit each holder hashes its snapshot LV in.
+pub const DIGEST_CHUNK: usize = 4 << 20;
+/// Agent: how long a restore's first data waits for pending digests
+/// before it starts as the sync source.
+pub const DIGEST_WAIT: Duration = Duration::from_secs(120);
 
 /// The last phase a node completed, and whether it succeeded.
 /// `takenPool`, `lvBytes` and `allocatedBytes` come from the successful
-/// Taking ack and every later ack copies them unchanged: the replica may
-/// move to another Pool, the snapshot LV never does.
+/// Taking ack and every later ack copies them unchanged, as it does
+/// `digest` and `digestBytes` once they exist: the replica may move to
+/// another Pool, the snapshot LV never does.
 #[derive(KubeSchema, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotAck {
@@ -150,6 +160,15 @@ pub struct SnapshotAck {
     /// Thin data mapped by the snapshot LV at the take.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allocated_bytes: Option<u64>,
+    /// Hex sha256 over the sha256 of each 4 MiB chunk of the snapshot LV
+    /// over [0, digestBytes), written once after Ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 64))]
+    pub digest: Option<String>,
+    /// The source's DRBD device size, read from the snapshot LV's own
+    /// superblock: the range the digest covers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest_bytes: Option<u64>,
     #[serde(default)]
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

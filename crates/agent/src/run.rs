@@ -9,6 +9,7 @@ use std::time::Duration;
 use kube::{Client, ResourceExt};
 
 use crate::devices::{HostDisks, SysDisks};
+use crate::digest::{Digests, LvHasher};
 use crate::events2::Tracker;
 use crate::exec::TokioExec;
 use crate::reconcile::{DrbdEnv, KubeLiveVolumes, Reconciler};
@@ -146,7 +147,9 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
     let rexec = Arc::new(node::ProgressExec::new(exec.clone(), progress.clone()));
     let liveness = node::Liveness::new(progress.clone(), events.is_some().then(|| tracker.clone()));
     let writer = Arc::new(Writer::new(client.clone(), &cfg.node, progress.clone()));
-    let reconciler = reconciler(&cfg, &rexec, &writer, features, &tracker, &inv);
+    let digests = Digests::new(Arc::new(LvHasher::new(exec.clone())), Some(trigger.clone()));
+    let reconciler =
+        reconciler(&cfg, &rexec, &writer, features, &tracker, &inv).with_digests(digests);
 
     let listener = ::csi::bind_unix(&cfg.csi_endpoint)
         .and_then(tokio::net::UnixListener::from_std)
