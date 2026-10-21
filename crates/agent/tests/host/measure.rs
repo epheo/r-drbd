@@ -1358,7 +1358,37 @@ async fn measure_quorum_before_first_data() {
     })
     .await;
     report("every disk Inconsistent, b never up", &all).await;
+    // The start the agent would run after its wait, were quorum no gate.
+    let out = rig.new_uuid(0, "--force-resync").await;
+    println!(
+        "b never up, new-current-uuid --force-resync on a: exit {:?} stderr {:?}",
+        out.exit_code,
+        out.stderr.trim()
+    );
+    report("b never up, a started as the source", &all).await;
+    let mark = kernel_mark().await;
     rig.up(1).await;
+    let start = Instant::now();
+    let (settled, _) = poll(&all, 60, |v| {
+        v.iter()
+            .all(|s| connected(s.as_ref(), 2) && !busy(s.as_ref()))
+    })
+    .await;
+    println!(
+        "b up at last: settled {settled} after {}\n{}",
+        secs(start.elapsed()),
+        kernel_since(&mark, "rw-mb").await
+    );
+    report("b up at last", &all).await;
+    // A fresh volume again for the partitions below.
+    for i in 0..3 {
+        rig.down(i).await;
+    }
+    rig.create_md(0).await;
+    rig.create_md(1).await;
+    for i in 0..3 {
+        rig.up(i).await;
+    }
     wait_for(&all, 30, "full mesh", mesh).await;
     report("all connected, every disk Inconsistent", &all).await;
     for first_data in [false, true] {
