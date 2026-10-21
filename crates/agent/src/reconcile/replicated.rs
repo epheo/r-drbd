@@ -1530,16 +1530,8 @@ impl Reconciler {
             return Ok(Resize::Waiting);
         }
         let name = s.vol.name_any();
-        // A restore grows from its snapshot's size: the new area holds each
-        // node's old metadata, which differs, so it syncs.
-        let synced = s.restoring();
-        tracing::info!(volume = name, from = current, synced, "growing DRBD device");
-        let argv = if synced {
-            argv::resize_synced(&name)
-        } else {
-            argv::resize(&name)
-        };
-        self.drbd_cmd(&argv, DRBD_TIMEOUT).await?;
+        tracing::info!(volume = name, from = current, "growing DRBD device");
+        self.drbd_cmd(&argv::resize(&name), DRBD_TIMEOUT).await?;
         Ok(Resize::Done)
     }
 

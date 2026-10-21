@@ -227,17 +227,10 @@ pub mod argv {
         a(&["drbdadm", "resume-io", res])
     }
 
-    /// --assume-clean: the grown part of every thin backing LV reads as
-    /// zeros where no old metadata lies, so there is nothing to sync. Not
-    /// so for a restore growing from its snapshot's size: see
-    /// [`resize_synced`].
-    pub fn resize(res: &str) -> Vec<String> {
-        a(&["drbdadm", "resize", "--assume-clean", &vol(res)])
-    }
-
-    /// A resize whose new area syncs: it holds each node's old metadata.
+    /// Never --assume-clean: the new area holds each node's old metadata,
+    /// which differs between nodes, so it must sync.
     /// Zero blocks travel as discards (rs-discard-granularity).
-    pub fn resize_synced(res: &str) -> Vec<String> {
+    pub fn resize(res: &str) -> Vec<String> {
         a(&["drbdadm", "resize", &vol(res)])
     }
 

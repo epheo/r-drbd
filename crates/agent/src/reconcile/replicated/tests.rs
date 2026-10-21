@@ -803,7 +803,6 @@ fn restored_peer(kib: u64) -> ReplicaStatus {
 
 #[tokio::test]
 async fn larger_restore_starts_at_the_snapshot_size_then_grows() {
-    let resize_synced: Vec<String> = ["drbdadm", "resize", "pvc-1/0"].map(str::to_owned).to_vec();
     let mut r = Rig::new(&[], FakeHost::default());
     r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
@@ -857,7 +856,7 @@ async fn larger_restore_starts_at_the_snapshot_size_then_grows() {
     // n2 grew too: the lowest node id resizes, and the new area syncs.
     reads_again(&x, &[source_lv(), lv(LV2_KIB)]);
     expect_lv_tags(&x, &[("pvc-1", &[OWN, FROM])]);
-    x.expect(resize_synced, ok(""));
+    x.expect(argv::resize("pvc-1"), ok(""));
     dry(&x, "");
     let w = r.pass(&[vol(LV2_KIB)], &[source_snapshot()]).await;
     assert_eq!(entry_of(&w).observed_generation, Some(3));
@@ -865,24 +864,20 @@ async fn larger_restore_starts_at_the_snapshot_size_then_grows() {
 }
 
 #[tokio::test]
-async fn expand_after_initialization_keeps_assume_clean() {
+async fn expand_after_initialization_syncs() {
     let mut r = Rig::new(&healthy(), up_host());
     let x = r.x.clone();
     reads(&x, &[source_lv(), lv(LV2_KIB)]);
     r.expect_check();
     r.expect_sweep();
-    x.expect(
-        ["drbdadm", "resize", "--assume-clean", "pvc-1/0"]
-            .map(str::to_owned)
-            .to_vec(),
-        ok(""),
-    );
+    x.expect(argv::resize("pvc-1"), ok(""));
     dry(&x, "");
     let vol = initialized(with_entries(
         restored(volume(2 * GIB)),
         vec![restored_peer(LV2_KIB)],
     ));
     r.pass(&[vol], &[source_snapshot()]).await;
+    assert!(!seen(&x, "--assume-clean"));
 }
 
 #[tokio::test]
