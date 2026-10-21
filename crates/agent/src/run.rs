@@ -577,9 +577,8 @@ impl Work for LoopWork {
         let snapshots = stores.snapshots.state();
         self.writer.revive();
         let writes = rec.pass(&pools, &volumes, &snapshots).await;
-        for pool in self.writer.apply(writes).await {
-            rec.events_unsent(&pool);
-        }
+        let unsent = self.writer.apply(writes).await;
+        rec.events_unsent(unsent);
         let pool_set_changed = self.pool_set.update(&pools, node);
         if rec.take_disks_changed() || pool_set_changed {
             let _ = self.disks.send(crate::inventory::Wake::Lvm);
@@ -660,8 +659,11 @@ impl Writer {
         self.dead.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Applies the writes; returns the Pools whose Events did not get through.
-    async fn apply(&self, writes: Vec<crate::reconcile::StatusWrite>) -> Vec<String> {
+    /// Applies the writes; returns the Events that did not get through.
+    async fn apply(
+        &self,
+        writes: Vec<crate::reconcile::StatusWrite>,
+    ) -> Vec<crate::reconcile::StatusWrite> {
         use std::sync::atomic::Ordering::Relaxed;
         let results = if self.dead.load(Relaxed) {
             writes.iter().map(|_| None).collect()
@@ -683,7 +685,7 @@ impl Writer {
             if matches!(w, crate::reconcile::StatusWrite::Event { .. })
                 && !matches!(res, Some(Ok(())))
             {
-                unsent.push(w.name().to_owned());
+                unsent.push(w.clone());
             }
             match res {
                 Some(Err(e)) => {
@@ -708,7 +710,10 @@ impl Writer {
 
 #[async_trait::async_trait]
 impl crate::reconcile::Publish for Writer {
-    async fn publish(&self, writes: Vec<crate::reconcile::StatusWrite>) -> Vec<String> {
+    async fn publish(
+        &self,
+        writes: Vec<crate::reconcile::StatusWrite>,
+    ) -> Vec<crate::reconcile::StatusWrite> {
         self.apply(writes).await
     }
 }

@@ -481,9 +481,22 @@ impl Reconciler {
         out
     }
 
-    /// The Events of [`Self::device_events`] for `pool` did not reach the
-    /// API: forget them so the next pass sends them again.
-    pub(crate) fn events_unsent(&mut self, pool: &str) {
+    /// The Events of `unsent` did not reach the API. A Pool's are made
+    /// again from state once forgotten; a Snapshot's come from a step that
+    /// may never run again, so they wait for the next pass as they are.
+    pub(crate) fn events_unsent(&mut self, unsent: Vec<StatusWrite>) {
+        for w in unsent {
+            match &w {
+                StatusWrite::Event {
+                    kind: "Snapshot", ..
+                } => self.events.push(w),
+                StatusWrite::Event { name, .. } => self.pool_events_unsent(name),
+                _ => {}
+            }
+        }
+    }
+
+    fn pool_events_unsent(&mut self, pool: &str) {
         self.device_events.remove(pool);
         self.pool_notes.remove(pool);
         let lvs = format!("{pool}/");

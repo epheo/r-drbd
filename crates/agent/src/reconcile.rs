@@ -439,8 +439,8 @@ pub struct Reconciler {
 /// host by one step, not by a whole pass.
 #[async_trait::async_trait]
 pub trait Publish: std::fmt::Debug + Send + Sync {
-    /// Applies `writes`; returns the Pools whose Events did not get through.
-    async fn publish(&self, writes: Vec<StatusWrite>) -> Vec<String>;
+    /// Applies `writes`; returns the Events that did not get through.
+    async fn publish(&self, writes: Vec<StatusWrite>) -> Vec<StatusWrite>;
 }
 
 impl Reconciler {
@@ -509,9 +509,8 @@ impl Reconciler {
         if writes.is_empty() {
             return;
         }
-        for pool in p.publish(std::mem::take(writes)).await {
-            self.events_unsent(&pool);
-        }
+        let unsent = p.publish(std::mem::take(writes)).await;
+        self.events_unsent(unsent);
     }
 
     #[must_use]
@@ -583,6 +582,15 @@ impl Reconciler {
     ) -> Vec<StatusWrite> {
         let mut reads = Reads::default();
         let mut writes = Vec::new();
+        // Unsent Snapshot Events of a Snapshot since gone say nothing more.
+        self.events.retain(|e| match e {
+            StatusWrite::Event {
+                kind: "Snapshot",
+                uid,
+                ..
+            } => snapshots.iter().any(|s| s.metadata.uid == *uid),
+            _ => true,
+        });
 
         let mut pools: Vec<&Pool> = pools
             .iter()

@@ -441,7 +441,7 @@ struct Recorded(std::sync::Mutex<Vec<Vec<String>>>);
 
 #[async_trait::async_trait]
 impl Publish for Recorded {
-    async fn publish(&self, writes: Vec<StatusWrite>) -> Vec<String> {
+    async fn publish(&self, writes: Vec<StatusWrite>) -> Vec<StatusWrite> {
         let names = writes.iter().map(|w| w.name().to_owned()).collect();
         self.0.lock().unwrap().push(names);
         Vec::new()
@@ -908,6 +908,32 @@ async fn a_repeated_conflict_sends_no_second_event() {
             .all(|w| matches!(w, StatusWrite::Pool { .. } | StatusWrite::Volume { .. })),
         "the same ack and no Event: {w:?}"
     );
+}
+
+/// A Snapshot Event comes from a step that may never run again: one
+/// that did not get through goes with the next pass, while its Snapshot
+/// is there.
+#[tokio::test]
+async fn an_unsent_snapshot_event_goes_with_the_next_pass() {
+    let x = Arc::new(ScriptedExec::new());
+    let mut r = Reconciler::new(NODE, x.clone());
+    let snap = Arc::new(snapshot("snap-1", "pvc-1", SnapshotPhase::Ready));
+    let event = StatusWrite::Event {
+        kind: "Snapshot",
+        name: "snap-1".into(),
+        uid: snap.metadata.uid.clone(),
+        reason: SNAPSHOT_LV_CONFLICT.into(),
+        message: "conflict".into(),
+    };
+    r.events_unsent(vec![event.clone()]);
+    reads(&x, &[]);
+    let w = r.pass(&[pool()], &[], std::slice::from_ref(&snap)).await;
+    assert_eq!(w.iter().filter(|w| **w == event).count(), 1, "{w:?}");
+    r.events_unsent(vec![event.clone()]);
+    reads(&x, &[]);
+    let w = r.pass(&[pool()], &[], &[]).await;
+    assert!(!w.contains(&event), "its Snapshot is gone");
+    x.assert_done();
 }
 
 #[tokio::test]
@@ -1441,7 +1467,14 @@ async fn snapshot_lvs_of_no_snapshot_are_reported_once() {
     );
     assert_eq!(pass(&mut r).await, [], "once per LV");
     // An Event that did not get through goes again.
-    r.events_unsent(POOL);
+    let unsent = StatusWrite::Event {
+        kind: "Pool",
+        name: POOL.into(),
+        uid: None,
+        reason: IMAGE_ORPHAN_LV.into(),
+        message: String::new(),
+    };
+    r.events_unsent(vec![unsent]);
     assert_eq!(pass(&mut r).await.len(), 2);
     let seen = x.seen.lock().unwrap();
     assert!(
