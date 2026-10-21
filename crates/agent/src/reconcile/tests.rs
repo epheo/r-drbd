@@ -1185,6 +1185,7 @@ async fn ready_snapshot_lv_is_rediscovered() {
         allocated_bytes: None,
         ..taken_ack(SnapshotPhase::Taking, POOL)
     }];
+    expect_tags(&x, &[("pvc-1+snap-1", &[&snap_tag("snap-1")])]);
     assert_eq!(snapshot_acks(&run(&x, vec![], vec![snap]).await), vec![]);
     // Only by its uid tag: untagged, or another Snapshot's, it is no copy.
     let other = storage::snap_tag("uid-other", GIB, 1);
@@ -1366,9 +1367,89 @@ async fn a_deleting_snapshot_without_a_phase_removes_nothing() {
     let st = s.status.as_mut().unwrap();
     st.phase = None;
     st.acks.clear();
+    expect_tags(&x, &[("pvc-1+snap-1", &[&snap_tag("snap-1")])]);
     let w = run(&x, vec![volume("pvc-1", GIB, 1)], vec![s]).await;
     assert_eq!(snapshot_acks(&w), vec![]);
     assert!(!x.seen.lock().unwrap().iter().any(|a| a[0] == "lvremove"));
+}
+
+fn orphan_events(writes: &[StatusWrite]) -> Vec<(String, String)> {
+    writes
+        .iter()
+        .filter_map(|w| match w {
+            StatusWrite::Event {
+                kind: "Pool",
+                name,
+                reason,
+                message,
+                ..
+            } if reason == IMAGE_ORPHAN_LV => Some((name.clone(), message.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A snapshot LV of no Snapshot is reported once, on its Pool, from its
+/// second pass on; nothing is removed or retagged.
+#[tokio::test]
+async fn snapshot_lvs_of_no_snapshot_are_reported_once() {
+    let other = storage::snap_tag("uid-gone", GIB, 2);
+    let own = snap_tag("snap-1");
+    let rows = [
+        lv_row("pvc-1+old", GIB_KIB, St::Inactive),
+        lv_row("pvc-1+legacy", GIB_KIB, St::Inactive),
+        lv_row("pvc-1+acked", GIB_KIB, St::Inactive),
+        lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive),
+    ];
+    let tags = [
+        ("pvc-1+old", &[other.as_str()][..]),
+        ("pvc-1+legacy", &[][..]),
+        ("pvc-1+acked", &[][..]),
+        ("pvc-1+snap-1", &[own.as_str()][..]),
+    ];
+    // snap-1 owns its tagged LV; acked is a legacy LV its Snapshot's ack names.
+    let mut acked = snapshot("acked", "pvc-1", SnapshotPhase::Ready);
+    acked.status.as_mut().unwrap().acks = vec![taken_ack(SnapshotPhase::Taking, POOL)];
+    let snaps: Vec<Arc<Snapshot>> = [snapshot("snap-1", "pvc-1", SnapshotPhase::Ready), acked]
+        .map(Arc::new)
+        .to_vec();
+    let x = Arc::new(ScriptedExec::new());
+    let mut r = Reconciler::new(NODE, x.clone());
+    let pass = async |r: &mut Reconciler| {
+        reads(&x, &rows);
+        x.expect(lvm::cmd::lv_tags(VG), ok(&tags_out(&tags)));
+        let w = r.pass(&[pool()], &[], &snaps).await;
+        x.assert_done();
+        orphan_events(&w)
+    };
+    assert_eq!(pass(&mut r).await, [], "not on its first pass");
+    let mut events = pass(&mut r).await;
+    events.sort();
+    assert_eq!(
+        events,
+        [
+            (
+                POOL.to_owned(),
+                "LV vg1/pvc-1+legacy: no snapshot tag, and no Snapshot's ack names it; left alone"
+                    .to_owned()
+            ),
+            (
+                POOL.to_owned(),
+                format!(
+                    "LV vg1/pvc-1+old: tag {other} names a Snapshot uid no Snapshot has; left alone"
+                )
+            ),
+        ]
+    );
+    assert_eq!(pass(&mut r).await, [], "once per LV");
+    // An Event that did not get through goes again.
+    r.events_unsent(POOL);
+    assert_eq!(pass(&mut r).await.len(), 2);
+    let seen = x.seen.lock().unwrap();
+    assert!(
+        seen.iter()
+            .all(|a| !matches!(a[0].as_str(), "lvremove" | "lvchange"))
+    );
 }
 
 /// A Failed Snapshot's copy goes on every node with a Pool, whether or
@@ -1432,6 +1513,8 @@ async fn a_complete_holder_set_is_never_extended() {
             ..taken_ack(SnapshotPhase::Taking, "p")
         })
         .to_vec();
+    // The orphan scan reads the tag of an LV no ack here names.
+    expect_tags(&x, &[("pvc-1+snap-1", &[&snap_tag("snap-1")])]);
     let w = run(&x, vec![], vec![snap]).await;
     assert_eq!(snapshot_acks(&w), vec![]);
 }
@@ -1716,6 +1799,7 @@ async fn restore_across_pools_is_an_error() {
     if let Some(st) = snap.status.as_mut() {
         st.acks = vec![taken_ack(SnapshotPhase::Taking, "pool-elsewhere")];
     }
+    expect_tags(&x, &[("pvc-1+snap-1", &[&snap_tag("snap-1")])]);
     let w = run(&x, vec![v], vec![snap]).await;
     let (_, e) = &volume_writes(&w)[0];
     assert_eq!(

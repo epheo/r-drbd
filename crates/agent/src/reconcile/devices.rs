@@ -486,6 +486,8 @@ impl Reconciler {
     pub(crate) fn events_unsent(&mut self, pool: &str) {
         self.device_events.remove(pool);
         self.pool_notes.remove(pool);
+        let lvs = format!("{pool}/");
+        self.orphans_reported.retain(|k| !k.starts_with(&lvs));
     }
 
     /// One Warning Event per path that cannot join a built Pool, when its

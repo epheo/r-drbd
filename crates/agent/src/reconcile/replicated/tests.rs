@@ -1103,6 +1103,10 @@ async fn restored_from_on_n2(
         expect_lv_tags(&x, &[("pvc-1", tags)]);
     }
     dry(&x, "");
+    if snaps.is_empty() {
+        // The orphan scan reads the tag of a snapshot LV no ack names.
+        expect_source_tags(&x);
+    }
     let w = r.pass_pools(&[pool_on("n2")], &[vol], snaps).await;
     entry_of(&w)
 }
@@ -1235,6 +1239,8 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
     let x = r.x.clone();
     reads(&x, &[source_lv()]);
     expect_create(&x, &[source_lv()]);
+    // The orphan scan reads the tag of a snapshot LV no ack here names.
+    expect_source_tags(&x);
     let e = n2_restore_pass(&mut r, &[]).await;
     assert_eq!((e.last_error, e.restored_from), (None, None));
 
@@ -1261,6 +1267,7 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
     let x = r.x.clone();
     reads(&x, &[source_lv()]);
     expect_create(&x, &[source_lv()]);
+    expect_source_tags(&x);
     let e = n2_restore_pass(&mut r, &[snap]).await;
     assert_eq!(e.last_error, None);
 

@@ -422,8 +422,12 @@ pub struct Reconciler {
     digests: Digests,
     /// The snapshot LVs this pass found still to hash.
     digest_jobs: Vec<digest::Job>,
-    /// Snapshot Events of this pass, returned with its writes.
+    /// Snapshot and orphan Events of this pass, returned with its writes.
     events: Vec<StatusWrite>,
+    /// `pool/lv` of the snapshot LVs of no Snapshot in the last pass.
+    orphan_suspects: HashSet<String>,
+    /// `pool/lv` of those reported, once each.
+    orphans_reported: HashSet<String>,
     /// Every Pool of this node by name, usable or not: what a discovery
     /// answer names as searched.
     pool_names: Vec<String>,
@@ -476,6 +480,8 @@ impl Reconciler {
             digests: Digests::default(),
             digest_jobs: Vec::new(),
             events: Vec::new(),
+            orphan_suspects: HashSet::new(),
+            orphans_reported: HashSet::new(),
             pool_names: Vec::new(),
         }
     }
@@ -1751,7 +1757,10 @@ impl Reconciler {
         res.map_err(|e| e.to_string())
     }
 
-    /// Thin LVs nobody claims are left alone, logged once per name.
+    /// Thin LVs nobody claims are left alone, logged once per name. A
+    /// snapshot LV of no Snapshot also gets one ImageOrphanLv Event on its
+    /// Pool, once it was one two passes in a row: a cache that lags behind
+    /// a new Snapshot never makes one.
     async fn log_orphans(
         &mut self,
         reads: &mut Reads,
@@ -1768,19 +1777,77 @@ impl Reconciler {
                     .map(|s| lvm::names::snapshot_lv(&s.spec.volume, &s.name_any())),
             )
             .collect();
+        let mut suspects = HashSet::new();
         for pool in pools {
             let Ok(rows) = reads.lvs(&self.lvm, &pool.spec.vg).await else {
                 continue;
             };
-            for r in storage::thin_lvs(&rows, &pool.spec.thin_pool) {
+            let thin: Vec<Lv> = storage::thin_lvs(&rows, &pool.spec.thin_pool)
+                .cloned()
+                .collect();
+            for r in &thin {
                 let key = format!("{}/{}", pool.spec.vg, r.name);
                 if !known.contains(&r.name) && self.orphans_logged.insert(key.clone()) {
                     tracing::info!(lv = key, "LV without a Volume or Snapshot: left alone");
                 }
             }
+            // A holder ack names an LV whose tag its take or search checked.
+            let pool_name = pool.name_any();
+            let acked = |lv: &str| {
+                snaps.iter().any(|s| {
+                    lvm::names::snapshot_lv(&s.spec.volume, &s.name_any()) == lv
+                        && s.status.iter().flat_map(|st| &st.acks).any(|a| {
+                            a.node == self.node
+                                && a.taken_pool.as_deref() == Some(pool_name.as_str())
+                        })
+                })
+            };
+            for r in thin
+                .iter()
+                .filter(|r| r.name.contains(lvm::names::SNAPSHOT_SEP) && !acked(&r.name))
+            {
+                let Ok(tagged) = reads.tagged(&self.lvm, &pool.spec.vg, &r.name).await else {
+                    break;
+                };
+                let Some(why) = orphan_snapshot_lv(snaps, &tagged.tags) else {
+                    continue;
+                };
+                let key = format!("{}/{}", pool.name_any(), r.name);
+                if self.orphan_suspects.contains(&key) && self.orphans_reported.insert(key.clone())
+                {
+                    let message = format!("LV {}/{}: {why}; left alone", pool.spec.vg, r.name);
+                    tracing::warn!(pool = pool.name_any(), message, "orphan snapshot LV");
+                    self.events.push(StatusWrite::Event {
+                        kind: "Pool",
+                        name: pool.name_any(),
+                        uid: pool.metadata.uid.clone(),
+                        reason: IMAGE_ORPHAN_LV.into(),
+                        message,
+                    });
+                }
+                suspects.insert(key);
+            }
         }
+        self.orphan_suspects = suspects;
     }
 }
+
+/// Why a snapshot LV no holder ack names belongs to no Snapshot: its snap
+/// tag names a uid no Snapshot has (objects restored from a backup get new
+/// uids), or it has no snap tag.
+fn orphan_snapshot_lv(snaps: &[&Snapshot], tags: &[String]) -> Option<String> {
+    let Some(tag) = tags.iter().find(|t| storage::parse_snap_tag(t).is_some()) else {
+        return Some("no snapshot tag, and no Snapshot's ack names it".to_owned());
+    };
+    let uid = storage::parse_snap_tag(tag)?.uid;
+    let owned = snaps
+        .iter()
+        .any(|s| s.metadata.uid.as_deref() == Some(uid.as_str()));
+    (!owned).then(|| format!("tag {tag} names a Snapshot uid no Snapshot has"))
+}
+
+/// Warning Event on a Pool: a snapshot LV in it belongs to no Snapshot.
+pub const IMAGE_ORPHAN_LV: &str = "ImageOrphanLv";
 
 /// The model's CEL rule already rejects these; an object written before the
 /// rule, or past it, must still never put such a name into an lvm argv.
