@@ -795,7 +795,9 @@ async fn a_ready_holder_acks_its_digest_once_hashed() {
     let hasher = Arc::new(FakeHasher::default());
     let digests = Digests::new(hasher.clone(), None);
     let mut r = Reconciler::new(NODE, x.clone()).with_digests(digests.clone());
-    let snap = Arc::new(snapshot("snap-1", "pvc-1", SnapshotPhase::Ready));
+    let mut snap = snapshot("snap-1", "pvc-1", SnapshotPhase::Ready);
+    snap.status.as_mut().unwrap().source_replicas = Some(2);
+    let snap = Arc::new(snap);
     reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
     let w = r.pass(&[pool()], &[], std::slice::from_ref(&snap)).await;
     assert_eq!(snapshot_acks(&w), vec![]);
@@ -816,6 +818,7 @@ async fn a_ready_holder_acks_its_digest_once_hashed() {
     assert_eq!(snapshot_acks(&w), vec![("snap-1".into(), want.clone())]);
 
     let mut acked = snapshot("snap-1", "pvc-1", SnapshotPhase::Ready);
+    acked.status.as_mut().unwrap().source_replicas = Some(2);
     acked.status.as_mut().unwrap().acks = vec![want];
     reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
     let w = r.pass(&[pool()], &[], &[Arc::new(acked)]).await;
@@ -825,20 +828,44 @@ async fn a_ready_holder_acks_its_digest_once_hashed() {
 }
 
 /// A single-replica source has no superblock and one copy: no digest.
+/// Without sourceReplicas a lone holder is taken as one.
 #[tokio::test]
 async fn a_single_replica_snapshot_is_never_hashed() {
-    let x = Arc::new(ScriptedExec::new());
-    let hasher = Arc::new(FakeHasher::default());
-    let mut r = Reconciler::new(NODE, x.clone()).with_digests(Digests::new(hasher.clone(), None));
-    let mut snap = snapshot("snap-1", "pvc-1", SnapshotPhase::Ready);
-    snap.status.as_mut().unwrap().source_replicas = Some(1);
-    reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
-    let w = r.pass(&[pool()], &[], &[Arc::new(snap)]).await;
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
+    for replicas in [Some(1), None] {
+        let x = Arc::new(ScriptedExec::new());
+        let hasher = Arc::new(FakeHasher::default());
+        let mut r =
+            Reconciler::new(NODE, x.clone()).with_digests(Digests::new(hasher.clone(), None));
+        let mut snap = snapshot("snap-1", "pvc-1", SnapshotPhase::Ready);
+        snap.status.as_mut().unwrap().source_replicas = replicas;
+        reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
+        let w = r.pass(&[pool()], &[], &[Arc::new(snap)]).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(snapshot_acks(&w), vec![]);
+        assert!(hasher.0.lock().unwrap().is_empty(), "{replicas:?}");
     }
-    assert_eq!(snapshot_acks(&w), vec![]);
-    assert!(hasher.0.lock().unwrap().is_empty());
+}
+
+/// Status lost on a replicated snapshot: a second holder's ack is the
+/// proof of DRBD copies, and the digest runs.
+#[test]
+fn a_digest_without_source_replicas_needs_two_holders() {
+    let mut st = snapshot("snap-1", "pvc-1", SnapshotPhase::Ready)
+        .status
+        .unwrap();
+    assert!(!wants_digest(&st));
+    st.acks.push(SnapshotAck {
+        node: "n2".into(),
+        ..taken_ack(SnapshotPhase::Taking, "p")
+    });
+    assert!(wants_digest(&st));
+    st.source_replicas = Some(1);
+    assert!(!wants_digest(&st));
+    st.source_replicas = Some(3);
+    st.acks.truncate(1);
+    assert!(wants_digest(&st));
 }
 
 /// The vgs report of another VG.
