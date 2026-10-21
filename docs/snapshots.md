@@ -26,6 +26,7 @@ Install the external-snapshotter CRDs and snapshot controller first.
         persistentVolumeClaimName: demo
 
 The CSI driver creates a Snapshot object; `kubectl get snapshots` shows its volume, phase and size.
+A CreateSnapshot retry under the same name replaces a Failed Snapshot with a new attempt, answers not ready while a lost status is being rebuilt, and refuses a Lost Snapshot with FailedPrecondition: take a new snapshot under another name (see [Operations](operations.md#a-lost-snapshot-status)).
 
 A snapshot of a replicated volume waits in Pending, saying why in `lastError`, until:
 
@@ -106,7 +107,9 @@ Rules:
   While the digests are pending each replica restores its copy and the first node waits for them up to 2 minutes; past that it is the sync source and the others are copied in full.
   The volume is Ready, and its claim usable, once any sync ends.
 - A holder whose node is down, whose agent is stale or whose Pool is not Available keeps the restore Pending, reason `Insufficient`, naming it.
-- A Ready snapshot whose acks lost their `takenPool` keeps the restore Pending, reason `SnapshotNotReady`, until each holder finds its LV again and acks it.
+- A Ready snapshot without a holder ack keeps the restore Pending, reason `SnapshotNotReady`: while it has fewer holders than its source had replicas, every node without an ack searches for its LV by the uid tag and acks a copy it finds.
+- A snapshot rebuilding a lost status (phase `Discovering`) is waited for: CreateVolume writes nothing until its size is known again.
+  A Lost one is refused: CreateVolume answers FailedPrecondition, and a restore already placed fails with reason `SnapshotLost`.
 - A replicated restore larger than its snapshot starts at the snapshot's size, then grows online; the new area syncs, zero blocks as discards.
   The claim is usable once the volume is Ready at the requested size.
 - A full thin pool for an empty replica stays an error.
@@ -128,6 +131,7 @@ Snapshot it, then restore the snapshot.
 Deleting the VolumeSnapshot (deletion policy Delete) deletes the Snapshot, and each node removes its snapshot LV.
 Each node removes it from the Pool it was taken in (`takenPool`), even after its replica moved to another Pool: the LV of that name with this Snapshot's uid tag, or with no snap tag (taken before tags existed), never one tagged with another uid.
 A node without that record searches the thin pools of its Pools for the LV with this Snapshot's uid tag; such an LV outside them is an error, never removed.
+A Snapshot rebuilding a lost status finishes that first; then, Ready or Lost, it removes the copies its discovery found.
 A Snapshot waits for the restores from it that are not yet initialized: it stays until each restored volume is first Ready, and a node holding a copy for such a restore keeps it until then.
 A restore that cannot start says why in its Ready condition, for example "LV <vg>/<lv> is not this restore's copy of snapshot <name>; delete the claim and restore again".
 Deleting a stuck claim removes its LVs and releases the Snapshot.

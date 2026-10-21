@@ -213,6 +213,44 @@ If an LV that a node already reported disappears (deleted by hand, disk replaced
   The replica stays `present: false` with a `lastError`, so the loss stays visible.
   Restore from a backup into a new PVC, then delete the old one.
 
+## A lost Snapshot status
+
+A Snapshot whose status is gone (an etcd restore, a hand edit, a bug), whole or in part, is rebuilt from its snapshot LVs, never taken again: new data never appears under a VolumeSnapshot that may have been seen ready.
+The controller sees the loss as the finalizer without a phase (it writes the first status before it adds the finalizer), or as Ready without `sizeBytes`.
+
+1. It sets phase `Discovering` and drops every ack, in one write.
+2. Every node with a Pool object searches the thin pools of all its Pools for the snapshot LV by the Snapshot's uid tag, and answers with the Pools it searched.
+   An answer counts only while those are still the node's Pools; a node whose Pools change answers again.
+   A search that fails is no answer.
+3. Once every such node answered:
+   - copies whose tags agree: phase Ready, with `sizeBytes`, `sourceReplicas` and `createdAt` from the tags and the LVs' creation times; the nodes that found a copy are its holders, and their digests write `copiesIdentical` again;
+   - no copy anywhere: phase `Lost`, reason `SnapshotLost`;
+   - copies whose tags disagree: phase `Lost`, reason `TagsDisagree`; the copies stay.
+   Lost gives one `ImageLost` Warning Event.
+
+While it waits:
+- IO a round had suspended stays suspended until each node's own deadline (4 minutes at most).
+- A node whose agent is down holds the decision: it could hold a copy.
+  After 10 minutes `Ready` reads `DiscoveryIncomplete`, and one `ImageDiscoveryIncomplete` Warning Event names the silent nodes.
+- Deleting that node's Node object changes nothing.
+  Deleting its Pool gives up on its copies; a Pool's deletion waits until its node answered, unless its agent is stale or its search fails.
+- CreateSnapshot answers not ready, and a restore waits.
+- A deleted Snapshot finishes its discovery first, then removes the copies found.
+
+A Lost Snapshot refuses restores (CreateVolume answers FailedPrecondition; a placed restore fails with `SnapshotLost`) and is never replaced: CreateSnapshot answers FailedPrecondition, so take a new snapshot under another name.
+Its copies stay until it is deleted.
+A copy that comes back later (a Pool recreated, a node returned): remove `status.phase` by hand, which starts a new discovery.
+
+A node left out of a discovery (its Pool deleted, then recreated) may still hold a copy: while a Ready Snapshot has fewer holders than `sourceReplicas`, every node without an ack searches for its LV and acks a copy it finds.
+
+Backups: keep r-drbd.io Snapshots out of API backups.
+A restored Snapshot object gets a new uid, so no tag matches it: restored with its finalizer it ends Lost, restored without one it is a new snapshot, and with its source alive a round takes the data of that day under the old name.
+A VolumeSnapshot backed up by a tool that copies the data is the supported path.
+To bind a restored Snapshot to its old copies by hand, retag each snapshot LV with the new uid (`lvchange --deltag` the old `r-drbd.snap.<uid>.<size>.<replicas>`, `--addtag` it with the new uid), then remove `status.phase`.
+
+Each agent reports, once, a snapshot LV in its Pools that belongs to no Snapshot (its tag names a uid no Snapshot has, or it has no tag and no ack names it), as an `ImageOrphanLv` Warning Event on the Pool naming the LV and the tag.
+Nothing is removed or retagged; remove such an LV by hand once you no longer need it.
+
 ## Upgrading r-drbd
 
 `kubectl apply -k deploy/base` of the new release: it carries the CRDs of that build.

@@ -20,6 +20,8 @@ These are the guarantees.
   A rebuilt replica never claims to hold data it does not have.
 - A restore whose snapshot LV is missing fails; it never creates an empty volume in its place.
 - A snapshot that failed on any node ends Failed; it is never reported Ready.
+- A Snapshot whose status is lost is rebuilt from the tags of its snapshot LVs, never taken again: new data never appears under a snapshot that may have been seen ready.
+  With no copy left, or copies that disagree, it is Lost and refuses restores.
 
 ## LVM
 
