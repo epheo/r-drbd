@@ -581,6 +581,32 @@ pub fn derive(res: Option<&Resource>) -> Derived {
     }
 }
 
+/// A resync of the volume runs or is about to. A peer Inconsistent while
+/// Established counts: a diskless node sees its peers' resync only so.
+pub fn resyncing(r: &Resource) -> bool {
+    let local = r.devices.get(&VOLUME).and_then(|d| d.disk.as_deref());
+    local == Some("Inconsistent")
+        || r.peer_devices.iter().any(|((_, v), p)| {
+            let rep = p.replication.as_deref();
+            *v == VOLUME
+                && (matches!(
+                    rep,
+                    Some(
+                        "StartingSyncS"
+                            | "StartingSyncT"
+                            | "WFBitMapS"
+                            | "WFBitMapT"
+                            | "WFSyncUUID"
+                            | "SyncSource"
+                            | "SyncTarget"
+                            | "PausedSyncS"
+                            | "PausedSyncT"
+                    )
+                ) || (rep == Some("Established")
+                    && p.peer_disk.as_deref() == Some("Inconsistent")))
+        })
+}
+
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn whole_percent(done: f64) -> u32 {
     done.clamp(0.0, 100.0).floor() as u32

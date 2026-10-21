@@ -1121,12 +1121,8 @@ impl Reconciler {
                 SnapshotPhase::Ready if taken.pool.is_none() && holder_missing(&status) => {
                     self.rediscover(reads, pools, &name, &lv).await?
                 }
-                // A single-replica source has no DRBD superblock to bound
-                // the digest, and a single copy nothing to match.
                 SnapshotPhase::Ready
-                    if taken.pool.is_some()
-                        && taken.digest.is_none()
-                        && status.source_replicas != Some(1) =>
+                    if taken.pool.is_some() && taken.digest.is_none() && wants_digest(&status) =>
                 {
                     let prev = prev.clone()?;
                     self.digest_step(reads, pools, vols, snap, &lv, prev)
@@ -1249,8 +1245,9 @@ impl Reconciler {
             Ok(Some((place, found))) => {
                 tracing::info!(
                     snapshot = name,
+                    lv,
                     pool = place.pool,
-                    "snapshot LV found without its ack: acking where it lives"
+                    "snapshot LV rediscovered without its ack: acked again"
                 );
                 Some(ack(&self.node, SnapshotPhase::Taking, found, Ok(())))
             }
@@ -1643,19 +1640,34 @@ fn ack(node: &str, phase: SnapshotPhase, taken: Taken, res: Result<(), String>) 
     }
 }
 
+fn holder_count(status: &model::SnapshotStatus) -> usize {
+    status
+        .acks
+        .iter()
+        .filter(|a| a.taken_pool.is_some())
+        .count()
+}
+
 /// Fewer acks with takenPool than the source had replicas, or no record
 /// of them: a holder may have lost its ack. Bounds the search to such
 /// Snapshots, so an LV of that name on another node is never adopted
 /// beside a complete set.
 fn holder_missing(status: &model::SnapshotStatus) -> bool {
-    let holders = status
-        .acks
-        .iter()
-        .filter(|a| a.taken_pool.is_some())
-        .count();
+    let holders = holder_count(status);
     status
         .source_replicas
         .is_none_or(|n| holders < usize::try_from(n).unwrap_or(usize::MAX))
+}
+
+/// A single-replica source has no DRBD superblock to bound the digest, and
+/// a single copy nothing to match. Without sourceReplicas (a status loss,
+/// or a snapshot older than the field) one holder is taken as that case
+/// until a second one acks.
+fn wants_digest(status: &model::SnapshotStatus) -> bool {
+    match status.source_replicas {
+        Some(n) => n != 1,
+        None => holder_count(status) >= 2,
+    }
 }
 
 /// The Snapshot a volume restores from, when it exists with the uid the source names.
