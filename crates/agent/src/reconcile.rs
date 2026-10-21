@@ -1249,8 +1249,9 @@ impl Reconciler {
             Ok(Some((place, found))) => {
                 tracing::info!(
                     snapshot = name,
+                    lv,
                     pool = place.pool,
-                    "snapshot LV found without its ack: acking where it lives"
+                    "snapshot LV rediscovered without its ack: acked again"
                 );
                 Some(ack(&self.node, SnapshotPhase::Taking, found, Ok(())))
             }

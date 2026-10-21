@@ -909,7 +909,14 @@ async fn ready_snapshot_lv_is_rediscovered() {
         reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
         let mut snap = snapshot("snap-1", "pvc-1", SnapshotPhase::Ready);
         snap.status.as_mut().unwrap().acks = acks;
+        let (logs, _g) = crate::logs::capture();
         let w = run(&x, vec![], vec![snap]).await;
+        assert_eq!(
+            logs.find("INFO", "rediscovered").len(),
+            1,
+            "{:?}",
+            logs.lines()
+        );
         let want = SnapshotAck {
             allocated_bytes: None,
             digest: None,

@@ -26,6 +26,9 @@ pub mod watch;
 
 mod run;
 
+#[cfg(test)]
+pub(crate) mod logs;
+
 pub use run::{Config, Error, run};
 
 use std::time::Duration;
