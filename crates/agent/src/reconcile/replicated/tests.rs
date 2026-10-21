@@ -2492,6 +2492,7 @@ async fn a_lost_status_keeps_the_freeze_to_the_deadline() {
         suspend_pass(&mut r).await;
         let mut s = snapshot(SnapshotPhase::Suspending);
         s.status.as_mut().unwrap().phase = phase;
+        s.metadata.finalizers = Some(vec![model::keys::FINALIZER_SNAPSHOT.into()]);
         let lost = [s];
         tokio::time::advance(model::snapshot::RESUME_AFTER.saturating_sub(Duration::from_secs(1)))
             .await;
@@ -2524,6 +2525,28 @@ async fn a_lost_status_keeps_the_freeze_to_the_deadline() {
         r.x.expect(argv::resume_io("pvc-1"), ok(""));
         dry(&r.x, "");
         r.pass(&[volume(GIB)], &[snapshot(phase)]).await;
+    }
+}
+
+/// Only the Snapshot whose round suspended IO holds it: another one of
+/// the volume, lost or rebuilding, never stretches the freeze.
+#[tokio::test]
+async fn another_snapshot_rebuilding_never_holds_the_freeze() {
+    for phase in [None, Some(SnapshotPhase::Discovering)] {
+        let mut r = Rig::new(&healthy(), up_host());
+        suspend_pass(&mut r).await;
+        let mut other = snapshot(SnapshotPhase::Suspending);
+        other.metadata.name = Some("snap-0".into());
+        other.metadata.uid = Some("other-uid".into());
+        other.metadata.finalizers = Some(vec![model::keys::FINALIZER_SNAPSHOT.into()]);
+        other.status.as_mut().unwrap().phase = phase;
+        let done = acked(SnapshotPhase::Ready, round_ack(SnapshotPhase::Taking, true));
+        reads_again(&r.x, &[lv(LV_KIB)]);
+        r.x.expect(argv::resume_io("pvc-1"), ok(""));
+        dry(&r.x, "");
+        r.pass(&[volume(GIB)], &[other, done]).await;
+        assert!(seen(&r.x, "resume-io"), "{phase:?}");
+        assert_eq!(r.rec.next_deadline(), None);
     }
 }
 

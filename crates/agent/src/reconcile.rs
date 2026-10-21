@@ -337,15 +337,17 @@ enum Origin {
 }
 
 /// A user IO suspend of one volume, as this agent run knows it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Freeze {
     /// On this agent's monotonic clock, never a wall clock: the deadlines
     /// must hold whatever the other nodes' clocks say.
     since: tokio::time::Instant,
-    /// This run suspended it for the current round. A suspend found after
-    /// a restart started at an unknown time: it is resumed in time, never
-    /// taken from.
-    mine: bool,
+    /// The uid of the Snapshot whose round this run suspended it for: no
+    /// other Snapshot holds it, so a status lost long ago never stretches
+    /// a later round's freeze. None: a suspend found after a restart,
+    /// started at an unknown time; any Snapshot of the volume holds it, it
+    /// is resumed in time and never taken from.
+    round: Option<String>,
 }
 
 /// Where an LV of this node lives.
@@ -1160,7 +1162,7 @@ impl Reconciler {
                                 let place = place.ok()?;
                                 lvm::names::check_new_lv(&place.vg, &lv).err()
                             });
-                        let res = self.suspend_step(v, prev.as_ref(), refused).await?;
+                        let res = self.suspend_step(v, snap, prev.as_ref(), refused).await?;
                         ack(&self.node, SnapshotPhase::Suspending, taken, res)
                     } else {
                         replica?;
@@ -1469,15 +1471,17 @@ impl Reconciler {
     async fn suspend_step(
         &mut self,
         vol: &Volume,
+        snap: &Snapshot,
         prev: Option<&SnapshotAck>,
         refused: Option<String>,
     ) -> Option<Result<(), String>> {
         let volume = &vol.name_any();
         let Some(p) = prev.filter(|a| a.phase == SnapshotPhase::Suspending) else {
-            return Some(match refused {
-                Some(e) => Err(e),
-                None => match vol.spec.assignment.as_ref().and_then(|a| a.minor) {
-                    Some(minor) => self.suspend(volume, minor).await,
+            return Some(match (refused, snap.metadata.uid.as_deref()) {
+                (Some(e), _) => Err(e),
+                (None, None) => Err("snapshot has no uid".to_owned()),
+                (None, Some(uid)) => match vol.spec.assignment.as_ref().and_then(|a| a.minor) {
+                    Some(minor) => self.suspend(volume, minor, uid).await,
                     None => Err("assignment has no minor".to_owned()),
                 },
             });
@@ -1718,7 +1722,7 @@ impl Reconciler {
         let fresh = self
             .freezes
             .get(origin)
-            .is_some_and(|f| f.mine && f.since.elapsed() < window);
+            .is_some_and(|f| f.round.is_some() && f.since.elapsed() < window);
         (!fresh || !res.suspended_by_user()).then(|| {
             format!(
                 "IO not suspended by this agent within the last {} s",

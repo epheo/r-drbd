@@ -115,12 +115,13 @@ pub(super) fn in_round(s: &Snapshot) -> bool {
 /// round is taken inside one freeze.
 fn holds_freeze(s: &Snapshot) -> bool {
     s.metadata.deletion_timestamp.is_none()
-        && s.status.as_ref().and_then(|st| st.phase).is_none_or(|p| {
-            matches!(
+        && match s.status.as_ref().and_then(|st| st.phase) {
+            Some(p) => matches!(
                 p,
                 SnapshotPhase::Suspending | SnapshotPhase::Taking | SnapshotPhase::Discovering
-            )
-        })
+            ),
+            None => s.status_lost(),
+        }
 }
 
 pub(super) fn snapshot_round_active(snapshots: &[Arc<Snapshot>], volume: &str) -> bool {
@@ -1775,9 +1776,9 @@ impl Reconciler {
         self.tracked(volume).is_some_and(|r| r.suspended_by_user())
     }
 
-    /// Ends a user IO suspend nobody needs: no Snapshot of the volume holds
-    /// it, or this agent's own deadline passed, whatever the controller
-    /// says. A round still running then gets a failed ack, best effort;
+    /// Ends a user IO suspend nobody needs: the Snapshot whose round
+    /// suspended it no longer holds it, or this agent's own deadline
+    /// passed, whatever the controller says. A round still running then gets a failed ack, best effort;
     /// safety does not rest on it, since every take ends before the
     /// deadline.
     pub(super) async fn freeze(&mut self, vol: &Volume, snaps: &[&Snapshot]) -> Vec<StatusWrite> {
@@ -1792,18 +1793,16 @@ impl Reconciler {
             return Vec::new();
         }
         let now = tokio::time::Instant::now();
-        let since = self
-            .freezes
-            .entry(name.clone())
-            .or_insert(super::Freeze {
-                since: now,
-                mine: false,
-            })
-            .since;
+        let freeze = self.freezes.entry(name.clone()).or_insert(super::Freeze {
+            since: now,
+            round: None,
+        });
+        let (since, round) = (freeze.since, freeze.round.clone());
         let holding: Vec<&Snapshot> = snaps
             .iter()
             .copied()
             .filter(|s| s.is_of(vol) && holds_freeze(s))
+            .filter(|s| round.is_none() || s.metadata.uid == round)
             .collect();
         let after = model::snapshot::RESUME_AFTER;
         if !holding.is_empty() && now.duration_since(since) < after {
@@ -1861,9 +1860,14 @@ impl Reconciler {
             .min()
     }
 
-    /// Suspends IO for a round; the take window and the resume deadline
-    /// count from here, on this agent's clock.
-    pub(super) async fn suspend(&mut self, volume: &str, minor: u32) -> Result<(), String> {
+    /// Suspends IO for the round of Snapshot `round`; the take window and
+    /// the resume deadline count from here, on this agent's clock.
+    pub(super) async fn suspend(
+        &mut self,
+        volume: &str,
+        minor: u32,
+        round: &str,
+    ) -> Result<(), String> {
         let r = self
             .tracked(volume)
             .ok_or_else(|| format!("DRBD resource {volume} is not up"))?;
@@ -1878,7 +1882,7 @@ impl Reconciler {
             volume.to_owned(),
             super::Freeze {
                 since: tokio::time::Instant::now(),
-                mine: true,
+                round: Some(round.to_owned()),
             },
         );
         if r.is_primary() {

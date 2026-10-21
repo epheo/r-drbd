@@ -229,7 +229,8 @@ The controller sees the loss as the finalizer without a phase (it writes the fir
    Lost gives one `ImageLost` Warning Event.
 
 While it waits:
-- IO a round had suspended stays suspended until each node's own deadline (4 minutes at most).
+- IO a round had suspended stays suspended on each node until 4 minutes after that node's own suspend; only the Snapshot whose round suspended it holds it, never another one's discovery.
+- No snapshot round, expansion or eviction starts on the volume until 4.5 minutes after the discovery began (every node's deadline plus a clock margin): only the agents know which round froze their IO.
 - A node whose agent is down holds the decision: it could hold a copy.
   After 10 minutes `Ready` reads `DiscoveryIncomplete`, and one `ImageDiscoveryIncomplete` Warning Event names the silent nodes.
 - Deleting that node's Node object changes nothing.

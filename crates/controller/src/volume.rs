@@ -1399,10 +1399,25 @@ async fn attach_report(
 /// A snapshot round runs in Suspending and Taking. Pending is not one:
 /// it waits for a Ready volume, which may need the very move it would block.
 pub fn round_running(s: &Snapshot) -> bool {
-    matches!(
-        s.status.as_ref().and_then(|st| st.phase),
-        Some(SnapshotPhase::Suspending | SnapshotPhase::Taking)
-    )
+    round_running_at(s, k8s_openapi::jiff::Timestamp::now())
+}
+
+/// A status lost mid round counts as one until every agent's own resume
+/// deadline passed: their freeze may still hold for it, and only the
+/// agents know which round suspended them.
+pub fn round_running_at(s: &Snapshot, now: k8s_openapi::jiff::Timestamp) -> bool {
+    let st = s.status.as_ref();
+    match st.and_then(|st| st.phase) {
+        Some(SnapshotPhase::Suspending | SnapshotPhase::Taking) => true,
+        Some(SnapshotPhase::Discovering) => {
+            let bound = model::snapshot::RESUME_AFTER + model::snapshot::CLOCK_MARGIN;
+            st.and_then(|st| st.phase_since.as_ref()).is_none_or(|t| {
+                std::time::Duration::try_from(now.duration_since(t.0)).unwrap_or_default() < bound
+            })
+        }
+        None => s.status_lost(),
+        Some(_) => false,
+    }
 }
 
 /// The first Snapshot of `volume` by name whose round runs.
@@ -3222,6 +3237,8 @@ mod tests {
     fn snapshot_rounds_that_block_eviction() {
         let mut snap = Snapshot::new("s", spec_of("v"));
         assert!(!round_running(&snap), "no status yet");
+        snap.metadata.finalizers = Some(vec![model::keys::FINALIZER_SNAPSHOT.into()]);
+        assert!(round_running(&snap), "status lost: maybe mid round");
         for (phase, running) in [
             (SnapshotPhase::Pending, false),
             (SnapshotPhase::Suspending, true),
@@ -3236,6 +3253,31 @@ mod tests {
             });
             assert_eq!(round_running(&snap), running, "{phase:?}");
         }
+    }
+
+    /// A discovery may have started mid round: it counts as one until
+    /// every agent's own deadline passed.
+    #[test]
+    fn a_fresh_discovery_counts_as_a_round_until_the_freeze_bound() {
+        let since = k8s_openapi::jiff::Timestamp::from_second(1_000_000).unwrap();
+        let mut snap = Snapshot::new("s", spec_of("v"));
+        snap.status = Some(model::SnapshotStatus {
+            phase: Some(SnapshotPhase::Discovering),
+            phase_since: Some(Time(since)),
+            ..model::SnapshotStatus::default()
+        });
+        let bound = model::snapshot::RESUME_AFTER + model::snapshot::CLOCK_MARGIN;
+        let at = |d: std::time::Duration| {
+            since + k8s_openapi::jiff::SignedDuration::try_from(d).unwrap()
+        };
+        assert!(round_running_at(&snap, at(std::time::Duration::ZERO)));
+        assert!(round_running_at(
+            &snap,
+            at(bound.saturating_sub(std::time::Duration::from_secs(1)))
+        ));
+        assert!(!round_running_at(&snap, at(bound)));
+        snap.status.as_mut().unwrap().phase_since = None;
+        assert!(round_running_at(&snap, at(bound)), "no start yet");
     }
 
     #[test]

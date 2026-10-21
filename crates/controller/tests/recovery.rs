@@ -471,6 +471,87 @@ async fn a_discovery_starts_on_the_version_read() {
     assert_eq!(nodes, BTreeSet::from(["n1"]));
 }
 
+/// A discovery may have started mid round, with IO still frozen for it on
+/// some node: no new round and no resize start on its volume until every
+/// agent's own deadline passed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fresh_discovery_holds_rounds_and_resizes_of_its_volume() {
+    use csi::tonic::{Code, Request};
+    use csi::v1::controller_server::Controller;
+    let assets = require_envtest!();
+    let (env, client, _ctl) = setup(&assets).await;
+    let _auto: Vec<_> = cluster(&client)
+        .await
+        .into_iter()
+        .map(FakeAgent::spawn_auto)
+        .collect();
+    ready_snapshot(&client).await;
+    // No agent on n4: the discovery stays open.
+    node(&client, "n4", true).await;
+    pool(&client, "p-n4", "n4", "fast", 100 * GIB).await;
+    clear(&client, json!(null)).await;
+    snapshot_where(&client, "snap", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Discovering)
+    })
+    .await;
+
+    create_snapshot(&client, "next", "src").await;
+    let held = snapshot_where(&client, "next", |s| {
+        s.status
+            .as_ref()
+            .and_then(|st| st.last_error.as_deref())
+            .is_some_and(|e| e.contains("snapshot snap"))
+    })
+    .await;
+    assert_eq!(snap_phase(&held), Some(SnapshotPhase::Pending));
+    let (stores, watchers) = controller::store::start(
+        client.clone(),
+        support::NAMESPACE,
+        controller::store::LEASE_STALE,
+    );
+    let _watchers = tokio::spawn(watchers);
+    stores.wait_ready().await.unwrap();
+    let svc = controller::csi::Csi::new(client.clone(), stores, support::config(&env, "ctl"));
+    let expand = || csi::v1::ControllerExpandVolumeRequest {
+        volume_id: "src".into(),
+        capacity_range: Some(csi::v1::CapacityRange {
+            required_bytes: i64::try_from(2 * GIB).unwrap(),
+            limit_bytes: 0,
+        }),
+        ..csi::v1::ControllerExpandVolumeRequest::default()
+    };
+    let e = svc
+        .controller_expand_volume(Request::new(expand()))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), Code::Aborted, "{e}");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let held = get_snapshot(&client, "next").await.unwrap();
+    assert_eq!(snap_phase(&held), Some(SnapshotPhase::Pending));
+
+    // Past every agent's deadline: the round and the resize go ahead.
+    let bound = model::snapshot::RESUME_AFTER + model::snapshot::CLOCK_MARGIN;
+    let ago = k8s_openapi::jiff::Timestamp::now()
+        .checked_sub(bound + Duration::from_secs(1))
+        .unwrap();
+    let ago = k8s_openapi::jiff::Timestamp::from_second(ago.as_second()).unwrap();
+    clear(&client, json!({ "phaseSince": ago.to_string() })).await;
+    snapshot_where(&client, "next", |s| {
+        snap_phase(s) == Some(SnapshotPhase::Ready)
+    })
+    .await;
+    support::eventually(Duration::from_secs(20), || async {
+        svc.controller_expand_volume(Request::new(expand()))
+            .await
+            .ok()
+    })
+    .await;
+    assert_eq!(
+        snap_phase(&get_snapshot(&client, "snap").await.unwrap()),
+        Some(SnapshotPhase::Discovering)
+    );
+}
+
 fn restore_request(name: &str) -> csi::v1::CreateVolumeRequest {
     use csi::v1::volume_capability::access_mode::Mode;
     use csi::v1::volume_capability::{AccessMode, AccessType, MountVolume};

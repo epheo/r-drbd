@@ -62,7 +62,7 @@ Each node keeps its own deadlines, on its own clock:
 - it resumes IO 4 minutes after its own suspend, even when the controller or the API server is gone; the snapshot then fails unless every copy was already taken.
 
 So IO stays frozen about 4 minutes at most.
-A node resumes before its deadline only on a phase past the round; a Snapshot whose phase vanished keeps IO frozen up to the deadline, so every copy of a round is taken inside one freeze.
+A node resumes before its deadline only when the Snapshot whose round froze its IO reaches a phase past the round; one whose phase vanished keeps IO frozen up to the deadline, so every copy of a round is taken inside one freeze.
 A node that is no longer suspended when it should be (a reboot, a resume on its deadline) fails the snapshot.
 A replica attached during the round never suspended, so it fails the snapshot too.
 While a round runs, volume expansion is refused (the call is retried) and no replica grows.
