@@ -12,9 +12,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::api::{Patch, PatchParams};
 use kube::{Api, Client, ResourceExt};
-use lvm::report::{Lv, Vg};
+use lvm::report::{Lv, Tagged, Vg};
 use model::condition::{self, Condition};
 use model::{
     AssignedReplica, DeviceState, DeviceStatus, Pool, ReplicaStatus, Role, Snapshot, SnapshotAck,
@@ -83,8 +84,9 @@ pub enum StatusWrite {
         name: String,
         ack: SnapshotAck,
     },
-    /// A Warning Event on a Pool.
+    /// A Warning Event on a Pool or a Snapshot.
     Event {
+        kind: &'static str,
         name: String,
         uid: Option<String>,
         reason: String,
@@ -168,6 +170,7 @@ impl StatusWrite {
         use k8s_openapi::api::core::v1::{Event, EventSource, ObjectReference};
         use kube::api::ObjectMeta;
         let Self::Event {
+            kind,
             name,
             uid,
             reason,
@@ -185,7 +188,7 @@ impl StatusWrite {
             },
             involved_object: ObjectReference {
                 api_version: Some(format!("{}/{}", model::GROUP, model::VERSION)),
-                kind: Some("Pool".into()),
+                kind: Some((*kind).into()),
                 name: Some(name.clone()),
                 uid: uid.clone(),
                 ..ObjectReference::default()
@@ -244,8 +247,8 @@ impl StatusWrite {
 struct Reads {
     lvs: HashMap<String, Result<Vec<Lv>, String>>,
     vgs: HashMap<String, Result<Vg, String>>,
-    /// Tags per LV, read only when a decision needs them.
-    tags: HashMap<String, Result<HashMap<String, Vec<String>>, String>>,
+    /// Tags and creation time per LV, read only when a decision needs them.
+    tags: HashMap<String, Result<HashMap<String, Tagged>, String>>,
     /// `vg/lv` of the LVs this pass created; never snapshotted in the same pass.
     created: HashSet<String>,
 }
@@ -283,8 +286,13 @@ impl Reads {
 
     /// Tags of one LV (empty when it has none).
     async fn tags(&mut self, lvm: &Lvm, vg: &str, lv: &str) -> Result<Vec<String>, String> {
+        Ok(self.tagged(lvm, vg, lv).await?.tags)
+    }
+
+    /// Tags and creation time of one LV (default when it is not there).
+    async fn tagged(&mut self, lvm: &Lvm, vg: &str, lv: &str) -> Result<Tagged, String> {
         if !self.tags.contains_key(vg) {
-            let r = lvm.tags(vg).await.map_err(|e| e.to_string());
+            let r = lvm.tagged(vg).await.map_err(|e| e.to_string());
             self.tags.insert(vg.to_owned(), r);
         }
         match &self.tags[vg] {
@@ -403,6 +411,8 @@ pub struct Reconciler {
     digests: Digests,
     /// The snapshot LVs this pass found still to hash.
     digest_jobs: Vec<digest::Job>,
+    /// Snapshot Events of this pass, returned with its writes.
+    events: Vec<StatusWrite>,
 }
 
 /// Where a pass sends its writes as each step ends, so statuses trail the
@@ -451,6 +461,7 @@ impl Reconciler {
             freezes: HashMap::new(),
             digests: Digests::default(),
             digest_jobs: Vec::new(),
+            events: Vec::new(),
         }
     }
 
@@ -615,6 +626,7 @@ impl Reconciler {
 
         self.digests.schedule(std::mem::take(&mut self.digest_jobs));
         self.log_orphans(&mut reads, &pools, &vols, &snaps).await;
+        writes.append(&mut self.events);
         writes
     }
 
@@ -1014,14 +1026,34 @@ impl Reconciler {
                 place.vg
             ));
         }
-        tracing::info!(
-            lv,
-            source,
-            vg = place.vg,
-            "restoring volume LV from snapshot"
-        );
+        let vg = place.vg.as_str();
+        let tagged = self.lvm.tags(vg).await.map_err(|e| e.to_string())?;
+        let uid = snap_tag_in(tagged.get(&source).map_or(&[], Vec::as_slice)).map(|t| t.uid);
+        if uid.is_none() || uid.as_deref() != snap.metadata.uid.as_deref() {
+            return Err(format!(
+                "snapshot LV {vg}/{source} has no tag of this snapshot: not its copy"
+            ));
+        }
+        tracing::info!(lv, source, vg, "restoring volume LV from snapshot");
         self.lvm
-            .restore(&place.vg, &source, lv, tags)
+            .restore(vg, &source, lv, tags)
+            .await
+            .map_err(|e| e.to_string())?;
+        // LVM copies no tags to a thin snapshot; a copy must never pass
+        // for the snapshot itself if one ever does.
+        let tagged = self.lvm.tags(vg).await.map_err(|e| e.to_string())?;
+        let inherited: Vec<&str> = tagged
+            .get(lv)
+            .into_iter()
+            .flatten()
+            .filter(|t| storage::is_snap_tag(t))
+            .map(String::as_str)
+            .collect();
+        if inherited.is_empty() {
+            return Ok(());
+        }
+        self.lvm
+            .change_tags(vg, lv, &[], &inherited)
             .await
             .map_err(|e| e.to_string())
     }
@@ -1060,24 +1092,9 @@ impl Reconciler {
                     (Some(_), _) if taken.pool.is_some() => return None,
                     (Some(_), _) => {
                         let vol = vol?;
-                        let origin = lvm::names::volume_lv(&snap.spec.volume);
-                        let res = match self.place(pools, replica_pool.as_deref()) {
-                            Ok(place) => {
-                                let origin_kind = match replicated {
-                                    Some(_) => Origin::Drbd(
-                                        self.snapshot_blocker(reads, &place, &origin, vol).await,
-                                    ),
-                                    None => Origin::Local,
-                                };
-                                self.take_snapshot(reads, &place, &origin, &lv, origin_kind)
-                                    .await
-                            }
-                            Err(e) => Err(e),
-                        };
-                        match res {
-                            Ok(t) => ack(&self.node, SnapshotPhase::Taking, t, Ok(())),
-                            Err(e) => ack(&self.node, SnapshotPhase::Taking, taken, Err(e)),
-                        }
+                        let pool = replica_pool.as_deref();
+                        self.take_step(reads, pools, snap, vol, pool, &lv, taken, prev.as_ref())
+                            .await
                     }
                     // Diskless or tiebreaker: no copy; its ack says its IO
                     // is still suspended, and Ready waits for it.
@@ -1312,6 +1329,7 @@ impl Reconciler {
                 // An inactive snapshot reports no allocation, and its origin
                 // has moved on since the take.
                 allocated_bytes: None,
+                lv_created_at: None,
                 digest: None,
                 digest_bytes: None,
             };
@@ -1348,6 +1366,82 @@ impl Reconciler {
         })
     }
 
+    /// The Taking ack of a diskful replica. An LV of the name that is not
+    /// this Snapshot's fails the round untouched, with one Event.
+    #[allow(clippy::too_many_arguments)]
+    async fn take_step(
+        &mut self,
+        reads: &mut Reads,
+        pools: &[&Pool],
+        snap: &Snapshot,
+        vol: &Volume,
+        pool: Option<&str>,
+        lv: &str,
+        taken: Taken,
+        prev: Option<&SnapshotAck>,
+    ) -> SnapshotAck {
+        let origin = lvm::names::volume_lv(&snap.spec.volume);
+        let mut conflict = false;
+        let res = match (self.place(pools, pool), snap_tag_of(snap)) {
+            (Ok(place), Ok((uid, tag))) => match self.foreign_lv(reads, &place, lv, uid).await {
+                Ok(Some(why)) => {
+                    conflict = true;
+                    Err(why)
+                }
+                Ok(None) => {
+                    let kind = if vol.spec.replicas >= 2 {
+                        Origin::Drbd(self.snapshot_blocker(reads, &place, &origin, vol).await)
+                    } else {
+                        Origin::Local
+                    };
+                    self.take_snapshot(reads, &place, &origin, lv, kind, &tag)
+                        .await
+                }
+                Err(e) => Err(e),
+            },
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        };
+        let a = match res {
+            Ok(t) => ack(&self.node, SnapshotPhase::Taking, t, Ok(())),
+            Err(e) => ack(&self.node, SnapshotPhase::Taking, taken, Err(e)),
+        };
+        if conflict && prev != Some(&a) {
+            self.events.push(StatusWrite::Event {
+                kind: "Snapshot",
+                name: snap.name_any(),
+                uid: snap.metadata.uid.clone(),
+                reason: SNAPSHOT_LV_CONFLICT.into(),
+                message: a.error.clone().unwrap_or_default(),
+            });
+        }
+        a
+    }
+
+    /// Why an LV of the snapshot LV's name is not this Snapshot's copy:
+    /// it has no snap tag, or another uid's. Such an LV is never adopted.
+    async fn foreign_lv(
+        &self,
+        reads: &mut Reads,
+        place: &Place,
+        lv: &str,
+        uid: &str,
+    ) -> Result<Option<String>, String> {
+        let rows = reads.lvs(&self.lvm, &place.vg).await?;
+        if find_in_pool(&rows, lv, &place.thin)?.is_none() {
+            return Ok(None);
+        }
+        let tags = reads.tags(&self.lvm, &place.vg, lv).await?;
+        let at = format!("LV {}/{lv}", place.vg);
+        Ok(match snap_tag_in(&tags) {
+            Some(t) if t.uid == uid => None,
+            Some(t) => Some(format!(
+                "{at} belongs to snapshot uid {}; left untouched",
+                t.uid
+            )),
+            None => Some(format!("{at} has no snapshot tag; left untouched")),
+        })
+    }
+
     /// Takes the snapshot LV, or finds it taken; returns what its ack
     /// records.
     async fn take_snapshot(
@@ -1357,11 +1451,13 @@ impl Reconciler {
         origin: &str,
         lv: &str,
         kind: Origin,
+        tag: &str,
     ) -> Result<Taken, String> {
-        self.take_lv(reads, place, origin, lv, kind).await?;
+        self.take_lv(reads, place, origin, lv, kind, tag).await?;
         let rows = reads.lvs(&self.lvm, &place.vg).await?;
         let row = find_in_pool(&rows, lv, &place.thin)?
             .ok_or_else(|| format!("snapshot LV {}/{lv} missing after its take", place.vg))?;
+        let created = reads.tagged(&self.lvm, &place.vg, lv).await?.created;
         Ok(Taken {
             pool: Some(place.pool.clone()),
             lv_bytes: Some(row.size_bytes),
@@ -1369,6 +1465,7 @@ impl Reconciler {
             // at the take it maps exactly what its origin maps.
             allocated_bytes: find_in_pool(&rows, origin, &place.thin)?
                 .and_then(lvm::report::thin_used_bytes),
+            lv_created_at: created.and_then(unix_time),
             ..Taken::default()
         })
     }
@@ -1380,6 +1477,7 @@ impl Reconciler {
         origin: &str,
         lv: &str,
         kind: Origin,
+        tag: &str,
     ) -> Result<(), String> {
         let rows = reads.lvs(&self.lvm, &place.vg).await?;
         if find_in_pool(&rows, lv, &place.thin)?.is_some() {
@@ -1393,7 +1491,7 @@ impl Reconciler {
         }
         let Origin::Drbd(not_ready) = kind else {
             tracing::info!(lv, origin, vg = place.vg, "taking snapshot");
-            let res = self.lvm.snapshot(&place.vg, origin, lv).await;
+            let res = self.lvm.snapshot(&place.vg, origin, lv, &[tag]).await;
             reads.invalidate(&place.vg);
             return res.map_err(|e| e.to_string());
         };
@@ -1412,7 +1510,7 @@ impl Reconciler {
             })
             .collect();
         tracing::info!(lv, origin, vg = place.vg, "taking snapshot");
-        let res = self.lvm.snapshot(&place.vg, origin, lv).await;
+        let res = self.lvm.snapshot(&place.vg, origin, lv, &[tag]).await;
         reads.invalidate(&place.vg);
         res.map_err(|e| e.to_string())?;
         if !inherited.is_empty() {
@@ -1610,6 +1708,7 @@ struct Taken {
     pool: Option<String>,
     lv_bytes: Option<u64>,
     allocated_bytes: Option<u64>,
+    lv_created_at: Option<Time>,
     digest: Option<String>,
     digest_bytes: Option<u64>,
 }
@@ -1620,6 +1719,7 @@ impl Taken {
             pool: a.taken_pool.clone(),
             lv_bytes: a.lv_bytes,
             allocated_bytes: a.allocated_bytes,
+            lv_created_at: a.lv_created_at.clone(),
             digest: a.digest.clone(),
             digest_bytes: a.digest_bytes,
         })
@@ -1633,11 +1733,40 @@ fn ack(node: &str, phase: SnapshotPhase, taken: Taken, res: Result<(), String>) 
         taken_pool: taken.pool,
         lv_bytes: taken.lv_bytes,
         allocated_bytes: taken.allocated_bytes,
+        lv_created_at: taken.lv_created_at,
         digest: taken.digest,
         digest_bytes: taken.digest_bytes,
         ok: res.is_ok(),
         error: res.err(),
     }
+}
+
+/// Warning Event: an LV of a Snapshot's LV name that is not its copy.
+pub const SNAPSHOT_LV_CONFLICT: &str = "SnapshotLvConflict";
+
+/// The uid and the snap tag of this Snapshot's LV: the controller writes
+/// sizeBytes and sourceReplicas on the way into Taking.
+fn snap_tag_of(snap: &Snapshot) -> Result<(&str, String), String> {
+    let st = snap.status.as_ref();
+    match (
+        snap.metadata.uid.as_deref(),
+        st.and_then(|s| s.size_bytes),
+        st.and_then(|s| s.source_replicas),
+    ) {
+        (Some(uid), Some(size), Some(n)) => Ok((uid, storage::snap_tag(uid, size, n))),
+        _ => Err("no uid, sizeBytes or sourceReplicas to tag the snapshot LV with".to_owned()),
+    }
+}
+
+/// The first snap tag among an LV's tags.
+fn snap_tag_in(tags: &[String]) -> Option<storage::SnapTag> {
+    tags.iter().find_map(|t| storage::parse_snap_tag(t))
+}
+
+fn unix_time(secs: i64) -> Option<Time> {
+    k8s_openapi::jiff::Timestamp::from_second(secs)
+        .ok()
+        .map(Time)
 }
 
 fn holder_count(status: &model::SnapshotStatus) -> usize {

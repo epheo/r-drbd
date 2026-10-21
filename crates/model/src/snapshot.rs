@@ -162,6 +162,9 @@ pub struct SnapshotAck {
     /// Thin data mapped by the snapshot LV at the take.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allocated_bytes: Option<u64>,
+    /// When LVM created the snapshot LV; createdAt is the earliest holder's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lv_created_at: Option<Time>,
     /// Hex sha256 over the sha256 of each 4 MiB chunk of the snapshot LV
     /// over [0, digestBytes), written once after Ready.
     #[serde(default, skip_serializing_if = "Option::is_none")]

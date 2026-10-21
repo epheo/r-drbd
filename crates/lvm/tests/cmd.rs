@@ -38,7 +38,8 @@ fn reports() {
     ]));
     assert_eq!(cmd::lvs("vg1"), want);
     let mut want = head("lvs");
-    want.extend(v(&["lv_name,lv_tags", "vg1"]));
+    want[2] = format!(r#"{C} report {{ time_format = "%s" }}"#);
+    want.extend(v(&["lv_name,lv_tags,lv_time", "vg1"]));
     assert_eq!(cmd::lv_tags("vg1"), want);
     let mut want = head("vgs");
     want.extend(v(&["vg_name,vg_extent_size", "vg1"]));
@@ -82,7 +83,7 @@ fn creates_put_options_before_names() {
         ])
     );
     assert_eq!(
-        cmd::snapshot("vg1", "pvc-1", "pvc-1+s"),
+        cmd::snapshot("vg1", "pvc-1", "pvc-1+s", &["t"]),
         v(&[
             "lvcreate",
             "--config",
@@ -94,6 +95,8 @@ fn creates_put_options_before_names() {
             "r",
             "--name",
             "pvc-1+s",
+            "--addtag",
+            "t",
             "vg1/pvc-1",
         ])
     );

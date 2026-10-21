@@ -663,7 +663,9 @@ async fn snapshot_replicated_rounds() {
     })
     .await;
     let st = s.status.unwrap();
-    assert!(st.created_at.is_some());
+    // The earliest holder's LV time: n1's sorts before n2's.
+    assert_eq!(st.created_at, Some(agents[0].lv_time()));
+    assert!(agents[0].lv_time().0 < agents[1].lv_time().0);
     assert_eq!(st.size_bytes, Some(GIB));
     assert!(st.last_error.is_none());
 

@@ -221,10 +221,22 @@ struct RawPoolLv {
     chunk_size: String,
 }
 
+// Field names are LVM's report keys.
+#[allow(clippy::struct_field_names)]
 #[derive(Deserialize)]
 struct RawTags {
     lv_name: String,
     lv_tags: String,
+    #[serde(default)]
+    lv_time: String,
+}
+
+/// One LV of [`crate::cmd::lv_tags`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tagged {
+    pub tags: Vec<String>,
+    /// lv_time in unix seconds; None where LVM gives none.
+    pub created: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -389,12 +401,35 @@ pub fn parse_thin_pools(json: &str) -> Result<Vec<PoolLv>, ReportError> {
 
 /// Tags per LV name; an LV without tags maps to an empty list.
 pub fn parse_tags(json: &str) -> Result<HashMap<String, Vec<String>>, ReportError> {
-    let d: Doc<LvSection<RawTags>> = doc("lvs", json)?;
-    Ok(d.report
+    Ok(parse_tagged(json)?
+        .into_iter()
+        .map(|(n, t)| (n, t.tags))
+        .collect())
+}
+
+/// Tags and creation time per LV name.
+pub fn parse_tagged(json: &str) -> Result<HashMap<String, Tagged>, ReportError> {
+    const R: &str = "lvs";
+    let d: Doc<LvSection<RawTags>> = doc(R, json)?;
+    d.report
         .into_iter()
         .flat_map(|s| s.lv)
-        .map(|r| (r.lv_name, split_tags(&r.lv_tags)))
-        .collect())
+        .map(|r| {
+            let c = Ctx {
+                report: R,
+                object: &r.lv_name,
+            };
+            let created = match r.lv_time.as_str() {
+                "" => None,
+                t => Some(
+                    t.parse()
+                        .map_err(|_| c.err("lv_time", t, "not unix seconds"))?,
+                ),
+            };
+            let tags = split_tags(&r.lv_tags);
+            Ok((r.lv_name, Tagged { tags, created }))
+        })
+        .collect()
 }
 
 pub fn parse_vgs(json: &str) -> Result<Vec<Vg>, ReportError> {

@@ -1117,6 +1117,12 @@
                               "nullable": true,
                               "type": "integer"
                             },
+                            "lvCreatedAt": {
+                              "description": "When LVM created the snapshot LV; createdAt is the earliest holder's.",
+                              "format": "date-time",
+                              "nullable": true,
+                              "type": "string"
+                            },
                             "node": {
                               "maxLength": 253,
                               "minLength": 1,

@@ -90,9 +90,35 @@ fn snapshot(name: &str, volume: &str, phase: SnapshotPhase) -> Snapshot {
     s.status = Some(SnapshotStatus {
         phase: Some(phase),
         acks,
+        size_bytes: Some(GIB),
+        source_replicas: Some(1),
         ..SnapshotStatus::default()
     });
     s
+}
+
+/// The snap tag of `snapshot(name, ..)`'s LV.
+fn snap_tag(name: &str) -> String {
+    storage::snap_tag(&format!("uid-{name}"), GIB, 1)
+}
+
+/// When LVM created every snapshot LV of these tests.
+const LV_TIME: i64 = 1_792_043_145;
+
+fn lv_time() -> Time {
+    Time(k8s_openapi::jiff::Timestamp::from_second(LV_TIME).unwrap())
+}
+
+/// The tag reads around a restore of `lv` from `source`, the LV of
+/// Snapshot `snapshot`: the source carries its tag, the copy none.
+fn expect_restore(x: &ScriptedExec, source: &str, snapshot: &str, lv: &str) {
+    let tag = snap_tag(snapshot);
+    x.expect(lvm::cmd::lv_tags(VG), ok(&tags_out(&[(source, &[&tag])])));
+    x.expect(lvm::cmd::restore(VG, source, lv, &[]), ok(""));
+    x.expect(
+        lvm::cmd::lv_tags(VG),
+        ok(&tags_out(&[(source, &[&tag]), (lv, &[])])),
+    );
 }
 
 fn taken_ack(phase: SnapshotPhase, pool: &str) -> SnapshotAck {
@@ -102,6 +128,7 @@ fn taken_ack(phase: SnapshotPhase, pool: &str) -> SnapshotAck {
         taken_pool: Some(pool.into()),
         lv_bytes: Some(GIB),
         allocated_bytes: Some(GIB / 4),
+        lv_created_at: None,
         digest: None,
         digest_bytes: None,
         ok: true,
@@ -489,7 +516,7 @@ async fn restore_then_grow() {
     let x = Arc::new(ScriptedExec::new());
     let snap_lv = lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive);
     reads(&x, std::slice::from_ref(&snap_lv));
-    x.expect(lvm::cmd::restore(VG, "pvc-1+snap-1", "pvc-2", &[]), ok(""));
+    expect_restore(&x, "pvc-1+snap-1", "snap-1", "pvc-2");
     expect_lvs(&x, &[snap_lv.clone(), lv_row("pvc-2", GIB_KIB, St::Active)]);
     x.expect(lvm::cmd::extend(VG, "pvc-2", 2 * GIB), ok(""));
     expect_lvs(&x, &[snap_lv, lv_row("pvc-2", 2 * GIB_KIB, St::Active)]);
@@ -505,6 +532,62 @@ async fn restore_then_grow() {
         volume_writes(&w),
         vec![("pvc-2".into(), entry("pvc-2", 2 * GIB_KIB, Some(3)))]
     );
+}
+
+#[tokio::test]
+async fn a_restore_reads_only_a_copy_with_its_snapshots_tag() {
+    // Taken before tags existed, or another uid's: not this Snapshot's copy.
+    let other = storage::snap_tag("uid-other", GIB, 1);
+    for tags in [vec![], vec![other.as_str()]] {
+        let x = Arc::new(ScriptedExec::new());
+        let snap_lv = lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive);
+        reads(&x, std::slice::from_ref(&snap_lv));
+        x.expect(
+            lvm::cmd::lv_tags(VG),
+            ok(&tags_out(&[("pvc-1+snap-1", &tags)])),
+        );
+        expect_lvs(&x, &[snap_lv]);
+        let mut v = volume("pvc-2", GIB, 1);
+        v.spec.source = Some(source("snap-1"));
+        let w = run(
+            &x,
+            vec![v],
+            vec![snapshot("snap-1", "pvc-1", SnapshotPhase::Ready)],
+        )
+        .await;
+        let (_, e) = &volume_writes(&w)[0];
+        assert!(!e.present);
+        assert_eq!(
+            e.last_error.as_deref(),
+            Some("snapshot LV vg1/pvc-1+snap-1 has no tag of this snapshot: not its copy")
+        );
+    }
+
+    // A snap tag the copy inherited goes in one lvchange.
+    let x = Arc::new(ScriptedExec::new());
+    let snap_lv = lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive);
+    let tag = snap_tag("snap-1");
+    reads(&x, std::slice::from_ref(&snap_lv));
+    x.expect(
+        lvm::cmd::lv_tags(VG),
+        ok(&tags_out(&[("pvc-1+snap-1", &[&tag])])),
+    );
+    x.expect(lvm::cmd::restore(VG, "pvc-1+snap-1", "pvc-2", &[]), ok(""));
+    x.expect(
+        lvm::cmd::lv_tags(VG),
+        ok(&tags_out(&[("pvc-1+snap-1", &[&tag]), ("pvc-2", &[&tag])])),
+    );
+    x.expect(lvm::cmd::change_tags(VG, "pvc-2", &[], &[&tag]), ok(""));
+    expect_lvs(&x, &[snap_lv, lv_row("pvc-2", GIB_KIB, St::Active)]);
+    let mut v = volume("pvc-2", GIB, 1);
+    v.spec.source = Some(source("snap-1"));
+    let w = run(
+        &x,
+        vec![v],
+        vec![snapshot("snap-1", "pvc-1", SnapshotPhase::Ready)],
+    )
+    .await;
+    assert!(volume_writes(&w)[0].1.present);
 }
 
 #[tokio::test]
@@ -664,20 +747,40 @@ async fn replicated_without_drbd_and_foreign_volumes() {
 async fn snapshot_taking() {
     let x = Arc::new(ScriptedExec::new());
     reads(&x, &[lv_row("pvc-1", GIB_KIB, St::Active)]);
-    x.expect(lvm::cmd::snapshot(VG, "pvc-1", "pvc-1+snap-1"), ok(""));
+    let tag = snap_tag("snap-1");
+    x.expect(
+        lvm::cmd::snapshot(VG, "pvc-1", "pvc-1+snap-1", &[&tag]),
+        ok(""),
+    );
     let origin = lv_row("pvc-1", GIB_KIB, St::Active)
         .replace(r#""data_percent":"0.00""#, r#""data_percent":"25.00""#);
     expect_lvs(&x, &[origin, lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
+    x.expect(
+        lvm::cmd::lv_tags(VG),
+        ok(&tagged_out(&[("pvc-1+snap-1", &[&tag], LV_TIME)])),
+    );
     let w = run(
         &x,
         vec![volume("pvc-1", GIB, 1)],
         vec![snapshot("snap-1", "pvc-1", SnapshotPhase::Taking)],
     )
     .await;
-    assert_eq!(
-        snapshot_acks(&w),
-        vec![("snap-1".into(), taken_ack(SnapshotPhase::Taking, POOL))]
-    );
+    let want = SnapshotAck {
+        lv_created_at: Some(lv_time()),
+        ..taken_ack(SnapshotPhase::Taking, POOL)
+    };
+    assert_eq!(snapshot_acks(&w), vec![("snap-1".into(), want)]);
+}
+
+#[tokio::test]
+async fn snapshot_taking_without_its_tag_values_fails() {
+    let x = Arc::new(ScriptedExec::new());
+    reads(&x, &[lv_row("pvc-1", GIB_KIB, St::Active)]);
+    let mut snap = snapshot("snap-1", "pvc-1", SnapshotPhase::Taking);
+    snap.status.as_mut().unwrap().source_replicas = None;
+    let w = run(&x, vec![volume("pvc-1", GIB, 1)], vec![snap]).await;
+    let (_, a) = &snapshot_acks(&w)[0];
+    assert!(!a.ok && a.taken_pool.is_none(), "{a:?}");
 }
 
 #[tokio::test]
@@ -690,6 +793,14 @@ async fn snapshot_taking_existing_lv_is_adopted() {
             lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive),
         ],
     );
+    x.expect(
+        lvm::cmd::lv_tags(VG),
+        ok(&tagged_out(&[(
+            "pvc-1+snap-1",
+            &[&snap_tag("snap-1")],
+            LV_TIME,
+        )])),
+    );
     let w = run(
         &x,
         vec![volume("pvc-1", GIB, 1)],
@@ -700,8 +811,100 @@ async fn snapshot_taking_existing_lv_is_adopted() {
     let (_, a) = &snapshot_acks(&w)[0];
     assert!(a.ok);
     assert_eq!(
-        (a.taken_pool.as_deref(), a.lv_bytes),
-        (Some(POOL), Some(GIB))
+        (a.taken_pool.as_deref(), a.lv_bytes, &a.lv_created_at),
+        (Some(POOL), Some(GIB), &Some(lv_time()))
+    );
+}
+
+#[tokio::test]
+async fn snapshot_taking_never_adopts_another_snapshots_lv() {
+    let other = storage::snap_tag("uid-other", GIB, 1);
+    for (tags, why) in [
+        (vec![], "has no snapshot tag"),
+        (vec![other.as_str()], "belongs to snapshot uid uid-other"),
+    ] {
+        let x = Arc::new(ScriptedExec::new());
+        reads(
+            &x,
+            &[
+                lv_row("pvc-1", GIB_KIB, St::Active),
+                lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive),
+            ],
+        );
+        x.expect(
+            lvm::cmd::lv_tags(VG),
+            ok(&tags_out(&[("pvc-1+snap-1", &tags)])),
+        );
+        let w = run(
+            &x,
+            vec![volume("pvc-1", GIB, 1)],
+            vec![snapshot("snap-1", "pvc-1", SnapshotPhase::Taking)],
+        )
+        .await;
+        let (_, a) = &snapshot_acks(&w)[0];
+        assert!(!a.ok && a.taken_pool.is_none(), "{a:?}");
+        let e = a.error.as_deref().unwrap();
+        assert_eq!(
+            e,
+            format!("LV vg1/pvc-1+snap-1 {why}; left untouched"),
+            "{e}"
+        );
+        let events: Vec<_> = w
+            .iter()
+            .filter_map(|w| match w {
+                StatusWrite::Event {
+                    kind,
+                    name,
+                    reason,
+                    message,
+                    ..
+                } => Some((*kind, name.as_str(), reason.as_str(), message.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            events,
+            [("Snapshot", "snap-1", SNAPSHOT_LV_CONFLICT, e)],
+            "one Event"
+        );
+        // Nothing removed, retagged or created.
+        let seen = x.seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .all(|a| !matches!(a[0].as_str(), "lvremove" | "lvchange" | "lvcreate")),
+            "{seen:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_repeated_conflict_sends_no_second_event() {
+    let x = Arc::new(ScriptedExec::new());
+    reads(
+        &x,
+        &[
+            lv_row("pvc-1", GIB_KIB, St::Active),
+            lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive),
+        ],
+    );
+    x.expect(
+        lvm::cmd::lv_tags(VG),
+        ok(&tags_out(&[("pvc-1+snap-1", &[])])),
+    );
+    let mut snap = snapshot("snap-1", "pvc-1", SnapshotPhase::Taking);
+    snap.status.as_mut().unwrap().acks = vec![SnapshotAck {
+        ok: false,
+        error: Some("LV vg1/pvc-1+snap-1 has no snapshot tag; left untouched".into()),
+        taken_pool: None,
+        lv_bytes: None,
+        allocated_bytes: None,
+        ..taken_ack(SnapshotPhase::Taking, POOL)
+    }];
+    let w = run(&x, vec![volume("pvc-1", GIB, 1)], vec![snap]).await;
+    assert!(
+        w.iter()
+            .all(|w| matches!(w, StatusWrite::Pool { .. } | StatusWrite::Volume { .. })),
+        "the same ack and no Event: {w:?}"
     );
 }
 
@@ -721,6 +924,7 @@ async fn snapshot_deleting_after_volume_is_gone() {
             taken_pool: Some(POOL.into()),
             lv_bytes: None,
             allocated_bytes: None,
+            lv_created_at: None,
             digest: None,
             digest_bytes: None,
             ok: true,
@@ -855,6 +1059,7 @@ fn a_digest_without_source_replicas_needs_two_holders() {
     let mut st = snapshot("snap-1", "pvc-1", SnapshotPhase::Ready)
         .status
         .unwrap();
+    st.source_replicas = None;
     assert!(!wants_digest(&st));
     st.acks.push(SnapshotAck {
         node: "n2".into(),
@@ -1039,6 +1244,7 @@ async fn snapshot_deleting_is_kept_only_for_its_own_uid() {
             taken_pool: Some(POOL.into()),
             lv_bytes: None,
             allocated_bytes: None,
+            lv_created_at: None,
             digest: None,
             digest_bytes: None,
             ok: true,
@@ -1366,7 +1572,7 @@ async fn failed_restore_stays_retryable() {
     let x = Arc::new(ScriptedExec::new());
     let snap_lv = lv_row("pvc-0+snap-1", GIB_KIB, St::Inactive);
     reads(&x, std::slice::from_ref(&snap_lv));
-    x.expect(lvm::cmd::restore(VG, "pvc-0+snap-1", "pvc-1", &[]), ok(""));
+    expect_restore(&x, "pvc-0+snap-1", "snap-1", "pvc-1");
     expect_lvs(&x, &[snap_lv.clone(), lv_row("pvc-1", GIB_KIB, St::Active)]);
     let mut v = volume("pvc-1", GIB, 1);
     v.spec.source = Some(source("snap-1"));
@@ -1393,7 +1599,7 @@ async fn seeded_marker_does_not_block_restore() {
     let x = Arc::new(ScriptedExec::new());
     let snap_lv = lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive);
     reads(&x, std::slice::from_ref(&snap_lv));
-    x.expect(lvm::cmd::restore(VG, "pvc-1+snap-1", "pvc-2", &[]), ok(""));
+    expect_restore(&x, "pvc-1+snap-1", "snap-1", "pvc-2");
     expect_lvs(&x, &[snap_lv, lv_row("pvc-2", GIB_KIB, St::Active)]);
     let mut v = volume("pvc-2", GIB, 1);
     v.spec.source = Some(source("snap-1"));

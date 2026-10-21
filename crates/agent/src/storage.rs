@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lvm::cmd;
-use lvm::report::{self, Lv, PoolLv, Pv, Vg, VgFull};
+use lvm::report::{self, Lv, PoolLv, Pv, Tagged, Vg, VgFull};
 
 pub mod plan;
 
@@ -94,6 +94,12 @@ impl Lvm {
     pub async fn tags(&self, vg: &str) -> Result<HashMap<String, Vec<String>>, CmdError> {
         let out = self.report(&cmd::lv_tags(vg)).await?;
         report::parse_tags(&out).map_err(|e| CmdError::new("lvs", e.to_string()))
+    }
+
+    /// Tags and creation time of every LV of `vg`.
+    pub async fn tagged(&self, vg: &str) -> Result<HashMap<String, Tagged>, CmdError> {
+        let out = self.report(&cmd::lv_tags(vg)).await?;
+        report::parse_tagged(&out).map_err(|e| CmdError::new("lvs", e.to_string()))
     }
 
     pub async fn vg(&self, vg: &str) -> Result<Vg, CmdError> {
@@ -217,9 +223,15 @@ impl Lvm {
     }
 
     /// Read-only thin snapshot, never activated.
-    pub async fn snapshot(&self, vg: &str, origin: &str, snap: &str) -> Result<(), CmdError> {
+    pub async fn snapshot(
+        &self,
+        vg: &str,
+        origin: &str,
+        snap: &str,
+        tags: &[&str],
+    ) -> Result<(), CmdError> {
         Self::check("lvcreate", vg, snap)?;
-        self.change(&cmd::snapshot(vg, origin, snap)).await
+        self.change(&cmd::snapshot(vg, origin, snap, tags)).await
     }
 
     /// Grow only; lvextend refuses anything else.
@@ -473,6 +485,41 @@ pub fn is_from_tag(tag: &str) -> bool {
     tag.starts_with(FROM_TAG_PREFIX)
 }
 
+pub const SNAP_TAG_PREFIX: &str = "r-drbd.snap.";
+
+/// Set by the lvcreate of every snapshot LV. The uid makes it this
+/// Snapshot's copy and no other's; the size and the source's replicas
+/// rebuild a lost status.
+pub fn snap_tag(snapshot_uid: &str, size_bytes: u64, source_replicas: u32) -> String {
+    format!("{SNAP_TAG_PREFIX}{snapshot_uid}.{size_bytes}.{source_replicas}")
+}
+
+/// What a snap tag records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapTag {
+    pub uid: String,
+    pub size_bytes: u64,
+    pub source_replicas: u32,
+}
+
+/// None for any other tag, and for a snap tag that does not parse.
+pub fn parse_snap_tag(tag: &str) -> Option<SnapTag> {
+    let rest = tag.strip_prefix(SNAP_TAG_PREFIX)?;
+    let mut parts = rest.rsplitn(3, '.');
+    let source_replicas = parts.next()?.parse().ok()?;
+    let size_bytes = parts.next()?.parse().ok()?;
+    let uid = parts.next().filter(|u| !u.is_empty() && !u.contains('.'))?;
+    Some(SnapTag {
+        uid: uid.to_owned(),
+        size_bytes,
+        source_replicas,
+    })
+}
+
+pub fn is_snap_tag(tag: &str) -> bool {
+    tag.starts_with(SNAP_TAG_PREFIX)
+}
+
 /// Pool capacity from one lvs read of the VG.
 pub fn pool_capacity(lvs: &[Lv], thin: &str) -> Result<PoolCapacity, String> {
     let pool = lvs
@@ -614,6 +661,20 @@ pub(crate) mod fixtures {
         let rows: Vec<String> = lvs
             .iter()
             .map(|(n, t)| format!(r#"{{"lv_name":"{n}", "lv_tags":"{}"}}"#, t.join(",")))
+            .collect();
+        json("lv", &rows)
+    }
+
+    /// The tags report with each LV's creation time.
+    pub(crate) fn tagged_out(lvs: &[(&str, &[&str], i64)]) -> String {
+        let rows: Vec<String> = lvs
+            .iter()
+            .map(|(n, t, time)| {
+                format!(
+                    r#"{{"lv_name":"{n}", "lv_tags":"{}", "lv_time":"{time}"}}"#,
+                    t.join(",")
+                )
+            })
             .collect();
         json("lv", &rows)
     }
@@ -1000,5 +1061,32 @@ mod tests {
         assert_eq!(t["a"], ["r-drbd.md"]);
         assert_eq!(t["b"].len(), 0);
         assert_eq!(t["c"], ["x", "r-drbd.md.2"]);
+    }
+
+    #[test]
+    fn snap_tags_round_trip() {
+        let uid = "0b6f4a3e-2c1d-4e5f-8a9b-0c1d2e3f4a5b";
+        let tag = snap_tag(uid, 1 << 30, 2);
+        assert_eq!(
+            tag,
+            "r-drbd.snap.0b6f4a3e-2c1d-4e5f-8a9b-0c1d2e3f4a5b.1073741824.2"
+        );
+        assert!(is_snap_tag(&tag));
+        let t = parse_snap_tag(&tag).unwrap();
+        assert_eq!(
+            (t.uid.as_str(), t.size_bytes, t.source_replicas),
+            (uid, 1 << 30, 2)
+        );
+        for bad in [
+            "r-drbd.from.a.b",
+            "r-drbd.snap.",
+            "r-drbd.snap.u.1",
+            "r-drbd.snap..1.2",
+            "r-drbd.snap.u.x.2",
+            "r-drbd.snap.u.1.x",
+            "r-drbd.snap.a.b.1.2",
+        ] {
+            assert_eq!(parse_snap_tag(bad), None, "{bad}");
+        }
     }
 }

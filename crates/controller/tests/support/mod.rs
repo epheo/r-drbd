@@ -750,6 +750,15 @@ impl FakeAgent {
         }
     }
 
+    /// When this node's snapshot LVs were made: distinct per node, so a
+    /// test tells which holder's time a Snapshot took.
+    pub fn lv_time(&self) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::Time {
+        let secs: i64 = self.node.bytes().map(i64::from).sum();
+        k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+            k8s_openapi::jiff::Timestamp::from_second(1_700_000_000 + secs).unwrap(),
+        )
+    }
+
     /// Applies this node's replica entry with the per-node field manager.
     pub async fn report(&self, volume: &str, entry: ReplicaStatus) {
         let status = json!({
@@ -884,6 +893,7 @@ impl FakeAgent {
             taken_pool: pool.map(str::to_owned),
             lv_bytes: None,
             allocated_bytes: None,
+            lv_created_at: pool.map(|_| self.lv_time()),
             digest: None,
             digest_bytes: None,
             ok,
@@ -900,6 +910,7 @@ impl FakeAgent {
             taken_pool: Some(pool.to_owned()),
             lv_bytes: None,
             allocated_bytes: None,
+            lv_created_at: None,
             digest: Some(digest.to_owned()),
             digest_bytes: Some(GIB),
             ok: true,

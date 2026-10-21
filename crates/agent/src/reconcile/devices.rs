@@ -501,6 +501,7 @@ impl Reconciler {
         if out.note != self.pool_notes.get(&name).cloned() {
             if let Some(n) = &out.note {
                 out.events.push(StatusWrite::Event {
+                    kind: "Pool",
                     name: name.clone(),
                     uid: pool.metadata.uid.clone(),
                     reason: "PoolNotGrown".into(),
@@ -525,6 +526,7 @@ impl Reconciler {
             .collect();
         if !new.is_empty() {
             out.events.push(StatusWrite::Event {
+                kind: "Pool",
                 name: name.clone(),
                 uid: pool.metadata.uid.clone(),
                 reason: "DeviceNotUsable".into(),

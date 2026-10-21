@@ -37,6 +37,11 @@ const OWN: &str = "r-drbd.md.uid-1.0";
 const SNAP_UID: &str = "snap-uid-1";
 /// The restore's proof that an LV came from snap-1.
 const FROM: &str = "r-drbd.from.uid-1.snap-uid-1";
+/// The snap tag of the restore source, snap-1 of pvc-0.
+const SOURCE_TAG: &str = "r-drbd.snap.snap-uid-1.1073741824.2";
+/// The uid and snap tag of snap-1 of pvc-1, the round of these tests.
+const ROUND_UID: &str = "round-uid-1";
+const ROUND_TAG: &str = "r-drbd.snap.round-uid-1.1073741824.2";
 const ALL: Features = Features {
     tiebreaker: true,
     discard_granularity: true,
@@ -387,6 +392,7 @@ fn source_snapshot() -> Snapshot {
             taken_pool: Some(format!("pool-{n}")),
             lv_bytes: None,
             allocated_bytes: None,
+            lv_created_at: None,
             digest: None,
             digest_bytes: None,
             ok: true,
@@ -426,11 +432,21 @@ fn peer_entry(node: &str, restored: bool) -> ReplicaStatus {
 /// The restore lvcreate of pvc-1 from this node's copy, with both tags,
 /// then the fresh read.
 fn expect_restore(x: &ScriptedExec) {
+    expect_source_tags(x);
     x.expect(
         lvm::cmd::restore(VG, "pvc-0+snap-1", "pvc-1", &[NEW, FROM]),
         ok(""),
     );
+    expect_lv_tags(
+        x,
+        &[("pvc-0+snap-1", &[SOURCE_TAG]), ("pvc-1", &[NEW, FROM])],
+    );
     expect_lvs(x, &[source_lv(), lv(LV_KIB)]);
+}
+
+/// The source copy carries its Snapshot's tag, read before a restore.
+fn expect_source_tags(x: &ScriptedExec) {
+    expect_lv_tags(x, &[("pvc-0+snap-1", &[SOURCE_TAG])]);
 }
 
 fn empty_create() -> Vec<String> {
@@ -454,8 +470,11 @@ fn snapshot(phase: SnapshotPhase) -> Snapshot {
             volume_uid: Some(UID.into()),
         },
     );
+    s.metadata.uid = Some(ROUND_UID.into());
     s.status = Some(SnapshotStatus {
         phase: Some(phase),
+        size_bytes: Some(GIB),
+        source_replicas: Some(2),
         ..SnapshotStatus::default()
     });
     s
@@ -1223,6 +1242,7 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
         taken_pool: Some("pool-elsewhere".into()),
         lv_bytes: None,
         allocated_bytes: None,
+        lv_created_at: None,
         digest: None,
         digest_bytes: None,
         ok: true,
@@ -1241,10 +1261,12 @@ async fn restore_peer_falls_back_on_any_restore_failure_but_not_a_full_pool() {
     r.rec.drbd.copies_identical = proven;
     let x = r.x.clone();
     reads(&x, &[source_lv()]);
+    expect_source_tags(&x);
     x.expect(
         lvm::cmd::restore(VG, "pvc-0+snap-1", "pvc-1", &[NEW, FROM]),
         code(5, "", "lvcreate failed"),
     );
+
     expect_create(&x, &[source_lv()]);
     let e = n2_restore_pass(&mut r, &[source_snapshot()]).await;
     assert_eq!(e.last_error, None);
@@ -1688,6 +1710,7 @@ async fn snapshot_lv_is_kept_while_a_restore_here_is_not_initialized() {
         taken_pool: Some(POOL.into()),
         lv_bytes: None,
         allocated_bytes: None,
+        lv_created_at: None,
         digest: None,
         digest_bytes: None,
         ok: true,
@@ -2288,6 +2311,7 @@ fn round_ack(phase: SnapshotPhase, ok: bool) -> SnapshotAck {
         taken_pool: taken.then(|| POOL.into()),
         lv_bytes: taken.then_some(LV_KIB * 1024),
         allocated_bytes: taken.then_some(0),
+        lv_created_at: None,
         digest: None,
         digest_bytes: None,
         ok,
@@ -2321,12 +2345,16 @@ async fn suspend_pass(r: &mut Rig) {
 
 fn expect_take(x: &ScriptedExec) {
     expect_lv_tags(x, &[("pvc-1", &[OWN])]);
-    x.expect(lvm::cmd::snapshot(VG, "pvc-1", "pvc-1+snap-1"), ok(""));
+    x.expect(
+        lvm::cmd::snapshot(VG, "pvc-1", "pvc-1+snap-1", &[ROUND_TAG]),
+        ok(""),
+    );
     expect_change(x, "pvc-1+snap-1", &[], &[OWN]);
     expect_lvs(
         x,
         &[lv(LV_KIB), lv_row("pvc-1+snap-1", LV_KIB, St::Inactive)],
     );
+    expect_lv_tags(x, &[("pvc-1", &[OWN]), ("pvc-1+snap-1", &[ROUND_TAG])]);
 }
 
 #[tokio::test]
@@ -2524,6 +2552,7 @@ async fn diskless_replica_keeps_its_freeze_through_taking() {
         taken_pool: None,
         lv_bytes: None,
         allocated_bytes: None,
+        lv_created_at: None,
         digest: None,
         digest_bytes: None,
         ok: true,
@@ -2539,6 +2568,7 @@ async fn diskless_replica_keeps_its_freeze_through_taking() {
         taken_pool: None,
         lv_bytes: None,
         allocated_bytes: None,
+        lv_created_at: None,
         digest: None,
         digest_bytes: None,
         ok: true,

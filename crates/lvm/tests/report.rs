@@ -155,6 +155,20 @@ fn tags() {
     let t = report::parse_tags(json).unwrap();
     assert_eq!(t["a"], ["r-drbd.md.1", "r-drbd.new"]);
     assert_eq!(t["b"].len(), 0);
+    let json = r#"{"report": [{"lv": [
+        {"lv_name":"a+s", "lv_tags":"r-drbd.snap.u.1.2", "lv_time":"1792043145"},
+        {"lv_name":"thin", "lv_tags":"", "lv_time":""}
+    ]}]}"#;
+    let t = report::parse_tagged(json).unwrap();
+    assert_eq!(t["a+s"].tags, ["r-drbd.snap.u.1.2"]);
+    assert_eq!(t["a+s"].created, Some(1_792_043_145));
+    assert_eq!(t["thin"].created, None);
+    // Without our time format LVM prints a local time.
+    let local = r#"{"report": [{"lv": [
+        {"lv_name":"a", "lv_tags":"", "lv_time":"2026-10-15 05:45:45 +0000"}
+    ]}]}"#;
+    let e = report::parse_tagged(local).unwrap_err().to_string();
+    assert!(e.contains("lv_time"), "{e}");
 }
 
 #[test]

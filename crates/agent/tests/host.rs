@@ -190,7 +190,14 @@ async fn lvm_lifecycle() {
     lvm.extend(VG, "rw-l-a1", 2 * GIB).await.unwrap();
     let e = lvm.extend(VG, "rw-l-a1", GIB).await.unwrap_err();
     println!("shrink refused: {e}");
-    lvm.snapshot(VG, "rw-l-a1", "rw-l-a1+snap").await.unwrap();
+    let tag = agent::storage::snap_tag("0b6f4a3e-2c1d-4e5f-8a9b-0c1d2e3f4a5b", 2 * GIB, 2);
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    lvm.snapshot(VG, "rw-l-a1", "rw-l-a1+snap", &[&tag])
+        .await
+        .unwrap();
     lvm.restore(VG, "rw-l-a1+snap", "rw-l-a2", &["rw-l.t2"])
         .await
         .unwrap();
@@ -206,9 +213,19 @@ async fn lvm_lifecycle() {
     let a2 = row(&rows, "rw-l-a2").unwrap();
     assert!(a2.active, "a restore is active on return");
     assert_eq!(lv_field("rw-l-a2", "lv_permissions").await, "writeable");
-    let tags = lvm.tags(VG).await.unwrap();
-    assert!(tags["rw-l-a1+snap"].is_empty(), "snapshots copy no tags");
-    assert_eq!(tags["rw-l-a2"], ["rw-l.t2"]);
+    // The snap tag from the snapshot's own lvcreate, none of its origin's;
+    // a restore copies none of its snapshot's.
+    let tagged = lvm.tagged(VG).await.unwrap();
+    assert_eq!(tagged["rw-l-a1+snap"].tags, std::slice::from_ref(&tag));
+    assert_eq!(tagged["rw-l-a2"].tags, ["rw-l.t2"]);
+    // lv_time in unix seconds, as the report config asks.
+    let created = tagged["rw-l-a1+snap"].created.unwrap();
+    let created = u64::try_from(created).unwrap();
+    assert!(
+        (before.saturating_sub(5)..before + 600).contains(&created),
+        "{created} vs {before}"
+    );
+    assert!(tagged["rw-l-a1"].created.unwrap() <= tagged["rw-l-a1+snap"].created.unwrap());
     lvm.change_tags(VG, "rw-l-a2", &["rw-l.t3"], &["rw-l.t2"])
         .await
         .unwrap();
@@ -517,6 +534,8 @@ async fn reconcile_decision_table() {
     snap.metadata.uid = Some("uid-snapshot-test-host".into());
     snap.status = Some(SnapshotStatus {
         phase: Some(SnapshotPhase::Taking),
+        size_bytes: Some(2 * GIB),
+        source_replicas: Some(1),
         ..SnapshotStatus::default()
     });
     let w = rec
@@ -535,6 +554,14 @@ async fn reconcile_decision_table() {
         .unwrap();
     println!("take: {ack:?}");
     assert!(ack.ok);
+    let tag = agent::storage::snap_tag("uid-snapshot-test-host", 2 * GIB, 1);
+    let tagged = lvm().tagged(VG).await.unwrap();
+    let lv = &tagged["rw-l-r1+snapshot-test-host"];
+    assert_eq!(lv.tags, [tag], "tagged by its lvcreate");
+    let created = lv
+        .created
+        .map(|s| k8s_openapi::jiff::Timestamp::from_second(s).unwrap());
+    assert_eq!(ack.lv_created_at.as_ref().map(|t| t.0), created);
     // The restore finds the copy through the ack's takenPool.
     snap.status.as_mut().unwrap().acks = vec![ack];
 
@@ -954,7 +981,7 @@ async fn restored_xfs_mounts_next_to_its_source() {
     host_command("sync").status().unwrap();
 
     // Snapshot of a mounted file system: dirty log, same UUID as the source.
-    lvm.snapshot(VG, src, snap).await.unwrap();
+    lvm.snapshot(VG, src, snap, &[]).await.unwrap();
     lvm.restore(VG, snap, copy, &[]).await.unwrap();
     let copy_dev = format!("/dev/{VG}/{copy}");
     let before = fs_uuid(&copy_dev);

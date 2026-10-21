@@ -286,6 +286,15 @@ pub fn holders(acks: &[SnapshotAck], reached_taking: bool, diskful: &[String]) -
         .collect()
 }
 
+/// The earliest creation time of a holder's snapshot LV: createdAt, so a
+/// status rebuilt from the LVs equals the lost one.
+pub fn earliest_holder(acks: &[SnapshotAck]) -> Option<Time> {
+    acks.iter()
+        .filter(|a| a.taken_pool.is_some())
+        .filter_map(|a| a.lv_created_at.clone())
+        .min_by_key(|t| t.0)
+}
+
 /// Every holder acked Deleting ok.
 pub fn deleted_everywhere(acks: &[SnapshotAck], holders: &BTreeSet<String>) -> bool {
     holders.iter().all(|n| {
@@ -802,7 +811,9 @@ async fn apply_step(
                 wanted.source_replicas = Some(v.spec.replicas);
             }
             if phase == SnapshotPhase::Ready && wanted.created_at.is_none() {
-                wanted.created_at = Some(crate::now());
+                let acks = s.status.as_ref().map(|st| st.acks.as_slice());
+                wanted.created_at =
+                    Some(earliest_holder(acks.unwrap_or_default()).unwrap_or_else(crate::now));
             }
             if error.is_some() {
                 wanted.last_error = error;
@@ -896,6 +907,7 @@ mod tests {
             taken_pool: (phase == P::Taking).then(|| format!("p-{node}")),
             lv_bytes: None,
             allocated_bytes: None,
+            lv_created_at: None,
             digest: None,
             digest_bytes: None,
             ok,
@@ -1369,6 +1381,21 @@ mod tests {
             &done,
             &holders(&done, true, &["n4".to_owned()])
         ));
+    }
+
+    #[test]
+    fn created_at_is_the_earliest_holders_lv_time() {
+        let at = |s: i64| Some(Time(Timestamp::from_second(s).unwrap()));
+        let taken = |node: &str, time: i64| SnapshotAck {
+            lv_created_at: at(time),
+            ..ack(node, P::Taking, true)
+        };
+        // A diskless ack is no holder, whatever it says.
+        let mut tiebreaker = taken("n3", 1);
+        tiebreaker.taken_pool = None;
+        let acks = [taken("n1", 20), taken("n2", 10), tiebreaker];
+        assert_eq!(earliest_holder(&acks), at(10));
+        assert_eq!(earliest_holder(&[ack("n1", P::Taking, true)]), None);
     }
 
     #[test]
