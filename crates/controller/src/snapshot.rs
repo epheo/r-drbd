@@ -600,7 +600,6 @@ async fn fail(api: &Api<Snapshot>, s: &Snapshot, current: Owned, error: String) 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proof {
     pub identical: bool,
-    pub source_replicas: u32,
     /// Each holder with its digest, for the Event.
     pub digests: String,
 }
@@ -608,9 +607,7 @@ pub struct Proof {
 /// The proof to write, None while a digest is pending or once written.
 /// A holder is a node whose ack names takenPool. With fewer holders than
 /// the source had replicas, a lost ack may still come back with another
-/// digest, so nothing is written. Without sourceReplicas (a status loss)
-/// it comes back from two or more holders: a digest exists only for an
-/// LV whose DRBD superblock gave its range.
+/// digest, so nothing is written.
 pub fn copies_proof(st: &model::SnapshotStatus) -> Option<Proof> {
     if st.copies_identical.is_some() {
         return None;
@@ -622,7 +619,7 @@ pub fn copies_proof(st: &model::SnapshotStatus) -> Option<Proof> {
         .map(|a| Some((a.node.as_str(), a.digest.as_deref()?, a.digest_bytes?)))
         .collect::<Option<Vec<_>>>()?;
     let n = u32::try_from(digests.len()).ok()?;
-    if n < st.source_replicas.unwrap_or(2).max(1) {
+    if n < st.source_replicas?.max(1) {
         return None;
     }
     let identical = digests
@@ -633,15 +630,10 @@ pub fn copies_proof(st: &model::SnapshotStatus) -> Option<Proof> {
         .map(|(n, d, b)| format!("{n} {d} over {b} bytes"))
         .collect::<Vec<_>>()
         .join(", ");
-    Some(Proof {
-        identical,
-        source_replicas: st.source_replicas.unwrap_or(n),
-        digests,
-    })
+    Some(Proof { identical, digests })
 }
 
-/// Writes copiesIdentical once, with sourceReplicas when it was lost;
-/// copies that differ get one Warning Event.
+/// Writes copiesIdentical once; copies that differ get one Warning Event.
 async fn record_proof(ctx: &Ctx<'_>, api: &Api<Snapshot>, s: &Snapshot, current: Owned) {
     let Some(p) = s.status.as_ref().and_then(copies_proof) else {
         return;
@@ -649,7 +641,6 @@ async fn record_proof(ctx: &Ctx<'_>, api: &Api<Snapshot>, s: &Snapshot, current:
     let name = s.name_any();
     let wanted = Owned {
         copies_identical: Some(p.identical),
-        source_replicas: Some(p.source_replicas),
         ..current
     };
     if !write(api, s, wanted).await {
@@ -1465,7 +1456,6 @@ mod tests {
         );
         let p = copies_proof(&same).unwrap();
         assert!(p.identical);
-        assert_eq!(p.source_replicas, 2);
         assert_eq!(p.digests, "n1 d over 9 bytes, n2 d over 9 bytes");
 
         let differ = status(
@@ -1507,16 +1497,12 @@ mod tests {
         assert_eq!(copies_proof(&written), None, "written once");
     }
 
-    /// Status lost: sourceReplicas comes back from two digested holders.
     #[test]
-    fn copies_proof_restores_source_replicas_from_two_holders() {
-        let one = status(vec![holder("n1", Some("d"), 9)], None);
-        assert_eq!(copies_proof(&one), None);
+    fn copies_proof_needs_source_replicas() {
         let two = status(
             vec![holder("n1", Some("d"), 9), holder("n2", Some("d"), 9)],
             None,
         );
-        let p = copies_proof(&two).unwrap();
-        assert_eq!((p.identical, p.source_replicas), (true, 2));
+        assert_eq!(copies_proof(&two), None);
     }
 }

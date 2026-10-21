@@ -1060,25 +1060,24 @@ async fn a_single_replica_snapshot_is_never_hashed() {
     }
 }
 
-/// Status lost on a replicated snapshot: a second holder's ack is the
-/// proof of DRBD copies, and the digest runs.
+/// Only a replicated source has a DRBD superblock to bound the digest;
+/// the holder count never stands in for sourceReplicas.
 #[test]
-fn a_digest_without_source_replicas_needs_two_holders() {
+fn a_digest_follows_source_replicas_alone() {
     let mut st = snapshot("snap-1", "pvc-1", SnapshotPhase::Ready)
         .status
         .unwrap();
-    st.source_replicas = None;
-    assert!(!wants_digest(&st));
+    st.source_replicas = Some(1);
     st.acks.push(SnapshotAck {
         node: "n2".into(),
         ..taken_ack(SnapshotPhase::Taking, "p")
     });
-    assert!(wants_digest(&st));
-    st.source_replicas = Some(1);
     assert!(!wants_digest(&st));
     st.source_replicas = Some(3);
     st.acks.truncate(1);
     assert!(wants_digest(&st));
+    st.source_replicas = None;
+    assert!(!wants_digest(&st));
 }
 
 /// The vgs report of another VG.
@@ -1137,48 +1136,49 @@ async fn snapshot_delete_on_a_node_without_pools_is_ok() {
     );
 }
 
-/// A Ready Snapshot whose status lost this node's ack, or one taken
-/// before acks named their Pool: the LV found again is acked again.
+/// A Ready Snapshot short of holders whose ack for this node is gone:
+/// the LV found again by its uid tag is acked again.
 #[tokio::test]
 async fn ready_snapshot_lv_is_rediscovered() {
-    let legacy = SnapshotAck {
-        taken_pool: None,
-        lv_bytes: None,
+    let x = Arc::new(ScriptedExec::new());
+    reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
+    x.expect(
+        lvm::cmd::lv_tags(VG),
+        ok(&tagged_out(&[(
+            "pvc-1+snap-1",
+            &[&snap_tag("snap-1")],
+            LV_TIME,
+        )])),
+    );
+    let mut snap = snapshot("snap-1", "pvc-1", SnapshotPhase::Ready);
+    snap.status.as_mut().unwrap().acks.clear();
+    let (logs, _g) = crate::logs::capture();
+    let w = run(&x, vec![], vec![snap.clone()]).await;
+    assert_eq!(
+        logs.find("INFO", "rediscovered").len(),
+        1,
+        "{:?}",
+        logs.lines()
+    );
+    let want = SnapshotAck {
         allocated_bytes: None,
+        lv_created_at: Some(lv_time()),
         digest: None,
         digest_bytes: None,
         ..taken_ack(SnapshotPhase::Taking, POOL)
     };
-    for acks in [vec![], vec![legacy]] {
-        let x = Arc::new(ScriptedExec::new());
-        reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
-        x.expect(
-            lvm::cmd::lv_tags(VG),
-            ok(&tagged_out(&[(
-                "pvc-1+snap-1",
-                &[&snap_tag("snap-1")],
-                LV_TIME,
-            )])),
-        );
-        let mut snap = snapshot("snap-1", "pvc-1", SnapshotPhase::Ready);
-        snap.status.as_mut().unwrap().acks = acks;
-        let (logs, _g) = crate::logs::capture();
-        let w = run(&x, vec![], vec![snap]).await;
-        assert_eq!(
-            logs.find("INFO", "rediscovered").len(),
-            1,
-            "{:?}",
-            logs.lines()
-        );
-        let want = SnapshotAck {
-            allocated_bytes: None,
-            lv_created_at: Some(lv_time()),
-            digest: None,
-            digest_bytes: None,
-            ..taken_ack(SnapshotPhase::Taking, POOL)
-        };
-        assert_eq!(snapshot_acks(&w), vec![("snap-1".into(), want)]);
-    }
+    assert_eq!(snapshot_acks(&w), vec![("snap-1".into(), want)]);
+    // A node with an ack, a tiebreaker's say, never searches.
+    let x = Arc::new(ScriptedExec::new());
+    reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
+    snap.status.as_mut().unwrap().acks = vec![SnapshotAck {
+        taken_pool: None,
+        lv_bytes: None,
+        allocated_bytes: None,
+        ..taken_ack(SnapshotPhase::Taking, POOL)
+    }];
+    assert_eq!(snapshot_acks(&run(&x, vec![], vec![snap]).await), vec![]);
+
     // Only by its uid tag: untagged, or another Snapshot's, it is no copy.
     let other = storage::snap_tag("uid-other", GIB, 1);
     for tags in [vec![], vec![other.as_str()]] {
