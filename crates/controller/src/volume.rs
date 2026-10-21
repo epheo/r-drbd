@@ -1411,18 +1411,28 @@ pub fn round_running(s: &Snapshot) -> bool {
 /// deadline passed: their freeze may still hold for it, and only the
 /// agents know which round suspended them.
 pub fn round_running_at(s: &Snapshot, now: k8s_openapi::jiff::Timestamp) -> bool {
-    let st = s.status.as_ref();
-    match st.and_then(|st| st.phase) {
+    match s.status.as_ref().and_then(|st| st.phase) {
         Some(SnapshotPhase::Suspending | SnapshotPhase::Taking) => true,
-        Some(SnapshotPhase::Discovering) => {
-            let bound = model::snapshot::RESUME_AFTER + model::snapshot::CLOCK_MARGIN;
-            st.and_then(|st| st.phase_since.as_ref()).is_none_or(|t| {
-                std::time::Duration::try_from(now.duration_since(t.0)).unwrap_or_default() < bound
-            })
-        }
+        Some(SnapshotPhase::Discovering) => lost_freeze_left(s, now).is_none_or(|d| !d.is_zero()),
         None => s.status_lost(),
         Some(_) => false,
     }
+}
+
+/// For a Snapshot in Discovering: the time left until every agent's own
+/// resume deadline passed, from the discovery's start; None before it has one.
+pub fn lost_freeze_left(
+    s: &Snapshot,
+    now: k8s_openapi::jiff::Timestamp,
+) -> Option<std::time::Duration> {
+    let st = s
+        .status
+        .as_ref()
+        .filter(|st| st.phase == Some(SnapshotPhase::Discovering))?;
+    let since = st.phase_since.as_ref()?;
+    let elapsed = std::time::Duration::try_from(now.duration_since(since.0)).unwrap_or_default();
+    let bound = model::snapshot::RESUME_AFTER + model::snapshot::CLOCK_MARGIN;
+    Some(bound.saturating_sub(elapsed))
 }
 
 /// The first Snapshot of `volume` by name whose round runs.
@@ -3301,7 +3311,15 @@ mod tests {
             at(bound.saturating_sub(std::time::Duration::from_secs(1)))
         ));
         assert!(!round_running_at(&snap, at(bound)));
+        // A round it holds looks again when the bound ends.
+        let s = std::time::Duration::from_secs;
+        assert_eq!(
+            lost_freeze_left(&snap, at(s(200))),
+            bound.checked_sub(s(200))
+        );
+        assert_eq!(lost_freeze_left(&snap, at(bound + s(1))), Some(s(0)));
         snap.status.as_mut().unwrap().phase_since = None;
+        assert_eq!(lost_freeze_left(&snap, at(bound)), None);
         assert!(round_running_at(&snap, at(bound)), "no start yet");
     }
 

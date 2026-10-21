@@ -550,17 +550,27 @@ async fn a_fresh_discovery_holds_rounds_and_resizes_of_its_volume() {
     let held = get_snapshot(&client, "next").await.unwrap();
     assert_eq!(snap_phase(&held), Some(SnapshotPhase::Pending));
 
-    // Past every agent's deadline: the round and the resize go ahead.
+    // Past every agent's deadline the round and the resize go ahead; the
+    // held round looks again when the bound ends, not on the resync.
     let bound = model::snapshot::RESUME_AFTER + model::snapshot::CLOCK_MARGIN;
     let ago = k8s_openapi::jiff::Timestamp::now()
-        .checked_sub(bound + Duration::from_secs(1))
+        .checked_sub(bound.saturating_sub(Duration::from_secs(4)))
         .unwrap();
     let ago = k8s_openapi::jiff::Timestamp::from_second(ago.as_second()).unwrap();
     clear(&client, json!({ "phaseSince": ago.to_string() })).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let held = get_snapshot(&client, "next").await.unwrap();
+    assert_eq!(snap_phase(&held), Some(SnapshotPhase::Pending));
+    let started = tokio::time::Instant::now();
     snapshot_where(&client, "next", |s| {
         snap_phase(s) == Some(SnapshotPhase::Ready)
     })
     .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(12),
+        "{:?}",
+        started.elapsed()
+    );
     support::eventually(Duration::from_secs(20), || async {
         svc.controller_expand_volume(Request::new(expand()))
             .await

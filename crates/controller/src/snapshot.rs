@@ -1062,6 +1062,10 @@ async fn step(
         (!left.is_zero()).then_some((f.count, wait, left))
     });
     let other = crate::volume::snapshot_in_progress(ctx.stores, &s.spec.volume);
+    let other_left = other
+        .as_deref()
+        .and_then(|n| ctx.stores.snapshot(n))
+        .and_then(|o| crate::volume::lost_freeze_left(&o, Timestamp::now()));
     let round = Round {
         phase,
         replicated: v.spec.replicas >= 2,
@@ -1091,6 +1095,7 @@ async fn step(
     let wake = match step {
         Step::Hold(_) => [
             backoff.map(|(_, _, left)| left),
+            other_left,
             renewal.then_some(RENEWAL_WAIT),
         ]
         .into_iter()
