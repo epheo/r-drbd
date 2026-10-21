@@ -1931,6 +1931,14 @@ fn ready_snapshot<'a>(snap: Option<&'a Snapshot>, wanted: &str) -> Result<&'a Sn
             format!("snapshot {wanted} not found"),
         )));
     };
+    // Its acks may be stale until the discovery ran.
+    if snap.status_lost() {
+        return Err(Placement::Wait(Cond::new(
+            FALSE,
+            reason::SNAPSHOT_NOT_READY,
+            format!("snapshot {wanted} lost its status: waiting for its discovery"),
+        )));
+    }
     if let Some(why) = taken_before_tags(snap) {
         return Err(Placement::Fail(Cond::new(
             FALSE,
@@ -3366,6 +3374,16 @@ mod tests {
             panic!("a discovery is waited for");
         };
         assert_eq!(c.reason, reason::SNAPSHOT_NOT_READY);
+        // Ready without its size lost its status: waited for, never used.
+        let st = snap.status.as_mut().unwrap();
+        st.phase = Some(SnapshotPhase::Ready);
+        st.acks = vec![holder_ack("n1", SnapshotPhase::Taking, "p1")];
+        let Err(Placement::Wait(c)) = ready_snapshot(Some(&snap), "s") else {
+            panic!("a lost status is waited for");
+        };
+        assert_eq!(c.reason, reason::SNAPSHOT_NOT_READY);
+        snap.status.as_mut().unwrap().size_bytes = Some(G);
+        assert!(ready_snapshot(Some(&snap), "s").is_ok());
     }
 
     /// The ack of a holder copy in `pool`, with the tag values of its take.
