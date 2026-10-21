@@ -1220,6 +1220,13 @@
                         "minimum": 0.0,
                         "nullable": true,
                         "type": "integer"
+                      },
+                      "sourceReplicas": {
+                        "description": "The source Volume's replicas, written on the way into Taking: the\nsource is often gone by the time a restore asks.",
+                        "format": "uint32",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
                       }
                     },
                     "type": "object"

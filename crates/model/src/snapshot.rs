@@ -90,6 +90,10 @@ pub struct SnapshotStatus {
     pub file_system: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<Time>,
+    /// The source Volume's replicas, written on the way into Taking: the
+    /// source is often gone by the time a restore asks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_replicas: Option<u32>,
     /// When the current phase began; the round bounds (Suspending, Taking)
     /// count from it and survive a controller restart. Agents never read
     /// it: a wall clock of another node is no input to their deadlines.

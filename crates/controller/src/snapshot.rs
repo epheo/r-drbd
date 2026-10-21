@@ -294,6 +294,7 @@ struct Owned {
     created_at: Option<Time>,
     phase_since: Option<Time>,
     file_system: Option<String>,
+    source_replicas: Option<u32>,
     last_error: Option<String>,
     observed_generation: Option<i64>,
 }
@@ -311,6 +312,7 @@ impl Owned {
             created_at: st.created_at,
             phase_since: st.phase_since,
             file_system: st.file_system,
+            source_replicas: st.source_replicas,
             last_error: st.last_error,
             observed_generation: st.observed_generation,
         }
@@ -327,6 +329,9 @@ impl Owned {
             }
             if let Some(v) = &self.file_system {
                 m.insert("fileSystem".into(), json!(v));
+            }
+            if let Some(v) = self.source_replicas {
+                m.insert("sourceReplicas".into(), json!(v));
             }
             if let Some(v) = &self.phase_since {
                 m.insert("phaseSince".into(), json!(v));
@@ -696,6 +701,7 @@ async fn apply_step(
                 wanted.size_bytes = Some(restore_size(v));
                 // A restore starts with the source's filesystem marker.
                 wanted.file_system = v.status.as_ref().and_then(|st| st.file_system.clone());
+                wanted.source_replicas = Some(v.spec.replicas);
             }
             if phase == SnapshotPhase::Ready && wanted.created_at.is_none() {
                 wanted.created_at = Some(crate::now());
