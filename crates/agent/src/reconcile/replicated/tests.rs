@@ -1741,6 +1741,7 @@ async fn snapshot_lv_is_kept_while_a_restore_here_is_not_initialized() {
     // Initialized: the copy goes.
     reads_again(&x, &[source_lv(), lv(LV_KIB)]);
     dry(&x, "");
+    expect_source_tags(&x);
     expect_lvs(&x, &[source_lv(), lv(LV_KIB)]);
     x.expect(lvm::cmd::remove(VG, "pvc-0+snap-1"), ok(""));
     expect_lvs(&x, &[lv(LV_KIB)]);

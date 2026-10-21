@@ -1136,7 +1136,7 @@ impl Reconciler {
                     }
                 }
                 Some(SnapshotPhase::Ready) if taken.pool.is_none() && holder_missing(&status) => {
-                    self.rediscover(reads, pools, &name, &lv).await?
+                    self.rediscover(reads, pools, snap, &lv).await?
                 }
                 Some(SnapshotPhase::Ready)
                     if taken.pool.is_some() && taken.digest.is_none() && wants_digest(&status) =>
@@ -1144,6 +1144,10 @@ impl Reconciler {
                     let prev = prev.clone()?;
                     self.digest_step(reads, pools, vols, snap, &lv, prev)
                         .await?
+                }
+                Some(SnapshotPhase::Failed) => {
+                    self.remove_failed_copy(reads, pools, snap, &lv).await;
+                    return None;
                 }
                 _ => return None,
             }
@@ -1175,19 +1179,20 @@ impl Reconciler {
             );
             return Some(ack(&self.node, phase, taken, Err(e)));
         }
+        let uid = snap.metadata.uid.as_deref().unwrap_or_default();
         if taken.pool.is_some() {
             let res = match self.place(pools, taken.pool.as_deref()) {
-                Ok(place) => self.remove_snapshot(reads, &place, lv).await,
+                Ok(place) => self.remove_snapshot(reads, &place, lv, uid).await,
                 Err(e) => Err(e),
             };
             return Some(ack(&self.node, phase, taken, res));
         }
         // Without takenPool the ack was lost, or never written: the LV, if
         // any, is wherever the search finds it.
-        match self.search_snapshot(reads, pools, lv).await {
-            Ok(Some((place, found))) => {
-                let res = self.remove_snapshot(reads, &place, lv).await;
-                Some(ack(&self.node, phase, found, res))
+        match self.find_own_lv(reads, pools, lv, uid).await {
+            Ok(Some(own)) => {
+                let res = self.remove_snapshot(reads, &own.place, lv, uid).await;
+                Some(ack(&self.node, phase, own.taken(), res))
             }
             Ok(None) => related.then(|| ack(&self.node, phase, taken, Ok(()))),
             Err(e) if related => Some(ack(&self.node, phase, taken, Err(e))),
@@ -1255,18 +1260,20 @@ impl Reconciler {
         &self,
         reads: &mut Reads,
         pools: &[&Pool],
-        name: &str,
+        snap: &Snapshot,
         lv: &str,
     ) -> Option<SnapshotAck> {
-        match self.search_snapshot(reads, pools, lv).await {
-            Ok(Some((place, found))) => {
+        let name = snap.name_any();
+        let uid = snap.metadata.uid.as_deref()?;
+        match self.find_own_lv(reads, pools, lv, uid).await {
+            Ok(Some(own)) => {
                 tracing::info!(
                     snapshot = name,
                     lv,
-                    pool = place.pool,
+                    pool = own.place.pool,
                     "snapshot LV rediscovered without its ack: acked again"
                 );
-                Some(ack(&self.node, SnapshotPhase::Taking, found, Ok(())))
+                Some(ack(&self.node, SnapshotPhase::Taking, own.taken(), Ok(())))
             }
             Ok(None) => None,
             Err(e) => {
@@ -1276,16 +1283,41 @@ impl Reconciler {
         }
     }
 
-    /// The LV of that exact name in the thin pool of one of this node's
-    /// Pools. One of that name elsewhere in their VGs is not ours: an
-    /// error, never removed. A Pool that cannot be read is an error too:
-    /// the LV may be there.
-    async fn search_snapshot(
+    /// A Failed Snapshot is never restored, and a partial copy left behind
+    /// would pass for an image after a status loss: each node removes an
+    /// LV with its uid tag, on every pass, whether or not it took part.
+    async fn remove_failed_copy(
+        &self,
+        reads: &mut Reads,
+        pools: &[&Pool],
+        snap: &Snapshot,
+        lv: &str,
+    ) {
+        let Some(uid) = snap.metadata.uid.as_deref() else {
+            return;
+        };
+        let res = match self.find_own_lv(reads, pools, lv, uid).await {
+            Ok(Some(own)) => self.remove_snapshot(reads, &own.place, lv, uid).await,
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = res {
+            tracing::warn!(snapshot = snap.name_any(), error = %e, "copy of a failed snapshot not removed");
+        }
+    }
+
+    /// This Snapshot's LV on this node: the exact name with its uid's snap
+    /// tag, in the thin pool of one of this node's Pools. The tag decides
+    /// first: an LV of the name without it belongs to no search. One with
+    /// it outside those thin pools is an error, never removed; so is a
+    /// Pool that cannot be read, since the LV may be there.
+    async fn find_own_lv(
         &self,
         reads: &mut Reads,
         pools: &[&Pool],
         lv: &str,
-    ) -> Result<Option<(Place, Taken)>, String> {
+        uid: &str,
+    ) -> Result<Option<OwnLv>, String> {
         if let Some(p) = self
             .invalid_pools
             .iter()
@@ -1294,47 +1326,42 @@ impl Reconciler {
         {
             return Err(format!("pool {p} cannot be searched: not ready"));
         }
-        let mut hits: Vec<(Place, Lv)> = Vec::new();
+        let mut hits: Vec<OwnLv> = Vec::new();
+        let mut vgs = HashSet::new();
         for p in pools {
-            let rows = reads.lvs(&self.lvm, &p.spec.vg).await?;
-            let Some(r) = rows.iter().find(|r| r.name == lv) else {
+            let vg = p.spec.vg.as_str();
+            if !vgs.insert(vg) {
+                continue;
+            }
+            let rows = reads.lvs(&self.lvm, vg).await?;
+            let Some(row) = rows.iter().find(|r| r.name == lv).cloned() else {
                 continue;
             };
-            let in_a_pool = |q: &&Pool| {
-                q.spec.vg == p.spec.vg && r.pool.as_deref() == Some(q.spec.thin_pool.as_str())
-            };
-            if !pools.iter().any(in_a_pool) {
+            let tagged = reads.tagged(&self.lvm, vg, lv).await?;
+            if snap_tag_in(&tagged.tags).is_none_or(|t| t.uid != uid) {
+                continue;
+            }
+            let Some(pool) = pools.iter().find(|q| {
+                q.spec.vg == vg && row.pool.as_deref() == Some(q.spec.thin_pool.as_str())
+            }) else {
                 return Err(format!(
-                    "LV {}/{lv} exists outside the thin pools of this node's Pools",
-                    p.spec.vg
+                    "LV {vg}/{lv} of this snapshot lies outside the thin pools of this node's Pools"
                 ));
-            }
-            if r.pool.as_deref() == Some(p.spec.thin_pool.as_str())
-                && hits.iter().all(|(h, _)| h.vg != p.spec.vg)
-            {
-                hits.push((self.place(pools, Some(&p.name_any()))?, r.clone()));
-            }
+            };
+            hits.push(OwnLv {
+                place: self.place(pools, Some(&pool.name_any()))?,
+                row,
+                created: tagged.created,
+            });
         }
         if hits.len() > 1 {
-            let at: Vec<&str> = hits.iter().map(|(h, _)| h.pool.as_str()).collect();
+            let at: Vec<&str> = hits.iter().map(|h| h.place.pool.as_str()).collect();
             return Err(format!(
                 "LV {lv} found in more than one Pool: {}",
                 at.join(", ")
             ));
         }
-        Ok(hits.pop().map(|(place, row)| {
-            let found = Taken {
-                pool: Some(place.pool.clone()),
-                lv_bytes: Some(row.size_bytes),
-                // An inactive snapshot reports no allocation, and its origin
-                // has moved on since the take.
-                allocated_bytes: None,
-                lv_created_at: None,
-                digest: None,
-                digest_bytes: None,
-            };
-            (place, found)
-        }))
+        Ok(hits.pop())
     }
 
     /// Suspending on a replicated volume; None leaves the ack as it is.
@@ -1599,14 +1626,28 @@ impl Reconciler {
         })
     }
 
+    /// Removes the snapshot LV in `place` unless another Snapshot's uid
+    /// tags it: then it is not this one's, and none was found. One with no
+    /// snap tag was taken before tags existed.
     async fn remove_snapshot(
         &self,
         reads: &mut Reads,
         place: &Place,
         lv: &str,
+        uid: &str,
     ) -> Result<(), String> {
         let rows = reads.lvs(&self.lvm, &place.vg).await?;
         if find_in_pool(&rows, lv, &place.thin)?.is_none() {
+            return Ok(());
+        }
+        let tags = reads.tags(&self.lvm, &place.vg, lv).await?;
+        if let Some(t) = snap_tag_in(&tags).filter(|t| t.uid != uid) {
+            tracing::info!(
+                lv,
+                vg = place.vg,
+                uid = t.uid,
+                "snapshot LV of another snapshot: left"
+            );
             return Ok(());
         }
         tracing::info!(lv, vg = place.vg, "removing snapshot LV");
@@ -1697,6 +1738,28 @@ fn find_in_pool<'a>(rows: &'a [Lv], name: &str, thin: &str) -> Result<Option<&'a
             Err(format!("LV exists outside thin pool {thin}"))
         }
         r => Ok(r),
+    }
+}
+
+/// A Snapshot's LV found by its uid tag.
+#[derive(Debug, Clone)]
+struct OwnLv {
+    place: Place,
+    row: Lv,
+    /// lv_time, unix seconds.
+    created: Option<i64>,
+}
+
+impl OwnLv {
+    /// What an ack records of it. An inactive snapshot reports no
+    /// allocation, and its origin has moved on since the take.
+    fn taken(&self) -> Taken {
+        Taken {
+            pool: Some(self.place.pool.clone()),
+            lv_bytes: Some(self.row.size_bytes),
+            lv_created_at: self.created.and_then(unix_time),
+            ..Taken::default()
+        }
     }
 }
 

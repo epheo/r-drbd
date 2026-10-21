@@ -102,6 +102,11 @@ fn snap_tag(name: &str) -> String {
     storage::snap_tag(&format!("uid-{name}"), GIB, 1)
 }
 
+/// The tags report of VG: each LV with its tags.
+fn expect_tags(x: &ScriptedExec, lvs: &[(&str, &[&str])]) {
+    x.expect(lvm::cmd::lv_tags(VG), ok(&tags_out(lvs)));
+}
+
 /// When LVM created every snapshot LV of these tests.
 const LV_TIME: i64 = 1_792_043_145;
 
@@ -913,6 +918,7 @@ async fn snapshot_deleting_after_volume_is_gone() {
     let x = Arc::new(ScriptedExec::new());
     let snap_lv = lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive);
     reads(&x, std::slice::from_ref(&snap_lv));
+    expect_tags(&x, &[("pvc-1+snap-1", &[&snap_tag("snap-1")])]);
     expect_lvs(&x, &[snap_lv]);
     x.expect(lvm::cmd::remove(VG, "pvc-1+snap-1"), ok(""));
     expect_lvs(&x, &[]);
@@ -949,6 +955,8 @@ async fn snapshot_delete_follows_taken_pool_after_a_pool_move() {
         lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive),
     ];
     reads(&x, &rows);
+    // Taken before tags existed: removed through takenPool all the same.
+    expect_tags(&x, &[("pvc-1+snap-1", &[])]);
     expect_lvs(&x, &rows);
     x.expect(lvm::cmd::remove(VG, "pvc-1+snap-1"), ok(""));
     expect_lvs(&x, &rows[..2]);
@@ -1089,6 +1097,11 @@ async fn snapshot_delete_without_taken_pool_searches_the_pools() {
     reads(&x, &[]);
     x.expect(lvm::cmd::lvs("vg2"), ok(&with_lv));
     expect_vgs_of(&x, "vg2");
+    let tag = snap_tag("snap-1");
+    x.expect(
+        lvm::cmd::lv_tags("vg2"),
+        ok(&tags_out(&[("pvc-1+snap-1", &[&tag])])),
+    );
     x.expect(lvm::cmd::lvs("vg2"), ok(&with_lv));
     x.expect(lvm::cmd::remove("vg2", "pvc-1+snap-1"), ok(""));
     x.expect(lvm::cmd::lvs("vg2"), ok(&lvs_out(&[])));
@@ -1139,6 +1152,14 @@ async fn ready_snapshot_lv_is_rediscovered() {
     for acks in [vec![], vec![legacy]] {
         let x = Arc::new(ScriptedExec::new());
         reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
+        x.expect(
+            lvm::cmd::lv_tags(VG),
+            ok(&tagged_out(&[(
+                "pvc-1+snap-1",
+                &[&snap_tag("snap-1")],
+                LV_TIME,
+            )])),
+        );
         let mut snap = snapshot("snap-1", "pvc-1", SnapshotPhase::Ready);
         snap.status.as_mut().unwrap().acks = acks;
         let (logs, _g) = crate::logs::capture();
@@ -1151,12 +1172,70 @@ async fn ready_snapshot_lv_is_rediscovered() {
         );
         let want = SnapshotAck {
             allocated_bytes: None,
+            lv_created_at: Some(lv_time()),
             digest: None,
             digest_bytes: None,
             ..taken_ack(SnapshotPhase::Taking, POOL)
         };
         assert_eq!(snapshot_acks(&w), vec![("snap-1".into(), want)]);
     }
+    // Only by its uid tag: untagged, or another Snapshot's, it is no copy.
+    let other = storage::snap_tag("uid-other", GIB, 1);
+    for tags in [vec![], vec![other.as_str()]] {
+        let x = Arc::new(ScriptedExec::new());
+        reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
+        expect_tags(&x, &[("pvc-1+snap-1", &tags)]);
+        let mut snap = snapshot("snap-1", "pvc-1", SnapshotPhase::Ready);
+        snap.status.as_mut().unwrap().acks.clear();
+        let w = run(&x, vec![], vec![snap]).await;
+        assert_eq!(snapshot_acks(&w), vec![]);
+    }
+}
+
+/// A Failed Snapshot's copy goes on every node with a Pool, whether or
+/// not it took part, and no ack says so. Another uid's LV, or one
+/// without a tag, stays.
+#[tokio::test]
+async fn a_failed_snapshots_copy_is_removed_everywhere() {
+    let snap_lv = lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive);
+    let x = Arc::new(ScriptedExec::new());
+    reads(&x, std::slice::from_ref(&snap_lv));
+    expect_tags(&x, &[("pvc-1+snap-1", &[&snap_tag("snap-1")])]);
+    expect_lvs(&x, std::slice::from_ref(&snap_lv));
+    x.expect(lvm::cmd::remove(VG, "pvc-1+snap-1"), ok(""));
+    expect_lvs(&x, &[]);
+    let mut failed = snapshot("snap-1", "pvc-1", SnapshotPhase::Failed);
+    failed.status.as_mut().unwrap().acks.clear();
+    let w = run(&x, vec![], vec![failed.clone()]).await;
+    assert_eq!(snapshot_acks(&w), vec![]);
+
+    let other = storage::snap_tag("uid-other", GIB, 1);
+    for tags in [vec![], vec![other.as_str()]] {
+        let x = Arc::new(ScriptedExec::new());
+        reads(&x, std::slice::from_ref(&snap_lv));
+        expect_tags(&x, &[("pvc-1+snap-1", &tags)]);
+        let w = run(&x, vec![], vec![failed.clone()]).await;
+        assert_eq!(snapshot_acks(&w), vec![]);
+        assert!(!x.seen.lock().unwrap().iter().any(|a| a[0] == "lvremove"));
+    }
+}
+
+/// Through takenPool the delete never removes another uid's LV: none of
+/// this Snapshot's was found.
+#[tokio::test]
+async fn a_delete_leaves_another_snapshots_lv() {
+    let x = Arc::new(ScriptedExec::new());
+    reads(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
+    expect_tags(
+        &x,
+        &[("pvc-1+snap-1", &[&storage::snap_tag("uid-new", GIB, 1)])],
+    );
+    let mut snap = deleting(snapshot("snap-1", "pvc-1", SnapshotPhase::Ready));
+    snap.status.as_mut().unwrap().acks = vec![taken_ack(SnapshotPhase::Taking, POOL)];
+    let w = run(&x, vec![], vec![snap]).await;
+    let (_, a) = &snapshot_acks(&w)[0];
+    assert!(a.ok && a.phase == SnapshotPhase::Deleting, "{a:?}");
+    assert!(!x.seen.lock().unwrap().iter().any(|a| a[0] == "lvremove"));
 }
 
 /// Every holder the source had acked: an LV of that name here is no copy
@@ -1268,6 +1347,7 @@ async fn snapshot_deleting_is_kept_only_for_its_own_uid() {
     // A restore naming another uid holds nothing.
     let x = Arc::new(ScriptedExec::new());
     reads(&x, &rows);
+    expect_tags(&x, &[("pvc-1+snap-1", &[&snap_tag("snap-1")])]);
     expect_lvs(&x, &rows);
     x.expect(lvm::cmd::remove(VG, "pvc-1+snap-1"), ok(""));
     expect_lvs(&x, &rows[..1]);
@@ -1373,14 +1453,13 @@ async fn foreign_lv_is_never_touched() {
 
 #[tokio::test]
 async fn foreign_snapshot_lv_is_never_removed() {
+    let rows = [
+        lv_row("pvc-1", GIB_KIB, St::Active),
+        foreign_row("pvc-1+snap-1", ""),
+    ];
     let x = Arc::new(ScriptedExec::new());
-    reads(
-        &x,
-        &[
-            lv_row("pvc-1", GIB_KIB, St::Active),
-            foreign_row("pvc-1+snap-1", ""),
-        ],
-    );
+    reads(&x, &rows);
+    expect_tags(&x, &[("pvc-1+snap-1", &[&snap_tag("snap-1")])]);
     let w = run(
         &x,
         vec![volume("pvc-1", GIB, 1)],
@@ -1391,9 +1470,23 @@ async fn foreign_snapshot_lv_is_never_removed() {
     assert!(!a.ok);
     assert_eq!(
         a.error.as_deref(),
-        Some("LV vg1/pvc-1+snap-1 exists outside the thin pools of this node's Pools")
+        Some(
+            "LV vg1/pvc-1+snap-1 of this snapshot lies outside the thin pools of this node's Pools"
+        )
     );
     assert_eq!(a.taken_pool, None);
+    // Without this Snapshot's tag it is none of the search's business.
+    let x = Arc::new(ScriptedExec::new());
+    reads(&x, &rows);
+    expect_tags(&x, &[("pvc-1+snap-1", &[])]);
+    let w = run(
+        &x,
+        vec![volume("pvc-1", GIB, 1)],
+        vec![snapshot("snap-1", "pvc-1", SnapshotPhase::Deleting)],
+    )
+    .await;
+    let (_, a) = &snapshot_acks(&w)[0];
+    assert!(a.ok && a.taken_pool.is_none(), "{a:?}");
 
     // With takenPool: only that Pool's thin pool counts.
     let x = Arc::new(ScriptedExec::new());
@@ -1483,6 +1576,7 @@ async fn phase_deleting_without_deletion_timestamp() {
             lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive),
         ],
     );
+    expect_tags(&x, &[("pvc-1+snap-1", &[&snap_tag("snap-1")])]);
     expect_lvs(&x, &[lv_row("pvc-1+snap-1", GIB_KIB, St::Inactive)]);
     x.expect(lvm::cmd::remove(VG, "pvc-1+snap-1"), ok(""));
     expect_lvs(&x, &[lv_row("pvc-1", GIB_KIB, St::Active)]);
