@@ -171,7 +171,8 @@ const REPEAT_MAX: Duration = Duration::from_secs(600);
 enum Resize {
     NotNeeded,
     Done,
-    /// This node resizes once every diskful peer has grown its LV.
+    /// This node resizes once every diskful peer has grown its LV and no
+    /// resync runs.
     Waiting,
 }
 
@@ -1483,7 +1484,8 @@ impl Reconciler {
     }
 
     /// Only the diskful replica with the lowest node id resizes, once every
-    /// diskful peer reports an LV of the new gross size and is connected:
+    /// diskful peer reports an LV of the new gross size and is connected
+    /// with no resync running:
     /// DRBD grows only to what every connected peer can hold, and a peer
     /// away during the resize would have to catch up on the size later.
     async fn resize_step(&self, s: &Step<'_>, r: &Resource) -> Result<Resize, String> {
@@ -1520,7 +1522,13 @@ impl Reconciler {
                 .connections
                 .get(&x.node)
                 .is_some_and(|c| c.state == "Connected");
-            grown && connected
+            // DRBD refuses a resize during a resync; its end is an events2
+            // change, which runs the next pass.
+            let in_sync = r
+                .peer_devices
+                .get(&(x.node.clone(), VOLUME))
+                .is_some_and(|p| p.replication.as_deref() == Some("Established"));
+            grown && connected && in_sync
         });
         let up_to_date = r
             .devices

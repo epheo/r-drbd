@@ -881,6 +881,38 @@ async fn expand_after_initialization_syncs() {
 }
 
 #[tokio::test]
+async fn resize_waits_for_the_resync_to_end() {
+    let mut lines = healthy();
+    lines[4] = "exists peer-device name:pvc-1 peer-node-id:1 conn-name:n2 volume:0 replication:SyncSource peer-disk:Inconsistent".into();
+    let mut r = Rig::new(&lines, up_host());
+    let x = r.x.clone();
+    let vol = || {
+        initialized(with_entries(
+            restored(volume(2 * GIB)),
+            vec![restored_peer(LV2_KIB)],
+        ))
+    };
+    reads(&x, &[source_lv(), lv(LV2_KIB)]);
+    r.expect_check();
+    r.expect_sweep();
+    dry(&x, "");
+    let w = r.pass(&[vol()], &[source_snapshot()]).await;
+    let e = entry_of(&w);
+    assert_eq!((e.observed_generation, e.last_error), (None, None));
+    assert!(!seen(&x, "resize"));
+
+    r.feed(&[
+        "change peer-device name:pvc-1 peer-node-id:1 conn-name:n2 volume:0 replication:Established peer-disk:UpToDate",
+    ]);
+    reads_again(&x, &[source_lv(), lv(LV2_KIB)]);
+    x.expect(argv::resize("pvc-1"), ok(""));
+    dry(&x, "");
+    let w = r.pass(&[vol()], &[source_snapshot()]).await;
+    assert_eq!(entry_of(&w).last_error, None);
+    assert!(seen(&x, "resize"));
+}
+
+#[tokio::test]
 async fn restore_never_clears_the_bitmap_when_its_lv_is_not_at_the_snapshot_size() {
     // Every peer restored and connected, but this LV is larger than its
     // snapshot LV, or the snapshot LV is not in the report.
