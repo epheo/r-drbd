@@ -44,6 +44,18 @@ const ALL: Features = Features {
 };
 
 #[test]
+fn source_start_warns_only_when_unexpected() {
+    use super::{SourceStart, source_start_cause as cause};
+    assert_eq!(cause(&[], true, Some(false)), SourceStart::CopiesDiffer);
+    assert_eq!(cause(&["n2"], true, Some(false)), SourceStart::CopiesDiffer);
+    assert_eq!(cause(&[], true, None), SourceStart::DigestsPending);
+    assert_eq!(cause(&["n2"], true, None), SourceStart::NotAllUsable);
+    assert_eq!(cause(&["n2"], true, Some(true)), SourceStart::NotAllUsable);
+    assert_eq!(cause(&[], false, Some(false)), SourceStart::NotAllUsable);
+    assert_eq!(cause(&[], false, Some(true)), SourceStart::NotAllUsable);
+}
+
+#[test]
 fn sizes_used_here() {
     let gross = drbd_config::gross_bytes(GIB, model::keys::PEER_SLOTS);
     assert_eq!(storage::desired_bytes(gross, EXTENT), LV_KIB * 1024);

@@ -2014,20 +2014,47 @@ impl Step<'_> {
 #[cfg(test)]
 mod tests;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceStart {
+    CopiesDiffer,
+    DigestsPending,
+    NotAllUsable,
+}
+
+fn source_start_cause(
+    waiting: &[&str],
+    at_snapshot_size: bool,
+    identical: Option<bool>,
+) -> SourceStart {
+    // Differing copies start at once by design: a peer not joined yet
+    // syncs whenever it connects.
+    if at_snapshot_size && identical == Some(false) {
+        SourceStart::CopiesDiffer
+    } else if at_snapshot_size && waiting.is_empty() {
+        SourceStart::DigestsPending
+    } else {
+        SourceStart::NotAllUsable
+    }
+}
+
 /// Differing copies are a known cause; digests still pending past their
 /// bound, a lost peer or a size mismatch deserve a warning.
 fn log_source_start(name: &str, waiting: &[&str], at_snapshot_size: bool, identical: Option<bool>) {
     let why = "source here, others full-sync";
-    if at_snapshot_size && waiting.is_empty() && identical == Some(false) {
-        tracing::info!(volume = name, "snapshot copies differ: {why}");
-    } else if at_snapshot_size && waiting.is_empty() {
-        tracing::warn!(volume = name, "snapshot digests still pending: {why}");
-    } else {
-        tracing::warn!(
-            volume = name,
-            ?waiting,
-            at_snapshot_size,
-            "copies not all usable: {why}"
-        );
+    match source_start_cause(waiting, at_snapshot_size, identical) {
+        SourceStart::CopiesDiffer => {
+            tracing::info!(volume = name, ?waiting, "snapshot copies differ: {why}");
+        }
+        SourceStart::DigestsPending => {
+            tracing::warn!(volume = name, "snapshot digests still pending: {why}");
+        }
+        SourceStart::NotAllUsable => {
+            tracing::warn!(
+                volume = name,
+                ?waiting,
+                at_snapshot_size,
+                "copies not all usable: {why}"
+            );
+        }
     }
 }
