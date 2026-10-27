@@ -139,8 +139,9 @@ pub fn valid_volume_name(name: &str) -> bool {
 /// the call instead of stalling the pass, CSI or the Lease for good.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
-/// The read timeout is a socket idle timeout: a quiet watch idles up to
-/// the server's watch timeout (290 s at most), so the bound sits above it.
+/// The read timeout is a socket idle timeout. It sits above kube-runtime's
+/// watch idle bound (the server's 290 s plus a 5 s margin), so a quiet
+/// watch never trips it.
 /// Keepalive sees only the next hop: behind a TCP proxy, an apiserver gone
 /// silent leaves a LIST mute, which would otherwise freeze that store.
 const WATCH_READ_TIMEOUT: Duration = Duration::from_secs(300);
