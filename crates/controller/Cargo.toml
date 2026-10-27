@@ -10,6 +10,10 @@ base64 = "0.22.1"
 csi.workspace = true
 futures.workspace = true
 getrandom = "0.3.4"
+# Already in the tree through kube: the watch client rebuilds its stack
+# on keepalive sockets, which kube::Config cannot set.
+hyper-timeout = "0.5.2"
+hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"] }
 k8s-openapi.workspace = true
 kube = { workspace = true, features = ["client", "runtime", "rustls-tls", "ring", "jsonpatch"] }
 lvm.workspace = true
@@ -21,10 +25,12 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
 tokio-stream.workspace = true
+tower = { version = "0.5.3", default-features = false, features = ["util"] }
 tracing.workspace = true
 
 [dev-dependencies]
 agent.workspace = true
+rustix = { workspace = true, features = ["net"] }
 # test-util: paused clock for the Lease deadline test.
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3.27.0"
