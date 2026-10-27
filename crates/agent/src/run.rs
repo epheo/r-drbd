@@ -68,7 +68,7 @@ impl Error {
 /// a dead connection: connect within 5 s, an answer within 30 s, so the
 /// write backoff retries on a fresh connection instead of hanging about
 /// 30 s per try. The read timeout is a socket idle timeout, so the
-/// watches keep their own client without it.
+/// watches keep their own client, bounded above a quiet watch.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// One request on the writes client; a backoff sleep fits the progress slack.
@@ -91,7 +91,7 @@ impl crate::reconcile::LiveVolumes for ProgressLive {
 
 async fn clients() -> Result<(Client, Client), Error> {
     let config = kube::Config::infer().await.map_err(Error::KubeConfig)?;
-    let watch = watch::client(&config)?;
+    let watch = watch::client(&watch::config(config.clone()))?;
     let mut writes = config;
     writes.connect_timeout = Some(CONNECT_TIMEOUT);
     writes.read_timeout = Some(READ_TIMEOUT);

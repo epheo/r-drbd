@@ -10,6 +10,7 @@ dependencies = [
  "csi",
  "drbd-config",
  "futures",
+ "hyper-timeout",
  "hyper-util",
  "k8s-openapi",
  "kube",
