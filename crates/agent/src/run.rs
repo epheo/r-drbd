@@ -91,7 +91,7 @@ impl crate::reconcile::LiveVolumes for ProgressLive {
 
 async fn clients() -> Result<(Client, Client), Error> {
     let config = kube::Config::infer().await.map_err(Error::KubeConfig)?;
-    let watch = Client::try_from(config.clone())?;
+    let watch = watch::client(&config)?;
     let mut writes = config;
     writes.connect_timeout = Some(CONNECT_TIMEOUT);
     writes.read_timeout = Some(READ_TIMEOUT);
