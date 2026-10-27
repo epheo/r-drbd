@@ -21,11 +21,16 @@ pub mod wait;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
+use hyper_timeout::TimeoutConnector;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::TokioExecutor;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::api::{Patch, PatchParams};
+use kube::client::{ClientBuilder, ConfigExt};
 use kube::{Api, Client, Resource, ResourceExt};
 use model::Assignment;
 use serde::de::DeserializeOwned;
+use tower::{BoxError, ServiceBuilder};
 use tracing::{debug, error, info, warn};
 
 use crate::store::Stores;
@@ -136,9 +141,19 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// The read timeout is a socket idle timeout: a quiet watch idles up to
 /// the server's watch timeout (290 s at most), so the bound sits above it.
-/// It still ends a LIST hung on a half-open connection, which would
-/// otherwise freeze that store.
+/// Keepalive sees only the next hop: behind a TCP proxy, an apiserver gone
+/// silent leaves a LIST mute, which would otherwise freeze that store.
 const WATCH_READ_TIMEOUT: Duration = Duration::from_secs(300);
+/// A watch reads a quiet socket: a peer gone without FIN or RST (a host
+/// killed or cut off) leaves its store stale until kube-runtime's 295 s
+/// idle timeout. Keepalive probes find it within USER_TIMEOUT.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const KEEPALIVE_PROBES: u32 = 3;
+/// Linux ends a failed keepalive at this bound, and applies it to unacked
+/// writes, which keepalive never probes.
+const USER_TIMEOUT: Duration =
+    KEEPALIVE_IDLE.saturating_add(KEEPALIVE_INTERVAL.saturating_mul(KEEPALIVE_PROBES));
 
 /// The controller's two kube clients.
 #[derive(Clone)]
@@ -157,12 +172,42 @@ impl std::fmt::Debug for Clients {
 
 impl Clients {
     pub fn new(config: kube::Config) -> Result<Self, Error> {
-        let build = |c| Client::try_from(c).map_err(|e| Error::kube("building the kube client", e));
+        let error = |e| Error::kube("building the kube client", e);
         Ok(Self {
-            watch: build(watch_config(config.clone()))?,
-            request: build(request_config(config))?,
+            watch: watch_client(&watch_config(config.clone())).map_err(error)?,
+            request: Client::try_from(request_config(config)).map_err(error)?,
         })
     }
+}
+
+fn keepalive_connector() -> HttpConnector {
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    http.set_keepalive(Some(KEEPALIVE_IDLE));
+    http.set_keepalive_interval(Some(KEEPALIVE_INTERVAL));
+    http.set_keepalive_retries(Some(KEEPALIVE_PROBES));
+    http.set_tcp_user_timeout(Some(USER_TIMEOUT));
+    http
+}
+
+/// kube's config-driven stack on keepalive sockets, since kube::Config
+/// cannot set keepalive. No retry or trace layer: the watcher backs off
+/// and store.rs logs its errors.
+fn watch_client(config: &kube::Config) -> Result<Client, kube::Error> {
+    let https = config.rustls_https_connector_with_connector(keepalive_connector())?;
+    let mut timeouts = TimeoutConnector::new(https);
+    timeouts.set_connect_timeout(config.connect_timeout);
+    timeouts.set_read_timeout(config.read_timeout);
+    timeouts.set_write_timeout(config.write_timeout);
+    let http: hyper_util::client::legacy::Client<_, kube::client::Body> =
+        hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build(timeouts);
+    let service = ServiceBuilder::new()
+        .layer(config.base_uri_layer())
+        .option_layer(config.auth_layer()?)
+        .layer(config.extra_headers_layer()?)
+        .map_err(BoxError::from)
+        .service(http);
+    Ok(ClientBuilder::new(service, config.default_namespace.clone()).build())
 }
 
 fn watch_config(mut config: kube::Config) -> kube::Config {
@@ -731,8 +776,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        CONNECT_TIMEOUT, Memory, READ_TIMEOUT, WATCH_READ_TIMEOUT, request_config, valid_name,
-        valid_volume_name, watch_config,
+        CONNECT_TIMEOUT, KEEPALIVE_IDLE, KEEPALIVE_INTERVAL, KEEPALIVE_PROBES, Memory,
+        READ_TIMEOUT, USER_TIMEOUT, WATCH_READ_TIMEOUT, keepalive_connector, request_config,
+        valid_name, valid_volume_name, watch_client, watch_config,
     };
     use crate::volume::Outcome;
     use kube::ResourceExt;
@@ -867,6 +913,88 @@ mod tests {
         assert_eq!(watch.read_timeout, Some(WATCH_READ_TIMEOUT));
         // Above the longest server-side watch timeout plus margin.
         assert!(WATCH_READ_TIMEOUT > Duration::from_secs(295));
+    }
+
+    #[tokio::test]
+    async fn watch_sockets_probe_a_silent_peer() {
+        use rustix::net::sockopt;
+        use tower::ServiceExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let uri = format!("http://{}", listener.local_addr().expect("addr"));
+        let io = keepalive_connector()
+            .oneshot(uri.parse().expect("uri"))
+            .await
+            .expect("connect");
+        let sock = io.inner();
+        assert!(sockopt::socket_keepalive(sock).expect("keepalive"));
+        assert_eq!(sockopt::tcp_keepidle(sock).expect("idle"), KEEPALIVE_IDLE);
+        assert_eq!(
+            sockopt::tcp_keepintvl(sock).expect("interval"),
+            KEEPALIVE_INTERVAL
+        );
+        assert_eq!(sockopt::tcp_keepcnt(sock).expect("count"), KEEPALIVE_PROBES);
+        let user_timeout = sockopt::tcp_user_timeout(sock).expect("user timeout");
+        assert_eq!(u128::from(user_timeout), USER_TIMEOUT.as_millis());
+    }
+
+    #[tokio::test]
+    async fn watch_client_sends_the_config_token_to_its_server() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let mut config = kube::Config::new(url.parse().expect("url"));
+        config.auth_info.token = Some(String::from("t0ken").into());
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            let mut head = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = s.read(&mut buf).expect("read");
+                assert_ne!(n, 0, "request ended before its head");
+                head.extend_from_slice(&buf[..n]);
+            }
+            let body = r#"{"apiVersion":"v1","kind":"Node","metadata":{"name":"n1"}}"#;
+            let len = body.len();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {len}\r\n\r\n{body}"
+            );
+            s.write_all(resp.as_bytes()).expect("write");
+            String::from_utf8(head).expect("utf8").to_ascii_lowercase()
+        });
+        let client = watch_client(&watch_config(config)).expect("client");
+        let node = kube::Api::<k8s_openapi::api::core::v1::Node>::all(client)
+            .get("n1")
+            .await
+            .expect("get");
+        assert_eq!(node.metadata.name.as_deref(), Some("n1"));
+        let head = server.join().expect("server");
+        assert!(head.starts_with("get /api/v1/nodes/n1 "), "{head}");
+        assert!(head.contains("authorization: bearer t0ken"), "{head}");
+    }
+
+    /// The read timeout stays for what keepalive cannot see: a live peer
+    /// that never answers, as a TCP proxy in front of a dead apiserver.
+    #[tokio::test]
+    async fn watch_client_ends_a_list_its_server_never_answers() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let mut config = kube::Config::new(url.parse().expect("url"));
+        config.read_timeout = Some(Duration::from_millis(200));
+        // Holds the accepted connection open, unanswered, until joined.
+        let server = std::thread::spawn(move || listener.accept().expect("accept"));
+        let nodes = kube::Api::<k8s_openapi::api::core::v1::Node>::all(
+            watch_client(&config).expect("client"),
+        );
+        let list = tokio::time::timeout(
+            Duration::from_secs(10),
+            nodes.list(&kube::api::ListParams::default()),
+        )
+        .await
+        .expect("the read timeout ends the list");
+        assert!(list.is_err(), "{list:?}");
+        drop(server.join().expect("server"));
     }
 
     #[test]
