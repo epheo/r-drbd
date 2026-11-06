@@ -1,0 +1,37 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # A hijacked release is usually yanked within days; skip the fresh ones.
+    cooldown:
+      default-days: 7
+    groups:
+      # One PR, so cargo-deny's duplicate-version check sees the whole bump.
+      cargo:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directories: [/, /deploy/openshift/kmm]
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    ignore:
+      # rust-toolchain.toml is the one toolchain pin; bump both together by hand.
+      - dependency-name: "*rust"
+    groups:
+      images:
+        patterns: ["*"]
