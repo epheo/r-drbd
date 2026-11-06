@@ -6,7 +6,7 @@ license.workspace = true
 description = "r-drbd controller: reconcilers, allocation, CSI controller plugin"
 
 [dependencies]
-base64 = "0.22.1"
+base64 = "0.23.1"
 csi.workspace = true
 futures.workspace = true
 getrandom = "0.3.4"
