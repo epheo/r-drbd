@@ -9,7 +9,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Installs the toolchain and components rust-toolchain.toml names.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
@@ -18,12 +18,12 @@ jobs:
       # envtest runs a real etcd and kube-apiserver for the controller tests;
       # the require flag turns a broken install into failures, not skips.
       - id: tools
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/tools
           key: ${{ runner.os }}-envtest-1.33.0-csi-test-v5.6.0
       - if: steps.tools.outputs.cache-hit != 'true'
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: stable
           cache: false
