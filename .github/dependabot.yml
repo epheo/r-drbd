@@ -7,7 +7,14 @@ updates:
     # A hijacked release is usually yanked within days; skip the fresh ones.
     cooldown:
       default-days: 7
+    ignore:
+      # ahash, under kube-runtime, pins getrandom 0.3; a newer one is a duplicate.
+      - dependency-name: getrandom
+        update-types: ["version-update:semver-major"]
     groups:
+      # kube pins k8s-openapi and base64, so none of them can move alone.
+      kube:
+        patterns: [kube, k8s-openapi, base64]
       # One PR, so cargo-deny's duplicate-version check sees the whole bump.
       cargo:
         patterns: ["*"]
