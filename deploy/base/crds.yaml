@@ -272,6 +272,13 @@
                         ],
                         "x-kubernetes-list-type": "map"
                       },
+                      "dataUsedPercent": {
+                        "description": "Thin pool data use: the whole part of lvs Data%.",
+                        "format": "uint32",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
+                      },
                       "devices": {
                         "description": "One row per `spec.devices` path, from the agent.",
                         "items": {
@@ -324,6 +331,13 @@
                       },
                       "freeBytes": {
                         "format": "uint64",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
+                      },
+                      "metadataUsedPercent": {
+                        "description": "Thin pool metadata use: the whole part of lvs Meta%. Above 80 the\nPool takes no new volumes; a full metadata area stops every volume.",
+                        "format": "uint32",
                         "minimum": 0.0,
                         "nullable": true,
                         "type": "integer"

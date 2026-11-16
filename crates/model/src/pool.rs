@@ -169,6 +169,13 @@ pub struct PoolStatus {
     pub total_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub free_bytes: Option<u64>,
+    /// Thin pool data use: the whole part of lvs Data%.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_used_percent: Option<u32>,
+    /// Thin pool metadata use: the whole part of lvs Meta%. Above 80 the
+    /// Pool takes no new volumes; a full metadata area stops every volume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_used_percent: Option<u32>,
     /// Thin pool chunk size; feeds rs-discard-granularity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_bytes: Option<u64>,

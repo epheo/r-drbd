@@ -536,6 +536,8 @@ async fn ready_pool_writes_nothing_when_unchanged() {
     p.status = Some(PoolStatus {
         total_bytes: Some(cap.total_bytes),
         free_bytes: Some(cap.free_bytes),
+        data_used_percent: cap.data_used_percent,
+        metadata_used_percent: cap.metadata_used_percent,
         chunk_bytes: Some(cap.chunk_bytes),
         conditions: vec![available.clone()],
         observed_generation: Some(1),

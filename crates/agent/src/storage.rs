@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lvm::cmd;
-use lvm::report::{self, Lv, PoolLv, Pv, Tagged, Vg, VgFull};
+use lvm::report::{self, Lv, Percent, PoolLv, Pv, Tagged, Vg, VgFull};
 
 pub mod plan;
 
@@ -29,6 +29,8 @@ pub struct PoolCapacity {
     pub total_bytes: u64,
     pub free_bytes: u64,
     pub chunk_bytes: u64,
+    pub data_used_percent: Option<u32>,
+    pub metadata_used_percent: Option<u32>,
 }
 
 pub struct Lvm {
@@ -533,6 +535,10 @@ pub fn pool_capacity(lvs: &[Lv], thin: &str) -> Result<PoolCapacity, String> {
         total_bytes: pool.size_bytes,
         free_bytes,
         chunk_bytes: pool.chunk_bytes,
+        // Whole percents: every Pool status write wakes every agent and the
+        // controller, and metadata hundredths move on almost any write.
+        data_used_percent: pool.data_used.map(Percent::floor),
+        metadata_used_percent: pool.metadata_used.map(Percent::floor),
     })
 }
 
@@ -716,6 +722,8 @@ mod tests {
                 total_bytes: POOL_BYTES,
                 free_bytes: POOL_FREE,
                 chunk_bytes: 65_536,
+                data_used_percent: Some(10),
+                metadata_used_percent: None,
             }
         );
         x.assert_done();
