@@ -357,6 +357,8 @@ async fn pool_unchanged_writes_nothing() {
     p.status = Some(PoolStatus {
         total_bytes: Some(cap.total_bytes),
         free_bytes: Some(cap.free_bytes),
+        data_used_percent: cap.data_used_percent,
+        metadata_used_percent: cap.metadata_used_percent,
         chunk_bytes: Some(cap.chunk_bytes),
         volumes: vec!["owned-by-controller".into()],
         committed_bytes: None,
@@ -371,6 +373,63 @@ async fn pool_unchanged_writes_nothing() {
         .await;
     assert!(w.is_empty(), "{w:?}");
     x.assert_done();
+}
+
+/// A metadata move alone is a write: alerts read metadataUsedPercent.
+#[tokio::test]
+async fn pool_writes_used_percents() {
+    let row = pool_row().replace(
+        r#""chunk_size":"65536""#,
+        r#""chunk_size":"65536", "metadata_percent":"8.18""#,
+    );
+    let pass = |status: Option<PoolStatus>| {
+        let x = Arc::new(ScriptedExec::new());
+        x.expect(
+            lvm::cmd::lvs(VG),
+            ok(&json("lv", std::slice::from_ref(&row))),
+        );
+        expect_vgs(&x);
+        let mut p = (*pool()).clone();
+        p.status = status;
+        async move {
+            let w = Reconciler::new(NODE, x.clone())
+                .pass(&[Arc::new(p)], &[], &[])
+                .await;
+            x.assert_done();
+            w
+        }
+    };
+    let w = pass(None).await;
+    let body = w[0].body();
+    assert_eq!(body["status"]["dataUsedPercent"], 10);
+    assert_eq!(body["status"]["metadataUsedPercent"], 8);
+    let StatusWrite::Pool {
+        capacity,
+        available,
+        ..
+    } = &w[0]
+    else {
+        panic!("pool write expected");
+    };
+    let cap = capacity.clone().unwrap();
+    let written = PoolStatus {
+        total_bytes: Some(cap.total_bytes),
+        free_bytes: Some(cap.free_bytes),
+        data_used_percent: Some(10),
+        metadata_used_percent: Some(8),
+        chunk_bytes: Some(cap.chunk_bytes),
+        conditions: vec![available.clone()],
+        observed_generation: Some(1),
+        ..PoolStatus::default()
+    };
+    let w = pass(Some(written.clone())).await;
+    assert!(w.is_empty(), "{w:?}");
+    let stale = PoolStatus {
+        metadata_used_percent: Some(7),
+        ..written
+    };
+    let w = pass(Some(stale)).await;
+    assert_eq!(w[0].body()["status"]["metadataUsedPercent"], 8);
 }
 
 /// A thin pool LVM flags, or with its metadata nearly full, takes no new

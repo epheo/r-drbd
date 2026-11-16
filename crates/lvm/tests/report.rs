@@ -137,6 +137,15 @@ fn percent_forms() {
     });
     assert_eq!(used, Some(125_000));
     assert_eq!(free("33.333"), Some(666_670));
+    let floor = |p: &str| {
+        report::parse_lvs(&with_field("data_percent", p)).unwrap()[0]
+            .data_used
+            .map(report::Percent::floor)
+    };
+    assert_eq!(floor("11.04"), Some(11));
+    assert_eq!(floor("99.99"), Some(99));
+    assert_eq!(floor("100.00"), Some(100));
+    assert_eq!(floor("12,5"), Some(12));
     assert_eq!(free("7"), Some(930_000));
     for bad in ["-1", ".5", "1.2.3", "1e2", "0.0000000001"] {
         assert!(

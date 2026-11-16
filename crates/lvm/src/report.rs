@@ -91,6 +91,12 @@ impl Percent {
         100 * 10u64.pow(self.scale)
     }
 
+    /// The whole part, as `lvs` prints it before the point.
+    pub fn floor(self) -> u32 {
+        // parse caps digits at whole(): never more than 100.
+        u32::try_from(self.digits / 10u64.pow(self.scale)).unwrap_or(100)
+    }
+
     /// Strictly above `percent`.
     pub fn above(self, percent: u64) -> bool {
         self.digits > percent.saturating_mul(10u64.pow(self.scale))

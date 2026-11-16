@@ -19,6 +19,8 @@ Group `r-drbd.io/v1alpha1`, cluster scoped.
 | `spec.reclaimPolicy` | string | `Retain` or `Delete`; devices only; mutable; absent means `Retain` |
 | `status.totalBytes` | integer | Thin pool data size |
 | `status.freeBytes` | integer | Thin pool free space |
+| `status.dataUsedPercent` | integer | Thin pool data use, the whole part of `lvs` Data% |
+| `status.metadataUsedPercent` | integer | Thin pool metadata use, the whole part of `lvs` Meta%; above 80 the Pool takes no new volumes |
 | `status.chunkBytes` | integer | Thin pool chunk size |
 | `status.committedBytes` | integer | Sum of the sizes of the volumes placed here |
 | `status.placeableBytes` | integer | Largest new volume placement accepts here now, rounded down to MiB, 0 when placement skips the Pool (see [Pools](pools.md#capacity)) |

@@ -181,6 +181,7 @@ Pick the link of the whole disk (no `-part` suffix); the target (`../../nvme1n1`
 | Field | Meaning |
 |---|---|
 | `totalBytes`, `freeBytes` | Thin pool data size and free space |
+| `dataUsedPercent`, `metadataUsedPercent` | Thin pool data and metadata use, the whole part of what `lvs` shows; whole percents keep status writes rare |
 | `chunkBytes` | Thin pool chunk size; DRBD resync discards are aligned to it, capped at 1 MiB |
 | `committedBytes` | Sum of the sizes of the volumes with a diskful replica here |
 | `placeableBytes` | Largest new volume placement accepts here now, rounded down to MiB; 0 when the Pool is not Available, its node is not Ready or its agent is down, or it is being deleted |
@@ -236,6 +237,7 @@ A volume fits when its size is at most `placeable`.
 
 Set `overcommitPercent` above 100 only if you watch `freeBytes` and can grow the pool (`lvextend`) before it fills.
 Snapshots still use space beyond `committed`; keep watching `freeBytes` when you take them.
+Watch `metadataUsedPercent` too: above 80 the Pool takes no new volumes, and full metadata stops every volume in the pool.
 Lowering the policy below what is committed leaves existing volumes alone; the Pool just takes no new ones.
 
 Restores: every replica of a restore is gated and counted at the volume's full size, like a new volume.

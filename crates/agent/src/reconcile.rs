@@ -136,6 +136,12 @@ impl StatusWrite {
                 if let Ok(c) = capacity {
                     status["totalBytes"] = json!(c.total_bytes);
                     status["freeBytes"] = json!(c.free_bytes);
+                    if let Some(p) = c.data_used_percent {
+                        status["dataUsedPercent"] = json!(p);
+                    }
+                    if let Some(p) = c.metadata_used_percent {
+                        status["metadataUsedPercent"] = json!(p);
+                    }
                 }
                 if let Some(c) = chunk_bytes {
                     status["chunkBytes"] = json!(c);
@@ -251,6 +257,14 @@ impl StatusWrite {
         }
         Ok(())
     }
+}
+
+/// `current` already holds what [`StatusWrite::body`] writes from `cap`.
+fn capacity_written(current: &model::PoolStatus, cap: Option<&PoolCapacity>) -> bool {
+    current.total_bytes == cap.map(|c| c.total_bytes)
+        && current.free_bytes == cap.map(|c| c.free_bytes)
+        && current.data_used_percent == cap.and_then(|c| c.data_used_percent)
+        && current.metadata_used_percent == cap.and_then(|c| c.metadata_used_percent)
 }
 
 /// lvs and vgs reads of one pass, per VG; a mutation drops the VG's entry.
@@ -749,8 +763,7 @@ impl Reconciler {
         };
         let cap = capacity.as_ref().ok();
         let chunk_bytes = cap.map(|c| c.chunk_bytes).or(current.chunk_bytes);
-        let unchanged = current.total_bytes == cap.map(|c| c.total_bytes)
-            && current.free_bytes == cap.map(|c| c.free_bytes)
+        let unchanged = capacity_written(&current, cap)
             && current.chunk_bytes == chunk_bytes
             && current.observed_generation == generation
             && condition::get(&current.conditions, condition::types::AVAILABLE) == Some(&available)
