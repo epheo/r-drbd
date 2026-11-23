@@ -5,7 +5,11 @@ FROM docker.io/library/rust:1.99.0-alpine AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY . .
-RUN cargo build --release --locked --target x86_64-unknown-linux-musl -p r-drbd \
+# Compiled dependencies survive a source change in the cache mounts; CI
+# carries them from run to run.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked --target x86_64-unknown-linux-musl -p r-drbd \
  && install -D target/x86_64-unknown-linux-musl/release/r-drbd /out/r-drbd
 
 FROM docker.io/library/alpine:3.22 AS drbd-utils
