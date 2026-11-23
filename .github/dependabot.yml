@@ -31,7 +31,7 @@ updates:
         patterns: ["*"]
 
   - package-ecosystem: docker
-    directories: [/, /deploy/openshift/kmm]
+    directories: [/, /deploy/openshift/kmm, /tools/ci]
     schedule:
       interval: weekly
     cooldown:
