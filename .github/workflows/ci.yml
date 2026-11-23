@@ -249,9 +249,48 @@ jobs:
           path: ${{ runner.temp }}/vm-disk-work/proof/logs
           if-no-files-found: ignore
 
+  host-suite:
+    needs: [image, vm-disk]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+      - if: needs.vm-disk.outputs.source == 'ghcr'
+        env:
+          TAG: ${{ needs.vm-disk.outputs.tag }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: tools/ci/disk-oci.sh pull "$TAG" "$RUNNER_TEMP/vm-disk"
+      - if: needs.vm-disk.outputs.source == 'artifact'
+        uses: actions/download-artifact@v8
+        with:
+          name: vm-disk
+          path: ${{ runner.temp }}/vm-disk
+      - uses: actions/download-artifact@v8
+        with:
+          name: r-drbd-image
+          path: ${{ runner.temp }}/in
+      - uses: actions/download-artifact@v8
+        with:
+          name: host-test
+          path: ${{ runner.temp }}/in
+      - env:
+          WORKDIR: ${{ runner.temp }}/host-suite
+        run: >-
+          tools/ci/host-suite.sh "$RUNNER_TEMP/vm-disk"
+          "$RUNNER_TEMP/in/r-drbd.tar" "$RUNNER_TEMP/in/host-test"
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: host-suite-logs
+          path: ${{ runner.temp }}/host-suite/logs
+          if-no-files-found: ignore
+
   ci-ok:
     if: always()
-    needs: [changes, lint, build, envtest, image, vm-disk]
+    needs: [changes, lint, build, envtest, image, vm-disk, host-suite]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
