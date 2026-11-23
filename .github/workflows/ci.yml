@@ -4,6 +4,10 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      base:
+        description: Run only the lanes the change since this ref needs; empty runs every lane
+        default: ""
 permissions:
   contents: read
 concurrency:
@@ -13,7 +17,35 @@ env:
   # Backtraces keep their lines; the test archive shrinks several fold.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # Without a base, as on main, every lane runs: the public tree test
+      # then still sees a docs-only change once it merges.
+      - id: diff
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || inputs.base }}
+        run: |
+          if [ -z "$BASE" ]; then
+            echo code=true >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base=$(git rev-parse --verify -q "origin/$BASE" || git rev-parse --verify "$BASE")
+          files=$(git diff --name-only "$(git merge-base "$base" HEAD)" HEAD)
+          printf '%s\n' "$files"
+          code=false
+          if printf '%s\n' "$files" | grep -qvE '^docs/|\.md$'; then code=true; fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
   lint:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -28,6 +60,8 @@ jobs:
           command: check licenses bans advisories
 
   build:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -96,7 +130,7 @@ jobs:
 
   ci-ok:
     if: always()
-    needs: [lint, build, envtest]
+    needs: [changes, lint, build, envtest]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
