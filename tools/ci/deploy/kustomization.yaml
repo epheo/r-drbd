@@ -1,0 +1,17 @@
+# The PR's deploy/base on the PR's image, which the two-node lane loads
+# into each node's container storage: never pulled.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../../deploy/base
+images:
+  - name: ghcr.io/epheo/r-drbd
+    newName: localhost/r-drbd
+    newTag: ci
+patches:
+  - target: {kind: Deployment, name: r-drbd-controller}
+    patch: |
+      - {op: replace, path: /spec/template/spec/containers/0/imagePullPolicy, value: Never}
+  - target: {kind: DaemonSet, name: r-drbd-agent}
+    patch: |
+      - {op: replace, path: /spec/template/spec/containers/0/imagePullPolicy, value: Never}
