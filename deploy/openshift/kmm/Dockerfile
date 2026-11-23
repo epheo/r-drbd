@@ -5,7 +5,7 @@ ARG DTK_AUTO
 
 # The toolkit ships no patch(1), which DRBD's kernel compat step runs; its
 # only needs are libraries every RHEL base has.
-FROM registry.access.redhat.com/ubi9/ubi:9.8 AS tools
+FROM registry.access.redhat.com/ubi9/ubi:9.9 AS tools
 RUN dnf -y install patch && dnf clean all
 
 FROM ${DTK_AUTO} AS build
@@ -32,7 +32,7 @@ RUN install -D -t /opt/lib/modules/${KERNEL_FULL_VERSION} \
  && ! grep -q 'unknown symbol' /tmp/depmod.log \
  && grep -q '^drbd_transport_tcp.ko: drbd.ko' /opt/lib/modules/${KERNEL_FULL_VERSION}/modules.dep
 
-FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.9
 ARG KERNEL_FULL_VERSION
 COPY --from=build /opt/lib/modules/${KERNEL_FULL_VERSION} /opt/lib/modules/${KERNEL_FULL_VERSION}
 RUN ln -sfn /host/lib/modules/${KERNEL_FULL_VERSION} /opt/lib/modules/${KERNEL_FULL_VERSION}/host
