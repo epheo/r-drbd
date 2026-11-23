@@ -22,6 +22,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       code: ${{ steps.diff.outputs.code }}
+      vm: ${{ steps.diff.outputs.vm }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -33,7 +34,7 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha || inputs.base }}
         run: |
           if [ -z "$BASE" ]; then
-            echo code=true >> "$GITHUB_OUTPUT"
+            printf 'code=true\nvm=true\n' >> "$GITHUB_OUTPUT"
             exit 0
           fi
           base=$(git rev-parse --verify -q "origin/$BASE" || git rev-parse --verify "$BASE")
@@ -41,7 +42,11 @@ jobs:
           printf '%s\n' "$files"
           code=false
           if printf '%s\n' "$files" | grep -qvE '^docs/|\.md$'; then code=true; fi
-          echo "code=$code" >> "$GITHUB_OUTPUT"
+          # What the VM lanes test: the agent and controller, their image,
+          # their manifests and the lanes themselves.
+          vm=false
+          if printf '%s\n' "$files" | grep -qE '^(crates/|deploy/|tools/ci/|Cargo\.|Containerfile$|rust-toolchain\.toml$|\.github/workflows/ci\.yml$)'; then vm=true; fi
+          printf 'code=%s\nvm=%s\n' "$code" "$vm" >> "$GITHUB_OUTPUT"
 
   lint:
     needs: changes
@@ -184,9 +189,47 @@ jobs:
           path: ${{ runner.temp }}/r-drbd.tar
           retention-days: 3
 
+  # The disk the VM lanes boot, built once per MicroShift image and disk
+  # recipe; PRs read the one main built.
+  vm-disk:
+    needs: changes
+    if: needs.changes.outputs.vm == 'true'
+    # bootc-image-builder fails its mounts on ubuntu-26.04.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: key
+        run: |
+          digest=$(sed -n 's/^FROM [^ ]*microshift[^ ]*@sha256:\([0-9a-f]*\).*/\1/p' tools/ci/microshift.Containerfile)
+          echo "key=vm-disk-${digest:0:12}-${{ hashFiles('tools/ci/microshift.Containerfile', 'tools/ci/disk.sh') }}" >> "$GITHUB_OUTPUT"
+      - id: cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/vm-disk
+          key: ${{ steps.key.outputs.key }}
+          lookup-only: true
+      - if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          WORK: ${{ runner.temp }}/vm-disk-work
+        run: tools/ci/disk.sh "$RUNNER_TEMP/vm-disk"
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/vm-disk
+          key: ${{ steps.key.outputs.key }}
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: vm-disk-logs
+          path: ${{ runner.temp }}/vm-disk-work/proof/logs
+          if-no-files-found: ignore
+
   ci-ok:
     if: always()
-    needs: [changes, lint, build, envtest, image]
+    needs: [changes, lint, build, envtest, image, vm-disk]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
