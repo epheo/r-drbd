@@ -6,6 +6,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
 env:
   # Backtraces keep their lines; the test archive shrinks several fold.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
