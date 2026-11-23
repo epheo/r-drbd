@@ -29,7 +29,8 @@ pub const GIB: u64 = 1 << 30;
 /// Where `setup-envtest use 1.33.0` installs, relative to the XDG data dir.
 const ENVTEST_DIR: &str = "kubebuilder-envtest/k8s/1.33.0-linux-amd64";
 /// apiservers running at once in one test binary; more starved the
-/// apiserver start on a loaded 32 core machine.
+/// apiserver start on a loaded 32 core machine. Under nextest every test
+/// is its own process: the envtest group in .config/nextest.toml caps it.
 const MAX_PARALLEL: usize = 4;
 
 static SLOTS: Mutex<usize> = Mutex::new(0);
