@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# r-drbd across two VMs of the CI disk: node1 the control plane, node2 a
-# worker, both with a spare disk. The PR's image and deploy/base, one Pool
+# r-drbd across VMs of the CI disk: node1 the control plane, node2 a
+# worker, both with a spare disk; NODES=3 adds node3, a worker without one
+# that only holds tiebreakers. The PR's image and deploy/base, one Pool
 # built from a blank disk, one on a VG made by hand, then smoke checks of
 # what one host cannot show. Each wait is bounded; on failure the cluster
 # state, the r-drbd logs and every node's journal land in $WORKDIR/logs.
@@ -11,7 +12,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 DISK=$(realpath "$1")
 image=$(realpath "$2")
 WORKDIR=$(realpath -m "${WORKDIR:-$(mktemp -d)}")
-NODES=2
+NODES=${NODES:-2}
 mkdir -p "$WORKDIR"
 # shellcheck source=vm.sh
 . "$here/vm.sh"
@@ -77,7 +78,8 @@ trap cleanup EXIT
 mem_watch &
 MEM_PID=$!
 vm_boot 1 5120 8
-vm_boot 2 5120 8
+vm_boot 2 "${WORKER_MEM:-5120}" 8
+[ "$NODES" = 3 ] && vm_boot 3 "${WORKER_MEM:-5120}" 1
 # shellcheck disable=SC2086
 vm_ssh_up $VMS
 # shellcheck disable=SC2086
@@ -218,6 +220,12 @@ pod rep-b node2 rep
 [ "$(read_pattern rep-b)" = "$sum" ] || die "rep: node2 reads other data than node1 wrote"
 gone pod rep-b
 
+if [ "$NODES" = 3 ]; then
+    log "tiebreaker: diskless on node3"
+    role=$(k get volumes.r-drbd.io "$REP" -o jsonpath='{.spec.assignment.replicas[?(@.node=="node3")].role}')
+    [ "$role" = tiebreaker ] || die "$REP: node3 is '$role', not the tiebreaker"
+fi
+
 log "snapshot of replicas 2, restored with no resync"
 pod rep-a node1 rep
 snap rep-snap rep
@@ -289,6 +297,12 @@ pod rep-io node1 rep "$WRITER"
 sleep 5
 vm_monitor 2 system_reset
 retry 120 "$REP Degraded" phase_is "$REP" Degraded
+if [ "$NODES" = 3 ]; then
+    # With the tiebreaker, node1 keeps quorum: writes go on.
+    before=$(written)
+    sleep 10
+    [ "$(written)" -gt "$before" ] || die "no write went through while node2 was down"
+fi
 retry 600 "node2 back" vm 2 true
 vm_boot_id 2 > "$WORKDIR/boot2"
 retry 600 "node2 Ready" _node_ready 2
@@ -326,5 +340,6 @@ vm 2 lvs ci-vg/thin >/dev/null || die "node2: the hand-made thin pool is gone"
 
 vm_same_boot 1
 vm_same_boot 2
+[ "$NODES" = 3 ] && vm_same_boot 3
 mem_peaks | tee "$WORKDIR/logs/memory-peaks.log"
 log "two-node lane passed"

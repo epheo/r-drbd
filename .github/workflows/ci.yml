@@ -288,10 +288,14 @@ jobs:
           path: ${{ runner.temp }}/host-suite/logs
           if-no-files-found: ignore
 
+  # A third VM fits a standard runner: replicas 2 get their tiebreaker.
   two-node:
     needs: [image, vm-disk]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      NODES: "3"
+      WORKER_MEM: "3584"
     permissions:
       contents: read
       packages: read
