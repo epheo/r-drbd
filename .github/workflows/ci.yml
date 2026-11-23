@@ -3,6 +3,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "23 3 * * *"
   workflow_dispatch:
     inputs:
       base:
@@ -12,6 +14,11 @@ on:
         description: Build the VM disk and hand it over as a run artifact, never published, as a PR does
         type: boolean
         default: false
+      lane:
+        description: Lanes to run
+        type: choice
+        options: [all, checks, host-suite, two-node]
+        default: all
 permissions:
   contents: read
 concurrency:
@@ -26,8 +33,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      code: ${{ steps.diff.outputs.code }}
-      vm: ${{ steps.diff.outputs.vm }}
+      checks: ${{ steps.diff.outputs.checks }}
+      host-suite: ${{ steps.diff.outputs.host-suite }}
+      two-node: ${{ steps.diff.outputs.two-node }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -37,25 +45,34 @@ jobs:
       - id: diff
         env:
           BASE: ${{ github.event.pull_request.base.sha || inputs.base }}
+          LANE: ${{ inputs.lane || 'all' }}
         run: |
-          if [ -z "$BASE" ]; then
-            printf 'code=true\nvm=true\n' >> "$GITHUB_OUTPUT"
-            exit 0
+          code=true
+          vm=true
+          if [ -n "$BASE" ]; then
+            base=$(git rev-parse --verify -q "origin/$BASE" || git rev-parse --verify "$BASE")
+            files=$(git diff --name-only "$(git merge-base "$base" HEAD)" HEAD)
+            printf '%s\n' "$files"
+            code=false
+            if printf '%s\n' "$files" | grep -qvE '^docs/|\.md$'; then code=true; fi
+            # What the VM lanes test: the agent and controller, their image,
+            # their manifests and the lanes themselves.
+            vm=false
+            if printf '%s\n' "$files" | grep -qE '^(crates/|deploy/|tools/ci/|Cargo\.|Containerfile$|rust-toolchain\.toml$|\.github/workflows/ci\.yml$)'; then vm=true; fi
           fi
-          base=$(git rev-parse --verify -q "origin/$BASE" || git rev-parse --verify "$BASE")
-          files=$(git diff --name-only "$(git merge-base "$base" HEAD)" HEAD)
-          printf '%s\n' "$files"
-          code=false
-          if printf '%s\n' "$files" | grep -qvE '^docs/|\.md$'; then code=true; fi
-          # What the VM lanes test: the agent and controller, their image,
-          # their manifests and the lanes themselves.
-          vm=false
-          if printf '%s\n' "$files" | grep -qE '^(crates/|deploy/|tools/ci/|Cargo\.|Containerfile$|rust-toolchain\.toml$|\.github/workflows/ci\.yml$)'; then vm=true; fi
-          printf 'code=%s\nvm=%s\n' "$code" "$vm" >> "$GITHUB_OUTPUT"
+          checks=$code
+          host=$vm
+          two=$vm
+          case $LANE in
+            checks) host=false two=false ;;
+            host-suite) checks=false two=false ;;
+            two-node) checks=false host=false ;;
+          esac
+          printf 'checks=%s\nhost-suite=%s\ntwo-node=%s\n' "$checks" "$host" "$two" | tee -a "$GITHUB_OUTPUT"
 
   lint:
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.checks == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -71,7 +88,7 @@ jobs:
 
   build:
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.checks == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -142,7 +159,9 @@ jobs:
   # lanes take the PR image and the host tests as a static binary.
   image:
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: >-
+      needs.changes.outputs.checks == 'true' || needs.changes.outputs.host-suite == 'true'
+      || needs.changes.outputs.two-node == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -200,7 +219,7 @@ jobs:
   # that needs a new disk hands its own to the lanes as a run artifact.
   vm-disk:
     needs: changes
-    if: needs.changes.outputs.vm == 'true'
+    if: needs.changes.outputs.host-suite == 'true' || needs.changes.outputs.two-node == 'true'
     # bootc-image-builder fails its mounts on ubuntu-26.04.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -250,7 +269,8 @@ jobs:
           if-no-files-found: ignore
 
   host-suite:
-    needs: [image, vm-disk]
+    needs: [changes, image, vm-disk]
+    if: needs.changes.outputs.host-suite == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -290,7 +310,8 @@ jobs:
 
   # A third VM fits a standard runner: replicas 2 get their tiebreaker.
   two-node:
-    needs: [image, vm-disk]
+    needs: [changes, image, vm-disk]
+    if: needs.changes.outputs.two-node == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
