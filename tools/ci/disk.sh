@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The VM disk the lanes boot: the pinned MicroShift image, made by
-# bootc-image-builder into a compressed qcow2, with a throwaway root key.
+# bootc-image-builder into a compressed qcow2. It holds no ssh key: vm.sh
+# gives root one per run.
 # Every change but a serial console is in /etc. MicroShift leaves out the
 # r-drbd it embeds and greenboot does not wait for it: each lane deploys
 # the PR's own. One boot proves greenboot goes green with no reboot
@@ -19,17 +20,11 @@ image=$(sed -n 's/^FROM \([^ ]*microshift[^ ]*\).*/\1/p' "$pins")
 pm() { sudo podman "$@"; }
 
 mkdir -p "$out" "$work/output"
-rm -f "$out/id" "$out/id.pub"
-ssh-keygen -q -t ed25519 -N '' -C r-drbd-ci -f "$out/id"
 
 # kustomizePaths globs match every manifests.d entry but 000-r-*, in the
 # order MicroShift applies them by default. Go globs: a dash in a class is
 # escaped, or the whole config fails to parse and greenboot goes red.
 cat > "$work/config.toml" <<EOF
-[[customizations.user]]
-name = "root"
-key = "$(cat "$out/id.pub")"
-
 # A boot that never reaches ssh shows why in the console log.
 [customizations.kernel]
 append = "console=ttyS0,115200"

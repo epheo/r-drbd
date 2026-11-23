@@ -8,6 +8,10 @@ on:
       base:
         description: Run only the lanes the change since this ref needs; empty runs every lane
         default: ""
+      disk-artifact:
+        description: Build the VM disk and hand it over as a run artifact, never published, as a PR does
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -16,6 +20,7 @@ concurrency:
 env:
   # Backtraces keep their lines; the test archive shrinks several fold.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  DISK_REPO: ghcr.io/${{ github.repository_owner }}/r-drbd-ci-disk
 jobs:
   changes:
     runs-on: ubuntu-latest
@@ -190,36 +195,53 @@ jobs:
           retention-days: 3
 
   # The disk the VM lanes boot, built once per MicroShift image and disk
-  # recipe; PRs read the one main built.
+  # recipe and published in GHCR, not the Actions cache: the cache can
+  # evict it between this job and the lanes. A PR never publishes; one
+  # that needs a new disk hands its own to the lanes as a run artifact.
   vm-disk:
     needs: changes
     if: needs.changes.outputs.vm == 'true'
     # bootc-image-builder fails its mounts on ubuntu-26.04.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
     outputs:
-      key: ${{ steps.key.outputs.key }}
+      tag: ${{ steps.key.outputs.tag }}
+      source: ${{ steps.disk.outputs.source }}
     steps:
       - uses: actions/checkout@v7
       - id: key
         run: |
           digest=$(sed -n 's/^FROM [^ ]*microshift[^ ]*@sha256:\([0-9a-f]*\).*/\1/p' tools/ci/microshift.Containerfile)
-          echo "key=vm-disk-${digest:0:12}-${{ hashFiles('tools/ci/microshift.Containerfile', 'tools/ci/disk.sh') }}" >> "$GITHUB_OUTPUT"
-      - id: cache
-        uses: actions/cache/restore@v6
-        with:
-          path: ${{ runner.temp }}/vm-disk
-          key: ${{ steps.key.outputs.key }}
-          lookup-only: true
-      - if: steps.cache.outputs.cache-hit != 'true'
+          echo "tag=${digest:0:12}-${{ hashFiles('tools/ci/microshift.Containerfile', 'tools/ci/disk.sh') }}" >> "$GITHUB_OUTPUT"
+      - id: disk
         env:
+          TAG: ${{ steps.key.outputs.tag }}
+          FORCE: ${{ inputs.disk-artifact == true }}
+          PUBLISH: ${{ github.event_name != 'pull_request' && inputs.disk-artifact != true }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WORK: ${{ runner.temp }}/vm-disk-work
-        run: tools/ci/disk.sh "$RUNNER_TEMP/vm-disk"
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
+        run: |
+          if [ "$FORCE" != true ] && tools/ci/disk-oci.sh exists "$TAG"; then
+            echo "source=ghcr" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tools/ci/disk.sh "$RUNNER_TEMP/vm-disk"
+          if [ "$PUBLISH" = true ]; then
+            tools/ci/disk-oci.sh push "$RUNNER_TEMP/vm-disk" "$TAG"
+            echo "source=ghcr" >> "$GITHUB_OUTPUT"
+          else
+            echo "source=artifact" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.disk.outputs.source == 'artifact'
+        uses: actions/upload-artifact@v7
         with:
-          path: ${{ runner.temp }}/vm-disk
-          key: ${{ steps.key.outputs.key }}
+          name: vm-disk
+          path: ${{ runner.temp }}/vm-disk/disk.qcow2
+          retention-days: 1
+          compression-level: 0
       - if: failure()
         uses: actions/upload-artifact@v7
         with:
