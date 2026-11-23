@@ -128,7 +128,8 @@ jobs:
           R_DRBD_REQUIRE_ENVTEST: "1"
           CSI_SANITY: ${{ runner.temp }}/tools/csi-sanity
 
-  # Apart from build, so the envtest shards need not wait for it.
+  # Apart from build, so the envtest shards need not wait for it. The VM
+  # lanes take the PR image and the host tests as a static binary.
   image:
     needs: changes
     if: needs.changes.outputs.code == 'true'
@@ -136,6 +137,22 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: host test binary
+        env:
+          # ring compiles C; clang targets musl without musl-tools.
+          CC_x86_64_unknown_linux_musl: clang
+        run: |
+          bin=$(cargo test -p agent --test host --no-run --locked \
+              --target x86_64-unknown-linux-musl --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "host" and .profile.test) | .executable')
+          install -D "$bin" "$RUNNER_TEMP/host-test/host-test"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: host-test
+          path: ${{ runner.temp }}/host-test/host-test
+          retention-days: 3
       - uses: docker/setup-buildx-action@v4
       # Same caches as image.yml, which says why.
       - id: cargo
