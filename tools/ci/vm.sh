@@ -5,8 +5,10 @@
 # scripts/lib-qemu.sh, .github/actions/vm-host), Apache-2.0.
 #
 # Sourced. The caller sets WORKDIR (scratch and logs) and DISK (the
-# directory holding disk.qcow2 and its key, from disk.sh), then calls
-# vm_tools and vm_net_user or vm_net_bridge before vm_boot.
+# directory holding disk.qcow2, from disk.sh), then calls vm_tools and
+# vm_net_user or vm_net_bridge before vm_boot. The disk holds no key: each
+# run makes its own and hands the public half to root by a systemd
+# credential, so the published disk opens to no one.
 
 CI_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 QEMU_IMAGE=localhost/r-drbd-ci-qemu
@@ -31,7 +33,8 @@ retry() { # retry SECONDS DESCRIPTION CMD...
 
 vm_tools() {
     mkdir -p "$WORKDIR/logs"
-    install -m 600 "$DISK/id" "$WORKDIR/id"
+    rm -f "$WORKDIR/id" "$WORKDIR/id.pub"
+    ssh-keygen -q -t ed25519 -N '' -C r-drbd-ci -f "$WORKDIR/id"
     sudo podman build -q -t "$QEMU_IMAGE" -f "$CI_DIR/qemu.Containerfile" "$CI_DIR" >/dev/null
 }
 
@@ -100,6 +103,7 @@ vm_boot() { # vm_boot N MEMORY_MIB DATA_DISK_GIB
         -device "virtio-blk-pci,drive=data,serial=data$n" \
         -netdev "$net" -device "virtio-net-pci,netdev=n0,mac=$(vm_mac "$n")" \
         -device virtio-rng-pci -display none \
+        -smbios "type=11,value=io.systemd.credential:ssh.authorized_keys.root=$(cat "$WORKDIR/id.pub")" \
         -serial "file:$WORKDIR/logs/console$n.log" \
         -monitor "unix:$WORKDIR/monitor$n.sock,server=on,wait=off" \
         -pidfile "$WORKDIR/qemu$n.pid"
