@@ -12,7 +12,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked --target x86_64-unknown-linux-musl -p r-drbd \
  && install -D target/x86_64-unknown-linux-musl/release/r-drbd /out/r-drbd
 
-FROM docker.io/library/alpine:3.22 AS drbd-utils
+FROM docker.io/library/alpine:3.24 AS drbd-utils
 ARG DRBD_UTILS_VERSION=9.35.0
 ARG DRBD_UTILS_SHA256=8815afb25c84fafadf6ef43be68805d261c5f33ec29016121a327821acaf6ade
 RUN apk add --no-cache bash build-base flex linux-headers
