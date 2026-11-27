@@ -4,7 +4,8 @@
 ARG DTK_AUTO
 
 # The toolkit ships no patch(1), which DRBD's kernel compat step runs; its
-# only needs are libraries every RHEL base has.
+# only needs are libraries every RHEL base has. Keep this UBI on the
+# toolkit's RHEL major: a newer one's patch needs a newer glibc.
 FROM registry.access.redhat.com/ubi9/ubi:9.9 AS tools
 RUN dnf -y install patch && dnf clean all
 
