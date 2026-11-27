@@ -4,8 +4,8 @@
 # With GITHUB_TOKEN set, logs in to the registry first.
 set -euo pipefail
 
-ORAS_VERSION=1.3.6
-ORAS_SHA256=66fb0ad7206f3f6fa77ed5b552049d364ccf4b50b1684554f731f76302b52ca0
+ORAS_VERSION=1.4.0
+ORAS_SHA256=d8e1dce2fd8ce996f1d901845b688eb0cf505a6082897606f053825bb47935d1
 : "${DISK_REPO:?}"
 bin=${RUNNER_TEMP:-/tmp}/oras-$ORAS_VERSION
 oras=$bin/oras
