@@ -292,7 +292,7 @@ impl Pipe {
             self.task.abort();
             tracing::warn!("output pipe still open after the command exited");
         }
-        let bytes = self.buf.lock().map(|b| b.clone()).unwrap_or_default();
+        let bytes = self.buf.lock().map_or_default(|b| b.clone());
         String::from_utf8_lossy(&bytes).into_owned()
     }
 }

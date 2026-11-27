@@ -140,7 +140,7 @@ pub(crate) async fn reconcile_all(ctx: &Ctx<'_>, memory: &mut Memory) {
     // A live agent's copies in a Pool count until its node answered every
     // discovery: the Pool's deletion would give them up unasked.
     let owed = |node: &str| -> Vec<String> {
-        let uids = by_node.get(node).map(Vec::as_slice).unwrap_or_default();
+        let uids = by_node.get(node).map_or_default(Vec::as_slice);
         if !ctx.stores.agent_fresh(node) {
             return Vec::new();
         }
@@ -154,13 +154,8 @@ pub(crate) async fn reconcile_all(ctx: &Ctx<'_>, memory: &mut Memory) {
         let name = pool.name_any();
         let wanted: Vec<String> = usage
             .get(&(pool.spec.node.clone(), name.clone()))
-            .map(|h| h.iter().map(|(n, _)| n.clone()).collect())
-            .unwrap_or_default();
-        let current = pool
-            .status
-            .as_ref()
-            .map(|s| s.volumes.clone())
-            .unwrap_or_default();
+            .map_or_default(|h| h.iter().map(|(n, _)| n.clone()).collect());
+        let current = pool.status.as_ref().map_or_default(|s| s.volumes.clone());
         if pool.metadata.deletion_timestamp.is_some() {
             if !has_finalizer(pool.as_ref(), FINALIZER_POOL) {
                 continue;

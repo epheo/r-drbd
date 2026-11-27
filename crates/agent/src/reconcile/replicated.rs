@@ -626,8 +626,7 @@ impl Reconciler {
             .unwrap_or_default()
             .iter()
             .find(|e| e.node == self.node)
-            .map(|e| e.unreachable_peers.as_slice())
-            .unwrap_or_default();
+            .map_or_default(|e| e.unreachable_peers.as_slice());
         let seen = res
             .into_iter()
             .flat_map(|r| &r.connections)
@@ -1578,8 +1577,7 @@ impl Reconciler {
             .vol
             .status
             .as_ref()
-            .map(|st| st.replicas.as_slice())
-            .unwrap_or_default();
+            .map_or_default(|st| st.replicas.as_slice());
         let peers_ready = diskful().filter(|x| x.node != self.node).all(|x| {
             let grown = entries
                 .iter()

@@ -281,10 +281,7 @@ impl HostDisks for SysDisks {
             .as_ref()
             .map_err(Clone::clone)
             .and_then(|n| read_sys(&self.sys, n));
-        let mounts = sys
-            .as_ref()
-            .map(|s| mounts_of(mounts, s))
-            .unwrap_or_default();
+        let mounts = sys.as_ref().map_or_default(|s| mounts_of(mounts, s));
         let udev = match (&name, &sys) {
             (Ok(n), Ok(s)) => self.udev(n, s),
             _ => Udev::Unknown,
@@ -653,11 +650,7 @@ pub async fn check(
         let (state, message) = if let Some(s) = early {
             s
         } else {
-            let node = f
-                .dev
-                .as_ref()
-                .map(|n| n.display().to_string())
-                .unwrap_or_default();
+            let node = f.dev.as_ref().map_or_default(|n| n.display().to_string());
             let sigs = run_ok(exec, &wipefs_argv(&node), DEFAULT_TIMEOUT)
                 .await
                 .map_err(|e| e.to_string())

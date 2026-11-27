@@ -1331,8 +1331,7 @@ impl Member {
     fn stuck(&self) -> Vec<model::PeerProbe> {
         self.entry
             .as_ref()
-            .map(|e| e.unreachable_peers.clone())
-            .unwrap_or_default()
+            .map_or_default(|e| e.unreachable_peers.clone())
     }
 }
 

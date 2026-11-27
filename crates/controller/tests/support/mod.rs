@@ -721,7 +721,7 @@ pub async fn snapshot_where(
 }
 
 pub fn phase_of(v: &Volume) -> model::VolumePhase {
-    v.status.as_ref().map(|s| s.phase).unwrap_or_default()
+    v.status.as_ref().map_or_default(|s| s.phase)
 }
 
 pub fn snap_phase(s: &Snapshot) -> Option<SnapshotPhase> {

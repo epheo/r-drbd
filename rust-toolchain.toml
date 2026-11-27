@@ -1,6 +1,6 @@
 [toolchain]
 # The one toolchain pin: the Containerfile image and CI follow it.
-channel = "1.99.0"
+channel = "1.100.0"
 profile = "minimal"
 components = ["rustfmt", "clippy"]
 # Static builds for test hosts and scratch images.

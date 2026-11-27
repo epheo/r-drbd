@@ -371,8 +371,7 @@ impl Memory {
                 model::condition::get(&s.conditions, model::condition::types::SPLIT_BRAIN)
             })
             .filter(|c| c.status == model::condition::TRUE)
-            .map(|c| volume::pairs_from_message(&c.message))
-            .unwrap_or_default()
+            .map_or_default(|c| volume::pairs_from_message(&c.message))
     }
 
     pub(crate) fn set_probe_wait(&mut self, v: &model::Volume, waiting: bool) {

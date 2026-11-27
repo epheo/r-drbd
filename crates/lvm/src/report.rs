@@ -454,13 +454,11 @@ pub fn log_errors(json: &str) -> Vec<String> {
         #[serde(default)]
         log: Vec<LogEntry>,
     }
-    serde_json::from_str::<LogOnly>(json)
-        .map(|d| {
-            d.log
-                .into_iter()
-                .filter(|e| e.log_type == "error")
-                .map(|e| e.log_message)
-                .collect()
-        })
-        .unwrap_or_default()
+    serde_json::from_str::<LogOnly>(json).map_or_default(|d| {
+        d.log
+            .into_iter()
+            .filter(|e| e.log_type == "error")
+            .map(|e| e.log_message)
+            .collect()
+    })
 }
