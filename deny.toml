@@ -6,6 +6,11 @@ allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.
 confidence-threshold = 0.9
 unused-allowed-license = "deny"
 
+# Build only: psm's build script writes its archive with it.
+[[licenses.exceptions]]
+crate = "ar_archive_writer"
+allow = ["Apache-2.0 WITH LLVM-exception"]
+
 [bans]
 multiple-versions = "deny"
 # Upstream duplicates no manifest here can unify; a new one fails the check.
@@ -14,6 +19,7 @@ skip = [
   { crate = "foldhash:<0.2", reason = "hashbrown 0.15 via petgraph, build only" },
   { crate = "getrandom:<0.3", reason = "ring" },
   { crate = "hashbrown:<0.17", reason = "petgraph (build) and kube-runtime" },
+  { crate = "prettyplease:<0.3", reason = "tonic-build on 0.2, prost-build on 0.3, build only" },
   { crate = "syn:<3", reason = "proc macros not yet on syn 3" },
   { crate = "unicode-width:<0.2", reason = "miette via protox, build only" },
 ]
