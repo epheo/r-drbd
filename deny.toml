@@ -10,6 +10,7 @@ unused-allowed-license = "deny"
 multiple-versions = "deny"
 # Upstream duplicates no manifest here can unify; a new one fails the check.
 skip = [
+  { crate = "base64:<0.23", reason = "k8s-openapi on 0.22, kube-client 5 on 0.23" },
   { crate = "foldhash:<0.2", reason = "hashbrown 0.15 via petgraph, build only" },
   { crate = "getrandom:<0.3", reason = "ring" },
   { crate = "hashbrown:<0.17", reason = "petgraph (build) and kube-runtime" },
