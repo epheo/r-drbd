@@ -8,7 +8,7 @@ updates:
     cooldown:
       default-days: 7
     ignore:
-      # ahash, under kube-runtime, pins getrandom 0.3; a newer one is a duplicate.
+      # ahash, under kube-runtime, sets the getrandom major; another is a duplicate.
       - dependency-name: getrandom
         update-types: ["version-update:semver-major"]
     groups:

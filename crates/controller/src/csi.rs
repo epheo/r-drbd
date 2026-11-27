@@ -534,8 +534,7 @@ impl Csi {
                     let requisite = req
                         .accessibility_requirements
                         .as_ref()
-                        .map(|t| t.requisite.as_slice())
-                        .unwrap_or_default();
+                        .map_or_default(|t| t.requisite.as_slice());
                     let mut allowed: Vec<String> = holders
                         .into_iter()
                         .map(|(n, _)| n)
@@ -1379,7 +1378,7 @@ fn ready_outcome(name: &str, v: Arc<Volume>, generation: i64, requested: u64) ->
             Some(Err((
                 Status::resource_exhausted(format!(
                     "volume {name}: {}",
-                    c.map(|c| c.message.as_str()).unwrap_or_default()
+                    c.map_or_default(|c| c.message.as_str())
                 )),
                 reported,
             )))
@@ -1389,8 +1388,7 @@ fn ready_outcome(name: &str, v: Arc<Volume>, generation: i64, requested: u64) ->
         VolumePhase::Failed => {
             let msg = format!(
                 "volume {name} failed: {}",
-                c.map(|c| format!("{}: {}", c.reason, c.message))
-                    .unwrap_or_default()
+                c.map_or_default(|c| format!("{}: {}", c.reason, c.message))
             );
             let reported = v.metadata.uid.clone().zip(st.observed_generation);
             Some(Err((Status::failed_precondition(msg), reported)))

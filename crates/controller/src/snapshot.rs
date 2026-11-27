@@ -174,7 +174,7 @@ pub fn start_blocker(r: &Round<'_>) -> Option<String> {
     if !r.stale.is_empty() {
         return Some(format!("agent not reachable on {}", r.stale.join(", ")));
     }
-    let entries = st.map(|s| s.replicas.as_slice()).unwrap_or_default();
+    let entries = st.map_or_default(|s| s.replicas.as_slice());
     let entry = |n: &str| entries.iter().find(|e| e.node == n);
     // Each Secondary suspends after the Primary drained; with two
     // Primaries (a live migration) neither order holds for both.
@@ -262,8 +262,7 @@ fn suspending(r: &Round<'_>) -> Step {
         .volume
         .status
         .as_ref()
-        .map(|s| s.replicas.as_slice())
-        .unwrap_or_default();
+        .map_or_default(|s| s.replicas.as_slice());
     let stale: Vec<&str> = r
         .nodes(Some(Role::Diskful))
         .into_iter()
@@ -497,8 +496,7 @@ async fn write(api: &Api<Snapshot>, s: &Snapshot, mut wanted: Owned) -> bool {
     let existing = s
         .status
         .as_ref()
-        .map(|st| st.conditions.as_slice())
-        .unwrap_or_default();
+        .map_or_default(|st| st.conditions.as_slice());
     let cond = ready_cond(phase, wanted.last_error.as_deref(), wanted.reason);
     wanted.conditions = build_conditions(existing, &[(types::READY, &cond)], s.metadata.generation);
     wanted.observed_generation = s.metadata.generation;
@@ -753,8 +751,7 @@ pub async fn start_discovery(api: &Api<Snapshot>, s: &Snapshot) {
     let existing = s
         .status
         .as_ref()
-        .map(|st| st.conditions.as_slice())
-        .unwrap_or_default();
+        .map_or_default(|st| st.conditions.as_slice());
     let cond = ready_cond(SnapshotPhase::Discovering, None, None);
     let conditions = build_conditions(existing, &[(types::READY, &cond)], s.metadata.generation);
     let patch = json!({
@@ -918,11 +915,7 @@ async fn discover(
         return Some(model::snapshot::DISCOVERY_SILENT);
     };
     let elapsed = Duration::try_from(Timestamp::now().duration_since(since.0)).unwrap_or_default();
-    let acks = s
-        .status
-        .as_ref()
-        .map(|st| st.acks.as_slice())
-        .unwrap_or_default();
+    let acks = s.status.as_ref().map_or_default(|st| st.acks.as_slice());
     match discovery(acks, Some(since), pools) {
         Discovery::Waiting(silent) => {
             let message = format!("waiting for the answer of {}", silent.join(", "));
@@ -1081,11 +1074,7 @@ async fn step(
     let phase_for = current.phase_since.as_ref().map(|t| {
         Duration::try_from(Timestamp::now().duration_since(t.0)).unwrap_or(Duration::ZERO)
     });
-    let acks = s
-        .status
-        .as_ref()
-        .map(|st| st.acks.as_slice())
-        .unwrap_or_default();
+    let acks = s.status.as_ref().map_or_default(|st| st.acks.as_slice());
     let failures = v.uid().and_then(|u| memory.round_failures.get(&u));
     let silent =
         |n: &str| failures.is_some_and(|f| f.awaits_renewal(n, ctx.stores.agent_renewed_at(n)));
@@ -1289,11 +1278,7 @@ async fn delete(
     if !has_finalizer(s, FINALIZER_SNAPSHOT) {
         return;
     }
-    let acks = s
-        .status
-        .as_ref()
-        .map(|st| st.acks.as_slice())
-        .unwrap_or_default();
+    let acks = s.status.as_ref().map_or_default(|st| st.acks.as_slice());
     // sizeBytes is written on the way into Taking.
     let reached_taking = current.size_bytes.is_some()
         || matches!(

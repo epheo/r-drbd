@@ -529,14 +529,12 @@ fn known_values(
 
 /// Every agent-reported error, "node: text", sorted.
 fn replica_errors(status: Option<&VolumeStatus>) -> Vec<String> {
-    let mut errors: Vec<String> = status
-        .map(|s| {
-            s.replicas
-                .iter()
-                .filter_map(|e| e.last_error.as_ref().map(|x| format!("{}: {x}", e.node)))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut errors: Vec<String> = status.map_or_default(|s| {
+        s.replicas
+            .iter()
+            .filter_map(|e| e.last_error.as_ref().map(|x| format!("{}: {x}", e.node)))
+            .collect()
+    });
     errors.sort();
     errors
 }
@@ -604,9 +602,8 @@ pub fn aggregate_nodes(
     latched: &BTreeSet<Pair>,
     generation: Option<i64>,
 ) -> Summary {
-    let entries: HashMap<&str, &model::ReplicaStatus> = status
-        .map(|s| s.replicas.iter().map(|e| (e.node.as_str(), e)).collect())
-        .unwrap_or_default();
+    let entries: HashMap<&str, &model::ReplicaStatus> =
+        status.map_or_default(|s| s.replicas.iter().map(|e| (e.node.as_str(), e)).collect());
     let diskful: Vec<&str> = assignment
         .replicas
         .iter()
@@ -693,9 +690,8 @@ pub fn resolve_done(
     if summary.split_brain.status != FALSE {
         return false;
     }
-    let entries: HashMap<&str, &model::ReplicaStatus> = status
-        .map(|s| s.replicas.iter().map(|e| (e.node.as_str(), e)).collect())
-        .unwrap_or_default();
+    let entries: HashMap<&str, &model::ReplicaStatus> =
+        status.map_or_default(|s| s.replicas.iter().map(|e| (e.node.as_str(), e)).collect());
     assignment
         .replicas
         .iter()
@@ -850,8 +846,7 @@ impl Owned {
         let existing = v
             .status
             .as_ref()
-            .map(|s| s.conditions.as_slice())
-            .unwrap_or_default();
+            .map_or_default(|s| s.conditions.as_slice());
         let generation = v.metadata.generation;
         let mut conditions = build_conditions(existing, conds, generation);
         conditions.sort_by(|a, b| a.type_.cmp(&b.type_));
@@ -1071,10 +1066,7 @@ fn probe_key(prober: &str, p: &model::PeerProbe) -> (String, String, String) {
     (
         prober.to_owned(),
         p.node.clone(),
-        p.peer_run
-            .as_ref()
-            .map(|t| t.0.to_string())
-            .unwrap_or_default(),
+        p.peer_run.as_ref().map_or_default(|t| t.0.to_string()),
     )
 }
 
@@ -1368,9 +1360,8 @@ async fn attach_report(
         .collect::<Vec<_>>()
         .join("; ");
     let before = memory.attach_failed.get(&uid);
-    let nodes_before: Vec<&str> = before
-        .map(|(n, _)| n.iter().map(String::as_str).collect())
-        .unwrap_or_default();
+    let nodes_before: Vec<&str> =
+        before.map_or_default(|(n, _)| n.iter().map(String::as_str).collect());
     if nodes != nodes_before {
         if failed.is_empty() {
             info!(volume = name, "every attached node has a replica");
@@ -1468,11 +1459,7 @@ async fn evict_step(
 ) {
     let uid = v.metadata.uid.clone().unwrap_or_default();
     let name = v.name_any();
-    let entries = v
-        .status
-        .as_ref()
-        .map(|s| s.replicas.as_slice())
-        .unwrap_or_default();
+    let entries = v.status.as_ref().map_or_default(|s| s.replicas.as_slice());
     let initialized = v
         .status
         .as_ref()
@@ -1631,8 +1618,7 @@ async fn peer_event(ctx: &Ctx<'_>, memory: &mut Memory, v: &Volume, now: &Cond) 
                 .as_ref()
                 .and_then(|s| condition::get(&s.conditions, types::PEER_UNREACHABLE))
                 .filter(|c| c.status == TRUE)
-                .map(|c| c.reason.clone())
-                .unwrap_or_default(),
+                .map_or_default(|c| c.reason.clone()),
             false_since: None,
         });
     let (next, event) = peer_transition(
@@ -2176,10 +2162,7 @@ fn place(ctx: &Ctx<'_>, placing: &Placing, v: &Volume) -> Placement {
                     .collect::<Vec<_>>()
                     .join(", ")
             };
-            let pin = req
-                .node
-                .map(|n| format!("; one must be on {n}"))
-                .unwrap_or_default();
+            let pin = req.node.map_or_default(|n| format!("; one must be on {n}"));
             Placement::Wait(Cond::new(
                 FALSE,
                 reason::INSUFFICIENT,

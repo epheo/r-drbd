@@ -3,13 +3,14 @@ name = "controller"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "r-drbd controller: reconcilers, allocation, CSI controller plugin"
 
 [dependencies]
 base64 = "0.22.1"
 csi.workspace = true
 futures.workspace = true
-getrandom = "0.3.4"
+getrandom = "0.4.3"
 # Already in the tree through kube: the watch client rebuilds its stack
 # on keepalive sockets, which kube::Config cannot set.
 hyper-timeout = "0.5.2"
