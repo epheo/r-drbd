@@ -357,7 +357,7 @@ name = "controller"
 version = "0.1.0"
 dependencies = [
  "agent",
- "base64 0.22.1",
+ "base64 0.23.1",
  "csi",
  "futures",
  "getrandom 0.4.3",
